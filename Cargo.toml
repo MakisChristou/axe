@@ -6,7 +6,8 @@ edition = "2024"
 [dependencies]
 alloy = { version = "1.6.3", features = ["provider-http", "signer-local", "network", "rpc-types", "contract"] }
 base64 = "0.22"
-clap = { version = "4.5.58", features = ["derive"] }
+clap = { version = "4.5.58", features = ["derive", "env"] }
+futures = "0.3"
 dirs = "6"
 dotenvy = "0.15"
 eyre = "0.6"
@@ -22,3 +23,20 @@ tokio = { version = "1", features = ["full"] }
 owo-colors = "4"
 indicatif = "0.17"
 comfy-table = "7"
+
+# Solana dependencies (load test)
+solana-sdk = "~3.0"
+solana-client = "~3.0"
+solana-transaction-status = "~3.0"
+solana-commitment-config = "~3.0"
+solana-axelar-gateway = { version = "0.1.11", features = ["no-entrypoint"], default-features = false }
+anchor-lang = { version = "1.0.0-rc.1", features = ["event-cpi"] }
+hex = "0.4"
+rand = "0.8"
+bip39 = "2"
+hmac = "0.12"
+sha2 = "0.10"
+
+[features]
+default = ["devnet-amplifier"]
+devnet-amplifier = ["solana-axelar-gateway/devnet-amplifier"]

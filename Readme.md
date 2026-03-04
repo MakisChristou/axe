@@ -107,6 +107,52 @@ ITS requires `ITS_SALT`, `ITS_PROXY_SALT`, and optionally `ITS_DEPLOYER_PRIVATE_
 - **Steps 5, 8, 10, 22:** Vote on governance proposals after they're submitted
 - **Step 13:** Merge infrastructure PR and register chain support for verifiers
 
+## Load Testing (Solana → EVM)
+
+Sends `call_contract` transactions from Solana to a destination EVM chain and tracks each message through the Amplifier pipeline.
+
+**Source chain is Solana only.** Destination can be any EVM chain in your config.
+
+### Quick start
+
+```bash
+cargo run --release -- test load-test \
+  --config ../axelar-contract-deployments/axelar-chains-config/info/devnet-amplifier.json \
+  --destination-chain avalanche-fuji \
+  --private-key $EVM_PRIVATE_KEY \
+  --keypair ~/.config/solana/id.json \
+  --time 5 \
+  --delay 1000
+```
+
+This sends 1 tx/sec for 5 seconds, then verifies each message on-chain through 4 checkpoints:
+
+1. **Voted** — VotingVerifier quorum reached
+2. **Routed** — message appears on destination Cosmos Gateway
+3. **Approved** — `isMessageApproved` returns true on EVM gateway
+4. **Executed** — approval consumed (relayer executed)
+
+### Options
+
+| Flag                    | Description                                 | Default                              |
+| ----------------------- | ------------------------------------------- | ------------------------------------ |
+| `--config`              | Path to chains config JSON                  | (required, or `CHAINS_CONFIG` env)   |
+| `--destination-chain`   | Axelar ID of destination EVM chain          | (required)                           |
+| `--source-chain`        | Axelar ID of Solana                         | `solana-18`                          |
+| `--private-key`         | EVM private key (deploys SenderReceiver)    | (required, or `EVM_PRIVATE_KEY` env) |
+| `--keypair`             | Path to Solana keypair JSON                 | `~/.config/solana/id.json`           |
+| `--mnemonic`            | Mnemonic to derive multiple Solana keypairs | -                                    |
+| `--addresses-to-derive` | Number of keypairs from mnemonic            | -                                    |
+| `--time`                | Test duration in seconds                    | (required)                           |
+| `--delay`               | Delay between txs in milliseconds           | `10`                                 |
+| `--skip-gmp-verify`     | Skip on-chain verification phase            | `false`                              |
+| `--output-dir`          | Directory for report JSON                   | `output`                             |
+
+### State
+
+- **SenderReceiver cache:** `~/.local/share/axelar-evm-deployer/load-test-{chain}.json` — deployed SenderReceiver address is reused across runs
+- **Report:** `{output-dir}/report.json` — full metrics for every transaction
+
 ## Testing GMP
 
 After deployment, run a full end-to-end GMP loopback test:

@@ -3,6 +3,7 @@ mod commands;
 mod cosmos;
 mod evm;
 mod preflight;
+mod solana;
 mod state;
 mod steps;
 pub mod ui;
@@ -40,6 +41,38 @@ async fn main() -> Result<()> {
         cli::Commands::Test { subcommand } => match subcommand {
             cli::TestCommands::Gmp { axelar_id } => commands::test_gmp::run(axelar_id).await,
             cli::TestCommands::Its { axelar_id } => commands::test_its::run(axelar_id).await,
+            cli::TestCommands::LoadTest {
+                config,
+                destination_chain,
+                source_chain,
+                private_key,
+                time,
+                delay,
+                keypair,
+                mnemonic,
+                addresses_to_derive,
+                contention_mode,
+                payload,
+                output_dir,
+                skip_gmp_verify,
+            } => {
+                commands::load_test::run(commands::load_test::LoadTestArgs {
+                    config,
+                    destination_chain,
+                    source_chain,
+                    private_key,
+                    time,
+                    delay,
+                    keypair,
+                    mnemonic,
+                    addresses_to_derive,
+                    contention_mode,
+                    payload,
+                    output_dir,
+                    skip_gmp_verify,
+                })
+                .await
+            }
         },
     }
 }
