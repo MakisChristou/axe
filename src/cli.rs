@@ -69,23 +69,23 @@ pub enum TestCommands {
         axelar_id: Option<String>,
     },
 
-    /// Cross-chain load test (auto-detects chains and RPCs from config)
+    /// Cross-chain load test (auto-detects chains, RPCs, and test type from config)
     LoadTest {
         /// Path to chains config JSON (e.g. devnet-amplifier.json, testnet.json, mainnet.json)
         #[arg(long, env = "CHAINS_CONFIG")]
         config: PathBuf,
 
-        /// Load test type: sol-to-evm, evm-to-sol, evm-to-evm
-        #[arg(long, value_enum)]
-        test_type: TestType,
-
         /// Test duration in seconds
-        #[arg(long)]
+        #[arg(long, default_value = "10")]
         time: u64,
 
         /// Delay between transactions in milliseconds
-        #[arg(long, default_value = "10")]
+        #[arg(long, default_value = "1000")]
         delay: u64,
+
+        /// Load test type (auto-detected from source/destination chain types if omitted)
+        #[arg(long, value_enum)]
+        test_type: Option<TestType>,
 
         /// Override destination chain axelar ID (auto-detected from config)
         #[arg(long)]
@@ -114,10 +114,6 @@ pub enum TestCommands {
         /// Output directory for all results
         #[arg(long, default_value = "output")]
         output_dir: PathBuf,
-
-        /// Skip on-chain cross-chain verification
-        #[arg(long)]
-        skip_gmp_verify: bool,
     },
 }
 

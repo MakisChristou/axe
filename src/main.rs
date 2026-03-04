@@ -53,31 +53,28 @@ async fn main() -> Result<()> {
                 contention_mode,
                 payload,
                 output_dir,
-                skip_gmp_verify,
             } => {
-                let (resolved_source, resolved_dest, solana_rpc, resolved_key) =
-                    commands::load_test::resolve_from_config(
-                        &config,
-                        test_type,
-                        source_chain,
-                        destination_chain,
-                        private_key,
-                    )?;
+                let resolved = commands::load_test::resolve_from_config(
+                    &config,
+                    test_type,
+                    source_chain,
+                    destination_chain,
+                    private_key,
+                )?;
 
                 commands::load_test::run(commands::load_test::LoadTestArgs {
                     config,
-                    test_type,
-                    destination_chain: resolved_dest,
-                    source_chain: resolved_source,
-                    solana_rpc,
-                    private_key: resolved_key,
+                    test_type: resolved.test_type,
+                    destination_chain: resolved.destination_chain,
+                    source_chain: resolved.source_chain,
+                    solana_rpc: resolved.solana_rpc,
+                    private_key: resolved.private_key,
                     time,
                     delay,
                     keypair,
                     contention_mode,
                     payload,
                     output_dir,
-                    skip_gmp_verify,
                 })
                 .await
             }
