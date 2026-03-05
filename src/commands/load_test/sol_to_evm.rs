@@ -47,6 +47,9 @@ pub enum ContentionMode {
     Parallel,
 }
 
+/// Minimum delay (ms) between individual Solana transactions to avoid RPC rate limiting.
+const MIN_TX_DELAY_MS: u64 = 200;
+
 /// Prepare the signing keypairs for the load test.
 ///
 /// When `num_keys >= 2`, derives N keypairs from the main one, funds any that
@@ -55,10 +58,11 @@ pub enum ContentionMode {
 ///
 /// When `num_keys <= 1`, returns the main keypair as the only signer.
 fn prepare_keypairs(
-    args: &LoadTestArgs,
+    solana_rpc: &str,
+    num_keys: usize,
     main_keypair: &Keypair,
 ) -> eyre::Result<Vec<Arc<dyn Signer + Send + Sync>>> {
-    if args.num_keys <= 1 {
+    if num_keys <= 1 {
         return Ok(vec![
             Arc::new(Keypair::new_from_array(main_keypair.to_bytes()[..32].try_into().unwrap()))
                 as Arc<dyn Signer + Send + Sync>,
@@ -66,9 +70,9 @@ fn prepare_keypairs(
     }
 
     ui::section("Derived Keys");
-    ui::info(&format!("deriving {} keypairs from main wallet...", args.num_keys));
+    ui::info(&format!("deriving {} keypairs from main wallet...", num_keys));
 
-    let derived = keypairs::derive_keypairs(main_keypair, args.num_keys)?;
+    let derived = keypairs::derive_keypairs(main_keypair, num_keys)?;
 
     // Show derived addresses
     for (i, kp) in derived.iter().enumerate() {
@@ -76,7 +80,7 @@ fn prepare_keypairs(
     }
 
     // Fund any that need it
-    let balances = keypairs::ensure_funded(&args.solana_rpc, main_keypair, &derived)?;
+    let balances = keypairs::ensure_funded(solana_rpc, main_keypair, &derived)?;
 
     println!();
     #[allow(clippy::float_arithmetic)]
@@ -100,9 +104,32 @@ pub async fn run_load_test_with_metrics(
     args: &LoadTestArgs,
     destination_address: &str,
 ) -> eyre::Result<LoadTestReport> {
+    // Enforce minimum delay between Solana txs to avoid RPC rate limiting
+    let effective_delay = args.delay.max(MIN_TX_DELAY_MS);
+    if effective_delay != args.delay {
+        ui::warn(&format!(
+            "delay clamped to {}ms minimum (was {}ms) to avoid RPC rate limiting",
+            MIN_TX_DELAY_MS, args.delay
+        ));
+    }
+
+    // Auto-scale num_keys so each tx uses a unique key (avoids nonce contention)
+    #[allow(clippy::integer_division)]
+    let expected_txs = (args.time * 1000) / effective_delay;
+    let effective_num_keys = match args.contention_mode {
+        ContentionMode::None => args.num_keys.max(expected_txs as usize),
+        _ => args.num_keys,
+    };
+    if effective_num_keys != args.num_keys {
+        ui::info(&format!(
+            "auto-scaled num_keys from {} to {} (1 key per expected tx)",
+            args.num_keys, effective_num_keys
+        ));
+    }
+
     ui::kv("duration", &format!("{}s", args.time));
-    ui::kv("delay", &format!("{}ms", args.delay));
-    ui::kv("num keys", &args.num_keys.to_string());
+    ui::kv("delay", &format!("{}ms", effective_delay));
+    ui::kv("num keys", &effective_num_keys.to_string());
     ui::kv("contention mode", &format!("{:?}", args.contention_mode));
 
     let tx_output = args.output_dir.join("transactions.txt");
@@ -134,7 +161,7 @@ pub async fn run_load_test_with_metrics(
     }
 
     // Derive and fund keypairs
-    let keypairs = prepare_keypairs(args, &main_keypair)?;
+    let keypairs = prepare_keypairs(&args.solana_rpc, effective_num_keys, &main_keypair)?;
     let keypairs = Arc::new(keypairs);
     let key_count = keypairs.len();
 
@@ -144,7 +171,8 @@ pub async fn run_load_test_with_metrics(
     };
 
     let duration = Duration::from_secs(args.time);
-    let delay_duration = Duration::from_millis(args.delay);
+    let delay_duration = Duration::from_millis(effective_delay);
+    let min_tx_stagger = Duration::from_millis(MIN_TX_DELAY_MS);
 
     let metrics_list: Arc<Mutex<Vec<TxMetrics>>> = Arc::new(Mutex::new(Vec::new()));
     let mut pending_tasks = Vec::new();
@@ -160,12 +188,12 @@ pub async fn run_load_test_with_metrics(
 
     match args.contention_mode {
         ContentionMode::Parallel => {
-            // Fire one tx per keypair simultaneously each wave
+            // Fire one tx per keypair each wave, staggered to avoid rate limiting
             loop {
                 if start_time.elapsed() >= duration {
                     break;
                 }
-                // Spawn one task per key
+                // Spawn one task per key with stagger between each
                 for i in 0..key_count {
                     if start_time.elapsed() >= duration {
                         break;
@@ -191,6 +219,10 @@ pub async fn run_load_test_with_metrics(
                         .await;
                     });
                     pending_tasks.push(handle);
+                    // Stagger between txs within a wave to avoid RPC rate limiting
+                    if i + 1 < key_count {
+                        tokio::time::sleep(min_tx_stagger).await;
+                    }
                 }
                 tokio::time::sleep(delay_duration).await;
             }
@@ -284,7 +316,7 @@ pub async fn run_load_test_with_metrics(
         destination_chain: args.destination_chain.clone(),
         destination_address: destination_address.to_string(),
         duration_secs: args.time,
-        delay_ms: args.delay,
+        delay_ms: effective_delay,
         num_keys: key_count,
         contention_mode: format!("{:?}", args.contention_mode),
         total_submitted,
