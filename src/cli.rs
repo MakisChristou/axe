@@ -111,6 +111,10 @@ pub enum TestCommands {
         #[arg(long, value_enum, default_value = "none")]
         contention_mode: ContentionMode,
 
+        /// Override source chain RPC URL (default: from config)
+        #[arg(long)]
+        source_rpc: Option<String>,
+
         /// Hex-encoded payload to send (default: random test message)
         #[arg(long)]
         payload: Option<String>,

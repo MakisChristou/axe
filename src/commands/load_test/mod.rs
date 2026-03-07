@@ -144,6 +144,7 @@ pub fn resolve_from_config(
     source_chain_override: Option<String>,
     destination_chain_override: Option<String>,
     private_key_override: Option<String>,
+    source_rpc_override: Option<String>,
 ) -> Result<ResolvedConfig> {
     let config_content = std::fs::read_to_string(config)
         .map_err(|e| eyre::eyre!("failed to read config {}: {e}", config.display()))?;
@@ -202,6 +203,8 @@ pub fn resolve_from_config(
             })?
             .to_string(),
     };
+
+    let solana_rpc = source_rpc_override.unwrap_or(solana_rpc);
 
     Ok(ResolvedConfig {
         test_type,

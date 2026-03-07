@@ -52,6 +52,7 @@ async fn main() -> Result<()> {
                 keypair,
                 num_keys,
                 contention_mode,
+                source_rpc,
                 payload,
                 output_dir,
             } => {
@@ -61,6 +62,7 @@ async fn main() -> Result<()> {
                     source_chain,
                     destination_chain,
                     private_key,
+                    source_rpc,
                 )?;
 
                 commands::load_test::run(commands::load_test::LoadTestArgs {
