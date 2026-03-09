@@ -104,14 +104,21 @@ pub async fn run_load_test_with_metrics(
     args: &LoadTestArgs,
     destination_address: &str,
 ) -> eyre::Result<LoadTestReport> {
-    // Enforce minimum delay between Solana txs to avoid RPC rate limiting
-    let effective_delay = args.delay.max(MIN_TX_DELAY_MS);
-    if effective_delay != args.delay {
-        ui::warn(&format!(
-            "delay clamped to {}ms minimum (was {}ms) to avoid RPC rate limiting",
-            MIN_TX_DELAY_MS, args.delay
-        ));
-    }
+    // Enforce minimum delay between Solana txs to avoid RPC rate limiting,
+    // unless a custom --source-rpc is provided (user controls the endpoint).
+    let effective_delay = if args.source_rpc_override {
+        args.delay
+    } else {
+        let clamped = args.delay.max(MIN_TX_DELAY_MS);
+        if clamped != args.delay {
+            ui::warn(&format!(
+                "delay clamped to {}ms minimum (was {}ms) to avoid RPC rate limiting \
+                 (use --source-rpc to bypass)",
+                MIN_TX_DELAY_MS, args.delay
+            ));
+        }
+        clamped
+    };
 
     // Auto-scale num_keys so each tx uses a unique key (avoids nonce contention)
     #[allow(clippy::integer_division)]
@@ -172,7 +179,11 @@ pub async fn run_load_test_with_metrics(
 
     let duration = Duration::from_secs(args.time);
     let delay_duration = Duration::from_millis(effective_delay);
-    let min_tx_stagger = Duration::from_millis(MIN_TX_DELAY_MS);
+    let min_tx_stagger = if args.source_rpc_override {
+        Duration::ZERO
+    } else {
+        Duration::from_millis(MIN_TX_DELAY_MS)
+    };
 
     let metrics_list: Arc<Mutex<Vec<TxMetrics>>> = Arc::new(Mutex::new(Vec::new()));
     let mut pending_tasks = Vec::new();

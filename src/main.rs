@@ -60,6 +60,7 @@ async fn main() -> Result<()> {
                 payload,
                 output_dir,
             } => {
+                let has_rpc_override = source_rpc.is_some();
                 let resolved = commands::load_test::resolve_from_config(
                     &config,
                     test_type,
@@ -83,6 +84,7 @@ async fn main() -> Result<()> {
                     contention_mode,
                     payload,
                     output_dir,
+                    source_rpc_override: has_rpc_override,
                 })
                 .await
             }

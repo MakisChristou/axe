@@ -59,6 +59,8 @@ pub struct LoadTestArgs {
     pub contention_mode: ContentionMode,
     pub payload: Option<String>,
     pub output_dir: PathBuf,
+    /// Whether --source-rpc was provided (skips rate-limit guard)
+    pub source_rpc_override: bool,
 }
 
 /// Cache file for storing SenderReceiver address per chain.
