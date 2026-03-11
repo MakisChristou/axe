@@ -21,7 +21,6 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 struct PendingTx {
     idx: usize,
     message_id: String,
-    sig_short: String,
     send_instant: Instant,
     source_address: String,
     contract_addr: Address,
@@ -61,11 +60,8 @@ pub async fn verify_onchain<P: Provider>(
         return Ok(VerificationReport::default());
     }
 
-    ui::kv("transactions to verify", &total.to_string());
-
     // Read Cosmos config
     let (lcd, _, _, _) = read_axelar_config(config)?;
-    ui::kv("cosmos LCD", &lcd);
 
     // Contract addresses (VotingVerifier is optional)
     let voting_verifier = read_axelar_contract_field(
@@ -77,14 +73,6 @@ pub async fn verify_onchain<P: Provider>(
         config,
         &format!("/axelar/contracts/Gateway/{destination_chain}/address"),
     )?;
-
-    if let Some(ref vv) = voting_verifier {
-        ui::address(&format!("voting verifier ({source_chain})"), vv);
-    }
-    ui::address(
-        &format!("cosmos gateway ({destination_chain})"),
-        &cosm_gateway,
-    );
 
     let gw_contract = AxelarAmplifierGateway::new(gateway_addr, provider);
     let contract_addr: Address = destination_address.parse()?;
@@ -98,7 +86,6 @@ pub async fn verify_onchain<P: Provider>(
             PendingTx {
                 idx,
                 message_id: format!("{}-1.1", tx.signature),
-                sig_short: truncate_sig(&tx.signature),
                 send_instant: tx.send_instant.unwrap_or_else(Instant::now),
                 source_address: tx.source_address.clone(),
                 contract_addr,
@@ -202,24 +189,20 @@ async fn batch_poll_voted(
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-    spinner.finish_and_clear();
-
-    println!();
+    // Mark timed-out txs as failed
     for &i in &pending {
-        if let Some(secs) = txs[i].timing.voted_secs {
-            println!(
-                "    {}  T + {secs:>6.1}s  \u{2714} voted",
-                txs[i].sig_short
-            );
-        } else {
-            let elapsed = txs[i].send_instant.elapsed().as_secs_f64();
-            println!(
-                "    {}  T + {elapsed:>6.1}s  \u{2718} voted (timed out)",
-                txs[i].sig_short
-            );
+        if txs[i].timing.voted_secs.is_none() && !txs[i].failed {
             txs[i].failed = true;
             txs[i].fail_reason = Some("VotingVerifier: timed out".into());
         }
+    }
+
+    let timed_out = pending_count - done_count;
+    spinner.finish_and_clear();
+    if timed_out > 0 {
+        ui::success(&format!("voted {done_count}/{pending_count} ({timed_out} timed out)"));
+    } else {
+        ui::success(&format!("voted {done_count}/{pending_count}"));
     }
 }
 
@@ -271,24 +254,20 @@ async fn batch_poll_routed(
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-    spinner.finish_and_clear();
-
-    println!();
+    // Mark timed-out txs as failed
     for &i in &pending {
-        if let Some(secs) = txs[i].timing.routed_secs {
-            println!(
-                "    {}  T + {secs:>6.1}s  \u{2714} routed",
-                txs[i].sig_short
-            );
-        } else {
-            let elapsed = txs[i].send_instant.elapsed().as_secs_f64();
-            println!(
-                "    {}  T + {elapsed:>6.1}s  \u{2718} routed (timed out)",
-                txs[i].sig_short
-            );
+        if txs[i].timing.routed_secs.is_none() && !txs[i].failed {
             txs[i].failed = true;
             txs[i].fail_reason = Some("cosmos routing: timed out".into());
         }
+    }
+
+    let timed_out = pending_count - done_count;
+    spinner.finish_and_clear();
+    if timed_out > 0 {
+        ui::success(&format!("routed {done_count}/{pending_count} ({timed_out} timed out)"));
+    } else {
+        ui::success(&format!("routed {done_count}/{pending_count}"));
     }
 }
 
@@ -313,18 +292,6 @@ async fn batch_poll_approved<P: Provider>(
     ));
     let deadline = Instant::now() + POLL_TIMEOUT;
     let mut done_count = 0usize;
-
-    // Print params for first tx so we can verify correctness
-    if let Some(&i) = pending.first() {
-        ui::info(&format!(
-            "isMessageApproved params: sourceChain={}, messageId={}, sourceAddress={}, contractAddress={:?}, payloadHash=0x{}",
-            source_chain,
-            txs[i].message_id,
-            txs[i].source_address,
-            txs[i].contract_addr,
-            alloy::hex::encode(txs[i].payload_hash),
-        ));
-    }
 
     loop {
         for &i in &pending {
@@ -361,24 +328,20 @@ async fn batch_poll_approved<P: Provider>(
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-    spinner.finish_and_clear();
-
-    println!();
+    // Mark timed-out txs as failed
     for &i in &pending {
-        if let Some(secs) = txs[i].timing.approved_secs {
-            println!(
-                "    {}  T + {secs:>6.1}s  \u{2714} approved",
-                txs[i].sig_short
-            );
-        } else {
-            let elapsed = txs[i].send_instant.elapsed().as_secs_f64();
-            println!(
-                "    {}  T + {elapsed:>6.1}s  \u{2718} approved (timed out)",
-                txs[i].sig_short
-            );
+        if txs[i].timing.approved_secs.is_none() && !txs[i].failed {
             txs[i].failed = true;
             txs[i].fail_reason = Some("EVM approval: timed out".into());
         }
+    }
+
+    let timed_out = pending_count - done_count;
+    spinner.finish_and_clear();
+    if timed_out > 0 {
+        ui::success(&format!("approved {done_count}/{pending_count} ({timed_out} timed out)"));
+    } else {
+        ui::success(&format!("approved {done_count}/{pending_count}"));
     }
 }
 
@@ -441,25 +404,21 @@ async fn batch_poll_executed<P: Provider>(
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-    spinner.finish_and_clear();
-
-    println!();
+    // Mark timed-out txs as failed
     for &i in &pending {
-        if let Some(secs) = txs[i].timing.executed_secs {
-            println!(
-                "    {}  T + {secs:>6.1}s  \u{2714} executed",
-                txs[i].sig_short
-            );
-        } else {
-            let elapsed = txs[i].send_instant.elapsed().as_secs_f64();
-            println!(
-                "    {}  T + {elapsed:>6.1}s  \u{2718} executed (timed out)",
-                txs[i].sig_short
-            );
+        if txs[i].timing.executed_secs.is_none() && !txs[i].failed {
             txs[i].failed = true;
             txs[i].timing.executed_ok = Some(false);
             txs[i].fail_reason = Some("EVM execution: timed out".into());
         }
+    }
+
+    let timed_out = pending_count - done_count;
+    spinner.finish_and_clear();
+    if timed_out > 0 {
+        ui::success(&format!("executed {done_count}/{pending_count} ({timed_out} timed out)"));
+    } else {
+        ui::success(&format!("executed {done_count}/{pending_count}"));
     }
 }
 
@@ -656,14 +615,6 @@ fn parse_payload_hash(hex_str: &str) -> Result<FixedBytes<32>> {
     Ok(FixedBytes::from_slice(&bytes))
 }
 
-fn truncate_sig(sig: &str) -> String {
-    if sig.len() > 24 {
-        format!("{}..{}", &sig[..16], &sig[sig.len() - 8..])
-    } else {
-        sig.to_string()
-    }
-}
-
 #[allow(clippy::float_arithmetic)]
 fn avg_option(iter: impl Iterator<Item = f64>) -> Option<f64> {
     let vals: Vec<f64> = iter.collect();
@@ -710,10 +661,7 @@ pub async fn verify_onchain_solana(
         return Ok(VerificationReport::default());
     }
 
-    ui::kv("transactions to verify", &total.to_string());
-
     let (lcd, _, _, _) = read_axelar_config(config)?;
-    ui::kv("cosmos LCD", &lcd);
 
     let voting_verifier = read_axelar_contract_field(
         config,
@@ -724,15 +672,6 @@ pub async fn verify_onchain_solana(
         config,
         &format!("/axelar/contracts/Gateway/{destination_chain}/address"),
     )?;
-
-    if let Some(ref vv) = voting_verifier {
-        ui::address(&format!("voting verifier ({source_chain})"), vv);
-    }
-    ui::address(
-        &format!("cosmos gateway ({destination_chain})"),
-        &cosm_gateway,
-    );
-    ui::kv("solana RPC", solana_rpc);
 
     // For EVM->Sol, message_id is stored directly in TxMetrics.signature
     let mut txs: Vec<PendingTx> = confirmed
@@ -745,7 +684,6 @@ pub async fn verify_onchain_solana(
             PendingTx {
                 idx,
                 message_id,
-                sig_short: truncate_sig(&tx.signature),
                 send_instant: tx.send_instant.unwrap_or_else(Instant::now),
                 source_address: tx.source_address.clone(),
                 contract_addr: Address::ZERO,
@@ -852,24 +790,20 @@ async fn batch_poll_solana_approved(
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-    spinner.finish_and_clear();
-
-    println!();
+    // Mark timed-out txs as failed
     for &i in &pending {
-        if let Some(secs) = txs[i].timing.approved_secs {
-            println!(
-                "    {}  T + {secs:>6.1}s  \u{2714} approved",
-                txs[i].sig_short
-            );
-        } else {
-            let elapsed = txs[i].send_instant.elapsed().as_secs_f64();
-            println!(
-                "    {}  T + {elapsed:>6.1}s  \u{2718} approved (timed out)",
-                txs[i].sig_short
-            );
+        if txs[i].timing.approved_secs.is_none() && !txs[i].failed {
             txs[i].failed = true;
             txs[i].fail_reason = Some("Solana approval: timed out".into());
         }
+    }
+
+    let timed_out = pending_count - done_count;
+    spinner.finish_and_clear();
+    if timed_out > 0 {
+        ui::success(&format!("approved {done_count}/{pending_count} ({timed_out} timed out)"));
+    } else {
+        ui::success(&format!("approved {done_count}/{pending_count}"));
     }
 }
 
@@ -930,25 +864,21 @@ async fn batch_poll_solana_executed(
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-    spinner.finish_and_clear();
-
-    println!();
+    // Mark timed-out txs as failed
     for &i in &pending {
-        if let Some(secs) = txs[i].timing.executed_secs {
-            println!(
-                "    {}  T + {secs:>6.1}s  \u{2714} executed",
-                txs[i].sig_short
-            );
-        } else {
-            let elapsed = txs[i].send_instant.elapsed().as_secs_f64();
-            println!(
-                "    {}  T + {elapsed:>6.1}s  \u{2718} executed (timed out)",
-                txs[i].sig_short
-            );
+        if txs[i].timing.executed_secs.is_none() && !txs[i].failed {
             txs[i].failed = true;
             txs[i].timing.executed_ok = Some(false);
             txs[i].fail_reason = Some("Solana execution: timed out".into());
         }
+    }
+
+    let timed_out = pending_count - done_count;
+    spinner.finish_and_clear();
+    if timed_out > 0 {
+        ui::success(&format!("executed {done_count}/{pending_count} ({timed_out} timed out)"));
+    } else {
+        ui::success(&format!("executed {done_count}/{pending_count}"));
     }
 }
 

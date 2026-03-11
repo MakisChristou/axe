@@ -1,10 +1,12 @@
 use std::fs::File;
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use eyre::eyre;
 use futures::future::join_all;
+use indicatif::ProgressBar;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 use tokio::sync::Mutex;
@@ -53,31 +55,16 @@ fn prepare_keypairs(
         )) as Arc<dyn Signer + Send + Sync>]);
     }
 
-    ui::section("Derived Keys");
-    ui::info(&format!(
-        "deriving {} keypairs from main wallet...",
-        num_keys
-    ));
-
     let derived = keypairs::derive_keypairs(main_keypair, num_keys)?;
-
-    // Show derived addresses
-    for (i, kp) in derived.iter().enumerate() {
-        ui::info(&format!("  key {}: {}", i, kp.pubkey()));
-    }
-
-    // Fund any that need it
     let balances = keypairs::ensure_funded(solana_rpc, main_keypair, &derived)?;
 
-    println!();
     #[allow(clippy::float_arithmetic)]
     let total_sol: f64 = balances.iter().sum::<u64>() as f64 / 1e9;
     ui::success(&format!(
-        "proceeding with {} funded keys ({:.4} SOL total across keys)",
+        "funded {} keys ({:.4} SOL)",
         derived.len(),
         total_sol,
     ));
-    println!();
 
     Ok(derived
         .into_iter()
@@ -92,8 +79,6 @@ pub async fn run_load_test_with_metrics(
     destination_address: &str,
 ) -> eyre::Result<LoadTestReport> {
     let num_txs = args.num_txs.max(1) as usize;
-
-    ui::kv("num txs", &num_txs.to_string());
 
     let tx_output = args.output_dir.join("transactions.txt");
     if let Some(parent) = tx_output.parent() {
@@ -138,7 +123,8 @@ pub async fn run_load_test_with_metrics(
     let test_start = Instant::now();
     let solana_rpc = args.solana_rpc.clone();
 
-    println!();
+    let confirmed_counter = Arc::new(AtomicU64::new(0));
+    let spinner = ui::wait_spinner(&format!("sending (0/{key_count} confirmed)..."));
 
     // Fire all txs in parallel (one per keypair)
     for i in 0..key_count {
@@ -149,6 +135,9 @@ pub async fn run_load_test_with_metrics(
         let output_clone = Arc::clone(&output_file);
         let metrics_clone = Arc::clone(&metrics_list);
         let rpc = solana_rpc.clone();
+        let counter = Arc::clone(&confirmed_counter);
+        let sp = spinner.clone();
+        let total = key_count;
 
         let handle = tokio::spawn(async move {
             execute_and_record(
@@ -159,6 +148,9 @@ pub async fn run_load_test_with_metrics(
                 &tx_payload,
                 output_clone,
                 metrics_clone,
+                counter,
+                sp,
+                total,
             )
             .await;
         });
@@ -168,14 +160,10 @@ pub async fn run_load_test_with_metrics(
     let total_submitted = pending_tasks.len() as u64;
     let test_duration = test_start.elapsed().as_secs_f64();
 
-    if !pending_tasks.is_empty() {
-        let spinner = ui::wait_spinner(&format!(
-            "Waiting for {} pending transactions...",
-            pending_tasks.len()
-        ));
-        join_all(pending_tasks).await;
-        spinner.finish_and_clear();
-    }
+    join_all(pending_tasks).await;
+    let confirmed_count = confirmed_counter.load(Ordering::Relaxed);
+    spinner.finish_and_clear();
+    ui::success(&format!("sent {confirmed_count}/{total_submitted} confirmed"));
 
     let metrics = metrics_list.lock().await.clone();
     let total_confirmed = metrics.iter().filter(|m| m.success).count() as u64;
@@ -232,14 +220,13 @@ pub async fn run_load_test_with_metrics(
     let metrics_json = serde_json::to_string_pretty(&report)?;
     std::fs::write(&metrics_output, metrics_json)?;
 
-    println!();
     ui::kv("metrics saved to", &metrics_output.display().to_string());
     ui::kv("transactions saved to", &tx_output.display().to_string());
 
     Ok(report)
 }
 
-#[allow(clippy::semicolon_outside_block)]
+#[allow(clippy::semicolon_outside_block, clippy::too_many_arguments)]
 async fn execute_and_record(
     solana_rpc: &str,
     keypair: Arc<dyn Signer + Send + Sync>,
@@ -248,6 +235,9 @@ async fn execute_and_record(
     payload: &[u8],
     output_file: Arc<Mutex<File>>,
     metrics_list: Arc<Mutex<Vec<TxMetrics>>>,
+    confirmed_counter: Arc<AtomicU64>,
+    spinner: ProgressBar,
+    total: usize,
 ) {
     let submit_start = Instant::now();
 
@@ -266,16 +256,8 @@ async fn execute_and_record(
                     eprintln!("  failed to write signature to file: {e}");
                 }
             }
-            let sig_short = if sig.len() > 24 {
-                format!("{}..{}", &sig[..16], &sig[sig.len() - 8..])
-            } else {
-                sig.clone()
-            };
-            ui::success(&format!(
-                "{sig_short} ({}ms, {} CU)",
-                metrics.latency_ms.unwrap_or(0),
-                metrics.compute_units.unwrap_or(0)
-            ));
+            let done = confirmed_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            spinner.set_message(format!("sending ({done}/{total} confirmed)..."));
             metrics_list.lock().await.push(metrics);
         }
         Err(e) => {
@@ -296,7 +278,6 @@ async fn execute_and_record(
                 send_instant: None,
                 amplifier_timing: None,
             };
-            ui::error(&format!("tx failed: {e}"));
             metrics_list.lock().await.push(metrics);
         }
     }

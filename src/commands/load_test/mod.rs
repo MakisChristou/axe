@@ -399,10 +399,8 @@ async fn run_sol_to_evm(args: LoadTestArgs, run_start: Instant) -> Result<()> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| eyre::eyre!("no rpc URL for chain '{dest}' in config"))?;
 
-    ui::kv("source chain", src);
-    ui::kv("destination chain", dest);
-    ui::kv("solana RPC", &args.solana_rpc);
-    ui::kv("EVM RPC", rpc_url);
+    ui::kv("source", src);
+    ui::kv("destination", dest);
 
     let gateway_addr = read_contract_address(&args.config, dest, "AxelarGateway")?;
     let gas_service_addr = read_contract_address(&args.config, dest, "AxelarGasService")?;
@@ -465,18 +463,8 @@ async fn run_sol_to_evm(args: LoadTestArgs, run_start: Instant) -> Result<()> {
     ui::address("SenderReceiver", &format!("{sender_receiver_addr}"));
     let destination_address = format!("{sender_receiver_addr}");
 
-    // --- Phase 1: Send transactions ---
-    println!("\n{}", "=".repeat(60));
-    println!("PHASE 1: LOAD TEST");
-    println!("{}\n", "=".repeat(60));
-
     let mut report =
         sol_to_evm::run_load_test_with_metrics(&args, &destination_address).await?;
-
-    // --- Phase 2: On-chain verification ---
-    println!("\n{}", "=".repeat(60));
-    println!("PHASE 2: ON-CHAIN VERIFICATION");
-    println!("{}\n", "=".repeat(60));
 
     let verification = verify::verify_onchain(
         &args.config,
@@ -507,10 +495,8 @@ async fn run_evm_to_sol(args: LoadTestArgs, run_start: Instant) -> Result<()> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| eyre::eyre!("no rpc URL for source chain '{src}' in config"))?;
 
-    ui::kv("source chain", src);
-    ui::kv("destination chain", dest);
-    ui::kv("EVM RPC (source)", evm_rpc_url);
-    ui::kv("Solana RPC (dest)", &args.solana_rpc);
+    ui::kv("source", src);
+    ui::kv("destination", dest);
 
     let gateway_addr = read_contract_address(&args.config, src, "AxelarGateway")?;
     ui::address("EVM gateway (source)", &format!("{gateway_addr}"));
@@ -531,11 +517,6 @@ async fn run_evm_to_sol(args: LoadTestArgs, run_start: Instant) -> Result<()> {
     let destination_address = evm_to_sol::MEMO_PROGRAM_ADDRESS;
     ui::kv("destination program", destination_address);
 
-    // --- Phase 1: Send EVM transactions ---
-    println!("\n{}", "=".repeat(60));
-    println!("PHASE 1: LOAD TEST");
-    println!("{}\n", "=".repeat(60));
-
     let mut report = evm_to_sol::run_load_test_with_metrics(
         &args,
         gateway_addr,
@@ -544,11 +525,6 @@ async fn run_evm_to_sol(args: LoadTestArgs, run_start: Instant) -> Result<()> {
         &provider,
     )
     .await?;
-
-    // --- Phase 2: On-chain verification ---
-    println!("\n{}", "=".repeat(60));
-    println!("PHASE 2: ON-CHAIN VERIFICATION");
-    println!("{}\n", "=".repeat(60));
 
     let verification = verify::verify_onchain_solana(
         &args.config,
@@ -569,10 +545,6 @@ fn finish_report(
     report: &LoadTestReport,
     run_start: Instant,
 ) -> Result<()> {
-    println!("\n{}", "=".repeat(60));
-    println!("PHASE 3: FINAL REPORT");
-    println!("{}\n", "=".repeat(60));
-
     let report_output = args.output_dir.join("report.json");
     let report_json = serde_json::to_string_pretty(report)?;
     std::fs::write(&report_output, &report_json)?;

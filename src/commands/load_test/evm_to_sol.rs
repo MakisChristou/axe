@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::Write;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use alloy::{
@@ -12,6 +13,7 @@ use alloy::{
 };
 use eyre::eyre;
 use futures::future::join_all;
+use indicatif::ProgressBar;
 use rand::Rng;
 use solana_sdk::pubkey::Pubkey;
 use tokio::sync::Mutex;
@@ -83,13 +85,10 @@ pub async fn run_load_test_with_metrics<P: Provider + Clone + 'static>(
 ) -> eyre::Result<LoadTestReport> {
     let num_txs = args.num_txs.max(1) as usize;
 
-    ui::kv("num txs", &num_txs.to_string());
-
     // Derive the memo program's counter PDA
     let memo_program_id = Pubkey::from_str(MEMO_PROGRAM_ADDRESS)
         .map_err(|e| eyre!("invalid memo program address: {e}"))?;
     let (counter_pda, _) = Pubkey::find_program_address(&[b"counter"], &memo_program_id);
-    ui::kv("memo counter PDA", &counter_pda.to_string());
 
     let tx_output = args.output_dir.join("transactions.txt");
     if let Some(parent) = tx_output.parent() {
@@ -116,7 +115,8 @@ pub async fn run_load_test_with_metrics<P: Provider + Clone + 'static>(
     let dest_chain = args.destination_chain.clone();
     let dest_addr = destination_address.to_string();
 
-    println!();
+    let confirmed_counter = Arc::new(AtomicU64::new(0));
+    let spinner = ui::wait_spinner(&format!("sending (0/{num_txs} confirmed)..."));
 
     // Send N txs sequentially with a small stagger to avoid rate limiting
     for i in 0..num_txs {
@@ -128,6 +128,9 @@ pub async fn run_load_test_with_metrics<P: Provider + Clone + 'static>(
         let provider = provider.clone();
         let gw_addr = gateway_addr;
         let signer_addr = signer_address;
+        let counter = Arc::clone(&confirmed_counter);
+        let sp = spinner.clone();
+        let total = num_txs;
 
         let handle = tokio::spawn(async move {
             execute_and_record_evm(
@@ -139,6 +142,9 @@ pub async fn run_load_test_with_metrics<P: Provider + Clone + 'static>(
                 &tx_payload,
                 output_clone,
                 metrics_clone,
+                counter,
+                sp,
+                total,
             )
             .await;
         });
@@ -151,14 +157,10 @@ pub async fn run_load_test_with_metrics<P: Provider + Clone + 'static>(
     let total_submitted = pending_tasks.len() as u64;
     let test_duration = test_start.elapsed().as_secs_f64();
 
-    if !pending_tasks.is_empty() {
-        let spinner = ui::wait_spinner(&format!(
-            "Waiting for {} pending transactions...",
-            pending_tasks.len()
-        ));
-        join_all(pending_tasks).await;
-        spinner.finish_and_clear();
-    }
+    join_all(pending_tasks).await;
+    let confirmed_count = confirmed_counter.load(Ordering::Relaxed);
+    spinner.finish_and_clear();
+    ui::success(&format!("sent {confirmed_count}/{total_submitted} confirmed"));
 
     let metrics = metrics_list.lock().await.clone();
     let total_confirmed = metrics.iter().filter(|m| m.success).count() as u64;
@@ -210,7 +212,6 @@ pub async fn run_load_test_with_metrics<P: Provider + Clone + 'static>(
     let metrics_json = serde_json::to_string_pretty(&report)?;
     std::fs::write(&metrics_output, metrics_json)?;
 
-    println!();
     ui::kv("metrics saved to", &metrics_output.display().to_string());
     ui::kv("transactions saved to", &tx_output.display().to_string());
 
@@ -228,6 +229,9 @@ async fn execute_and_record_evm<P: Provider>(
     payload: &[u8],
     output_file: Arc<Mutex<File>>,
     metrics_list: Arc<Mutex<Vec<TxMetrics>>>,
+    confirmed_counter: Arc<AtomicU64>,
+    spinner: ProgressBar,
+    total: usize,
 ) {
     let submit_start = Instant::now();
     let payload_hash = alloy::hex::encode(keccak256(payload));
@@ -291,35 +295,21 @@ async fn execute_and_record_evm<P: Provider>(
                         let _ = writeln!(file, "{message_id}");
                     }
 
-                    let short = truncate_id(&message_id);
-                    ui::success(&format!(
-                        "{short} ({latency_ms}ms, {gas} gas)",
-                        gas = receipt.gas_used
-                    ));
+                    let done = confirmed_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    spinner.set_message(format!("sending ({done}/{total} confirmed)..."));
                     metrics_list.lock().await.push(metrics);
                 }
                 Ok(Err(e)) => {
                     record_failure(submit_start, &e.to_string(), &metrics_list).await;
-                    ui::error(&format!("tx receipt error: {e}"));
                 }
                 Err(_) => {
                     record_failure(submit_start, "tx timed out", &metrics_list).await;
-                    ui::error("tx timed out after 120s");
                 }
             }
         }
         Err(e) => {
             record_failure(submit_start, &e.to_string(), &metrics_list).await;
-            ui::error(&format!("tx send error: {e}"));
         }
-    }
-}
-
-fn truncate_id(id: &str) -> String {
-    if id.len() > 24 {
-        format!("{}..{}", &id[..16], &id[id.len() - 8..])
-    } else {
-        id.to_string()
     }
 }
 
