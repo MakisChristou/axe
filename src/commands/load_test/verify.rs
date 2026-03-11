@@ -110,6 +110,7 @@ pub async fn verify_onchain<P: Provider>(
             destination_chain,
             destination_address,
             deadline,
+            "axelar",
         )
         .await;
     } else {
@@ -117,13 +118,13 @@ pub async fn verify_onchain<P: Provider>(
     }
 
     // === Step 2/4: Routed (Cosmos Gateway) ===
-    batch_poll_routed(&mut txs, &lcd, &cosm_gateway, source_chain, deadline).await;
+    batch_poll_routed(&mut txs, &lcd, &cosm_gateway, source_chain, deadline, "axelar").await;
 
     // === Step 3/4: Approved (EVM gateway) ===
     batch_poll_approved(&mut txs, &gw_contract, source_chain, destination_chain, deadline).await;
 
     // === Step 4/4: Executed (approval consumed) ===
-    batch_poll_executed(&mut txs, &gw_contract, source_chain, deadline).await;
+    batch_poll_executed(&mut txs, &gw_contract, source_chain, deadline, destination_chain).await;
 
     // Write timings + compute stats
     let report = compute_verification_report(&txs, metrics);
@@ -143,6 +144,7 @@ async fn batch_poll_voted(
     destination_chain: &str,
     destination_address: &str,
     deadline: Instant,
+    annotation: &str,
 ) {
     let pending: Vec<usize> = (0..txs.len()).filter(|&i| !txs[i].failed).collect();
     let pending_count = pending.len();
@@ -203,9 +205,9 @@ async fn batch_poll_voted(
     let timed_out = pending_count - done_count;
     spinner.finish_and_clear();
     if timed_out > 0 {
-        ui::success(&format!("voted {done_count}/{pending_count} ({timed_out} timed out)"));
+        ui::success_annotated(&format!("voted {done_count}/{pending_count} ({timed_out} timed out)"), annotation);
     } else {
-        ui::success(&format!("voted {done_count}/{pending_count}"));
+        ui::success_annotated(&format!("voted {done_count}/{pending_count}"), annotation);
     }
 }
 
@@ -219,6 +221,7 @@ async fn batch_poll_routed(
     cosm_gateway: &str,
     source_chain: &str,
     deadline: Instant,
+    annotation: &str,
 ) {
     let pending: Vec<usize> = (0..txs.len()).filter(|&i| !txs[i].failed).collect();
     let pending_count = pending.len();
@@ -268,9 +271,9 @@ async fn batch_poll_routed(
     let timed_out = pending_count - done_count;
     spinner.finish_and_clear();
     if timed_out > 0 {
-        ui::success(&format!("routed {done_count}/{pending_count} ({timed_out} timed out)"));
+        ui::success_annotated(&format!("routed {done_count}/{pending_count} ({timed_out} timed out)"), annotation);
     } else {
-        ui::success(&format!("routed {done_count}/{pending_count}"));
+        ui::success_annotated(&format!("routed {done_count}/{pending_count}"), annotation);
     }
 }
 
@@ -342,9 +345,9 @@ async fn batch_poll_approved<P: Provider>(
     let timed_out = pending_count - done_count;
     spinner.finish_and_clear();
     if timed_out > 0 {
-        ui::success(&format!("approved {done_count}/{pending_count} ({timed_out} timed out)"));
+        ui::success_annotated(&format!("approved {done_count}/{pending_count} ({timed_out} timed out)"), destination_chain);
     } else {
-        ui::success(&format!("approved {done_count}/{pending_count}"));
+        ui::success_annotated(&format!("approved {done_count}/{pending_count}"), destination_chain);
     }
 }
 
@@ -357,6 +360,7 @@ async fn batch_poll_executed<P: Provider>(
     gw_contract: &AxelarAmplifierGateway::AxelarAmplifierGatewayInstance<&P>,
     source_chain: &str,
     deadline: Instant,
+    annotation: &str,
 ) {
     let pending: Vec<usize> = (0..txs.len())
         .filter(|&i| !txs[i].failed && txs[i].timing.executed_ok.is_none())
@@ -419,9 +423,9 @@ async fn batch_poll_executed<P: Provider>(
     let timed_out = pending_count - done_count;
     spinner.finish_and_clear();
     if timed_out > 0 {
-        ui::success(&format!("executed {done_count}/{pending_count} ({timed_out} timed out)"));
+        ui::success_annotated(&format!("executed {done_count}/{pending_count} ({timed_out} timed out)"), annotation);
     } else {
-        ui::success(&format!("executed {done_count}/{pending_count}"));
+        ui::success_annotated(&format!("executed {done_count}/{pending_count}"), annotation);
     }
 }
 
@@ -721,6 +725,7 @@ pub async fn verify_onchain_solana(
             destination_chain,
             destination_address,
             deadline,
+            "axelar",
         )
         .await;
     } else {
@@ -728,13 +733,13 @@ pub async fn verify_onchain_solana(
     }
 
     // Step 2/4: Routed (reused)
-    batch_poll_routed(&mut txs, &lcd, &cosm_gateway, source_chain, deadline).await;
+    batch_poll_routed(&mut txs, &lcd, &cosm_gateway, source_chain, deadline, "axelar").await;
 
     // Step 3/4: Approved on Solana
     batch_poll_solana_approved(&mut txs, &command_ids, solana_rpc, destination_chain, deadline).await;
 
     // Step 4/4: Executed on Solana
-    batch_poll_solana_executed(&mut txs, &command_ids, solana_rpc, deadline).await;
+    batch_poll_solana_executed(&mut txs, &command_ids, solana_rpc, destination_chain, deadline).await;
 
     // Compute stats (same as verify_onchain)
     let report = compute_verification_report(&txs, metrics);
@@ -807,9 +812,9 @@ async fn batch_poll_solana_approved(
     let timed_out = pending_count - done_count;
     spinner.finish_and_clear();
     if timed_out > 0 {
-        ui::success(&format!("approved {done_count}/{pending_count} ({timed_out} timed out)"));
+        ui::success_annotated(&format!("approved {done_count}/{pending_count} ({timed_out} timed out)"), destination_chain);
     } else {
-        ui::success(&format!("approved {done_count}/{pending_count}"));
+        ui::success_annotated(&format!("approved {done_count}/{pending_count}"), destination_chain);
     }
 }
 
@@ -821,6 +826,7 @@ async fn batch_poll_solana_executed(
     txs: &mut [PendingTx],
     command_ids: &[[u8; 32]],
     solana_rpc: &str,
+    annotation: &str,
     deadline: Instant,
 ) {
     let pending: Vec<usize> = (0..txs.len())
@@ -882,9 +888,9 @@ async fn batch_poll_solana_executed(
     let timed_out = pending_count - done_count;
     spinner.finish_and_clear();
     if timed_out > 0 {
-        ui::success(&format!("executed {done_count}/{pending_count} ({timed_out} timed out)"));
+        ui::success_annotated(&format!("executed {done_count}/{pending_count} ({timed_out} timed out)"), annotation);
     } else {
-        ui::success(&format!("executed {done_count}/{pending_count}"));
+        ui::success_annotated(&format!("executed {done_count}/{pending_count}"), annotation);
     }
 }
 

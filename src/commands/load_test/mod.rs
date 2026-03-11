@@ -19,6 +19,8 @@ use alloy::{
 use eyre::Result;
 use serde_json::json;
 
+use owo_colors::OwoColorize;
+
 use crate::evm::read_artifact_bytecode;
 use crate::ui;
 use crate::utils::read_contract_address;
@@ -615,20 +617,47 @@ fn print_final_report(report: &LoadTestReport) {
         }
 
         // Segment breakdown
+        let src = &report.source_chain;
+        let dst = &report.destination_chain;
         if let Some(val) = report.avg_latency_ms {
-            println!("  \u{251c}\u{2500} source tx      avg {:.1}s", val / 1000.0);
+            println!(
+                "  {} {}  {}",
+                "\u{251c}\u{2500} confirm       ".dimmed(),
+                format!("avg {:.1}s", val / 1000.0),
+                format!("({src})").dimmed(),
+            );
         }
         if let Some(val) = v.avg_voted_secs {
-            println!("  \u{251c}\u{2500} voted          avg {val:.1}s");
+            println!(
+                "  {} {}  {}",
+                "\u{251c}\u{2500} voted         ".dimmed(),
+                format!("avg {val:.1}s"),
+                "(axelar)".dimmed(),
+            );
         }
         if let Some(val) = v.avg_routed_secs {
-            println!("  \u{251c}\u{2500} routed         avg {val:.1}s");
+            println!(
+                "  {} {}  {}",
+                "\u{251c}\u{2500} routed        ".dimmed(),
+                format!("avg {val:.1}s"),
+                "(axelar)".dimmed(),
+            );
         }
         if let Some(val) = v.avg_approved_secs {
-            println!("  \u{251c}\u{2500} approved       avg {val:.1}s");
+            println!(
+                "  {} {}  {}",
+                "\u{251c}\u{2500} approved      ".dimmed(),
+                format!("avg {val:.1}s"),
+                format!("({dst})").dimmed(),
+            );
         }
         if let Some(val) = v.avg_executed_secs {
-            println!("  \u{2514}\u{2500} executed       avg {val:.1}s");
+            println!(
+                "  {} {}  {}",
+                "\u{2514}\u{2500} executed      ".dimmed(),
+                format!("avg {val:.1}s"),
+                format!("({dst})").dimmed(),
+            );
         }
 
         // Stuck
@@ -642,8 +671,8 @@ fn print_final_report(report: &LoadTestReport) {
             println!(
                 "  stuck            {}/{} ({:.1}%) \u{2014} {}",
                 v.stuck,
-                v.total_verified + v.stuck,
-                v.stuck as f64 / (v.total_verified + v.stuck) as f64 * 100.0,
+                v.total_verified,
+                if v.total_verified > 0 { v.stuck as f64 / v.total_verified as f64 * 100.0 } else { 0.0 },
                 stuck_detail.join(", "),
             );
         }

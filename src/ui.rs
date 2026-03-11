@@ -14,6 +14,16 @@ pub fn success(msg: &str) {
     println!("  {} {}", "+".green(), msg.green());
 }
 
+/// Print success with a dimmed chain annotation: "  + {msg}  ({annotation})"
+pub fn success_annotated(msg: &str, annotation: &str) {
+    println!(
+        "  {} {}  {}",
+        "+".green(),
+        msg.green(),
+        format!("({annotation})").dimmed()
+    );
+}
+
 /// Print info: "  {msg}" in dimmed
 pub fn info(msg: &str) {
     println!("  {}", msg.dimmed());
