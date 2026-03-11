@@ -88,6 +88,11 @@ pub struct VerificationReport {
     pub avg_routed_secs: Option<f64>,
     pub avg_approved_secs: Option<f64>,
     pub avg_executed_secs: Option<f64>,
+    pub max_executed_secs: Option<f64>,
+    /// Number of txs that timed out before completing all phases.
+    pub stuck: u64,
+    /// Which phase each stuck tx got stuck at.
+    pub stuck_at: Vec<FailureCategory>,
 }
 
 /// Categorized failure count.

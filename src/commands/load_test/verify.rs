@@ -12,8 +12,8 @@ use crate::cosmos::{lcd_cosmwasm_smart_query, read_axelar_config, read_axelar_co
 use crate::evm::AxelarAmplifierGateway;
 use crate::ui;
 
-/// Maximum time to wait for each checkpoint (10 minutes).
-const POLL_TIMEOUT: Duration = Duration::from_secs(600);
+/// Maximum time to wait for each checkpoint (5 minutes).
+const POLL_TIMEOUT: Duration = Duration::from_secs(300);
 /// Delay between poll attempts.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -136,74 +136,9 @@ pub async fn verify_onchain<P: Provider>(
     batch_poll_executed(&mut txs, &gw_contract, source_chain).await;
 
     // Write timings + compute stats
-    let mut successful = 0u64;
-    let mut failed = 0u64;
-    let mut failure_reasons: std::collections::HashMap<String, u64> =
-        std::collections::HashMap::new();
+    let report = compute_verification_report(&txs, metrics);
 
-    for tx in &txs {
-        metrics[tx.idx].amplifier_timing = Some(tx.timing.clone());
-        if tx.failed {
-            failed += 1;
-            if let Some(ref reason) = tx.fail_reason {
-                *failure_reasons.entry(reason.clone()).or_insert(0) += 1;
-            }
-        } else if tx.timing.executed_ok == Some(true) {
-            successful += 1;
-        }
-    }
-
-    let total_verified = successful + failed;
-    #[allow(clippy::cast_precision_loss, clippy::float_arithmetic)]
-    let success_rate = if total_verified > 0 {
-        successful as f64 / total_verified as f64
-    } else {
-        0.0
-    };
-
-    let failure_categories: Vec<FailureCategory> = failure_reasons
-        .into_iter()
-        .map(|(reason, count)| FailureCategory { reason, count })
-        .collect();
-
-    let all_timings: Vec<&AmplifierTiming> = txs.iter().map(|t| &t.timing).collect();
-    let avg_voted = avg_option(all_timings.iter().filter_map(|t| t.voted_secs));
-    let avg_routed = avg_option(all_timings.iter().filter_map(|t| t.routed_secs));
-    let avg_approved = avg_option(all_timings.iter().filter_map(|t| t.approved_secs));
-    let avg_executed = avg_option(all_timings.iter().filter_map(|t| t.executed_secs));
-
-    println!();
-    ui::kv("successful", &successful.to_string());
-    ui::kv("failed", &failed.to_string());
-    ui::kv(
-        "success rate",
-        &format!("{:.1}%", success_rate * 100.0),
-    );
-    if let Some(v) = avg_voted {
-        ui::kv("avg voted", &format!("{v:.1}s"));
-    }
-    if let Some(v) = avg_routed {
-        ui::kv("avg routed", &format!("{v:.1}s"));
-    }
-    if let Some(v) = avg_approved {
-        ui::kv("avg approved", &format!("{v:.1}s"));
-    }
-    if let Some(v) = avg_executed {
-        ui::kv("avg executed", &format!("{v:.1}s"));
-    }
-
-    Ok(VerificationReport {
-        total_verified,
-        successful,
-        pending: 0,
-        failed,
-        success_rate,
-        failure_reasons: failure_categories,
-        avg_voted_secs: avg_voted,
-        avg_routed_secs: avg_routed,
-        avg_approved_secs: avg_approved,
-        avg_executed_secs: avg_executed,
-    })
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------
@@ -615,6 +550,98 @@ async fn check_evm_is_message_approved<P: Provider>(
 }
 
 // ---------------------------------------------------------------------------
+// Shared report computation
+// ---------------------------------------------------------------------------
+
+/// Compute the `VerificationReport` from pending tx results, writing timings
+/// back into the original metrics array.
+#[allow(clippy::cast_precision_loss, clippy::float_arithmetic)]
+fn compute_verification_report(
+    txs: &[PendingTx],
+    metrics: &mut [TxMetrics],
+) -> VerificationReport {
+    let mut successful = 0u64;
+    let mut failed = 0u64;
+    let mut failure_reasons: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+    let mut stuck_count = 0u64;
+    let mut stuck_phases: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+
+    for tx in txs {
+        metrics[tx.idx].amplifier_timing = Some(tx.timing.clone());
+        if tx.failed {
+            failed += 1;
+            if let Some(ref reason) = tx.fail_reason {
+                *failure_reasons.entry(reason.clone()).or_insert(0) += 1;
+
+                // Categorize stuck txs by the phase they got stuck at
+                if reason.contains("timed out") {
+                    stuck_count += 1;
+                    let phase = stuck_phase(tx);
+                    *stuck_phases.entry(phase).or_insert(0) += 1;
+                }
+            }
+        } else if tx.timing.executed_ok == Some(true) {
+            successful += 1;
+        }
+    }
+
+    let total_verified = successful + failed;
+    let success_rate = if total_verified > 0 {
+        successful as f64 / total_verified as f64
+    } else {
+        0.0
+    };
+
+    let failure_categories: Vec<FailureCategory> = failure_reasons
+        .into_iter()
+        .map(|(reason, count)| FailureCategory { reason, count })
+        .collect();
+
+    let stuck_at: Vec<FailureCategory> = stuck_phases
+        .into_iter()
+        .map(|(reason, count)| FailureCategory { reason, count })
+        .collect();
+
+    let all_timings: Vec<&AmplifierTiming> = txs.iter().map(|t| &t.timing).collect();
+    let avg_voted = avg_option(all_timings.iter().filter_map(|t| t.voted_secs));
+    let avg_routed = avg_option(all_timings.iter().filter_map(|t| t.routed_secs));
+    let avg_approved = avg_option(all_timings.iter().filter_map(|t| t.approved_secs));
+    let avg_executed = avg_option(all_timings.iter().filter_map(|t| t.executed_secs));
+    let max_executed = max_option(all_timings.iter().filter_map(|t| t.executed_secs));
+
+    VerificationReport {
+        total_verified,
+        successful,
+        pending: 0,
+        failed,
+        success_rate,
+        failure_reasons: failure_categories,
+        avg_voted_secs: avg_voted,
+        avg_routed_secs: avg_routed,
+        avg_approved_secs: avg_approved,
+        avg_executed_secs: avg_executed,
+        max_executed_secs: max_executed,
+        stuck: stuck_count,
+        stuck_at,
+    }
+}
+
+/// Determine which phase a timed-out tx got stuck at (the last phase it didn't complete).
+fn stuck_phase(tx: &PendingTx) -> String {
+    if tx.timing.voted_secs.is_none() {
+        "voted".into()
+    } else if tx.timing.routed_secs.is_none() {
+        "routed".into()
+    } else if tx.timing.approved_secs.is_none() {
+        "approved".into()
+    } else {
+        "executed".into()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
 
@@ -645,6 +672,10 @@ fn avg_option(iter: impl Iterator<Item = f64>) -> Option<f64> {
     } else {
         Some(vals.iter().sum::<f64>() / vals.len() as f64)
     }
+}
+
+fn max_option(iter: impl Iterator<Item = f64>) -> Option<f64> {
+    iter.reduce(f64::max)
 }
 
 // ===========================================================================
@@ -762,74 +793,9 @@ pub async fn verify_onchain_solana(
     batch_poll_solana_executed(&mut txs, &command_ids, solana_rpc).await;
 
     // Compute stats (same as verify_onchain)
-    let mut successful = 0u64;
-    let mut failed = 0u64;
-    let mut failure_reasons: std::collections::HashMap<String, u64> =
-        std::collections::HashMap::new();
+    let report = compute_verification_report(&txs, metrics);
 
-    for tx in &txs {
-        metrics[tx.idx].amplifier_timing = Some(tx.timing.clone());
-        if tx.failed {
-            failed += 1;
-            if let Some(ref reason) = tx.fail_reason {
-                *failure_reasons.entry(reason.clone()).or_insert(0) += 1;
-            }
-        } else if tx.timing.executed_ok == Some(true) {
-            successful += 1;
-        }
-    }
-
-    let total_verified = successful + failed;
-    #[allow(clippy::cast_precision_loss, clippy::float_arithmetic)]
-    let success_rate = if total_verified > 0 {
-        successful as f64 / total_verified as f64
-    } else {
-        0.0
-    };
-
-    let failure_categories: Vec<FailureCategory> = failure_reasons
-        .into_iter()
-        .map(|(reason, count)| FailureCategory { reason, count })
-        .collect();
-
-    let all_timings: Vec<&AmplifierTiming> = txs.iter().map(|t| &t.timing).collect();
-    let avg_voted = avg_option(all_timings.iter().filter_map(|t| t.voted_secs));
-    let avg_routed = avg_option(all_timings.iter().filter_map(|t| t.routed_secs));
-    let avg_approved = avg_option(all_timings.iter().filter_map(|t| t.approved_secs));
-    let avg_executed = avg_option(all_timings.iter().filter_map(|t| t.executed_secs));
-
-    println!();
-    ui::kv("successful", &successful.to_string());
-    ui::kv("failed", &failed.to_string());
-    ui::kv(
-        "success rate",
-        &format!("{:.1}%", success_rate * 100.0),
-    );
-    if let Some(v) = avg_voted {
-        ui::kv("avg voted", &format!("{v:.1}s"));
-    }
-    if let Some(v) = avg_routed {
-        ui::kv("avg routed", &format!("{v:.1}s"));
-    }
-    if let Some(v) = avg_approved {
-        ui::kv("avg approved", &format!("{v:.1}s"));
-    }
-    if let Some(v) = avg_executed {
-        ui::kv("avg executed", &format!("{v:.1}s"));
-    }
-
-    Ok(VerificationReport {
-        total_verified,
-        successful,
-        pending: 0,
-        failed,
-        success_rate,
-        failure_reasons: failure_categories,
-        avg_voted_secs: avg_voted,
-        avg_routed_secs: avg_routed,
-        avg_approved_secs: avg_approved,
-        avg_executed_secs: avg_executed,
-    })
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------

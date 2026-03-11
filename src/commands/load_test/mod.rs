@@ -619,31 +619,73 @@ async fn deploy_sender_receiver<P: alloy::providers::Provider>(
 
 #[allow(clippy::float_arithmetic)]
 fn print_final_report(report: &LoadTestReport) {
-    ui::section("SUMMARY");
-    ui::kv(
-        "txs",
-        &format!(
-            "{}/{} confirmed, {:.1}% landed",
-            report.total_confirmed,
-            report.total_submitted,
-            report.landing_rate * 100.0,
-        ),
+    println!();
+    println!("\u{2550}\u{2550}\u{2550} SUMMARY \u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}");
+    println!(
+        "  transactions     {}/{} confirmed ({:.1}% landed)",
+        report.total_confirmed,
+        report.total_submitted,
+        report.landing_rate * 100.0,
     );
-    if let Some(avg) = report.avg_latency_ms {
-        ui::kv("source latency", &format!("{avg:.0}ms avg"));
-    }
+
     if let Some(ref v) = report.verification {
-        ui::kv(
-            "cross-chain",
-            &format!(
-                "{}/{} executed ({:.0}%)",
-                v.successful,
-                v.total_verified,
-                v.success_rate * 100.0,
-            ),
+        println!();
+
+        // End-to-end line
+        match (v.avg_executed_secs, v.max_executed_secs) {
+            (Some(avg), Some(max)) => {
+                println!("  end-to-end       avg {avg:.1}s \u{2502} max {max:.1}s");
+            }
+            (Some(avg), None) => {
+                println!("  end-to-end       avg {avg:.1}s");
+            }
+            _ => {}
+        }
+
+        // Segment breakdown
+        if let Some(val) = report.avg_latency_ms {
+            println!("  \u{251c}\u{2500} source tx      avg {:.1}s", val / 1000.0);
+        }
+        if let Some(val) = v.avg_voted_secs {
+            println!("  \u{251c}\u{2500} voted          avg {val:.1}s");
+        }
+        if let Some(val) = v.avg_routed_secs {
+            println!("  \u{251c}\u{2500} routed         avg {val:.1}s");
+        }
+        if let Some(val) = v.avg_approved_secs {
+            println!("  \u{251c}\u{2500} approved       avg {val:.1}s");
+        }
+        if let Some(val) = v.avg_executed_secs {
+            println!("  \u{2514}\u{2500} executed       avg {val:.1}s");
+        }
+
+        // Stuck
+        if v.stuck > 0 {
+            let stuck_detail: Vec<String> = v
+                .stuck_at
+                .iter()
+                .map(|c| format!("{} at {}", c.count, c.reason))
+                .collect();
+            println!();
+            println!(
+                "  stuck            {}/{} ({:.1}%) \u{2014} {}",
+                v.stuck,
+                v.total_verified + v.stuck,
+                v.stuck as f64 / (v.total_verified + v.stuck) as f64 * 100.0,
+                stuck_detail.join(", "),
+            );
+        }
+
+        // Failures
+        println!(
+            "  failures         {}",
+            v.failed - v.stuck,
         );
-        if let Some(avg) = v.avg_executed_secs {
-            ui::kv("end-to-end", &format!("{avg:.1}s avg"));
+        for cat in &v.failure_reasons {
+            if !cat.reason.contains("timed out") {
+                println!("                   {} \u{00d7} {}", cat.count, cat.reason);
+            }
         }
     }
+    println!();
 }

@@ -233,19 +233,6 @@ pub async fn run_load_test_with_metrics(
     std::fs::write(&metrics_output, metrics_json)?;
 
     println!();
-    ui::kv("total submitted", &report.total_submitted.to_string());
-    ui::kv("total confirmed", &report.total_confirmed.to_string());
-    ui::kv("total failed", &report.total_failed.to_string());
-    ui::kv(
-        "landing rate",
-        &format!("{:.1}%", report.landing_rate * 100.0),
-    );
-    if let Some(avg) = report.avg_latency_ms {
-        ui::kv("avg latency", &format!("{avg:.1}ms"));
-    }
-    if let Some(avg) = report.avg_compute_units {
-        ui::kv("avg compute units", &format!("{avg:.0}"));
-    }
     ui::kv("metrics saved to", &metrics_output.display().to_string());
     ui::kv("transactions saved to", &tx_output.display().to_string());
 
