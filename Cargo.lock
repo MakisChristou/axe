@@ -1453,6 +1453,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "solana-axelar-gas-service",
  "solana-axelar-gateway",
  "solana-client",
  "solana-commitment-config",
@@ -5787,6 +5788,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana-axelar-gas-service"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb896b757d86c243f1a24c99e2cc145043a18922d750bdfd0d3c4193aac2b886"
+dependencies = [
+ "anchor-lang",
+ "bytemuck",
+ "solana-axelar-operators",
+ "solana-axelar-std",
+]
+
+[[package]]
 name = "solana-axelar-gateway"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5803,6 +5816,16 @@ dependencies = [
  "solana-axelar-std",
  "solana-keccak-hasher",
  "solana-secp256k1-recover",
+]
+
+[[package]]
+name = "solana-axelar-operators"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3841c6366fdfeea03fbba18c1a439932a8af4df36839cce7cd0f18e334480f7"
+dependencies = [
+ "anchor-lang",
+ "solana-axelar-std",
 ]
 
 [[package]]

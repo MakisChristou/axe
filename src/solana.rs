@@ -64,14 +64,55 @@ pub fn send_call_contract(
         AccountMeta::new_readonly(solana_axelar_gateway::id(), false),
     ];
 
-    let instruction = Instruction {
+    let call_contract_ix = Instruction {
         program_id: solana_axelar_gateway::id(),
         accounts,
         data: ix_data,
     };
 
+    // Pay gas on non-devnet environments so the relayer picks up the message.
+    #[cfg(not(feature = "devnet-amplifier"))]
+    let pay_gas_ix = {
+        let payload_hash: [u8; 32] = solana_sdk::keccak::hash(payload).to_bytes();
+        let treasury_pda = solana_axelar_gas_service::Treasury::find_pda().0;
+        let gas_event_authority = Pubkey::find_program_address(
+            &[b"__event_authority"],
+            &solana_axelar_gas_service::id(),
+        )
+        .0;
+
+        let pay_gas_data = solana_axelar_gas_service::instruction::PayGas {
+            destination_chain: destination_chain.to_string(),
+            destination_address: destination_address.to_string(),
+            payload_hash,
+            amount: 100_000,
+            refund_address: fee_payer,
+        }
+        .data();
+
+        Instruction {
+            program_id: solana_axelar_gas_service::id(),
+            accounts: vec![
+                AccountMeta::new(fee_payer, true),
+                AccountMeta::new(treasury_pda, false),
+                AccountMeta::new_readonly(
+                    Pubkey::from_str_const("11111111111111111111111111111111"),
+                    false,
+                ),
+                AccountMeta::new_readonly(gas_event_authority, false),
+                AccountMeta::new_readonly(solana_axelar_gas_service::id(), false),
+            ],
+            data: pay_gas_data,
+        }
+    };
+
+    #[cfg(not(feature = "devnet-amplifier"))]
+    let instructions = vec![pay_gas_ix, call_contract_ix];
+    #[cfg(feature = "devnet-amplifier")]
+    let instructions = vec![call_contract_ix];
+
     let blockhash = rpc_client.get_latest_blockhash()?;
-    let message = Message::new_with_blockhash(&[instruction], Some(&fee_payer), &blockhash);
+    let message = Message::new_with_blockhash(&instructions, Some(&fee_payer), &blockhash);
     let mut transaction = Transaction::new_unsigned(message);
     transaction.sign(&[keypair], blockhash);
 
@@ -103,6 +144,15 @@ pub fn send_call_contract(
     };
 
     Ok((signature.to_string(), metrics))
+}
+
+/// 1-based instruction index of `call_contract` in the transaction.
+/// When a `pay_gas` instruction is prepended (non-devnet), call_contract is at index 2.
+pub fn solana_call_contract_index() -> u8 {
+    #[cfg(not(feature = "devnet-amplifier"))]
+    { 2 }
+    #[cfg(feature = "devnet-amplifier")]
+    { 1 }
 }
 
 fn fetch_tx_details(

@@ -10,10 +10,11 @@ use solana_sdk::pubkey::Pubkey;
 use super::metrics::{AmplifierTiming, FailureCategory, TxMetrics, VerificationReport};
 use crate::cosmos::{lcd_cosmwasm_smart_query, read_axelar_config, read_axelar_contract_field};
 use crate::evm::AxelarAmplifierGateway;
+use crate::solana::solana_call_contract_index;
 use crate::ui;
 
-/// Maximum total time for all verification phases (3 minutes).
-const VERIFY_TIMEOUT: Duration = Duration::from_secs(180);
+/// Maximum total time for all verification phases (5 minutes).
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(300);
 /// Delay between poll attempts.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -87,7 +88,7 @@ pub async fn verify_onchain<P: Provider>(
             let payload_hash = parse_payload_hash(&tx.payload_hash).unwrap_or_default();
             PendingTx {
                 idx,
-                message_id: format!("{}-1.1", tx.signature),
+                message_id: format!("{}-{}.1", tx.signature, solana_call_contract_index()),
                 send_instant: tx.send_instant.unwrap_or_else(Instant::now),
                 source_address: tx.source_address.clone(),
                 contract_addr,

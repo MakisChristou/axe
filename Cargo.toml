@@ -30,10 +30,14 @@ solana-client = "~3.0"
 solana-transaction-status = "~3.0"
 solana-commitment-config = "~3.0"
 solana-axelar-gateway = { version = "0.1.11", features = ["no-entrypoint"], default-features = false }
+solana-axelar-gas-service = { version = "0.1.11", features = ["no-entrypoint"], default-features = false }
 anchor-lang = { version = "1.0.0-rc.1", features = ["event-cpi"] }
 hex = "0.4"
 rand = "0.8"
 
 [features]
 default = ["devnet-amplifier"]
-devnet-amplifier = ["solana-axelar-gateway/devnet-amplifier"]
+devnet-amplifier = ["solana-axelar-gateway/devnet-amplifier", "solana-axelar-gas-service/devnet-amplifier"]
+stagenet = ["solana-axelar-gateway/stagenet", "solana-axelar-gas-service/stagenet"]
+testnet = ["solana-axelar-gateway/testnet", "solana-axelar-gas-service/testnet"]
+mainnet = ["solana-axelar-gateway/mainnet", "solana-axelar-gas-service/mainnet"]
