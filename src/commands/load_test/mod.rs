@@ -420,11 +420,12 @@ async fn run_sol_to_evm(args: LoadTestArgs, run_start: Instant) -> Result<()> {
         let addr: alloy::primitives::Address = addr_str.parse()?;
         let code = read_provider.get_code_at(addr).await?;
         if code.is_empty() {
-            ui::warn("cached SenderReceiver has no code, redeploying...");
             let private_key = args.private_key.as_ref().ok_or_else(|| {
                 eyre::eyre!("EVM private key required to deploy SenderReceiver. Set EVM_PRIVATE_KEY env var or use --private-key")
             })?;
             let signer: PrivateKeySigner = private_key.parse()?;
+            check_evm_balance(&read_provider, signer.address()).await?;
+            ui::warn("cached SenderReceiver has no code, redeploying...");
             let write_provider = ProviderBuilder::new()
                 .wallet(signer)
                 .connect_http(rpc_url.parse()?);
@@ -446,11 +447,14 @@ async fn run_sol_to_evm(args: LoadTestArgs, run_start: Instant) -> Result<()> {
             (addr, provider)
         }
     } else {
-        ui::info("deploying SenderReceiver on destination chain...");
         let private_key = args.private_key.as_ref().ok_or_else(|| {
             eyre::eyre!("EVM private key required to deploy SenderReceiver. Set EVM_PRIVATE_KEY env var or use --private-key")
         })?;
         let signer: PrivateKeySigner = private_key.parse()?;
+        let deployer_addr = signer.address();
+        let read_provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+        check_evm_balance(&read_provider, deployer_addr).await?;
+        ui::info("deploying SenderReceiver on destination chain...");
         let write_provider = ProviderBuilder::new()
             .wallet(signer)
             .connect_http(rpc_url.parse()?);
@@ -510,6 +514,8 @@ async fn run_evm_to_sol(args: LoadTestArgs, run_start: Instant) -> Result<()> {
     })?;
     let signer: PrivateKeySigner = private_key.parse()?;
     let signer_address = signer.address();
+    let read_provider = ProviderBuilder::new().connect_http(evm_rpc_url.parse()?);
+    check_evm_balance(&read_provider, signer_address).await?;
     let provider = ProviderBuilder::new()
         .wallet(signer)
         .connect_http(evm_rpc_url.parse()?);
@@ -552,6 +558,20 @@ fn finish_report(
         ui::format_elapsed(run_start)
     ));
 
+    Ok(())
+}
+
+async fn check_evm_balance<P: alloy::providers::Provider>(
+    provider: &P,
+    address: alloy::primitives::Address,
+) -> Result<()> {
+    let balance = provider.get_balance(address).await?;
+    if balance.is_zero() {
+        eyre::bail!(
+            "EVM wallet {address} has no funds. Fund it first:\n  \
+             Use a faucet or transfer native tokens to {address}"
+        );
+    }
     Ok(())
 }
 
