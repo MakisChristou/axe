@@ -59,13 +59,21 @@ pub fn ensure_funded(
     let mut balances: Vec<u64> = Vec::with_capacity(derived.len());
     let mut to_fund: Vec<(usize, u64)> = Vec::new(); // (index, deficit)
 
+    let check_pb = ProgressBar::new(derived.len() as u64);
+    check_pb.set_style(
+        ProgressStyle::with_template("  {bar:40.cyan/dim} {pos}/{len} keys checked")
+            .unwrap()
+            .progress_chars("=> "),
+    );
     for (i, kp) in derived.iter().enumerate() {
         let balance = rpc.get_balance(&kp.pubkey()).unwrap_or(0);
         balances.push(balance);
         if balance < MIN_LAMPORTS_PER_KEY {
             to_fund.push((i, TARGET_LAMPORTS_PER_KEY - balance));
         }
+        check_pb.inc(1);
     }
+    check_pb.finish_and_clear();
 
     if to_fund.is_empty() {
         ui::success(&format!(

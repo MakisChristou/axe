@@ -22,6 +22,7 @@ use serde_json::json;
 
 use owo_colors::OwoColorize;
 
+use crate::cosmos::read_axelar_contract_field;
 use crate::evm::read_artifact_bytecode;
 use crate::ui;
 use crate::utils::read_contract_address;
@@ -400,6 +401,20 @@ async fn run_sol_to_evm(args: LoadTestArgs, run_start: Instant) -> Result<()> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| eyre::eyre!("no rpc URL for chain '{dest}' in config"))?;
 
+    // Check that verification contracts exist for this chain pair before doing any work
+    if read_axelar_contract_field(
+        &args.config,
+        &format!("/axelar/contracts/Gateway/{dest}/address"),
+    )
+    .is_err()
+    {
+        eyre::bail!(
+            "destination chain '{dest}' has no Cosmos Gateway in the config — \
+             verification would fail. Pick a chain that has a Gateway entry, e.g.:\n  {}",
+            list_gateway_chains(&config_root).join(", ")
+        );
+    }
+
     ui::kv("source", src);
     ui::kv("destination", dest);
 
@@ -500,6 +515,20 @@ async fn run_evm_to_sol(args: LoadTestArgs, run_start: Instant) -> Result<()> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| eyre::eyre!("no rpc URL for source chain '{src}' in config"))?;
 
+    // Check that verification contracts exist for this chain pair before doing any work
+    if read_axelar_contract_field(
+        &args.config,
+        &format!("/axelar/contracts/Gateway/{dest}/address"),
+    )
+    .is_err()
+    {
+        eyre::bail!(
+            "destination chain '{dest}' has no Cosmos Gateway in the config — \
+             verification would fail. Pick a chain that has a Gateway entry, e.g.:\n  {}",
+            list_gateway_chains(&config_root).join(", ")
+        );
+    }
+
     ui::kv("source", src);
     ui::kv("destination", dest);
 
@@ -559,6 +588,20 @@ fn finish_report(
     ));
 
     Ok(())
+}
+
+/// List chain names that have a Cosmos Gateway address in the config.
+fn list_gateway_chains(config_root: &serde_json::Value) -> Vec<String> {
+    config_root
+        .pointer("/axelar/contracts/Gateway")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter(|(_, v)| v.get("address").and_then(|a| a.as_str()).is_some())
+                .map(|(k, _)| k.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn check_evm_balance<P: alloy::providers::Provider>(

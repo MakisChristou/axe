@@ -323,7 +323,19 @@ async fn batch_poll_approved<P: Provider>(
                         "waiting to be approved on {destination_chain} ({done_count}/{pending_count} done)..."
                     ));
                 }
-                Ok(false) => {}
+                Ok(false) => {
+                    // Already executed (approval consumed) — count as approved+executed
+                    let elapsed = txs[i].send_instant.elapsed().as_secs_f64();
+                    if txs[i].timing.approved_secs.is_none() {
+                        txs[i].timing.approved_secs = Some(elapsed);
+                    }
+                    txs[i].timing.executed_secs = Some(elapsed);
+                    txs[i].timing.executed_ok = Some(true);
+                    done_count += 1;
+                    spinner.set_message(format!(
+                        "waiting to be approved on {destination_chain} ({done_count}/{pending_count} done)..."
+                    ));
+                }
                 Err(e) => {
                     spinner.set_message(format!("EVM isMessageApproved error: {e}"));
                 }
