@@ -35,7 +35,12 @@ fn default_gas_value() -> u64 {
     { 100_000 }
 }
 
-pub async fn run(args: LoadTestArgs, run_start: Instant) -> eyre::Result<()> {
+pub async fn run(mut args: LoadTestArgs, run_start: Instant) -> eyre::Result<()> {
+    // --source-rpc overrides the Solana (source) RPC
+    if let Some(rpc) = args.source_rpc.take() {
+        args.solana_rpc = rpc;
+    }
+
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
@@ -44,14 +49,11 @@ pub async fn run(args: LoadTestArgs, run_start: Instant) -> eyre::Result<()> {
         .map_err(|e| eyre!("failed to read config {}: {e}", args.config.display()))?;
     let config_root: serde_json::Value = serde_json::from_str(&config_content)?;
 
-    let evm_rpc_url = match &args.source_rpc {
-        Some(rpc) => rpc.clone(),
-        None => config_root
-            .pointer(&format!("/chains/{dest}/rpc"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| eyre!("no rpc URL for destination chain '{dest}' in config"))?
-            .to_string(),
-    };
+    let evm_rpc_url = config_root
+        .pointer(&format!("/chains/{dest}/rpc"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| eyre!("no rpc URL for destination chain '{dest}' in config"))?
+        .to_string();
 
     // Validate RPCs
     validate_solana_rpc(&args.solana_rpc).await?;
