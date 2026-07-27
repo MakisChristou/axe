@@ -374,18 +374,19 @@ pub(super) async fn run_evm_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
             .await
         });
 
-        let mut report = evm_sender::run_sustained_load_test_with_metrics(
-            &args,
-            sender_receiver_addr,
-            &main_key,
-            &evm_rpc_url,
-            destination_address,
-            Some(verify_tx),
-            Some(send_done),
-            spinner_tx,
-            false,
-        )
-        .await?;
+        let mut report =
+            evm_sender::run_sustained_load_test_with_metrics(evm_sender::SustainedLoadRequest {
+                args: &args,
+                sender_receiver: sender_receiver_addr,
+                main_key: &main_key,
+                evm_rpc_url: &evm_rpc_url,
+                destination_address,
+                verify_tx: Some(verify_tx),
+                send_done: Some(send_done),
+                verify_spinner_tx: spinner_tx,
+                evm_destination: false,
+            })
+            .await?;
 
         // Wait for verification to finish.
         let (verification, timings) = verify_handle.await??;
@@ -628,18 +629,19 @@ pub(super) async fn run_evm_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
             }
         });
 
-        let mut report = evm_sender::run_sustained_load_test_with_metrics(
-            &args,
-            sender_receiver_addr,
-            &main_key,
-            &source_rpc_url,
-            &destination_address,
-            Some(verify_tx),
-            Some(send_done),
-            spinner_tx,
-            true,
-        )
-        .await?;
+        let mut report =
+            evm_sender::run_sustained_load_test_with_metrics(evm_sender::SustainedLoadRequest {
+                args: &args,
+                sender_receiver: sender_receiver_addr,
+                main_key: &main_key,
+                evm_rpc_url: &source_rpc_url,
+                destination_address: &destination_address,
+                verify_tx: Some(verify_tx),
+                send_done: Some(send_done),
+                verify_spinner_tx: spinner_tx,
+                evm_destination: true,
+            })
+            .await?;
 
         let (verification, timings) = verify_handle.await??;
         for (msg_id, timing) in timings {
@@ -986,23 +988,25 @@ pub(super) async fn run_stellar_to_evm(args: LoadTestArgs, _run_start: Instant) 
             .is_ok();
 
         let result = crate::commands::load_test::stellar_sender::run_sustained(
-            &stellar_client,
-            wallets,
-            stellar_example,
-            stellar_gateway,
-            args.destination_axelar_id.clone(),
-            destination_address.clone(),
-            payload_override,
-            tps as usize,
-            duration_secs,
-            args.key_cycle as usize,
-            Some(verify_tx),
-            Some(send_done),
-            spinner,
-            has_voting_verifier,
-            sender_receiver_addr,
-            stellar_gas_token,
-            gas_stroops,
+            crate::commands::load_test::stellar_sender::SustainedRequest {
+                client: stellar_client.clone(),
+                wallets,
+                example_contract: stellar_example,
+                gateway_contract: stellar_gateway,
+                destination_chain: args.destination_axelar_id.clone(),
+                destination_address: destination_address.clone(),
+                payload_override,
+                tps: tps as usize,
+                duration_secs,
+                key_cycle: args.key_cycle as usize,
+                verify_tx: Some(verify_tx),
+                send_done: Some(send_done),
+                spinner,
+                has_voting_verifier,
+                destination_contract_addr: sender_receiver_addr,
+                gas_token_contract: stellar_gas_token,
+                gas_amount_stroops: gas_stroops,
+            },
         )
         .await;
 
@@ -1028,16 +1032,18 @@ pub(super) async fn run_stellar_to_evm(args: LoadTestArgs, _run_start: Instant) 
         report
     } else {
         let mut report = crate::commands::load_test::stellar_sender::run_burst(
-            &stellar_client,
-            &wallets,
-            stellar_example,
-            stellar_gateway,
-            &args.destination_axelar_id,
-            &destination_address,
-            payload_override,
-            src,
-            stellar_gas_token,
-            gas_stroops,
+            crate::commands::load_test::stellar_sender::BurstRequest {
+                client: &stellar_client,
+                wallets: &wallets,
+                example_contract: stellar_example,
+                gateway_contract: stellar_gateway,
+                destination_chain: &args.destination_axelar_id,
+                destination_address: &destination_address,
+                payload_override,
+                source_chain: src,
+                gas_token_contract: stellar_gas_token,
+                gas_amount_stroops: gas_stroops,
+            },
         )
         .await?;
         let verification = verify::verify_onchain(
@@ -1235,18 +1241,18 @@ pub(super) async fn run_stellar_to_sol(args: LoadTestArgs, _run_start: Instant) 
     .await?;
 
     let test_start = Instant::now();
-    let mut report = stellar_sender::run_burst(
-        &stellar_client,
-        &wallets,
-        stellar_example.clone(),
-        stellar_gateway,
-        &args.destination_axelar_id,
-        &destination_address,
+    let mut report = stellar_sender::run_burst(stellar_sender::BurstRequest {
+        client: &stellar_client,
+        wallets: &wallets,
+        example_contract: stellar_example.clone(),
+        gateway_contract: stellar_gateway,
+        destination_chain: &args.destination_axelar_id,
+        destination_address: &destination_address,
         payload_override,
-        src,
-        stellar_xlm,
-        gas_stroops,
-    )
+        source_chain: src,
+        gas_token_contract: stellar_xlm,
+        gas_amount_stroops: gas_stroops,
+    })
     .await?;
     report.destination_address = destination_address.clone();
 
@@ -1623,7 +1629,6 @@ pub(super) async fn run_sui_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
     let main_wallet = load_sui_main_wallet()?;
     ui::kv("Sui wallet", &main_wallet.address_hex());
     let bal = sui_client.get_balance(&main_wallet.address).await?;
-    #[allow(clippy::cast_precision_loss, clippy::float_arithmetic)]
     let sui_amount = bal as f64 / 1e9;
     ui::kv("Sui balance", &format!("{bal} mist ({sui_amount:.4} SUI)"));
     if bal < SUI_DEFAULT_GAS_VALUE_MIST + SUI_DEFAULT_GAS_BUDGET_MIST {
@@ -1695,8 +1700,11 @@ pub(super) async fn run_sui_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
 
         match result {
             Ok(r) if r.success => {
-                #[allow(clippy::cast_possible_truncation)]
-                let latency_ms = send_start.elapsed().as_millis() as u64;
+                let latency_ms = send_start
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
                 let message_id = format!("{}-{}", r.digest, r.event_index);
                 metrics.push(TxMetrics {
                     signature: message_id,
@@ -1977,18 +1985,18 @@ pub(super) async fn run_stellar_to_sui(args: LoadTestArgs, _run_start: Instant) 
     .await?;
 
     let test_start = Instant::now();
-    let mut report = stellar_sender::run_burst(
-        &stellar_client,
-        &wallets,
-        stellar_example.clone(),
-        stellar_gateway,
-        &args.destination_axelar_id,
-        &sui_channel,
+    let mut report = stellar_sender::run_burst(stellar_sender::BurstRequest {
+        client: &stellar_client,
+        wallets: &wallets,
+        example_contract: stellar_example.clone(),
+        gateway_contract: stellar_gateway,
+        destination_chain: &args.destination_axelar_id,
+        destination_address: &sui_channel,
         payload_override,
-        src,
-        stellar_xlm,
-        gas_stroops,
-    )
+        source_chain: src,
+        gas_token_contract: stellar_xlm,
+        gas_amount_stroops: gas_stroops,
+    })
     .await?;
     report.destination_address = sui_channel.clone();
 

@@ -480,15 +480,15 @@ async fn check_stellar_remote_deploy_approval(
     let payload_hash = parse_payload_hash(&info.payload_hash)
         .wrap_err("remote deploy second-leg payload_hash is invalid")?;
     let approved = client
-        .gateway_is_message_approved(
-            &args.signer_pk,
-            &args.gateway_contract,
-            &info.source_chain,
-            &info.message_id,
-            &info.source_address,
-            &info.destination_address,
-            payload_hash.0,
-        )
+        .gateway_is_message_approved(crate::stellar::MessageApprovalQuery {
+            signer_account_pk: &args.signer_pk,
+            gateway_contract: &args.gateway_contract,
+            source_chain: &info.source_chain,
+            message_id: &info.message_id,
+            source_address: &info.source_address,
+            contract_address: &info.destination_address,
+            payload_hash: payload_hash.0,
+        })
         .await?
         .ok_or_else(|| eyre::eyre!("Stellar gateway returned non-bool approval result"))?;
 

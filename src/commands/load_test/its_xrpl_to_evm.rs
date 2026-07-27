@@ -309,23 +309,23 @@ async fn run_sustained_pipeline(
     // the Routed → HubApproved → ... stages drive the pipeline.
     let has_voting_verifier = false;
 
-    let result = xrpl_sender::run_sustained(
-        xrpl_client,
+    let result = xrpl_sender::run_sustained(xrpl_sender::SustainedRequest {
+        client: xrpl_client.clone(),
         wallets,
-        multisig,
-        dest.clone(),
-        evm.dest_address_hex.clone(),
+        destination_multisig: multisig,
+        destination_chain: dest.clone(),
+        destination_address_hex: evm.dest_address_hex.clone(),
         gas_fee_drops,
-        "axelar".to_string(),
-        evm.axelarnet_gw_addr.clone(),
-        tps_n,
+        gmp_dest_chain: "axelar".to_string(),
+        gmp_dest_address: evm.axelarnet_gw_addr.clone(),
+        tps: tps_n,
         duration_secs,
         key_cycle,
-        Some(verify_tx),
-        Some(send_done),
+        verify_tx: Some(verify_tx),
+        send_done: Some(send_done),
         spinner,
         has_voting_verifier,
-    )
+    })
     .await;
 
     let mut report = super::sustained::build_sustained_report(
@@ -364,18 +364,18 @@ async fn run_burst_pipeline(
     let dest = &args.destination_chain;
 
     let test_start = Instant::now();
-    let mut report = xrpl_sender::run_burst(
-        xrpl_client,
+    let mut report = xrpl_sender::run_burst(xrpl_sender::BurstRequest {
+        client: xrpl_client,
         wallets,
-        multisig,
-        dest,
-        &evm.dest_address_hex,
+        destination_multisig: multisig,
+        destination_chain: dest,
+        destination_address_hex: &evm.dest_address_hex,
         gas_fee_drops,
-        "axelar",
-        &evm.axelarnet_gw_addr,
-        src,
-        dest,
-    )
+        gmp_dest_chain: "axelar",
+        gmp_dest_address: &evm.axelarnet_gw_addr,
+        source_chain: src,
+        destination_chain_label: dest,
+    })
     .await?;
     report.destination_address = format!("{}", evm.its_proxy_addr);
 

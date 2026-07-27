@@ -466,10 +466,19 @@ async fn run_sustained_pipeline(
                 .connect_http(url.parse().expect("invalid RPC URL"));
 
             Box::pin(async move {
-                let mut result = execute_interchain_transfer(
-                    &provider, its_proxy, tid, &dc, &rb, amt, gv, gsf, nonce,
-                )
-                .await;
+                let mut result =
+                    execute_interchain_transfer(super::its_evm_source::InterchainTransferRequest {
+                        provider: &provider,
+                        its_proxy,
+                        token_id: tid,
+                        destination_chain: &dc,
+                        receiver: &rb,
+                        amount: amt,
+                        gas_value: gv,
+                        gas_arg_scaling_factor: gsf,
+                        explicit_nonce: nonce,
+                    })
+                    .await;
                 if result.success {
                     match super::verify::tx_to_pending_its(&result, has_vv) {
                         Ok(pending) => {
@@ -569,10 +578,19 @@ async fn run_burst_pipeline(
 
             let mut m = None;
             for attempt in 0..=MAX_RETRIES {
-                let result = execute_interchain_transfer(
-                    &provider, its_proxy, tid, &dc, &rb, amt, gv, gsf, None,
-                )
-                .await;
+                let result =
+                    execute_interchain_transfer(super::its_evm_source::InterchainTransferRequest {
+                        provider: &provider,
+                        its_proxy,
+                        token_id: tid,
+                        destination_chain: &dc,
+                        receiver: &rb,
+                        amount: amt,
+                        gas_value: gv,
+                        gas_arg_scaling_factor: gsf,
+                        explicit_nonce: None,
+                    })
+                    .await;
 
                 if result.success || attempt == MAX_RETRIES {
                     m = Some(result);

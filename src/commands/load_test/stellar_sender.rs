@@ -53,18 +53,30 @@ pub fn make_payload(custom: &Option<Vec<u8>>) -> Vec<u8> {
 /// high-level wrapper that internally pays gas via `AxelarGasService` and
 /// emits the `ContractCall` event from `AxelarGateway`. Mirrors the reference
 /// `axelar-contract-deployments/stellar/gmp.js` script.
-#[allow(clippy::too_many_arguments)]
-async fn submit_single(
-    client: &StellarClient,
-    wallet: &StellarWallet,
-    example_contract: &str,
-    gateway_contract: &str,
-    destination_chain: &str,
-    destination_address: &str,
-    payload: &[u8],
-    gas_token_contract: &str,
+struct SubmitRequest<'a> {
+    client: &'a StellarClient,
+    wallet: &'a StellarWallet,
+    example_contract: &'a str,
+    gateway_contract: &'a str,
+    destination_chain: &'a str,
+    destination_address: &'a str,
+    payload: &'a [u8],
+    gas_token_contract: &'a str,
     gas_amount_stroops: u64,
-) -> TxMetrics {
+}
+
+async fn submit_single(request: SubmitRequest<'_>) -> TxMetrics {
+    let SubmitRequest {
+        client,
+        wallet,
+        example_contract,
+        gateway_contract,
+        destination_chain,
+        destination_address,
+        payload,
+        gas_token_contract,
+        gas_amount_stroops,
+    } = request;
     let submit_start = Instant::now();
     // The on-chain `ContractCall` event is emitted by the example contract
     // (which `AxelarExample.send` invokes internally), so the message's
@@ -180,19 +192,32 @@ fn fail_metrics(submit_start: Instant, source: &str, err: &str) -> TxMetrics {
 // Burst mode
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run_burst(
-    client: &StellarClient,
-    wallets: &[StellarWallet],
-    example_contract: String,
-    gateway_contract: String,
-    destination_chain: &str,
-    destination_address: &str,
-    payload_override: Option<Vec<u8>>,
-    source_chain: &str,
-    gas_token_contract: String,
-    gas_amount_stroops: u64,
-) -> Result<LoadTestReport> {
+pub(super) struct BurstRequest<'a> {
+    pub client: &'a StellarClient,
+    pub wallets: &'a [StellarWallet],
+    pub example_contract: String,
+    pub gateway_contract: String,
+    pub destination_chain: &'a str,
+    pub destination_address: &'a str,
+    pub payload_override: Option<Vec<u8>>,
+    pub source_chain: &'a str,
+    pub gas_token_contract: String,
+    pub gas_amount_stroops: u64,
+}
+
+pub async fn run_burst(request: BurstRequest<'_>) -> Result<LoadTestReport> {
+    let BurstRequest {
+        client,
+        wallets,
+        example_contract,
+        gateway_contract,
+        destination_chain,
+        destination_address,
+        payload_override,
+        source_chain,
+        gas_token_contract,
+        gas_amount_stroops,
+    } = request;
     let key_count = wallets.len();
     let metrics_list: Arc<Mutex<Vec<TxMetrics>>> = Arc::new(Mutex::new(Vec::new()));
     let confirmed = Arc::new(AtomicU64::new(0));
@@ -217,7 +242,18 @@ pub async fn run_burst(
         let sp = spinner.clone();
         let total = key_count;
         let handle = tokio::spawn(async move {
-            let m = submit_single(&c, &w, &ex, &gw, &dc, &da, &payload, &gas_token, gas).await;
+            let m = submit_single(SubmitRequest {
+                client: &c,
+                wallet: &w,
+                example_contract: &ex,
+                gateway_contract: &gw,
+                destination_chain: &dc,
+                destination_address: &da,
+                payload: &payload,
+                gas_token_contract: &gas_token,
+                gas_amount_stroops: gas,
+            })
+            .await;
             if m.success {
                 let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 sp.set_message(format!("sending ({done}/{total} confirmed)..."));
@@ -276,26 +312,46 @@ fn build_burst_report(
 // Sustained mode
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_sustained(
-    client: &StellarClient,
-    wallets: Vec<StellarWallet>,
-    example_contract: String,
-    gateway_contract: String,
-    destination_chain: String,
-    destination_address: String,
-    payload_override: Option<Vec<u8>>,
-    tps: usize,
-    duration_secs: u64,
-    key_cycle: usize,
-    verify_tx: Option<tokio::sync::mpsc::UnboundedSender<super::verify::PendingTx>>,
-    send_done: Option<Arc<AtomicBool>>,
-    spinner: ProgressBar,
-    has_voting_verifier: bool,
-    destination_contract_addr: alloy::primitives::Address,
-    gas_token_contract: String,
-    gas_amount_stroops: u64,
-) -> sustained::SustainedResult {
+pub(super) struct SustainedRequest {
+    pub client: StellarClient,
+    pub wallets: Vec<StellarWallet>,
+    pub example_contract: String,
+    pub gateway_contract: String,
+    pub destination_chain: String,
+    pub destination_address: String,
+    pub payload_override: Option<Vec<u8>>,
+    pub tps: usize,
+    pub duration_secs: u64,
+    pub key_cycle: usize,
+    pub verify_tx: Option<tokio::sync::mpsc::UnboundedSender<super::verify::PendingTx>>,
+    pub send_done: Option<Arc<AtomicBool>>,
+    pub spinner: ProgressBar,
+    pub has_voting_verifier: bool,
+    pub destination_contract_addr: alloy::primitives::Address,
+    pub gas_token_contract: String,
+    pub gas_amount_stroops: u64,
+}
+
+pub(super) async fn run_sustained(request: SustainedRequest) -> sustained::SustainedResult {
+    let SustainedRequest {
+        client,
+        wallets,
+        example_contract,
+        gateway_contract,
+        destination_chain,
+        destination_address,
+        payload_override,
+        tps,
+        duration_secs,
+        key_cycle,
+        verify_tx,
+        send_done,
+        spinner,
+        has_voting_verifier,
+        destination_contract_addr,
+        gas_token_contract,
+        gas_amount_stroops,
+    } = request;
     let client = Arc::new(client.clone());
     let wallets = Arc::new(wallets);
 
@@ -315,8 +371,18 @@ pub(super) async fn run_sustained(
 
         Box::pin(async move {
             let wallet = &ws[key_idx % ws.len()];
-            let mut m =
-                submit_single(&c, wallet, &ex, &gw, &dc, &da, &payload, &gas_token, gas).await;
+            let mut m = submit_single(SubmitRequest {
+                client: &c,
+                wallet,
+                example_contract: &ex,
+                gateway_contract: &gw,
+                destination_chain: &dc,
+                destination_address: &da,
+                payload: &payload,
+                gas_token_contract: &gas_token,
+                gas_amount_stroops: gas,
+            })
+            .await;
             if m.success
                 && let Some(ref tx_sender) = vtx
             {

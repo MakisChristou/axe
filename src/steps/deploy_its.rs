@@ -126,12 +126,14 @@ pub async fn run(
     let token_manager_deployer_addr = deploy_via_create2(
         &const_deployer,
         &provider,
-        deployer_addr,
-        "TokenManagerDeployer",
-        tmdeployer_bytecode,
-        None,
-        helper_salt,
-        &step,
+        Create2Deployment {
+            deployer: deployer_addr,
+            name: "TokenManagerDeployer",
+            bytecode: tmdeployer_bytecode,
+            constructor_args: None,
+            salt: helper_salt,
+            step: &step,
+        },
     )
     .await?;
     save_its_address(
@@ -147,12 +149,14 @@ pub async fn run(
     let interchain_token_addr = deploy_via_create2(
         &const_deployer,
         &provider,
-        deployer_addr,
-        "InterchainToken",
-        it_bytecode,
-        Some(its_proxy_addr.abi_encode()),
-        helper_salt,
-        &step,
+        Create2Deployment {
+            deployer: deployer_addr,
+            name: "InterchainToken",
+            bytecode: it_bytecode,
+            constructor_args: Some(its_proxy_addr.abi_encode()),
+            salt: helper_salt,
+            step: &step,
+        },
     )
     .await?;
     save_its_address(ctx, step_idx, "InterchainToken", interchain_token_addr)?;
@@ -163,12 +167,14 @@ pub async fn run(
     let interchain_token_deployer_addr = deploy_via_create2(
         &const_deployer,
         &provider,
-        deployer_addr,
-        "InterchainTokenDeployer",
-        itd_bytecode,
-        Some(interchain_token_addr.abi_encode()),
-        helper_salt,
-        &step,
+        Create2Deployment {
+            deployer: deployer_addr,
+            name: "InterchainTokenDeployer",
+            bytecode: itd_bytecode,
+            constructor_args: Some(interchain_token_addr.abi_encode()),
+            salt: helper_salt,
+            step: &step,
+        },
     )
     .await?;
     save_its_address(
@@ -184,12 +190,14 @@ pub async fn run(
     let token_manager_addr = deploy_via_create2(
         &const_deployer,
         &provider,
-        deployer_addr,
-        "TokenManager",
-        tm_bytecode,
-        Some(its_proxy_addr.abi_encode()),
-        helper_salt,
-        &step,
+        Create2Deployment {
+            deployer: deployer_addr,
+            name: "TokenManager",
+            bytecode: tm_bytecode,
+            constructor_args: Some(its_proxy_addr.abi_encode()),
+            salt: helper_salt,
+            step: &step,
+        },
     )
     .await?;
     save_its_address(ctx, step_idx, "TokenManager", token_manager_addr)?;
@@ -198,12 +206,14 @@ pub async fn run(
     let token_handler_addr = deploy_via_create2(
         &const_deployer,
         &provider,
-        deployer_addr,
-        "TokenHandler",
-        th_bytecode,
-        None,
-        helper_salt,
-        &step,
+        Create2Deployment {
+            deployer: deployer_addr,
+            name: "TokenHandler",
+            bytecode: th_bytecode,
+            constructor_args: None,
+            salt: helper_salt,
+            step: &step,
+        },
     )
     .await?;
     save_its_address(ctx, step_idx, "TokenHandler", token_handler_addr)?;
@@ -231,12 +241,14 @@ pub async fn run(
     let its_impl_addr = deploy_via_create2(
         &const_deployer,
         &provider,
-        deployer_addr,
-        "InterchainTokenServiceImpl",
-        its_impl_bytecode,
-        Some(its_impl_constructor_args),
-        impl_salt,
-        &step,
+        Create2Deployment {
+            deployer: deployer_addr,
+            name: "InterchainTokenServiceImpl",
+            bytecode: its_impl_bytecode,
+            constructor_args: Some(its_impl_constructor_args),
+            salt: impl_salt,
+            step: &step,
+        },
     )
     .await?;
     save_its_address(ctx, step_idx, "InterchainTokenServiceImpl", its_impl_addr)?;
@@ -278,12 +290,14 @@ pub async fn run(
     let factory_impl_addr = deploy_via_create2(
         &const_deployer,
         &provider,
-        deployer_addr,
-        "InterchainTokenFactoryImpl",
-        factory_impl_bytecode,
-        Some(its_proxy_addr.abi_encode()),
-        impl_salt,
-        &step,
+        Create2Deployment {
+            deployer: deployer_addr,
+            name: "InterchainTokenFactoryImpl",
+            bytecode: factory_impl_bytecode,
+            constructor_args: Some(its_proxy_addr.abi_encode()),
+            salt: impl_salt,
+            step: &step,
+        },
     )
     .await?;
     save_its_address(
@@ -366,17 +380,28 @@ pub async fn run(
 
 /// Deploy a contract via CREATE2 using ConstAddressDeployer.
 /// Checks step state and on-chain code to skip already-deployed contracts.
-#[allow(clippy::too_many_arguments)]
-async fn deploy_via_create2<P: Provider>(
-    const_deployer: &ConstAddressDeployer::ConstAddressDeployerInstance<P>,
-    provider: P,
-    deployer_addr: Address,
-    name: &str,
+struct Create2Deployment<'a> {
+    deployer: Address,
+    name: &'a str,
     bytecode: Vec<u8>,
     constructor_args: Option<Vec<u8>>,
     salt: FixedBytes<32>,
-    step: &Step,
+    step: &'a Step,
+}
+
+async fn deploy_via_create2<P: Provider>(
+    const_deployer: &ConstAddressDeployer::ConstAddressDeployerInstance<P>,
+    provider: P,
+    deployment: Create2Deployment<'_>,
 ) -> Result<Address> {
+    let Create2Deployment {
+        deployer: deployer_addr,
+        name,
+        bytecode,
+        constructor_args,
+        salt,
+        step,
+    } = deployment;
     let mut deploy_code = bytecode;
     if let Some(args) = constructor_args {
         deploy_code.extend_from_slice(&args);

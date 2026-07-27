@@ -150,18 +150,18 @@ pub async fn run_load_test_with_metrics(
         let network = args.network;
 
         let handle = tokio::spawn(async move {
-            execute_and_record(
-                &rpc,
-                kp,
+            execute_and_record(ExecuteRequest {
+                solana_rpc: &rpc,
+                keypair: kp,
                 network,
-                &dest_chain,
-                &dest_addr,
-                &tx_payload,
-                metrics_clone,
-                counter,
-                sp,
+                destination_chain: &dest_chain,
+                destination_address: &dest_addr,
+                payload: &tx_payload,
+                metrics: metrics_clone,
+                confirmed: counter,
+                spinner: sp,
                 total,
-            )
+            })
             .await;
         });
         pending_tasks.push(handle);
@@ -412,19 +412,32 @@ pub(super) async fn run_sustained_load_test_with_metrics(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn execute_and_record(
-    solana_rpc: &str,
+struct ExecuteRequest<'a> {
+    solana_rpc: &'a str,
     keypair: Arc<dyn Signer + Send + Sync>,
     network: Network,
-    dest_chain: &str,
-    dest_addr: &str,
-    payload: &[u8],
-    metrics_list: Arc<Mutex<Vec<TxMetrics>>>,
-    confirmed_counter: Arc<AtomicU64>,
+    destination_chain: &'a str,
+    destination_address: &'a str,
+    payload: &'a [u8],
+    metrics: Arc<Mutex<Vec<TxMetrics>>>,
+    confirmed: Arc<AtomicU64>,
     spinner: ProgressBar,
     total: usize,
-) {
+}
+
+async fn execute_and_record(request: ExecuteRequest<'_>) {
+    let ExecuteRequest {
+        solana_rpc,
+        keypair,
+        network,
+        destination_chain: dest_chain,
+        destination_address: dest_addr,
+        payload,
+        metrics: metrics_list,
+        confirmed: confirmed_counter,
+        spinner,
+        total,
+    } = request;
     let submit_start = Instant::now();
 
     let source_addr = keypair.pubkey().to_string();

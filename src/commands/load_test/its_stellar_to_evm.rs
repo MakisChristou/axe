@@ -75,22 +75,22 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
     let evm = resolve_evm_targets(&cfg, dest)?;
     let gas_stroops = parse_gas_stroops(args.gas_value.as_deref())?;
 
-    let (token_id, _salt, token_address, decimals) = setup_its_token(
-        &stellar.client,
-        &stellar.main_wallet,
-        &stellar.its_addr,
-        &stellar.gateway_addr,
-        &stellar.xlm_addr,
+    let (token_id, _salt, token_address, decimals) = setup_its_token(TokenSetupRequest {
+        client: &stellar.client,
+        main_wallet: &stellar.main_wallet,
+        its_contract: &stellar.its_addr,
+        gateway_contract: &stellar.gateway_addr,
+        xlm_token: &stellar.xlm_addr,
         gas_stroops,
-        src,
-        dest,
-        &args.destination_axelar_id,
-        args.token_id.as_deref(),
-        &args.config,
-        evm.evm_gateway_addr,
-        &evm_rpc_url,
-        sizing.num_keys,
-    )
+        source_chain: src,
+        destination_chain: dest,
+        destination_axelar_id: &args.destination_axelar_id,
+        token_id_override: args.token_id.as_deref(),
+        config: &args.config,
+        evm_gateway: evm.evm_gateway_addr,
+        evm_rpc_url: &evm_rpc_url,
+        num_txs: sizing.num_keys,
+    })
     .await?;
     ui::kv("token ID", &hex::encode(token_id));
     ui::address("token contract (Stellar)", &token_address);
@@ -121,30 +121,19 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
     )
     .await?;
 
+    let pipeline = PipelineContext {
+        args: &args,
+        stellar: &stellar,
+        evm: &evm,
+        sizing: &sizing,
+        token_id,
+        gas_stroops,
+        amount_per_tx,
+    };
     if !sizing.is_burst() {
-        run_sustained_pipeline(
-            &args,
-            &stellar,
-            wallets,
-            &evm,
-            &sizing,
-            token_id,
-            gas_stroops,
-            amount_per_tx,
-        )
-        .await
+        run_sustained_pipeline(&pipeline, wallets).await
     } else {
-        run_burst_pipeline(
-            &args,
-            &stellar,
-            wallets,
-            &evm,
-            &sizing,
-            token_id,
-            gas_stroops,
-            amount_per_tx,
-        )
-        .await
+        run_burst_pipeline(&pipeline, wallets).await
     }
 }
 
@@ -340,17 +329,30 @@ fn compute_amount_per_key(sizing: &RunSizing, key_cycle: u64, decimals: u32) -> 
 /// Drive the sustained-mode pipeline: spawn the streaming verifier, run the
 /// Stellar ITS sustained loop, stitch amplifier timings back into the report,
 /// and hand off to `finish_report`.
-#[allow(clippy::too_many_arguments)]
-async fn run_sustained_pipeline(
-    args: &LoadTestArgs,
-    stellar: &StellarSetup,
-    wallets: Vec<StellarWallet>,
-    evm: &EvmTargets,
-    sizing: &RunSizing,
+#[derive(Clone, Copy)]
+struct PipelineContext<'a> {
+    args: &'a LoadTestArgs,
+    stellar: &'a StellarSetup,
+    evm: &'a EvmTargets,
+    sizing: &'a RunSizing,
     token_id: [u8; 32],
     gas_stroops: u64,
     amount_per_tx: u128,
+}
+
+async fn run_sustained_pipeline(
+    pipeline: &PipelineContext<'_>,
+    wallets: Vec<StellarWallet>,
 ) -> Result<()> {
+    let PipelineContext {
+        args,
+        stellar,
+        evm,
+        sizing,
+        token_id,
+        gas_stroops,
+        amount_per_tx,
+    } = *pipeline;
     let src = &args.source_chain;
     let dest = &args.destination_chain;
     let (tps_n, duration_secs, key_cycle) = sizing.sustained().expect("sustained mode");
@@ -427,17 +429,19 @@ async fn run_sustained_pipeline(
 
 /// Drive the burst-mode pipeline: fan out `num_keys` parallel ITS transfers,
 /// batch-verify on the EVM destination, and hand off to `finish_report`.
-#[allow(clippy::too_many_arguments)]
 async fn run_burst_pipeline(
-    args: &LoadTestArgs,
-    stellar: &StellarSetup,
+    pipeline: &PipelineContext<'_>,
     wallets: Vec<StellarWallet>,
-    evm: &EvmTargets,
-    sizing: &RunSizing,
-    token_id: [u8; 32],
-    gas_stroops: u64,
-    amount_per_tx: u128,
 ) -> Result<()> {
+    let PipelineContext {
+        args,
+        stellar,
+        evm,
+        sizing,
+        token_id,
+        gas_stroops,
+        amount_per_tx,
+    } = *pipeline;
     let src = &args.source_chain;
     let dest = &args.destination_chain;
     let num_keys = sizing.num_keys;
@@ -537,23 +541,42 @@ async fn run_burst_pipeline(
 // Token setup
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-async fn setup_its_token(
-    client: &StellarClient,
-    main_wallet: &StellarWallet,
-    its_contract: &str,
-    gateway_contract: &str,
-    xlm_token: &str,
+struct TokenSetupRequest<'a> {
+    client: &'a StellarClient,
+    main_wallet: &'a StellarWallet,
+    its_contract: &'a str,
+    gateway_contract: &'a str,
+    xlm_token: &'a str,
     gas_stroops: u64,
-    src: &str,
-    dest: &str,
-    dest_axelar_id: &str,
-    token_id_override: Option<&str>,
-    config: &std::path::Path,
-    evm_gateway_addr: alloy::primitives::Address,
-    evm_rpc_url: &str,
+    source_chain: &'a str,
+    destination_chain: &'a str,
+    destination_axelar_id: &'a str,
+    token_id_override: Option<&'a str>,
+    config: &'a std::path::Path,
+    evm_gateway: alloy::primitives::Address,
+    evm_rpc_url: &'a str,
     num_txs: usize,
+}
+
+async fn setup_its_token(
+    request: TokenSetupRequest<'_>,
 ) -> Result<([u8; 32], [u8; 32], String, u32)> {
+    let TokenSetupRequest {
+        client,
+        main_wallet,
+        its_contract,
+        gateway_contract,
+        xlm_token,
+        gas_stroops,
+        source_chain: src,
+        destination_chain: dest,
+        destination_axelar_id: dest_axelar_id,
+        token_id_override,
+        config,
+        evm_gateway: evm_gateway_addr,
+        evm_rpc_url,
+        num_txs,
+    } = request;
     if let Some(tid_hex) = token_id_override {
         let tid_bytes = hex::decode(tid_hex.strip_prefix("0x").unwrap_or(tid_hex))
             .map_err(|e| eyre!("invalid --token-id: {e}"))?;
@@ -659,15 +682,15 @@ async fn setup_its_token(
     ui::kv("supply", &INITIAL_SUPPLY.to_string());
 
     let (deploy_invoked, token_id_opt) = client
-        .its_deploy_interchain_token(
-            main_wallet,
+        .its_deploy_interchain_token(crate::stellar::DeployInterchainTokenRequest {
+            wallet: main_wallet,
             its_contract,
             salt,
-            TOKEN_DECIMALS,
-            TOKEN_NAME,
-            TOKEN_SYMBOL,
-            INITIAL_SUPPLY,
-        )
+            decimals: TOKEN_DECIMALS,
+            name: TOKEN_NAME,
+            symbol: TOKEN_SYMBOL,
+            initial_supply: INITIAL_SUPPLY,
+        })
         .await?;
     if !deploy_invoked.success {
         return Err(eyre!("Stellar deploy_interchain_token failed"));
@@ -686,15 +709,15 @@ async fn setup_its_token(
     // Register on EVM destination via ITS hub.
     ui::info(&format!("deploying remote AXE token to {dest}..."));
     let remote_invoked = client
-        .its_deploy_remote_interchain_token(
-            main_wallet,
+        .its_deploy_remote_interchain_token(crate::stellar::DeployRemoteInterchainTokenRequest {
+            wallet: main_wallet,
             its_contract,
             gateway_contract,
             salt,
-            dest_axelar_id,
-            xlm_token,
-            gas_stroops,
-        )
+            destination_chain: dest_axelar_id,
+            gas_token: xlm_token,
+            gas_amount: gas_stroops,
+        })
         .await?;
     if !remote_invoked.success {
         return Err(eyre!("Stellar deploy_remote_interchain_token failed"));

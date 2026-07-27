@@ -97,7 +97,10 @@ mod tests {
     /// so the crates' baked constants verify the devnet row of every table
     /// against the upstream source of truth.
     #[test]
-    #[allow(clippy::disallowed_methods)] // the whole point is comparing against the crates' baked IDs
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "this guard test intentionally compares runtime IDs with the crates' baked IDs"
+    )]
     fn devnet_row_matches_pinned_crate_constants() {
         let n = Network::DevnetAmplifier;
         assert_eq!(n.solana_gateway_id(), solana_axelar_gateway::id());

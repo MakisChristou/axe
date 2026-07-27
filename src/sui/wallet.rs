@@ -26,7 +26,10 @@ const SECP256K1_PK_LEN: usize = 33; // compressed
 /// handful of these per run, so the indirection of `Box`-ing the larger
 /// variant isn't worth it.
 #[derive(Clone)]
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "wallets are few and long-lived; boxing the larger keypair would add needless indirection"
+)]
 pub enum SuiKeypair {
     Ed25519 {
         signing_key: EdSigningKey,

@@ -32,20 +32,34 @@ pub const DEFAULT_GAS_FEE_DROPS: u64 = 100_000; // 0.1 XRP
 
 /// Build, sign and submit a single `interchain_transfer` Payment.
 /// Returns (tx_hash_uppercase, metrics).
-#[allow(clippy::too_many_arguments)]
-async fn submit_single(
-    client: &XrplClient,
-    wallet: &XrplWallet,
-    destination_multisig: &AccountId,
+struct TransferSubmission<'a> {
+    client: &'a XrplClient,
+    wallet: &'a XrplWallet,
+    destination_multisig: &'a AccountId,
     total_drops: u64,
     gas_fee_drops: u64,
-    destination_chain: &str,
-    destination_address_hex: &str,
-    payload: Option<&[u8]>,
-    payload_hash_hex: &str,
-    gmp_dest_chain: &str,
-    gmp_dest_address: &str,
-) -> TxMetrics {
+    destination_chain: &'a str,
+    destination_address_hex: &'a str,
+    payload: Option<&'a [u8]>,
+    payload_hash_hex: &'a str,
+    gmp_dest_chain: &'a str,
+    gmp_dest_address: &'a str,
+}
+
+async fn submit_single(submission: TransferSubmission<'_>) -> TxMetrics {
+    let TransferSubmission {
+        client,
+        wallet,
+        destination_multisig,
+        total_drops,
+        gas_fee_drops,
+        destination_chain,
+        destination_address_hex,
+        payload,
+        payload_hash_hex,
+        gmp_dest_chain,
+        gmp_dest_address,
+    } = submission;
     let submit_start = Instant::now();
     let source_addr = wallet.address();
 
@@ -167,19 +181,32 @@ fn fail_metrics(submit_start: Instant, source: &str, err: &str) -> TxMetrics {
 
 /// Run a burst-mode XRPL ITS load test: fires one Payment per derived
 /// ephemeral wallet, in parallel.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_burst(
-    client: &XrplClient,
-    wallets: &[XrplWallet],
-    destination_multisig: &AccountId,
-    destination_chain: &str,
-    destination_address_hex: &str,
-    gas_fee_drops: u64,
-    gmp_dest_chain: &str,
-    gmp_dest_address: &str,
-    source_chain: &str,
-    destination_chain_label: &str,
-) -> Result<LoadTestReport> {
+pub(super) struct BurstRequest<'a> {
+    pub client: &'a XrplClient,
+    pub wallets: &'a [XrplWallet],
+    pub destination_multisig: &'a AccountId,
+    pub destination_chain: &'a str,
+    pub destination_address_hex: &'a str,
+    pub gas_fee_drops: u64,
+    pub gmp_dest_chain: &'a str,
+    pub gmp_dest_address: &'a str,
+    pub source_chain: &'a str,
+    pub destination_chain_label: &'a str,
+}
+
+pub async fn run_burst(request: BurstRequest<'_>) -> Result<LoadTestReport> {
+    let BurstRequest {
+        client,
+        wallets,
+        destination_multisig,
+        destination_chain,
+        destination_address_hex,
+        gas_fee_drops,
+        gmp_dest_chain,
+        gmp_dest_address,
+        source_chain,
+        destination_chain_label,
+    } = request;
     let key_count = wallets.len();
     let metrics_list: Arc<Mutex<Vec<TxMetrics>>> = Arc::new(Mutex::new(Vec::new()));
     let confirmed = Arc::new(AtomicU64::new(0));
@@ -203,19 +230,19 @@ pub async fn run_burst(
         let total = key_count;
         let total_drops = gas_fee_drops.saturating_add(NET_TRANSFER_DROPS);
         let handle = tokio::spawn(async move {
-            let m = submit_single(
-                &c,
-                &w,
-                &multisig,
+            let m = submit_single(TransferSubmission {
+                client: &c,
+                wallet: &w,
+                destination_multisig: &multisig,
                 total_drops,
                 gas_fee_drops,
-                &dc,
-                &da,
-                None,
-                "",
-                &gmp_c,
-                &gmp_a,
-            )
+                destination_chain: &dc,
+                destination_address_hex: &da,
+                payload: None,
+                payload_hash_hex: "",
+                gmp_dest_chain: &gmp_c,
+                gmp_dest_address: &gmp_a,
+            })
             .await;
             if m.success {
                 let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -277,24 +304,42 @@ fn build_burst_report(
 
 /// Run a sustained XRPL ITS load test. Uses the shared `sustained::run_sustained_loop`
 /// and streams confirmed txs to a verification channel.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_sustained(
-    client: &XrplClient,
-    wallets: Vec<XrplWallet>,
-    destination_multisig: AccountId,
-    destination_chain: String,
-    destination_address_hex: String,
-    gas_fee_drops: u64,
-    gmp_dest_chain: String,
-    gmp_dest_address: String,
-    tps: usize,
-    duration_secs: u64,
-    key_cycle: usize,
-    verify_tx: Option<tokio::sync::mpsc::UnboundedSender<super::verify::PendingTx>>,
-    send_done: Option<Arc<AtomicBool>>,
-    spinner: ProgressBar,
-    has_voting_verifier: bool,
-) -> sustained::SustainedResult {
+pub(super) struct SustainedRequest {
+    pub client: XrplClient,
+    pub wallets: Vec<XrplWallet>,
+    pub destination_multisig: AccountId,
+    pub destination_chain: String,
+    pub destination_address_hex: String,
+    pub gas_fee_drops: u64,
+    pub gmp_dest_chain: String,
+    pub gmp_dest_address: String,
+    pub tps: usize,
+    pub duration_secs: u64,
+    pub key_cycle: usize,
+    pub verify_tx: Option<tokio::sync::mpsc::UnboundedSender<super::verify::PendingTx>>,
+    pub send_done: Option<Arc<AtomicBool>>,
+    pub spinner: ProgressBar,
+    pub has_voting_verifier: bool,
+}
+
+pub(super) async fn run_sustained(request: SustainedRequest) -> sustained::SustainedResult {
+    let SustainedRequest {
+        client,
+        wallets,
+        destination_multisig,
+        destination_chain,
+        destination_address_hex,
+        gas_fee_drops,
+        gmp_dest_chain,
+        gmp_dest_address,
+        tps,
+        duration_secs,
+        key_cycle,
+        verify_tx,
+        send_done,
+        spinner,
+        has_voting_verifier,
+    } = request;
     let client = Arc::new(client.clone());
     let wallets = Arc::new(wallets);
 
@@ -313,19 +358,19 @@ pub(super) async fn run_sustained(
         Box::pin(async move {
             let wallet = &ws[key_idx % ws.len()];
             let total_drops = gas.saturating_add(NET_TRANSFER_DROPS);
-            let mut m = submit_single(
-                &c,
+            let mut m = submit_single(TransferSubmission {
+                client: &c,
                 wallet,
-                &multisig,
+                destination_multisig: &multisig,
                 total_drops,
-                gas,
-                &dc,
-                &da,
-                None,
-                "",
-                &gmp_c,
-                &gmp_a,
-            )
+                gas_fee_drops: gas,
+                destination_chain: &dc,
+                destination_address_hex: &da,
+                payload: None,
+                payload_hash_hex: "",
+                gmp_dest_chain: &gmp_c,
+                gmp_dest_address: &gmp_a,
+            })
             .await;
 
             if m.success

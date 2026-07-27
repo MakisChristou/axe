@@ -672,20 +672,21 @@ async fn run_sustained_pipeline(
                 .connect_http(url.parse().expect("invalid RPC URL"));
 
             Box::pin(async move {
-                let mut result = execute_interchain_transfer_with_data(
-                    &provider,
-                    its_proxy,
-                    tid,
-                    &dc,
-                    &rb,
-                    amt,
-                    gv,
-                    &cpda,
-                    ea,
-                    tma.as_ref(),
-                    nonce,
-                )
-                .await;
+                let mut result =
+                    execute_interchain_transfer_with_data(InterchainTransferWithDataRequest {
+                        provider: &provider,
+                        its_proxy,
+                        token_id: tid,
+                        destination_chain: &dc,
+                        receiver: &rb,
+                        amount: amt,
+                        gas_value: gv,
+                        counter_pda: &cpda,
+                        extra_accounts: ea,
+                        token_mint_ata: tma.as_ref(),
+                        explicit_nonce: nonce,
+                    })
+                    .await;
                 // Stream successful txs to the concurrent verification pipeline.
                 if result.success {
                     match super::verify::tx_to_pending_its(&result, has_vv) {
@@ -786,20 +787,21 @@ async fn run_burst_pipeline(
 
             let mut m = None;
             for attempt in 0..=MAX_RETRIES {
-                let result = execute_interchain_transfer_with_data(
-                    &provider,
-                    its_proxy,
-                    tid,
-                    &dc,
-                    &rb,
-                    amt,
-                    gv,
-                    &cpda,
-                    ea,
-                    tma.as_ref(),
-                    None,
-                )
-                .await;
+                let result =
+                    execute_interchain_transfer_with_data(InterchainTransferWithDataRequest {
+                        provider: &provider,
+                        its_proxy,
+                        token_id: tid,
+                        destination_chain: &dc,
+                        receiver: &rb,
+                        amount: amt,
+                        gas_value: gv,
+                        counter_pda: &cpda,
+                        extra_accounts: ea,
+                        token_mint_ata: tma.as_ref(),
+                        explicit_nonce: None,
+                    })
+                    .await;
 
                 if result.success || attempt == MAX_RETRIES {
                     m = Some(result);
@@ -973,20 +975,36 @@ async fn deploy_its_token<P: Provider>(
 }
 
 /// Send a single interchainTransfer with metadata that triggers the memo program.
-#[allow(clippy::too_many_arguments)]
-async fn execute_interchain_transfer_with_data<P: Provider>(
-    provider: &P,
+struct InterchainTransferWithDataRequest<'a, P> {
+    provider: &'a P,
     its_proxy: Address,
     token_id: FixedBytes<32>,
-    dest_chain: &str,
-    receiver_bytes: &Bytes,
+    destination_chain: &'a str,
+    receiver: &'a Bytes,
     amount: U256,
     gas_value: U256,
-    counter_pda: &Pubkey,
+    counter_pda: &'a Pubkey,
     extra_accounts: u32,
-    token_mint_ata: Option<&Pubkey>,
+    token_mint_ata: Option<&'a Pubkey>,
     explicit_nonce: Option<u64>,
+}
+
+async fn execute_interchain_transfer_with_data<P: Provider>(
+    request: InterchainTransferWithDataRequest<'_, P>,
 ) -> TxMetrics {
+    let InterchainTransferWithDataRequest {
+        provider,
+        its_proxy,
+        token_id,
+        destination_chain: dest_chain,
+        receiver: receiver_bytes,
+        amount,
+        gas_value,
+        counter_pda,
+        extra_accounts,
+        token_mint_ata,
+        explicit_nonce,
+    } = request;
     let submit_start = Instant::now();
 
     // Build unique metadata per tx (random memo string)

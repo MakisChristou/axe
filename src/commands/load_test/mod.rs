@@ -193,7 +193,10 @@ pub struct LoadTestArgs {
     pub extra_accounts: u32,
 }
 
-#[allow(clippy::cognitive_complexity)] // wide match over (protocol, test-type) pairs; flat by design
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "the protocol/test-type dispatch matrix is intentionally flat and exhaustive"
+)]
 pub async fn run(args: LoadTestArgs) -> Result<()> {
     let run_sizing = run_sizing::RunSizing::new(&args)?;
     let run_start = Instant::now();

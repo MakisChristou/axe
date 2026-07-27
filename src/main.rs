@@ -155,17 +155,17 @@ async fn main() -> Result<()> {
                         Some(path) => path,
                         None => config_source::resolve(network, None).await?.into_path(),
                     };
-                    commands::test_its::run_config(
+                    commands::test_its::run_config(commands::test_its::ConfigArgs {
                         config,
                         network,
                         source_chain,
                         destination_chain,
-                        mnemonic,
-                        evm_private_key,
+                        mnemonic_override: mnemonic,
+                        evm_private_key_override: evm_private_key,
                         amount,
                         gas_value,
                         fresh_token,
-                    )
+                    })
                     .await
                 } else {
                     commands::test_its::run(axelar_id).await

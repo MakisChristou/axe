@@ -432,9 +432,8 @@ fn message_id_for_source(tx: &TxMetrics, source_type: SourceChainType, network: 
 /// vary by destination chain — `contract_addr` (parsed for EVM, zero
 /// elsewhere), `command_id` (`Some` for Solana, `None` elsewhere), and the
 /// `gmp_destination_*` fields — so the caller passes those explicitly.
-#[allow(clippy::too_many_arguments)]
-fn pending_tx_for_gmp_batch(
-    tx: &TxMetrics,
+struct PendingGmpBatchArgs<'a> {
+    tx: &'a TxMetrics,
     idx: usize,
     message_id: String,
     contract_addr: Address,
@@ -442,7 +441,19 @@ fn pending_tx_for_gmp_batch(
     gmp_destination_chain: String,
     gmp_destination_address: String,
     initial_phase: Phase,
-) -> Result<PendingTx> {
+}
+
+fn pending_tx_for_gmp_batch(args: PendingGmpBatchArgs<'_>) -> Result<PendingTx> {
+    let PendingGmpBatchArgs {
+        tx,
+        idx,
+        message_id,
+        contract_addr,
+        command_id,
+        gmp_destination_chain,
+        gmp_destination_address,
+        initial_phase,
+    } = args;
     let payload_hash = parse_first_leg_payload_hash(tx, true)?;
     Ok(PendingTx {
         idx,
@@ -490,7 +501,10 @@ pub enum SourceChainType {
 /// 2. **Routed** — Destination Gateway outgoing_messages
 /// 3. **Approved** — EVM gateway isMessageApproved
 /// 4. **Executed** — EVM approval consumed
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "route adapter stays explicit until verification phase state is characterized and typed"
+)]
 pub async fn verify_onchain<P: Provider>(
     config: &Path,
     source_chain: &str,
@@ -551,16 +565,16 @@ pub async fn verify_onchain<P: Provider>(
         .iter()
         .map(|&idx| {
             let tx = &metrics[idx];
-            pending_tx_for_gmp_batch(
+            pending_tx_for_gmp_batch(PendingGmpBatchArgs {
                 tx,
                 idx,
-                message_id_for_source(tx, source_type, network),
+                message_id: message_id_for_source(tx, source_type, network),
                 contract_addr,
-                None, // EVM destination, not needed
-                String::new(),
-                String::new(),
+                command_id: None, // EVM destination, not needed
+                gmp_destination_chain: String::new(),
+                gmp_destination_address: String::new(),
                 initial_phase,
-            )
+            })
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -620,7 +634,10 @@ pub(in crate::commands::load_test) fn classify_route(
 /// - the destination checker is chosen by the **destination** type: a legacy
 ///   gateway (`EvmLegacy`: read the on-chain `ContractCallApproved` commandId,
 ///   then `isCommandExecuted`) or the Amplifier gateway (`isMessageApproved`).
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "route adapter stays explicit until verification phase state is characterized and typed"
+)]
 pub async fn verify_onchain_evm_legacy<P: Provider>(
     config: &Path,
     source_chain: &str,
@@ -677,16 +694,16 @@ pub async fn verify_onchain_evm_legacy<P: Provider>(
         .iter()
         .map(|&idx| {
             let tx = &metrics[idx];
-            pending_tx_for_gmp_batch(
+            pending_tx_for_gmp_batch(PendingGmpBatchArgs {
                 tx,
                 idx,
-                message_id_for_source(tx, source_type, network),
+                message_id: message_id_for_source(tx, source_type, network),
                 contract_addr,
-                None,
-                String::new(),
-                String::new(),
+                command_id: None,
+                gmp_destination_chain: String::new(),
+                gmp_destination_address: String::new(),
                 initial_phase,
-            )
+            })
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -732,7 +749,10 @@ pub async fn verify_onchain_evm_legacy<P: Provider>(
 
 /// Streaming version of `verify_onchain` for EVM destinations — runs
 /// concurrently with the send phase, receiving confirmed txs via the channel.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "route adapter stays explicit until verification phase state is characterized and typed"
+)]
 pub async fn verify_onchain_evm_streaming(
     config: &Path,
     source_chain: &str,
@@ -791,7 +811,10 @@ pub async fn verify_onchain_evm_streaming(
 /// legacy phase model and dest checker, but receives confirmed txs over the
 /// channel. `from_block` is captured here, before the first tx arrives, so the
 /// `ContractCallApproved` scan has a sound lower bound.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "route adapter stays explicit until verification phase state is characterized and typed"
+)]
 pub async fn verify_onchain_evm_legacy_streaming(
     config: &Path,
     source_chain: &str,
@@ -870,7 +893,10 @@ pub async fn verify_onchain_evm_legacy_streaming(
 /// GMP verification with a Stellar destination — uses Stellar's
 /// `is_message_approved` / `is_message_executed` Soroban view calls
 /// instead of an EVM gateway or Solana PDA.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "route adapter stays explicit until verification phase state is characterized and typed"
+)]
 pub async fn verify_onchain_stellar_gmp(
     config: &Path,
     source_chain: &str,
@@ -905,16 +931,16 @@ pub async fn verify_onchain_stellar_gmp(
         .iter()
         .map(|&idx| {
             let tx = &metrics[idx];
-            pending_tx_for_gmp_batch(
+            pending_tx_for_gmp_batch(PendingGmpBatchArgs {
                 tx,
                 idx,
-                message_id_for_source(tx, source_type, network),
-                Address::ZERO,
-                None,
-                tx.gmp_destination_chain.clone(),
-                destination_contract.to_string(),
+                message_id: message_id_for_source(tx, source_type, network),
+                contract_addr: Address::ZERO,
+                command_id: None,
+                gmp_destination_chain: tx.gmp_destination_chain.clone(),
+                gmp_destination_address: destination_contract.to_string(),
                 initial_phase,
-            )
+            })
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -948,7 +974,11 @@ pub async fn verify_onchain_stellar_gmp(
 /// Streaming variant of `verify_onchain_stellar_gmp`.
 /// Reserved for future sustained-mode flows (the burst-mode runners use
 /// `verify_onchain_stellar_gmp` above today).
-#[allow(clippy::too_many_arguments, dead_code)]
+#[expect(
+    clippy::too_many_arguments,
+    dead_code,
+    reason = "reserved streaming adapter mirrors the batch path until sustained Stellar GMP is enabled"
+)]
 pub async fn verify_onchain_stellar_gmp_streaming(
     config: &Path,
     source_chain: &str,
@@ -1155,7 +1185,10 @@ pub(super) fn tx_to_pending_its(tx: &TxMetrics, has_voting_verifier: bool) -> Re
 /// Burst-mode Sui destination verifier — block on confirmed metrics array.
 /// Uses Sui events polling (`MessageApproved` / `MessageExecuted` on the
 /// AxelarGateway events module) for the destination-side phases.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "route adapter stays explicit until verification phase state is characterized and typed"
+)]
 pub async fn verify_onchain_sui_gmp(
     config: &Path,
     source_chain: &str,
@@ -1199,16 +1232,16 @@ pub async fn verify_onchain_sui_gmp(
             // `messages_status` query never match (status "unknown") and the
             // verify phase timed out at "voted". Plumb the per-tx hub
             // destination through; for raw Sui-dest GMP it equals the channel.
-            pending_tx_for_gmp_batch(
+            pending_tx_for_gmp_batch(PendingGmpBatchArgs {
                 tx,
                 idx,
-                message_id_for_source(tx, source_type, network),
-                Address::ZERO,
-                None,
-                tx.gmp_destination_chain.clone(),
-                tx.gmp_destination_address.clone(),
+                message_id: message_id_for_source(tx, source_type, network),
+                contract_addr: Address::ZERO,
+                command_id: None,
+                gmp_destination_chain: tx.gmp_destination_chain.clone(),
+                gmp_destination_address: tx.gmp_destination_address.clone(),
                 initial_phase,
-            )
+            })
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -1241,7 +1274,10 @@ pub async fn verify_onchain_sui_gmp(
 ///
 /// Runs verification concurrently with the send phase. Receives confirmed
 /// transactions via the channel and starts polling them immediately.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "route adapter stays explicit until verification phase state is characterized and typed"
+)]
 pub async fn verify_onchain_solana_streaming(
     config: &Path,
     source_chain: &str,
@@ -1303,7 +1339,10 @@ pub async fn verify_onchain_solana_streaming(
 /// 2. **Routed** — Cosmos Gateway outgoing_messages (dest Solana chain)
 /// 3. **Approved** — Solana IncomingMessage PDA exists
 /// 4. **Executed** — Solana IncomingMessage PDA status = executed
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "route adapter stays explicit until verification phase state is characterized and typed"
+)]
 pub async fn verify_onchain_solana(
     config: &Path,
     source_chain: &str,
@@ -1346,16 +1385,16 @@ pub async fn verify_onchain_solana(
             // phase timed out at "voted". The TxMetrics already captured
             // these from the source-side CallContract event, so plumb them
             // through.
-            pending_tx_for_gmp_batch(
+            pending_tx_for_gmp_batch(PendingGmpBatchArgs {
                 tx,
                 idx,
                 message_id,
-                Address::ZERO,
-                Some(keccak256(&cmd_input).into()),
-                tx.gmp_destination_chain.clone(),
-                tx.gmp_destination_address.clone(),
+                contract_addr: Address::ZERO,
+                command_id: Some(keccak256(&cmd_input).into()),
+                gmp_destination_chain: tx.gmp_destination_chain.clone(),
+                gmp_destination_address: tx.gmp_destination_address.clone(),
                 initial_phase,
-            )
+            })
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -1404,7 +1443,6 @@ pub async fn verify_onchain_solana(
 /// 4. **Routed** — Cosmos Gateway outgoing_messages (second-leg)
 /// 5. **Approved** — Solana IncomingMessage PDA exists
 /// 6. **Executed** — Solana IncomingMessage PDA status = executed
-#[allow(clippy::too_many_arguments)]
 pub async fn verify_onchain_solana_its(
     config: &Path,
     source_chain: &str,
@@ -1534,7 +1572,10 @@ pub async fn verify_onchain_sui_its(
 
 /// Streaming version of `verify_onchain_solana_its` — runs concurrently with
 /// the send phase, receiving confirmed txs via the channel.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "route adapter stays explicit until verification phase state is characterized and typed"
+)]
 pub async fn verify_onchain_solana_its_streaming(
     config: &Path,
     source_chain: &str,
@@ -1588,7 +1629,10 @@ pub async fn verify_onchain_solana_its_streaming(
 /// `is_message_executed` view calls to detect destination-side approval and
 /// execution. The `signer_pk` is just the source account for simulate
 /// envelopes — read-only, no real authorization needed.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "route adapter stays explicit until verification phase state is characterized and typed"
+)]
 pub async fn verify_onchain_stellar_its(
     config: &Path,
     source_chain: &str,
@@ -1653,7 +1697,10 @@ pub async fn verify_onchain_stellar_its(
 }
 
 /// Streaming variant of `verify_onchain_stellar_its`.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "route adapter stays explicit until verification phase state is characterized and typed"
+)]
 pub async fn verify_onchain_stellar_its_streaming(
     config: &Path,
     source_chain: &str,
@@ -1772,7 +1819,10 @@ pub async fn verify_onchain_xrpl_its(
 }
 
 /// Streaming variant of `verify_onchain_xrpl_its`.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "route adapter stays explicit until verification phase state is characterized and typed"
+)]
 pub async fn verify_onchain_xrpl_its_streaming(
     config: &Path,
     source_chain: &str,
@@ -1834,7 +1884,10 @@ pub async fn verify_onchain_xrpl_its_streaming(
 /// 4. **Routed** — Cosmos Gateway outgoing_messages (second-leg, dest EVM chain)
 /// 5. **Approved** — EVM gateway isMessageApproved (second-leg)
 /// 6. **Executed** — EVM approval consumed
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "route adapter stays explicit until verification phase state is characterized and typed"
+)]
 pub async fn verify_onchain_evm_its(
     config: &Path,
     source_chain: &str,
@@ -1926,7 +1979,10 @@ async fn its_evm_dest<P: Provider>(
 
 /// Streaming version of `verify_onchain_evm_its` — runs concurrently with
 /// the send phase, receiving confirmed txs via the channel.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "route adapter stays explicit until verification phase state is characterized and typed"
+)]
 pub async fn verify_onchain_evm_its_streaming(
     config: &Path,
     source_chain: &str,

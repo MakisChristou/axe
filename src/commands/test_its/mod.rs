@@ -37,11 +37,11 @@ use solana_sdk::signer::Signer as SolSigner;
 
 use cache::{cache_path, try_load_cached_phase_a};
 use encoding::{encode_inner_transfer, encode_receive_from_hub};
-use phase_a::{poll_for_remote_token_deploy, run_phase_a_deploy};
+use phase_a::{PhaseADeployRequest, poll_for_remote_token_deploy, run_phase_a_deploy};
 use phase_b::{
     check_destination_trusts_source, poll_for_balance_on_destination, resolve_hub_address_evm_view,
 };
-use relay::{relay_to_destination, relay_to_hub};
+use relay::{DestinationRelayRequest, HubRelayRequest, relay_to_destination, relay_to_hub};
 use remediation::print_untrusted_chain_remediation;
 
 use crate::cli::resolve_axelar_id;
@@ -49,7 +49,7 @@ pub use crate::commands::event_extractors::{
     extract_contract_call_event, extract_token_deployed_event, generate_salt,
 };
 use crate::commands::test_helpers::{
-    end_poll_with_retry, execute_on_axelarnet_gateway, route_messages_with_retry,
+    CosmosTxContext, end_poll_with_retry, execute_on_axelarnet_gateway, route_messages_with_retry,
     submit_verify_messages_amplifier, wait_for_poll_votes,
 };
 use crate::config::ChainsConfig;
@@ -72,6 +72,18 @@ const PHASE_B_STEPS: usize = 9;
 /// proposal. 0.01 SOL covers the relay round-trip with comfortable headroom
 /// at testnet rates.
 const DEFAULT_ITS_GAS_VALUE_LAMPORTS: u64 = 10_000_000;
+
+pub struct ConfigArgs {
+    pub config: PathBuf,
+    pub network: crate::types::Network,
+    pub source_chain: Option<String>,
+    pub destination_chain: Option<String>,
+    pub mnemonic_override: Option<String>,
+    pub evm_private_key_override: Option<String>,
+    pub amount: Option<u64>,
+    pub gas_value: Option<u64>,
+    pub fresh_token: bool,
+}
 
 /// Default ITS interchain-transfer amount in token base units. The SVM-side
 /// test token mints with 9 decimals, so 1_000_000 base units = 0.001 token —
@@ -249,6 +261,14 @@ pub async fn run(axelar_id: Option<String>) -> Result<()> {
 
     let (signing_key, axelar_address) = derive_axelar_wallet(&state.mnemonic)?;
     let (lcd, chain_id, fee_denom, gas_price) = cfg.axelar.cosmos_tx_params()?;
+    let tx = CosmosTxContext {
+        signing_key: &signing_key,
+        axelar_address: &axelar_address,
+        lcd: &lcd,
+        chain_id: &chain_id,
+        fee_denom: &fee_denom,
+        gas_price,
+    };
 
     let cosm_gateway = cfg
         .axelar
@@ -276,17 +296,7 @@ pub async fn run(axelar_id: Option<String>) -> Result<()> {
 
     // ── Step 3: verify_messages ─────────────────────────────────────────
     ui::step_header(3, TOTAL_STEPS, "verify_messages");
-    let poll_id = submit_verify_messages_amplifier(
-        &its_msg,
-        &signing_key,
-        &axelar_address,
-        &lcd,
-        &chain_id,
-        &fee_denom,
-        gas_price,
-        &cosm_gateway,
-    )
-    .await?;
+    let poll_id = submit_verify_messages_amplifier(&its_msg, tx, &cosm_gateway).await?;
 
     if let Some(poll_id) = poll_id {
         ui::kv("poll_id", &poll_id);
@@ -294,17 +304,7 @@ pub async fn run(axelar_id: Option<String>) -> Result<()> {
         // ── Step 4: Wait for poll votes + end poll ──────────────────────────
         ui::step_header(4, TOTAL_STEPS, "Wait for poll votes + end poll");
         wait_for_poll_votes(&lcd, &voting_verifier, &poll_id).await?;
-        end_poll_with_retry(
-            &poll_id,
-            &signing_key,
-            &axelar_address,
-            &lcd,
-            &chain_id,
-            &fee_denom,
-            gas_price,
-            &voting_verifier,
-        )
-        .await?;
+        end_poll_with_retry(&poll_id, tx, &voting_verifier).await?;
     } else {
         ui::info("no new poll created — message already being verified by active verifiers");
         ui::step_header(4, TOTAL_STEPS, "Wait for poll votes + end poll");
@@ -313,17 +313,7 @@ pub async fn run(axelar_id: Option<String>) -> Result<()> {
 
     // ── Step 5: route_messages ──────────────────────────────────────────
     ui::step_header(5, TOTAL_STEPS, "route_messages");
-    route_messages_with_retry(
-        &its_msg,
-        &signing_key,
-        &axelar_address,
-        &lcd,
-        &chain_id,
-        &fee_denom,
-        gas_price,
-        &cosm_gateway,
-    )
-    .await?;
+    route_messages_with_retry(&its_msg, tx, &cosm_gateway).await?;
 
     // ── Step 6: Execute on AxelarnetGateway (hub) ───────────────────────
     ui::step_header(6, TOTAL_STEPS, "Execute on AxelarnetGateway (hub)");
@@ -339,12 +329,7 @@ pub async fn run(axelar_id: Option<String>) -> Result<()> {
         &axelar_id,
         DEST_CHAIN,
         &payload,
-        &signing_key,
-        &axelar_address,
-        &lcd,
-        &chain_id,
-        &fee_denom,
-        gas_price,
+        tx,
         &axelarnet_gateway,
     )
     .await?;
@@ -391,24 +376,19 @@ pub async fn run(axelar_id: Option<String>) -> Result<()> {
     // ── Step 9: Relay transfer to hub ────────────────────────────────────
     ui::step_header(9, TOTAL_STEPS, "Relay transfer to hub");
 
-    relay_to_hub(
-        &axelar_id,
-        &xfer_message_id,
-        &source_address,
-        &xfer_dest_chain,
-        &xfer_dest_addr,
-        &xfer_payload_hash,
-        &xfer_payload,
-        &signing_key,
-        &axelar_address,
-        &lcd,
-        &chain_id,
-        &fee_denom,
-        gas_price,
-        &cosm_gateway,
-        &voting_verifier,
-        &axelarnet_gateway,
-    )
+    relay_to_hub(HubRelayRequest {
+        axelar_id: &axelar_id,
+        message_id: &xfer_message_id,
+        source_address: &source_address,
+        destination_chain: &xfer_dest_chain,
+        destination_address: &xfer_dest_addr,
+        payload_hash: &xfer_payload_hash,
+        payload: &xfer_payload,
+        tx,
+        cosm_gateway: &cosm_gateway,
+        voting_verifier: &voting_verifier,
+        axelarnet_gateway: &axelarnet_gateway,
+    })
     .await?;
 
     // ── Step 10: Verify transfer on destination ──────────────────────────
@@ -427,18 +407,18 @@ pub async fn run(axelar_id: Option<String>) -> Result<()> {
 /// Print the cast-send remediation block when DEST_CHAIN isn't trusted on the
 /// source-chain ITS (or vice versa). The owner addresses are queried so the
 /// user knows which key needs to sign the setTrustedChain calls.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_config(
-    config: PathBuf,
-    network: crate::types::Network,
-    source_chain: Option<String>,
-    destination_chain: Option<String>,
-    mnemonic_override: Option<String>,
-    evm_private_key_override: Option<String>,
-    amount: Option<u64>,
-    gas_value: Option<u64>,
-    fresh_token: bool,
-) -> Result<()> {
+pub async fn run_config(args: ConfigArgs) -> Result<()> {
+    let ConfigArgs {
+        config,
+        network,
+        source_chain,
+        destination_chain,
+        mnemonic_override,
+        evm_private_key_override,
+        amount,
+        gas_value,
+        fresh_token,
+    } = args;
     let start = Instant::now();
     let gas_value = gas_value.unwrap_or(DEFAULT_ITS_GAS_VALUE_LAMPORTS);
 
@@ -628,36 +608,36 @@ pub async fn run_config(
         ui::success(&format!("dest token responds to name() → \"{name}\""));
         (tid, addr)
     } else {
-        run_phase_a_deploy(
-            &src,
-            &dst,
+        run_phase_a_deploy(PhaseADeployRequest {
             network,
-            &src_axelar_id,
-            &dst_axelar_id,
-            &src_rpc,
-            &sol_keypair,
+            src_axelar_id: &src_axelar_id,
+            dst_axelar_id: &dst_axelar_id,
+            src_rpc: &src_rpc,
+            sol_keypair: &sol_keypair,
             sol_pubkey,
-            &signing_key,
-            &axelar_address,
-            &lcd,
-            &chain_id,
-            &fee_denom,
-            gas_price,
-            &src_cosm_gateway,
-            &voting_verifier,
-            &axelarnet_gateway,
-            &dst_cosm_gateway,
-            &dst_multisig_prover,
-            &axelar_rpc,
-            &its_hub_address,
+            tx: CosmosTxContext {
+                signing_key: &signing_key,
+                axelar_address: &axelar_address,
+                lcd: &lcd,
+                chain_id: &chain_id,
+                fee_denom: &fee_denom,
+                gas_price,
+            },
+            src_cosm_gateway: &src_cosm_gateway,
+            voting_verifier: &voting_verifier,
+            axelarnet_gateway: &axelarnet_gateway,
+            dst_cosm_gateway: &dst_cosm_gateway,
+            dst_multisig_prover: &dst_multisig_prover,
+            axelar_rpc: &axelar_rpc,
+            its_hub_address: &its_hub_address,
             dst_its_proxy,
             dst_evm_gateway,
-            &dst_provider,
-            &its,
+            dst_provider: &dst_provider,
+            its: &its,
             gas_value,
-            &cache_file,
-            start,
-        )
+            cache_file: &cache_file,
+            phase_start: start,
+        })
         .await?
     };
 
@@ -701,18 +681,19 @@ pub async fn run_config(
 
     // Step B1: Solana — fire the InterchainTransfer
     ui::step_header(1, PHASE_B_STEPS, "Send InterchainTransfer (Solana → hub)");
-    let (xfer_sig, _metrics) = crate::solana::send_its_interchain_transfer(
-        &src_rpc,
-        &sol_keypair,
-        network,
-        &token_id,
-        &source_ata,
-        &mint,
-        dst_axelar_id.as_str(),
-        &receiver_bytes,
-        amount,
-        gas_value,
-    )?;
+    let (xfer_sig, _metrics) =
+        crate::solana::send_its_interchain_transfer(crate::solana::InterchainTransferRequest {
+            rpc_url: &src_rpc,
+            keypair: &sol_keypair,
+            network,
+            token_id: &token_id,
+            source_account: &source_ata,
+            mint: &mint,
+            destination_chain: dst_axelar_id.as_str(),
+            destination_address: &receiver_bytes,
+            amount,
+            gas_value,
+        })?;
     ui::tx_hash("solana tx", &xfer_sig);
 
     let xfer_first_leg_id = crate::solana::extract_its_message_id(&src_rpc, network, &xfer_sig)?;
@@ -734,24 +715,27 @@ pub async fn run_config(
         "Source → hub (verify, route, hub-execute)",
     );
     let xfer_payload_hash = FixedBytes::<32>::from(xfer_gw.payload_hash);
-    relay_to_hub(
-        src_axelar_id.as_str(),
-        &xfer_first_leg_id,
-        &xfer_gw.sender,
-        crate::types::HubChain::NAME,
-        &its_hub_address,
-        &xfer_payload_hash,
-        &xfer_gw.payload,
-        &signing_key,
-        &axelar_address,
-        &lcd,
-        &chain_id,
-        &fee_denom,
+    let tx = CosmosTxContext {
+        signing_key: &signing_key,
+        axelar_address: &axelar_address,
+        lcd: &lcd,
+        chain_id: &chain_id,
+        fee_denom: &fee_denom,
         gas_price,
-        &src_cosm_gateway,
-        &voting_verifier,
-        &axelarnet_gateway,
-    )
+    };
+    relay_to_hub(HubRelayRequest {
+        axelar_id: src_axelar_id.as_str(),
+        message_id: &xfer_first_leg_id,
+        source_address: &xfer_gw.sender,
+        destination_chain: crate::types::HubChain::NAME,
+        destination_address: &its_hub_address,
+        payload_hash: &xfer_payload_hash,
+        payload: &xfer_gw.payload,
+        tx,
+        cosm_gateway: &src_cosm_gateway,
+        voting_verifier: &voting_verifier,
+        axelarnet_gateway: &axelarnet_gateway,
+    })
     .await?;
 
     // Step B3+: hub → destination (reconstruct RECEIVE_FROM_HUB envelope and drive proof + execute)
@@ -764,26 +748,21 @@ pub async fn run_config(
     );
     let xfer_dest_payload = encode_receive_from_hub(&src_axelar_id, &xfer_inner);
 
-    relay_to_destination(
-        &xfer_first_leg_id,
-        &src_axelar_id,
-        &xfer_dest_payload,
+    relay_to_destination(DestinationRelayRequest {
+        first_leg_message_id: &xfer_first_leg_id,
+        src_axelar_id: &src_axelar_id,
+        dest_payload: &xfer_dest_payload,
         dst_its_proxy,
         dst_evm_gateway,
-        &dst_provider,
-        &signing_key,
-        &axelar_address,
-        &lcd,
-        &chain_id,
-        &fee_denom,
-        gas_price,
-        &dst_cosm_gateway,
-        &dst_multisig_prover,
-        &axelarnet_gateway,
-        &axelar_rpc,
-        3, // step base for Phase B's ui (B3..B8)
-        PHASE_B_STEPS,
-    )
+        dst_provider: &dst_provider,
+        tx,
+        dst_cosm_gateway: &dst_cosm_gateway,
+        dst_multisig_prover: &dst_multisig_prover,
+        axelarnet_gateway: &axelarnet_gateway,
+        axelar_rpc: &axelar_rpc,
+        step_base: 3,
+        step_total: PHASE_B_STEPS,
+    })
     .await?;
 
     // Step B-final: verify ERC20 balance went up by exactly `amount`.

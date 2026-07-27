@@ -108,7 +108,6 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
         Some(v) => v.parse().map_err(|e| eyre!("invalid --gas-value: {e}"))?,
         None => DEFAULT_GAS_STROOPS,
     };
-    #[allow(clippy::cast_precision_loss, clippy::float_arithmetic)]
     let gas_xlm = gas_stroops as f64 / 10_000_000.0;
     ui::kv("gas", &format!("{gas_stroops} stroops ({gas_xlm:.4} XLM)"));
 
@@ -132,8 +131,8 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
         format!("sending (0/{total_to_send} confirmed)...")
     };
     let spinner = ui::wait_spinner(&label);
-    #[allow(clippy::cast_possible_truncation)]
-    let mut metrics: Vec<TxMetrics> = Vec::with_capacity(total_to_send as usize);
+    let capacity = usize::try_from(total_to_send).unwrap_or(0);
+    let mut metrics: Vec<TxMetrics> = Vec::with_capacity(capacity);
     let mut interval = pacing.map(|p| {
         let mut i = tokio::time::interval(p);
         i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -146,22 +145,25 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
         }
         let submit_start = Instant::now();
         let result = stellar_client
-            .its_interchain_transfer(
-                &main_wallet,
-                &its_addr,
-                &gateway_addr,
+            .its_interchain_transfer(crate::stellar::InterchainTransferRequest {
+                wallet: &main_wallet,
+                its_contract: &its_addr,
+                gateway_contract: &gateway_addr,
                 token_id,
-                &dest_chain_id,
-                &sui_recipient_bytes,
-                u128::from(AMOUNT_PER_TX),
-                None,
-                &xlm_addr,
-                gas_stroops,
-            )
+                destination_chain: &dest_chain_id,
+                destination_address_bytes: &sui_recipient_bytes,
+                amount: u128::from(AMOUNT_PER_TX),
+                data: None,
+                gas_token: &xlm_addr,
+                gas_amount: gas_stroops,
+            })
             .await;
 
-        #[allow(clippy::cast_possible_truncation)]
-        let elapsed_ms = submit_start.elapsed().as_millis() as u64;
+        let elapsed_ms = submit_start
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
         match result {
             Ok(invoked) if invoked.success => {
                 let event_idx = invoked.event_index.unwrap_or(0);
@@ -213,7 +215,6 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
         "sent {total_confirmed}/{total_submitted} confirmed"
     ));
 
-    #[allow(clippy::cast_precision_loss, clippy::float_arithmetic)]
     let test_duration = test_start.elapsed().as_secs_f64();
     let mut report = LoadTestReport::from_transactions(
         ReportInput {

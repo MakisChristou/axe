@@ -131,35 +131,35 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
         .expect("Keypair::to_bytes() must produce 64 bytes (32 secret + 32 public)");
 
     let metrics = if let Some((tps, duration_secs)) = sustained_params {
-        run_sustained(
-            &sol_rpc,
+        run_sustained(SustainedRequest {
+            sol_rpc: sol_rpc.clone(),
             main_kp_secret,
-            args.network,
-            main_pubkey.to_string(),
+            network: args.network,
+            main_pubkey: main_pubkey.to_string(),
             token_id,
             source_ata,
             mint,
-            dest_chain_id.clone(),
-            sui_recipient_bytes.clone(),
+            dest_chain_id: dest_chain_id.clone(),
+            sui_recipient_bytes: sui_recipient_bytes.clone(),
             gas_value,
             tps,
             duration_secs,
-        )
+        })
         .await
     } else {
-        run_burst(
-            &sol_rpc,
-            &main_keypair,
-            args.network,
-            main_pubkey.to_string(),
+        run_burst(BurstRequest {
+            sol_rpc: &sol_rpc,
+            main_keypair: &main_keypair,
+            network: args.network,
+            main_pubkey: main_pubkey.to_string(),
             token_id,
             source_ata,
             mint,
-            &dest_chain_id,
-            &sui_recipient_bytes,
+            dest_chain_id: &dest_chain_id,
+            sui_recipient_bytes: &sui_recipient_bytes,
             gas_value,
-            args.num_txs.max(1) as usize,
-        )
+            num_txs: args.num_txs.max(1) as usize,
+        })
         .await
     };
 
@@ -169,7 +169,6 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
         "sent {total_confirmed}/{total_submitted} confirmed"
     ));
 
-    #[allow(clippy::cast_precision_loss, clippy::float_arithmetic)]
     let test_duration = test_start.elapsed().as_secs_f64();
     let mut report = LoadTestReport::from_transactions(
         ReportInput {
@@ -192,35 +191,49 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
     finalize_sui_dest_run_its(&args, &mut report, &sui_rpc, test_start).await
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_burst(
-    sol_rpc: &str,
-    main_keypair: &Keypair,
+struct BurstRequest<'a> {
+    sol_rpc: &'a str,
+    main_keypair: &'a Keypair,
     network: crate::types::Network,
-    main_pubkey_str: String,
+    main_pubkey: String,
     token_id: [u8; 32],
     source_ata: Pubkey,
     mint: Pubkey,
-    dest_chain_id: &str,
-    sui_recipient_bytes: &[u8],
+    dest_chain_id: &'a str,
+    sui_recipient_bytes: &'a [u8],
     gas_value: u64,
     num_txs: usize,
-) -> Vec<TxMetrics> {
+}
+
+async fn run_burst(request: BurstRequest<'_>) -> Vec<TxMetrics> {
+    let BurstRequest {
+        sol_rpc,
+        main_keypair,
+        network,
+        main_pubkey,
+        token_id,
+        source_ata,
+        mint,
+        dest_chain_id,
+        sui_recipient_bytes,
+        gas_value,
+        num_txs,
+    } = request;
     let mut metrics: Vec<TxMetrics> = Vec::with_capacity(num_txs);
     let spinner = ui::wait_spinner(&format!("sending (0/{num_txs} confirmed)..."));
     for _ in 0..num_txs {
-        let result = solana::send_its_interchain_transfer(
-            sol_rpc,
-            main_keypair,
+        let result = solana::send_its_interchain_transfer(solana::InterchainTransferRequest {
+            rpc_url: sol_rpc,
+            keypair: main_keypair,
             network,
-            &token_id,
-            &source_ata,
-            &mint,
-            dest_chain_id,
-            sui_recipient_bytes,
-            AMOUNT_PER_TX,
+            token_id: &token_id,
+            source_account: &source_ata,
+            mint: &mint,
+            destination_chain: dest_chain_id,
+            destination_address: sui_recipient_bytes,
+            amount: AMOUNT_PER_TX,
             gas_value,
-        );
+        });
         match result {
             Ok((sig, mut m)) => {
                 // The Amplifier voting verifier indexes Solana ITS messages by
@@ -240,7 +253,7 @@ async fn run_burst(
                 metrics.push(m);
             }
             Err(e) => {
-                metrics.push(failed_metric(main_pubkey_str.clone(), e.to_string()));
+                metrics.push(failed_metric(main_pubkey.clone(), e.to_string()));
             }
         }
         let confirmed = metrics.iter().filter(|m| m.success).count();
@@ -259,12 +272,11 @@ async fn run_burst(
 /// The underlying `send_its_interchain_transfer` call is sync (blocks
 /// on confirmation). We wrap each invocation in `tokio::spawn_blocking`
 /// so the tokio runtime doesn't stall on slow confirmations.
-#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
-async fn run_sustained(
-    sol_rpc: &str,
+struct SustainedRequest {
+    sol_rpc: String,
     main_kp_secret: [u8; 32],
     network: crate::types::Network,
-    main_pubkey_str: String,
+    main_pubkey: String,
     token_id: [u8; 32],
     source_ata: Pubkey,
     mint: Pubkey,
@@ -273,7 +285,23 @@ async fn run_sustained(
     gas_value: u64,
     tps: u64,
     duration_secs: u64,
-) -> Vec<TxMetrics> {
+}
+
+async fn run_sustained(request: SustainedRequest) -> Vec<TxMetrics> {
+    let SustainedRequest {
+        sol_rpc,
+        main_kp_secret,
+        network,
+        main_pubkey,
+        token_id,
+        source_ata,
+        mint,
+        dest_chain_id,
+        sui_recipient_bytes,
+        gas_value,
+        tps,
+        duration_secs,
+    } = request;
     let total_expected = tps * duration_secs;
     let metrics_list: Arc<Mutex<Vec<TxMetrics>>> = Arc::new(Mutex::new(Vec::new()));
     let confirmed = Arc::new(AtomicU64::new(0));
@@ -284,14 +312,15 @@ async fn run_sustained(
 
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(total_expected as usize);
+    let task_capacity = usize::try_from(total_expected).unwrap_or(0);
+    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(task_capacity);
 
     for tick in 0..duration_secs {
         interval.tick().await;
         for _ in 0..tps {
-            let rpc = sol_rpc.to_string();
+            let rpc = sol_rpc.clone();
             let kp_secret = main_kp_secret;
-            let src = main_pubkey_str.clone();
+            let src = main_pubkey.clone();
             let tid = token_id;
             let ata = source_ata;
             let m = mint;
@@ -306,18 +335,18 @@ async fn run_sustained(
             let handle = tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     let kp = Keypair::new_from_array(kp_secret);
-                    solana::send_its_interchain_transfer(
-                        &rpc,
-                        &kp,
+                    solana::send_its_interchain_transfer(solana::InterchainTransferRequest {
+                        rpc_url: &rpc,
+                        keypair: &kp,
                         network,
-                        &tid,
-                        &ata,
-                        &m,
-                        &dc,
-                        &rb,
-                        AMOUNT_PER_TX,
+                        token_id: &tid,
+                        source_account: &ata,
+                        mint: &m,
+                        destination_chain: &dc,
+                        destination_address: &rb,
+                        amount: AMOUNT_PER_TX,
                         gas_value,
-                    )
+                    })
                 })
                 .await;
 

@@ -5,6 +5,7 @@
 use eyre::Result;
 use serde_json::json;
 
+use super::StepTxContext;
 use super::defaults::DEFAULT_PROPOSAL_DEPOSIT_UAXL;
 use crate::commands::deploy::DeployContext;
 use crate::cosmos::{
@@ -13,20 +14,22 @@ use crate::cosmos::{
 };
 use crate::ui;
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_register_deployment(
     ctx: &mut DeployContext,
-    signing_key: &cosmrs::crypto::secp256k1::SigningKey,
-    axelar_address: &str,
-    lcd: &str,
-    chain_id: &str,
-    fee_denom: &str,
-    gas_price: f64,
-    use_governance: bool,
-    chain_axelar_id: &str,
-    env: &str,
-    proposal_key: &str,
+    tx: StepTxContext<'_>,
 ) -> Result<()> {
+    let StepTxContext {
+        signing_key,
+        axelar_address,
+        lcd,
+        chain_id,
+        fee_denom,
+        gas_price,
+        use_governance,
+        chain_axelar_id,
+        env,
+        proposal_key,
+    } = tx;
     ui::info(&format!("registering deployment for {chain_axelar_id}..."));
 
     let coordinator_addr =

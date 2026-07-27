@@ -15,8 +15,9 @@ use eyre::Result;
 
 use super::cache::{ItsTestCache, save_cache};
 use super::encoding::{encode_inner_deploy, encode_receive_from_hub, encode_send_to_hub_deploy};
-use super::relay::{relay_to_destination, relay_to_hub};
+use super::relay::{DestinationRelayRequest, HubRelayRequest, relay_to_destination, relay_to_hub};
 use crate::commands::event_extractors::generate_salt;
+use crate::commands::test_helpers::CosmosTxContext;
 use crate::evm::{ERC20, InterchainTokenService};
 use crate::timing::{DEST_CHAIN_POLL_ATTEMPTS, DEST_CHAIN_POLL_INTERVAL};
 use crate::ui;
@@ -29,39 +30,56 @@ const INITIAL_SUPPLY: u64 = 1_000_000_000_000;
 
 /// Returns `(token_id, dest_token_addr)` on success and writes the result to
 /// `cache_file` so a subsequent run skips this entire phase.
-#[allow(clippy::too_many_arguments)]
+pub(super) struct PhaseADeployRequest<'a, P> {
+    pub network: crate::types::Network,
+    pub src_axelar_id: &'a crate::types::ChainAxelarId,
+    pub dst_axelar_id: &'a crate::types::ChainAxelarId,
+    pub src_rpc: &'a str,
+    pub sol_keypair: &'a solana_sdk::signature::Keypair,
+    pub sol_pubkey: solana_sdk::pubkey::Pubkey,
+    pub tx: CosmosTxContext<'a>,
+    pub src_cosm_gateway: &'a str,
+    pub voting_verifier: &'a str,
+    pub axelarnet_gateway: &'a str,
+    pub dst_cosm_gateway: &'a str,
+    pub dst_multisig_prover: &'a str,
+    pub axelar_rpc: &'a str,
+    pub its_hub_address: &'a str,
+    pub dst_its_proxy: Address,
+    pub dst_evm_gateway: Address,
+    pub dst_provider: &'a P,
+    pub its: &'a InterchainTokenService::InterchainTokenServiceInstance<&'a P>,
+    pub gas_value: u64,
+    pub cache_file: &'a Path,
+    pub phase_start: Instant,
+}
+
 pub(super) async fn run_phase_a_deploy<P: Provider>(
-    src: &str,
-    dst: &str,
-    network: crate::types::Network,
-    src_axelar_id: &crate::types::ChainAxelarId,
-    dst_axelar_id: &crate::types::ChainAxelarId,
-    src_rpc: &str,
-    sol_keypair: &solana_sdk::signature::Keypair,
-    sol_pubkey: solana_sdk::pubkey::Pubkey,
-    signing_key: &cosmrs::crypto::secp256k1::SigningKey,
-    axelar_address: &str,
-    lcd: &str,
-    chain_id: &str,
-    fee_denom: &str,
-    gas_price: f64,
-    src_cosm_gateway: &str,
-    voting_verifier: &str,
-    axelarnet_gateway: &str,
-    dst_cosm_gateway: &str,
-    dst_multisig_prover: &str,
-    axelar_rpc: &str,
-    its_hub_address: &str,
-    dst_its_proxy: Address,
-    dst_evm_gateway: Address,
-    dst_provider: &P,
-    its: &InterchainTokenService::InterchainTokenServiceInstance<&P>,
-    gas_value: u64,
-    cache_file: &Path,
-    phase_start: Instant,
+    request: PhaseADeployRequest<'_, P>,
 ) -> Result<([u8; 32], Address)> {
-    let _ = src;
-    let _ = dst;
+    let PhaseADeployRequest {
+        network,
+        src_axelar_id,
+        dst_axelar_id,
+        src_rpc,
+        sol_keypair,
+        sol_pubkey,
+        tx,
+        src_cosm_gateway,
+        voting_verifier,
+        axelarnet_gateway,
+        dst_cosm_gateway,
+        dst_multisig_prover,
+        axelar_rpc,
+        its_hub_address,
+        dst_its_proxy,
+        dst_evm_gateway,
+        dst_provider,
+        its,
+        gas_value,
+        cache_file,
+        phase_start,
+    } = request;
 
     ui::section("Phase A: deploy local + remote (manual relay)");
 
@@ -79,15 +97,17 @@ pub(super) async fn run_phase_a_deploy<P: Provider>(
     ui::step_header(2, PHASE_A_STEPS, "Deploy local interchain token (Solana)");
     let spec = crate::types::ITS_CONFIG_SPEC;
     let local_sig = crate::solana::send_its_deploy_interchain_token(
-        src_rpc,
-        sol_keypair,
-        network,
-        &salt_bytes,
-        spec.name,
-        spec.symbol,
-        spec.decimals,
-        INITIAL_SUPPLY,
-        None,
+        crate::solana::DeployInterchainTokenRequest {
+            rpc_url: src_rpc,
+            keypair: sol_keypair,
+            network,
+            salt: &salt_bytes,
+            name: spec.name,
+            symbol: spec.symbol,
+            decimals: spec.decimals,
+            initial_supply: INITIAL_SUPPLY,
+            minter: None,
+        },
     )?;
     ui::tx_hash("solana tx", &local_sig);
     ui::success(&format!(
@@ -160,50 +180,40 @@ pub(super) async fn run_phase_a_deploy<P: Provider>(
         PHASE_A_STEPS,
         "Source → hub (verify, route, hub-execute)",
     );
-    relay_to_hub(
-        src_axelar_id.as_str(),
-        &first_leg_id,
-        &gw_sender,
-        crate::types::HubChain::NAME,
-        its_hub_address,
-        &first_leg_payload_hash,
-        &first_leg_payload,
-        signing_key,
-        axelar_address,
-        lcd,
-        chain_id,
-        fee_denom,
-        gas_price,
-        src_cosm_gateway,
+    relay_to_hub(HubRelayRequest {
+        axelar_id: src_axelar_id.as_str(),
+        message_id: &first_leg_id,
+        source_address: &gw_sender,
+        destination_chain: crate::types::HubChain::NAME,
+        destination_address: its_hub_address,
+        payload_hash: &first_leg_payload_hash,
+        payload: &first_leg_payload,
+        tx,
+        cosm_gateway: src_cosm_gateway,
         voting_verifier,
         axelarnet_gateway,
-    )
+    })
     .await?;
 
     // Step A5..10: hub → destination EVM, manual proof + execute
     let deploy_inner = encode_inner_deploy(&token_id, spec.name, spec.symbol, spec.decimals, &[]);
     let dest_payload_deploy = encode_receive_from_hub(src_axelar_id, &deploy_inner);
 
-    relay_to_destination(
-        &first_leg_id,
+    relay_to_destination(DestinationRelayRequest {
+        first_leg_message_id: &first_leg_id,
         src_axelar_id,
-        &dest_payload_deploy,
+        dest_payload: &dest_payload_deploy,
         dst_its_proxy,
         dst_evm_gateway,
         dst_provider,
-        signing_key,
-        axelar_address,
-        lcd,
-        chain_id,
-        fee_denom,
-        gas_price,
+        tx,
         dst_cosm_gateway,
         dst_multisig_prover,
         axelarnet_gateway,
         axelar_rpc,
-        5, // step base for ui
-        PHASE_A_STEPS,
-    )
+        step_base: 5,
+        step_total: PHASE_A_STEPS,
+    })
     .await?;
 
     // Step A11: verify destination token is deployed

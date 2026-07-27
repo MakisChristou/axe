@@ -121,20 +121,20 @@ pub async fn run(axelar_id: Option<String>) -> Result<()> {
     )
     .await?;
 
-    approve_and_execute_evm(
-        &provider,
-        gateway_addr,
-        sender_receiver_addr,
-        &axelar_id,
-        &source_address,
-        &message_id,
-        &execute_data_hex,
-        &payload_bytes,
+    approve_and_execute_evm(destination::EvmExecutionRequest {
+        provider: &provider,
+        gateway: gateway_addr,
+        sender_receiver: sender_receiver_addr,
+        source_chain: &axelar_id,
+        source_address: &source_address,
+        message_id: &message_id,
+        execute_data_hex: &execute_data_hex,
+        payload_bytes: &payload_bytes,
         payload_hash,
-        7,
-        8,
-        TOTAL_STEPS,
-    )
+        step_idx_approve: 7,
+        step_idx_execute: 8,
+        total_steps: TOTAL_STEPS,
+    })
     .await?;
 
     ui::section("Complete");
@@ -343,21 +343,21 @@ pub async fn run_config(
                 .rpc
                 .as_deref()
                 .ok_or_else(|| eyre::eyre!("no RPC for destination chain '{dst}'"))?;
-            destination::approve_and_execute_svm(
+            destination::approve_and_execute_svm(destination::SvmExecutionRequest {
                 dst_rpc,
                 network,
-                &src,
-                &dst,
-                &source_address,
-                &destination_address,
-                &message_id,
-                &payload_bytes,
+                source_chain: &src,
+                destination_chain: &dst,
+                source_address: &source_address,
+                destination_address: &destination_address,
+                message_id: &message_id,
+                payload_bytes: &payload_bytes,
                 payload_hash,
-                &execute_data_hex,
-                7,
-                8,
-                8,
-            )?;
+                execute_data_hex: &execute_data_hex,
+                step_idx_approve: 7,
+                step_idx_execute: 8,
+                total_steps: 8,
+            })?;
         }
         ChainType::Evm => {
             let dst_rpc = dst_cfg
@@ -379,20 +379,20 @@ pub async fn run_config(
             ui::address("destination EVM gateway", &format!("{gateway_addr}"));
             ui::address("destination SenderReceiver", &format!("{sender_receiver}"));
 
-            approve_and_execute_evm(
-                &dst_provider,
-                gateway_addr,
+            approve_and_execute_evm(destination::EvmExecutionRequest {
+                provider: &dst_provider,
+                gateway: gateway_addr,
                 sender_receiver,
-                &src,
-                &source_address,
-                &message_id,
-                &execute_data_hex,
-                &payload_bytes,
+                source_chain: &src,
+                source_address: &source_address,
+                message_id: &message_id,
+                execute_data_hex: &execute_data_hex,
+                payload_bytes: &payload_bytes,
                 payload_hash,
-                7,
-                8,
-                8,
-            )
+                step_idx_approve: 7,
+                step_idx_execute: 8,
+                total_steps: 8,
+            })
             .await?;
         }
     }

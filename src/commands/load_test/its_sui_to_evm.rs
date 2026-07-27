@@ -85,7 +85,6 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
     let main_wallet = load_sui_main_wallet()?;
     ui::kv("Sui wallet", &main_wallet.address_hex());
     let bal = sui_client.get_balance(&main_wallet.address).await?;
-    #[allow(clippy::cast_precision_loss, clippy::float_arithmetic)]
     let sui_amount = bal as f64 / 1e9;
     ui::kv("Sui balance", &format!("{bal} mist ({sui_amount:.4} SUI)"));
 
@@ -177,24 +176,28 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
 
     for i in 0..num_txs {
         let send_start = Instant::now();
-        let result = crate::sui::send_its_interchain_transfer(
-            &sui_client,
-            &main_wallet,
-            &its_contracts,
-            &coin_type,
-            token_id,
-            &args.destination_axelar_id,
-            &dest_address_bytes,
-            AMOUNT_PER_TX,
-            gas_value_mist,
-            SUI_DEFAULT_GAS_BUDGET_MIST,
-        )
-        .await;
+        let result =
+            crate::sui::send_its_interchain_transfer(crate::sui::InterchainTransferRequest {
+                client: &sui_client,
+                wallet: &main_wallet,
+                contracts: &its_contracts,
+                coin_type_tag: &coin_type,
+                token_id,
+                destination_chain: &args.destination_axelar_id,
+                destination_address_bytes: &dest_address_bytes,
+                transfer_amount: AMOUNT_PER_TX,
+                gas_value_mist,
+                gas_budget_mist: SUI_DEFAULT_GAS_BUDGET_MIST,
+            })
+            .await;
 
         match result {
             Ok(r) if r.success => {
-                #[allow(clippy::cast_possible_truncation)]
-                let latency_ms = send_start.elapsed().as_millis() as u64;
+                let latency_ms = send_start
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
                 let message_id = format!("{}-{}", r.digest, r.event_index);
                 metrics.push(TxMetrics {
                     signature: message_id,

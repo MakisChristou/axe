@@ -632,7 +632,17 @@ async fn run_sustained_pipeline(
 
             Box::pin(async move {
                 let mut result = super::its_evm_source::execute_interchain_transfer(
-                    &provider, its_proxy, tid, &dc, &rb, amt, gv, gsf, nonce,
+                    super::its_evm_source::InterchainTransferRequest {
+                        provider: &provider,
+                        its_proxy,
+                        token_id: tid,
+                        destination_chain: &dc,
+                        receiver: &rb,
+                        amount: amt,
+                        gas_value: gv,
+                        gas_arg_scaling_factor: gsf,
+                        explicit_nonce: nonce,
+                    },
                 )
                 .await;
                 if result.success {
@@ -731,7 +741,17 @@ async fn run_burst_pipeline(
             let mut m = None;
             for attempt in 0..=MAX_RETRIES {
                 let result = super::its_evm_source::execute_interchain_transfer(
-                    &provider, its_proxy, tid, &dc, &rb, amt, gv, gsf, None,
+                    super::its_evm_source::InterchainTransferRequest {
+                        provider: &provider,
+                        its_proxy,
+                        token_id: tid,
+                        destination_chain: &dc,
+                        receiver: &rb,
+                        amount: amt,
+                        gas_value: gv,
+                        gas_arg_scaling_factor: gsf,
+                        explicit_nonce: None,
+                    },
                 )
                 .await;
                 if result.success || attempt == MAX_RETRIES {

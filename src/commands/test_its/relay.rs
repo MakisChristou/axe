@@ -18,7 +18,7 @@ use eyre::Result;
 use serde_json::json;
 
 use crate::commands::test_helpers::{
-    end_poll_with_retry, execute_on_axelarnet_gateway, extract_event_attr,
+    CosmosTxContext, end_poll_with_retry, execute_on_axelarnet_gateway, extract_event_attr,
     route_messages_with_retry, submit_verify_messages_amplifier, wait_for_poll_votes,
     wait_for_proof,
 };
@@ -32,26 +32,35 @@ use crate::timing::{
 };
 use crate::ui;
 
+pub(super) struct HubRelayRequest<'a> {
+    pub axelar_id: &'a str,
+    pub message_id: &'a str,
+    pub source_address: &'a str,
+    pub destination_chain: &'a str,
+    pub destination_address: &'a str,
+    pub payload_hash: &'a FixedBytes<32>,
+    pub payload: &'a [u8],
+    pub tx: CosmosTxContext<'a>,
+    pub cosm_gateway: &'a str,
+    pub voting_verifier: &'a str,
+    pub axelarnet_gateway: &'a str,
+}
+
 /// Relay a message through the Amplifier pipeline: verify → poll → route → execute on hub.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn relay_to_hub(
-    axelar_id: &str,
-    message_id: &str,
-    source_address: &str,
-    destination_chain: &str,
-    destination_address: &str,
-    payload_hash: &FixedBytes<32>,
-    payload: &[u8],
-    signing_key: &cosmrs::crypto::secp256k1::SigningKey,
-    axelar_address: &str,
-    lcd: &str,
-    chain_id: &str,
-    fee_denom: &str,
-    gas_price: f64,
-    cosm_gateway: &str,
-    voting_verifier: &str,
-    axelarnet_gateway: &str,
-) -> Result<()> {
+pub(super) async fn relay_to_hub(request: HubRelayRequest<'_>) -> Result<()> {
+    let HubRelayRequest {
+        axelar_id,
+        message_id,
+        source_address,
+        destination_chain,
+        destination_address,
+        payload_hash,
+        payload,
+        tx,
+        cosm_gateway,
+        voting_verifier,
+        axelarnet_gateway,
+    } = request;
     let msg = json!({
         "cc_id": {
             "message_id": message_id,
@@ -64,48 +73,18 @@ pub(super) async fn relay_to_hub(
     });
 
     ui::info("verify_messages...");
-    let poll_id = submit_verify_messages_amplifier(
-        &msg,
-        signing_key,
-        axelar_address,
-        lcd,
-        chain_id,
-        fee_denom,
-        gas_price,
-        cosm_gateway,
-    )
-    .await?;
+    let poll_id = submit_verify_messages_amplifier(&msg, tx, cosm_gateway).await?;
 
     if let Some(poll_id) = poll_id {
         ui::kv("poll_id", &poll_id);
-        wait_for_poll_votes(lcd, voting_verifier, &poll_id).await?;
-        end_poll_with_retry(
-            &poll_id,
-            signing_key,
-            axelar_address,
-            lcd,
-            chain_id,
-            fee_denom,
-            gas_price,
-            voting_verifier,
-        )
-        .await?;
+        wait_for_poll_votes(tx.lcd, voting_verifier, &poll_id).await?;
+        end_poll_with_retry(&poll_id, tx, voting_verifier).await?;
     } else {
         ui::info("no new poll — already being verified by active verifiers");
     }
 
     ui::info("route_messages...");
-    route_messages_with_retry(
-        &msg,
-        signing_key,
-        axelar_address,
-        lcd,
-        chain_id,
-        fee_denom,
-        gas_price,
-        cosm_gateway,
-    )
-    .await?;
+    route_messages_with_retry(&msg, tx, cosm_gateway).await?;
 
     ui::info("execute on AxelarnetGateway...");
     execute_on_axelarnet_gateway(
@@ -113,12 +92,7 @@ pub(super) async fn relay_to_hub(
         axelar_id,
         destination_chain,
         payload,
-        signing_key,
-        axelar_address,
-        lcd,
-        chain_id,
-        fee_denom,
-        gas_price,
+        tx,
         axelarnet_gateway,
     )
     .await?;
@@ -126,31 +100,52 @@ pub(super) async fn relay_to_hub(
     Ok(())
 }
 
+pub(super) struct DestinationRelayRequest<'a, P> {
+    pub first_leg_message_id: &'a str,
+    pub src_axelar_id: &'a crate::types::ChainAxelarId,
+    pub dest_payload: &'a [u8],
+    pub dst_its_proxy: Address,
+    pub dst_evm_gateway: Address,
+    pub dst_provider: &'a P,
+    pub tx: CosmosTxContext<'a>,
+    pub dst_cosm_gateway: &'a str,
+    pub dst_multisig_prover: &'a str,
+    pub axelarnet_gateway: &'a str,
+    pub axelar_rpc: &'a str,
+    pub step_base: usize,
+    pub step_total: usize,
+}
+
 /// Drive the second leg actively: wait for hub-routed message → discover its
 /// cc_id → wait for the destination cosm gateway to have it → construct_proof
 /// on the destination MultisigProver → submit to the EVM gateway →
 /// `ITS.execute(...)` on the destination ITS proxy.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn relay_to_destination<P: Provider>(
-    first_leg_message_id: &str,
-    src_axelar_id: &crate::types::ChainAxelarId,
-    dest_payload: &[u8],
-    dst_its_proxy: Address,
-    dst_evm_gateway: Address,
-    dst_provider: &P,
-    signing_key: &cosmrs::crypto::secp256k1::SigningKey,
-    axelar_address: &str,
-    lcd: &str,
-    chain_id: &str,
-    fee_denom: &str,
-    gas_price: f64,
-    dst_cosm_gateway: &str,
-    dst_multisig_prover: &str,
-    axelarnet_gateway: &str,
-    axelar_rpc: &str,
-    step_base: usize,
-    step_total: usize,
+    request: DestinationRelayRequest<'_, P>,
 ) -> Result<()> {
+    let DestinationRelayRequest {
+        first_leg_message_id,
+        src_axelar_id,
+        dest_payload,
+        dst_its_proxy,
+        dst_evm_gateway,
+        dst_provider,
+        tx,
+        dst_cosm_gateway,
+        dst_multisig_prover,
+        axelarnet_gateway,
+        axelar_rpc,
+        step_base,
+        step_total,
+    } = request;
+    let CosmosTxContext {
+        signing_key,
+        axelar_address,
+        lcd,
+        chain_id,
+        fee_denom,
+        gas_price,
+    } = tx;
     // Wait until the AxelarnetGateway hub has approved the first-leg message.
     // executable_messages is keyed by the *source* chain of the message.
     ui::step_header(step_base, step_total, "Wait for hub approval");

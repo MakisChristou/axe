@@ -422,18 +422,32 @@ async fn execute_and_record_evm<P: Provider>(
 ///
 /// Uses a rotating pool of `tps * key_cycle` derived wallets, cycling keys
 /// every `key_cycle` seconds. Sends `tps` txs per second for `duration_secs`.
-#[allow(clippy::too_many_arguments)]
+pub(super) struct SustainedLoadRequest<'a> {
+    pub args: &'a LoadTestArgs,
+    pub sender_receiver: Address,
+    pub main_key: &'a [u8; 32],
+    pub evm_rpc_url: &'a str,
+    pub destination_address: &'a str,
+    pub verify_tx: Option<tokio::sync::mpsc::UnboundedSender<super::verify::PendingTx>>,
+    pub send_done: Option<Arc<AtomicBool>>,
+    pub verify_spinner_tx: tokio::sync::oneshot::Sender<indicatif::ProgressBar>,
+    pub evm_destination: bool,
+}
+
 pub(super) async fn run_sustained_load_test_with_metrics(
-    args: &LoadTestArgs,
-    sender_receiver_addr: Address,
-    main_key: &[u8; 32],
-    evm_rpc_url: &str,
-    destination_address: &str,
-    verify_tx: Option<tokio::sync::mpsc::UnboundedSender<super::verify::PendingTx>>,
-    send_done: Option<Arc<AtomicBool>>,
-    verify_spinner_tx: tokio::sync::oneshot::Sender<indicatif::ProgressBar>,
-    evm_destination: bool,
+    request: SustainedLoadRequest<'_>,
 ) -> eyre::Result<LoadTestReport> {
+    let SustainedLoadRequest {
+        args,
+        sender_receiver: sender_receiver_addr,
+        main_key,
+        evm_rpc_url,
+        destination_address,
+        verify_tx,
+        send_done,
+        verify_spinner_tx,
+        evm_destination,
+    } = request;
     // `run_sustained` is only called from sustained-mode dispatch, where
     // both `tps` and `duration_secs` have already been validated as `Some`.
     let tps = args

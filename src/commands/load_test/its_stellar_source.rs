@@ -29,18 +29,18 @@ pub(super) async fn submit_transfer(request: TransferRequest<'_>) -> TxMetrics {
     let source_addr = request.its_contract.to_string();
     match request
         .client
-        .its_interchain_transfer(
-            request.wallet,
-            request.its_contract,
-            request.gateway_contract,
-            request.token_id,
-            request.destination_chain,
-            request.destination_address_bytes,
-            request.transfer_amount,
-            None,
-            request.gas_token,
-            request.gas_amount_stroops,
-        )
+        .its_interchain_transfer(crate::stellar::InterchainTransferRequest {
+            wallet: request.wallet,
+            its_contract: request.its_contract,
+            gateway_contract: request.gateway_contract,
+            token_id: request.token_id,
+            destination_chain: request.destination_chain,
+            destination_address_bytes: request.destination_address_bytes,
+            amount: request.transfer_amount,
+            data: None,
+            gas_token: request.gas_token,
+            gas_amount: request.gas_amount_stroops,
+        })
         .await
     {
         Ok(invoked) => {

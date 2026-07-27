@@ -224,19 +224,34 @@ pub struct ItsSendResult {
 /// `0x96b4…::token::TOKEN`); `transfer_amount` is in coin sub-units.
 /// `destination_address_bytes` is the raw address as the destination chain
 /// expects (20B for EVM, 32B for Solana/Stellar).
-#[allow(clippy::too_many_arguments)]
+pub struct InterchainTransferRequest<'a> {
+    pub client: &'a SuiClient,
+    pub wallet: &'a SuiWallet,
+    pub contracts: &'a SuiItsContractsConfig,
+    pub coin_type_tag: &'a str,
+    pub token_id: [u8; 32],
+    pub destination_chain: &'a str,
+    pub destination_address_bytes: &'a [u8],
+    pub transfer_amount: u64,
+    pub gas_value_mist: u64,
+    pub gas_budget_mist: u64,
+}
+
 pub async fn send_its_interchain_transfer(
-    client: &SuiClient,
-    wallet: &SuiWallet,
-    contracts: &SuiItsContractsConfig,
-    coin_type_tag: &str,
-    token_id: [u8; 32],
-    destination_chain: &str,
-    destination_address_bytes: &[u8],
-    transfer_amount: u64,
-    gas_value_mist: u64,
-    gas_budget_mist: u64,
+    request: InterchainTransferRequest<'_>,
 ) -> Result<ItsSendResult> {
+    let InterchainTransferRequest {
+        client,
+        wallet,
+        contracts,
+        coin_type_tag,
+        token_id,
+        destination_chain,
+        destination_address_bytes,
+        transfer_amount,
+        gas_value_mist,
+        gas_budget_mist,
+    } = request;
     let coin_tt: TypeTag = coin_type_tag
         .parse()
         .map_err(|e| eyre!("invalid coin_type '{coin_type_tag}': {e}"))?;

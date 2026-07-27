@@ -27,18 +27,33 @@ use crate::types::Network;
 
 /// Deploy an interchain token on Solana.
 /// Returns the transaction signature.
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy)]
+pub struct DeployInterchainTokenRequest<'a> {
+    pub rpc_url: &'a str,
+    pub keypair: &'a dyn Signer,
+    pub network: Network,
+    pub salt: &'a [u8; 32],
+    pub name: &'a str,
+    pub symbol: &'a str,
+    pub decimals: u8,
+    pub initial_supply: u64,
+    pub minter: Option<&'a Pubkey>,
+}
+
 pub fn send_its_deploy_interchain_token(
-    rpc_url: &str,
-    keypair: &dyn Signer,
-    network: Network,
-    salt: &[u8; 32],
-    name: &str,
-    symbol: &str,
-    decimals: u8,
-    initial_supply: u64,
-    minter: Option<&Pubkey>,
+    request: DeployInterchainTokenRequest<'_>,
 ) -> Result<String> {
+    let DeployInterchainTokenRequest {
+        rpc_url,
+        keypair,
+        network,
+        salt,
+        name,
+        symbol,
+        decimals,
+        initial_supply,
+        minter,
+    } = request;
     let rpc_client = rpc_client(rpc_url);
     let fee_payer = keypair.pubkey();
     let deployer = fee_payer;
@@ -206,19 +221,35 @@ pub fn send_its_deploy_remote_interchain_token(
 
 /// Send an ITS `InterchainTransfer` instruction.
 /// Returns the transaction signature and per-tx metrics.
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy)]
+pub struct InterchainTransferRequest<'a> {
+    pub rpc_url: &'a str,
+    pub keypair: &'a dyn Signer,
+    pub network: Network,
+    pub token_id: &'a [u8; 32],
+    pub source_account: &'a Pubkey,
+    pub mint: &'a Pubkey,
+    pub destination_chain: &'a str,
+    pub destination_address: &'a [u8],
+    pub amount: u64,
+    pub gas_value: u64,
+}
+
 pub fn send_its_interchain_transfer(
-    rpc_url: &str,
-    keypair: &dyn Signer,
-    network: Network,
-    token_id: &[u8; 32],
-    source_account: &Pubkey,
-    mint: &Pubkey,
-    destination_chain: &str,
-    destination_address: &[u8],
-    amount: u64,
-    gas_value: u64,
+    request: InterchainTransferRequest<'_>,
 ) -> Result<(String, TxMetrics)> {
+    let InterchainTransferRequest {
+        rpc_url,
+        keypair,
+        network,
+        token_id,
+        source_account,
+        mint,
+        destination_chain,
+        destination_address,
+        amount,
+        gas_value,
+    } = request;
     let submit_start = Instant::now();
     let rpc_client = rpc_client(rpc_url);
     let fee_payer = keypair.pubkey();

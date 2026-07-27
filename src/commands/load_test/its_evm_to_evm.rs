@@ -152,29 +152,20 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
         receiver_bytes,
     };
 
+    let pipeline = PipelineContext {
+        args: &args,
+        cfg: &cfg,
+        source_rpc_url: &source_rpc_url,
+        destination_rpc_url: &dest_rpc_url,
+        destination_gateway: dest_gateway_addr,
+        derived: &derived,
+        sizing: &sizing,
+        targets: &targets,
+    };
     if !sizing.burst_mode {
-        run_sustained_pipeline(
-            &args,
-            &cfg,
-            &source_rpc_url,
-            &dest_rpc_url,
-            dest_gateway_addr,
-            &derived,
-            &sizing,
-            &targets,
-        )
-        .await
+        run_sustained_pipeline(&pipeline).await
     } else {
-        run_burst_pipeline(
-            &args,
-            &source_rpc_url,
-            &dest_rpc_url,
-            dest_gateway_addr,
-            &derived,
-            &sizing,
-            &targets,
-        )
-        .await
+        run_burst_pipeline(&pipeline).await
     }
 }
 
@@ -442,17 +433,29 @@ fn hub_gas_extra_per_key(args: &LoadTestArgs, sizing: &RunSizing, gas_value_wei:
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_sustained_pipeline(
-    args: &LoadTestArgs,
-    cfg: &ChainsConfig,
-    source_rpc_url: &str,
-    dest_rpc_url: &str,
-    dest_gateway_addr: Address,
-    derived: &[PrivateKeySigner],
-    sizing: &RunSizing,
-    targets: &TransferTargets,
-) -> eyre::Result<()> {
+#[derive(Clone, Copy)]
+struct PipelineContext<'a> {
+    args: &'a LoadTestArgs,
+    cfg: &'a ChainsConfig,
+    source_rpc_url: &'a str,
+    destination_rpc_url: &'a str,
+    destination_gateway: Address,
+    derived: &'a [PrivateKeySigner],
+    sizing: &'a RunSizing,
+    targets: &'a TransferTargets,
+}
+
+async fn run_sustained_pipeline(pipeline: &PipelineContext<'_>) -> eyre::Result<()> {
+    let PipelineContext {
+        args,
+        cfg,
+        source_rpc_url,
+        destination_rpc_url: dest_rpc_url,
+        destination_gateway: dest_gateway_addr,
+        derived,
+        sizing,
+        targets,
+    } = *pipeline;
     let src = &args.source_chain;
     let dest = &args.destination_chain;
     let tps = sizing.sustained_params.expect("burst_mode is false").0 as usize;
@@ -535,10 +538,19 @@ async fn run_sustained_pipeline(
                 .connect_http(url.parse().expect("invalid RPC URL"));
 
             Box::pin(async move {
-                let mut result = execute_interchain_transfer(
-                    &provider, its_proxy, tid, &dc, &rb, amt, gv, gsf, nonce,
-                )
-                .await;
+                let mut result =
+                    execute_interchain_transfer(super::its_evm_source::InterchainTransferRequest {
+                        provider: &provider,
+                        its_proxy,
+                        token_id: tid,
+                        destination_chain: &dc,
+                        receiver: &rb,
+                        amount: amt,
+                        gas_value: gv,
+                        gas_arg_scaling_factor: gsf,
+                        explicit_nonce: nonce,
+                    })
+                    .await;
                 if result.success {
                     match super::verify::tx_to_pending_its(&result, has_vv) {
                         Ok(pending) => {
@@ -589,16 +601,17 @@ async fn run_sustained_pipeline(
     finish_report(args, &mut report, test_start)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_burst_pipeline(
-    args: &LoadTestArgs,
-    source_rpc_url: &str,
-    dest_rpc_url: &str,
-    dest_gateway_addr: Address,
-    derived: &[PrivateKeySigner],
-    sizing: &RunSizing,
-    targets: &TransferTargets,
-) -> eyre::Result<()> {
+async fn run_burst_pipeline(pipeline: &PipelineContext<'_>) -> eyre::Result<()> {
+    let PipelineContext {
+        args,
+        source_rpc_url,
+        destination_rpc_url: dest_rpc_url,
+        destination_gateway: dest_gateway_addr,
+        derived,
+        sizing,
+        targets,
+        ..
+    } = *pipeline;
     let src = &args.source_chain;
     let dest = &args.destination_chain;
     let num_txs = sizing.num_txs;
@@ -636,10 +649,19 @@ async fn run_burst_pipeline(
 
             let mut m = None;
             for attempt in 0..=MAX_RETRIES {
-                let result = execute_interchain_transfer(
-                    &provider, its_proxy, tid, &dc, &rb, amt, gv, gsf, None,
-                )
-                .await;
+                let result =
+                    execute_interchain_transfer(super::its_evm_source::InterchainTransferRequest {
+                        provider: &provider,
+                        its_proxy,
+                        token_id: tid,
+                        destination_chain: &dc,
+                        receiver: &rb,
+                        amount: amt,
+                        gas_value: gv,
+                        gas_arg_scaling_factor: gsf,
+                        explicit_nonce: None,
+                    })
+                    .await;
 
                 if result.success || attempt == MAX_RETRIES {
                     m = Some(result);

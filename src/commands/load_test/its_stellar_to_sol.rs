@@ -313,22 +313,22 @@ async fn prepare_token_and_wallets(
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
-    let (token_id, _salt, token_address, decimals) = setup_its_token(
-        &stellar.client,
+    let (token_id, _salt, token_address, decimals) = setup_its_token(TokenSetupRequest {
+        client: &stellar.client,
         main_wallet,
-        args.network,
-        &stellar.its_addr,
-        &stellar.gateway_addr,
-        &stellar.xlm_addr,
+        network: args.network,
+        its_contract: &stellar.its_addr,
+        gateway_contract: &stellar.gateway_addr,
+        xlm_token: &stellar.xlm_addr,
         gas_stroops,
-        src,
-        dest,
-        &args.destination_axelar_id,
-        args.token_id.as_deref(),
-        &args.config,
+        source_chain: src,
+        destination_chain: dest,
+        destination_axelar_id: &args.destination_axelar_id,
+        token_id_override: args.token_id.as_deref(),
+        config: &args.config,
         solana_rpc_url,
-        sizing.num_keys,
-    )
+        num_txs: sizing.num_keys,
+    })
     .await?;
     ui::kv("token ID", &hex::encode(token_id));
     ui::address("token contract (Stellar)", &token_address);
@@ -555,23 +555,42 @@ async fn run_burst_pipeline(
 // Token setup
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-async fn setup_its_token(
-    client: &StellarClient,
-    main_wallet: &StellarWallet,
+struct TokenSetupRequest<'a> {
+    client: &'a StellarClient,
+    main_wallet: &'a StellarWallet,
     network: crate::types::Network,
-    its_contract: &str,
-    gateway_contract: &str,
-    xlm_token: &str,
+    its_contract: &'a str,
+    gateway_contract: &'a str,
+    xlm_token: &'a str,
     gas_stroops: u64,
-    src: &str,
-    dest: &str,
-    dest_axelar_id: &str,
-    token_id_override: Option<&str>,
-    config: &std::path::Path,
-    solana_rpc_url: &str,
+    source_chain: &'a str,
+    destination_chain: &'a str,
+    destination_axelar_id: &'a str,
+    token_id_override: Option<&'a str>,
+    config: &'a std::path::Path,
+    solana_rpc_url: &'a str,
     num_txs: usize,
+}
+
+async fn setup_its_token(
+    request: TokenSetupRequest<'_>,
 ) -> Result<([u8; 32], [u8; 32], String, u32)> {
+    let TokenSetupRequest {
+        client,
+        main_wallet,
+        network,
+        its_contract,
+        gateway_contract,
+        xlm_token,
+        gas_stroops,
+        source_chain: src,
+        destination_chain: dest,
+        destination_axelar_id: dest_axelar_id,
+        token_id_override,
+        config,
+        solana_rpc_url,
+        num_txs,
+    } = request;
     if let Some(tid_hex) = token_id_override {
         let tid_bytes = hex::decode(tid_hex.strip_prefix("0x").unwrap_or(tid_hex))
             .map_err(|e| eyre!("invalid --token-id: {e}"))?;
@@ -677,15 +696,15 @@ async fn setup_its_token(
     ui::kv("supply", &INITIAL_SUPPLY.to_string());
 
     let (deploy_invoked, token_id_opt) = client
-        .its_deploy_interchain_token(
-            main_wallet,
+        .its_deploy_interchain_token(crate::stellar::DeployInterchainTokenRequest {
+            wallet: main_wallet,
             its_contract,
             salt,
-            TOKEN_DECIMALS,
-            TOKEN_NAME,
-            TOKEN_SYMBOL,
-            INITIAL_SUPPLY,
-        )
+            decimals: TOKEN_DECIMALS,
+            name: TOKEN_NAME,
+            symbol: TOKEN_SYMBOL,
+            initial_supply: INITIAL_SUPPLY,
+        })
         .await?;
     if !deploy_invoked.success {
         return Err(eyre!("Stellar deploy_interchain_token failed"));
@@ -704,15 +723,15 @@ async fn setup_its_token(
     // Register on Solana destination via ITS hub.
     ui::info(&format!("deploying remote AXE token to {dest}..."));
     let remote_invoked = client
-        .its_deploy_remote_interchain_token(
-            main_wallet,
+        .its_deploy_remote_interchain_token(crate::stellar::DeployRemoteInterchainTokenRequest {
+            wallet: main_wallet,
             its_contract,
             gateway_contract,
             salt,
-            dest_axelar_id,
-            xlm_token,
-            gas_stroops,
-        )
+            destination_chain: dest_axelar_id,
+            gas_token: xlm_token,
+            gas_amount: gas_stroops,
+        })
         .await?;
     if !remote_invoked.success {
         return Err(eyre!("Stellar deploy_remote_interchain_token failed"));

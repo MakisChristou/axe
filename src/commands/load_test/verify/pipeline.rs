@@ -268,7 +268,10 @@ pub(super) struct PollPipelineArgs {
     pub network: crate::types::Network,
 }
 
-#[allow(clippy::cognitive_complexity)]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "polling state machine stays flat until phase transitions have dedicated characterization tests"
+)]
 pub(super) async fn poll_pipeline<P: Provider>(
     txs: &mut Vec<PendingTx>,
     mut rx: Option<&mut mpsc::UnboundedReceiver<PendingTx>>,
@@ -749,15 +752,15 @@ pub(super) async fn poll_pipeline<P: Provider>(
                     for &i in &dest_indices {
                         let phase = txs[i].phase;
                         let approved = client
-                            .gateway_is_message_approved(
-                                signer_pk,
+                            .gateway_is_message_approved(crate::stellar::MessageApprovalQuery {
+                                signer_account_pk: signer_pk,
                                 gateway_contract,
                                 source_chain,
-                                &txs[i].message_id,
-                                &txs[i].source_address,
-                                &txs[i].gmp_destination_address,
-                                required_payload_hash(&txs[i])?.0,
-                            )
+                                message_id: &txs[i].message_id,
+                                source_address: &txs[i].source_address,
+                                contract_address: &txs[i].gmp_destination_address,
+                                payload_hash: required_payload_hash(&txs[i])?.0,
+                            })
                             .await?
                             .ok_or_else(|| {
                                 eyre::eyre!(
@@ -988,7 +991,10 @@ pub(super) struct PollItsHubArgs {
 }
 
 /// Full ITS polling pipeline: Voted → HubApproved → DiscoverSecondLeg → Routed → Approved → Executed.
-#[allow(clippy::cognitive_complexity)]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "polling state machine stays flat until phase transitions have dedicated characterization tests"
+)]
 pub(super) async fn poll_pipeline_its_hub(
     txs: &mut Vec<PendingTx>,
     mut rx: Option<&mut mpsc::UnboundedReceiver<PendingTx>>,
@@ -1367,14 +1373,15 @@ pub(super) async fn poll_pipeline_its_hub(
                             let result = if phase == Phase::Approved {
                                 client
                                     .gateway_is_message_approved(
-                                        signer_pk,
+                                        crate::stellar::MessageApprovalQuery {
+                                        signer_account_pk: signer_pk,
                                         gateway_contract,
-                                        "axelar",
-                                        &second_leg,
-                                        &src_addr,
-                                        &dest_contract,
-                                        payload_hash_arr,
-                                    )
+                                        source_chain: "axelar",
+                                        message_id: &second_leg,
+                                        source_address: &src_addr,
+                                        contract_address: &dest_contract,
+                                        payload_hash: payload_hash_arr,
+                                    })
                                     .await?
                                     .ok_or_else(|| {
                                         eyre::eyre!(
@@ -1582,7 +1589,10 @@ pub(super) struct PollItsHubEvmArgs {
 
 /// Full ITS polling pipeline with EVM destination (batch + streaming):
 /// Voted → HubApproved → DiscoverSecondLeg → Routed → Approved(EVM) → Executed(EVM).
-#[allow(clippy::cognitive_complexity)]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "polling state machine stays flat until phase transitions have dedicated characterization tests"
+)]
 pub(super) async fn poll_pipeline_its_hub_evm<P: Provider>(
     txs: &mut Vec<PendingTx>,
     mut rx: Option<&mut mpsc::UnboundedReceiver<PendingTx>>,
@@ -2034,37 +2044,6 @@ pub(super) async fn poll_pipeline_its_hub_evm<P: Provider>(
 // ---------------------------------------------------------------------------
 // Single-shot check helpers
 // ---------------------------------------------------------------------------
-
-/// Check VotingVerifier `messages_status` for a message.
-/// Returns true if status contains "succeeded" (quorum reached).
-#[allow(clippy::too_many_arguments, dead_code)]
-async fn check_voting_verifier(
-    lcd: &str,
-    voting_verifier: &str,
-    source_chain: &str,
-    message_id: &str,
-    source_address: &str,
-    destination_chain: &str,
-    destination_address: &str,
-    payload_hash_hex: &str,
-) -> Result<bool> {
-    let query = json!({
-        "messages_status": [{
-            "cc_id": {
-                "source_chain": source_chain,
-                "message_id": message_id,
-            },
-            "source_address": source_address,
-            "destination_chain": destination_chain,
-            "destination_address": destination_address,
-            "payload_hash": payload_hash_hex,
-        }]
-    });
-
-    let resp = lcd_cosmwasm_smart_query(lcd, voting_verifier, &query).await?;
-    let resp_str = serde_json::to_string(&resp)?;
-    Ok(resp_str.to_lowercase().contains("succeeded"))
-}
 
 /// Check if message is routed on destination Cosmos Gateway via `outgoing_messages`.
 pub(super) async fn check_cosmos_routed(

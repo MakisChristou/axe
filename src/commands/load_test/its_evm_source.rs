@@ -518,18 +518,32 @@ pub(super) async fn distribute_tokens<P: Provider>(
 /// "CONTRACT_REVERT_EXECUTED, data: 0x" at submit time). Other EVM chains
 /// in the matrix omit `gasScalingFactor` so callers pass 0 and behavior is
 /// unchanged.
-#[allow(clippy::too_many_arguments)]
+pub(super) struct InterchainTransferRequest<'a, P> {
+    pub provider: &'a P,
+    pub its_proxy: Address,
+    pub token_id: FixedBytes<32>,
+    pub destination_chain: &'a str,
+    pub receiver: &'a Bytes,
+    pub amount: U256,
+    pub gas_value: U256,
+    pub gas_arg_scaling_factor: u32,
+    pub explicit_nonce: Option<u64>,
+}
+
 pub(super) async fn execute_interchain_transfer<P: Provider>(
-    provider: &P,
-    its_proxy: Address,
-    token_id: FixedBytes<32>,
-    dest_chain: &str,
-    receiver_bytes: &Bytes,
-    amount: U256,
-    gas_value: U256,
-    gas_arg_scaling_factor: u32,
-    explicit_nonce: Option<u64>,
+    request: InterchainTransferRequest<'_, P>,
 ) -> TxMetrics {
+    let InterchainTransferRequest {
+        provider,
+        its_proxy,
+        token_id,
+        destination_chain: dest_chain,
+        receiver: receiver_bytes,
+        amount,
+        gas_value,
+        gas_arg_scaling_factor,
+        explicit_nonce,
+    } = request;
     let submit_start = Instant::now();
 
     let hub_gas = gas_value * U256::from(2);

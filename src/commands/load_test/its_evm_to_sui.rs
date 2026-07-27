@@ -167,7 +167,6 @@ async fn resolve_evm_context(
     let read_provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     check_evm_balance(&read_provider, main_addr).await?;
     let balance: u128 = read_provider.get_balance(main_addr).await?.to();
-    #[allow(clippy::cast_precision_loss, clippy::float_arithmetic)]
     let eth = balance as f64 / 1e18;
     ui::kv("wallet", &format!("{main_addr} ({eth:.6} ETH)"));
 
@@ -363,15 +362,17 @@ async fn run_burst_pipeline(
             let mut last = None;
             for attempt in 0..=MAX_RETRIES {
                 let result = super::its_evm_source::execute_interchain_transfer(
-                    &provider,
-                    its_proxy,
-                    tid,
-                    &dc,
-                    &rb,
-                    amount_per_tx,
-                    gas_value,
-                    gas_arg_scaling_factor,
-                    None,
+                    super::its_evm_source::InterchainTransferRequest {
+                        provider: &provider,
+                        its_proxy,
+                        token_id: tid,
+                        destination_chain: &dc,
+                        receiver: &rb,
+                        amount: amount_per_tx,
+                        gas_value,
+                        gas_arg_scaling_factor,
+                        explicit_nonce: None,
+                    },
                 )
                 .await;
                 if result.success || attempt == MAX_RETRIES {
@@ -402,7 +403,6 @@ async fn run_burst_pipeline(
         "sent {confirmed_count}/{total_submitted} confirmed"
     ));
 
-    #[allow(clippy::cast_precision_loss, clippy::float_arithmetic)]
     let test_duration = test_start.elapsed().as_secs_f64();
     let metrics = metrics_list.lock().await.clone();
     let mut report = LoadTestReport::from_transactions(
@@ -469,15 +469,17 @@ async fn run_sustained_pipeline(
 
             Box::pin(async move {
                 super::its_evm_source::execute_interchain_transfer(
-                    &provider,
-                    its_proxy,
-                    token_id,
-                    &dc,
-                    &rb,
-                    amt,
-                    gas_value,
-                    gas_arg_scaling_factor,
-                    nonce,
+                    super::its_evm_source::InterchainTransferRequest {
+                        provider: &provider,
+                        its_proxy,
+                        token_id,
+                        destination_chain: &dc,
+                        receiver: &rb,
+                        amount: amt,
+                        gas_value,
+                        gas_arg_scaling_factor,
+                        explicit_nonce: nonce,
+                    },
                 )
                 .await
             })

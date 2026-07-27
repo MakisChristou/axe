@@ -7,6 +7,7 @@ use cosmos_sdk_proto::cosmos::base::v1beta1::Coin as ProtoCoin;
 use eyre::Result;
 use serde_json::{Value, json};
 
+use super::StepTxContext;
 use super::defaults::{DEFAULT_PROPOSAL_DEPOSIT_UAXL, DEFAULT_REWARD_AMOUNT_UAXL};
 use crate::commands::deploy::DeployContext;
 use crate::cosmos::{
@@ -15,20 +16,22 @@ use crate::cosmos::{
 };
 use crate::ui;
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_create_reward_pools(
     ctx: &mut DeployContext,
-    signing_key: &cosmrs::crypto::secp256k1::SigningKey,
-    axelar_address: &str,
-    lcd: &str,
-    chain_id: &str,
-    fee_denom: &str,
-    gas_price: f64,
-    use_governance: bool,
-    chain_axelar_id: &str,
-    env: &str,
-    proposal_key: &str,
+    tx: StepTxContext<'_>,
 ) -> Result<()> {
+    let StepTxContext {
+        signing_key,
+        axelar_address,
+        lcd,
+        chain_id,
+        fee_denom,
+        gas_price,
+        use_governance,
+        chain_axelar_id,
+        env,
+        proposal_key,
+    } = tx;
     ui::info(&format!("creating reward pools for {chain_axelar_id}..."));
 
     let rewards_addr =
@@ -138,17 +141,17 @@ pub(super) async fn run_create_reward_pools(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_add_rewards(
-    ctx: &DeployContext,
-    signing_key: &cosmrs::crypto::secp256k1::SigningKey,
-    axelar_address: &str,
-    lcd: &str,
-    chain_id: &str,
-    fee_denom: &str,
-    gas_price: f64,
-    chain_axelar_id: &str,
-) -> Result<()> {
+pub(super) async fn run_add_rewards(ctx: &DeployContext, tx: StepTxContext<'_>) -> Result<()> {
+    let StepTxContext {
+        signing_key,
+        axelar_address,
+        lcd,
+        chain_id,
+        fee_denom,
+        gas_price,
+        chain_axelar_id,
+        ..
+    } = tx;
     ui::info(&format!("adding rewards for {chain_axelar_id}..."));
 
     let rewards_addr =

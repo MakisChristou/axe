@@ -40,8 +40,8 @@ pub use gateway::{
     solana_call_contract_index,
 };
 pub use its::{
-    send_its_deploy_interchain_token, send_its_deploy_remote_interchain_token,
-    send_its_interchain_transfer,
+    DeployInterchainTokenRequest, InterchainTransferRequest, send_its_deploy_interchain_token,
+    send_its_deploy_remote_interchain_token, send_its_interchain_transfer,
 };
 pub use rpc::rpc_client;
 

@@ -100,20 +100,20 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
 
     let sizing = compute_run_sizing(&args);
 
-    let (token_id, _salt, mint) = setup_its_token(
-        &args.source_rpc,
-        &main_keypair,
-        args.network,
-        src,
-        dest,
-        sizing.num_keys,
+    let (token_id, _salt, mint) = setup_its_token(TokenSetupRequest {
+        solana_rpc: &args.source_rpc,
+        keypair: &main_keypair,
+        network: args.network,
+        source_chain: src,
+        destination_chain: dest,
+        num_txs: sizing.num_keys,
         gas_value,
-        args.token_id.as_deref(),
-        &args.config,
-        evm.evm_gateway_addr,
-        &evm_rpc_url,
-        &rpc_client,
-    )
+        token_id_override: args.token_id.as_deref(),
+        config: &args.config,
+        evm_gateway: evm.evm_gateway_addr,
+        evm_rpc_url: &evm_rpc_url,
+        rpc_client: &rpc_client,
+    })
     .await?;
 
     ui::kv("token ID", &hex::encode(token_id));
@@ -430,18 +430,18 @@ async fn run_sustained_pipeline(
                 )
                 .0;
 
-                match solana::send_its_interchain_transfer(
-                    &rpc,
-                    &kp,
+                match solana::send_its_interchain_transfer(solana::InterchainTransferRequest {
+                    rpc_url: &rpc,
+                    keypair: &kp,
                     network,
-                    &tid,
-                    &source_ata,
-                    &m,
-                    &dc,
-                    &da,
-                    amt,
-                    gv,
-                ) {
+                    token_id: &tid,
+                    source_account: &source_ata,
+                    mint: &m,
+                    destination_chain: &dc,
+                    destination_address: &da,
+                    amount: amt,
+                    gas_value: gv,
+                }) {
                     Ok((_sig, mut metrics)) => {
                         metrics.signature =
                             solana::extract_its_message_id(&rpc, network, &metrics.signature)
@@ -581,18 +581,18 @@ async fn run_burst_pipeline(
             )
             .0;
 
-            match solana::send_its_interchain_transfer(
-                &rpc,
-                &kp,
+            match solana::send_its_interchain_transfer(solana::InterchainTransferRequest {
+                rpc_url: &rpc,
+                keypair: &kp,
                 network,
-                &tid,
-                &source_ata,
-                &m,
-                &dc,
-                &da,
-                amt,
-                gv,
-            ) {
+                token_id: &tid,
+                source_account: &source_ata,
+                mint: &m,
+                destination_chain: &dc,
+                destination_address: &da,
+                amount: amt,
+                gas_value: gv,
+            }) {
                 Ok((_sig, mut metrics)) => {
                     // Format message_id: the ITS program CPI's gateway.call_contract
                     // at inner instruction index 1.4 (discovered empirically).
@@ -724,21 +724,38 @@ fn deployer_spl_balance(
 /// Deploy or reuse ITS token. Returns (token_id, salt, mint).
 /// When deploying fresh, waits for the remote deploy to propagate through the
 /// ITS hub and execute on the EVM destination before returning.
-#[allow(clippy::too_many_arguments)]
-async fn setup_its_token(
-    solana_rpc: &str,
-    keypair: &Keypair,
+struct TokenSetupRequest<'a> {
+    solana_rpc: &'a str,
+    keypair: &'a Keypair,
     network: crate::types::Network,
-    src: &str,
-    dest: &str,
+    source_chain: &'a str,
+    destination_chain: &'a str,
     num_txs: usize,
     gas_value: u64,
-    token_id_override: Option<&str>,
-    config: &Path,
-    evm_gateway_addr: Address,
-    evm_rpc_url: &str,
-    rpc_client: &solana_client::rpc_client::RpcClient,
+    token_id_override: Option<&'a str>,
+    config: &'a Path,
+    evm_gateway: Address,
+    evm_rpc_url: &'a str,
+    rpc_client: &'a solana_client::rpc_client::RpcClient,
+}
+
+async fn setup_its_token(
+    request: TokenSetupRequest<'_>,
 ) -> eyre::Result<([u8; 32], [u8; 32], solana_sdk::pubkey::Pubkey)> {
+    let TokenSetupRequest {
+        solana_rpc,
+        keypair,
+        network,
+        source_chain: src,
+        destination_chain: dest,
+        num_txs,
+        gas_value,
+        token_id_override,
+        config,
+        evm_gateway: evm_gateway_addr,
+        evm_rpc_url,
+        rpc_client,
+    } = request;
     if let Some(tid_hex) = token_id_override {
         let tid_bytes = hex::decode(tid_hex.strip_prefix("0x").unwrap_or(tid_hex))
             .map_err(|e| eyre!("invalid --token-id: {e}"))?;
@@ -830,17 +847,19 @@ async fn setup_its_token(
     ui::kv("decimals", &spec.decimals.to_string());
     ui::kv("supply", &total_supply.to_string());
 
-    let deploy_sig = solana::send_its_deploy_interchain_token(
-        solana_rpc,
-        keypair,
-        network,
-        &salt,
-        spec.name,
-        spec.symbol,
-        spec.decimals,
-        total_supply,
-        Some(&keypair.pubkey()), // deployer as minter for ongoing supply
-    )?;
+    let minter = keypair.pubkey();
+    let deploy_sig =
+        solana::send_its_deploy_interchain_token(solana::DeployInterchainTokenRequest {
+            rpc_url: solana_rpc,
+            keypair,
+            network,
+            salt: &salt,
+            name: spec.name,
+            symbol: spec.symbol,
+            decimals: spec.decimals,
+            initial_supply: total_supply,
+            minter: Some(&minter),
+        })?;
     ui::tx_hash("deploy tx", &deploy_sig);
 
     let token_id = solana::interchain_token_id(network, &keypair.pubkey(), &salt);

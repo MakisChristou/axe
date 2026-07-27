@@ -9,6 +9,7 @@ use base64::Engine;
 use eyre::Result;
 use serde_json::{Value, json};
 
+use super::StepTxContext;
 use super::defaults::{DEFAULT_PROPOSAL_DEPOSIT_UAXL, DEFAULT_VV_BLOCK_EXPIRY};
 use crate::commands::deploy::DeployContext;
 use crate::cosmos::{
@@ -19,20 +20,19 @@ use crate::evm::get_salt_from_key;
 use crate::ui;
 use crate::utils::compute_domain_separator;
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_instantiate(
-    ctx: &mut DeployContext,
-    signing_key: &cosmrs::crypto::secp256k1::SigningKey,
-    axelar_address: &str,
-    lcd: &str,
-    chain_id: &str,
-    fee_denom: &str,
-    gas_price: f64,
-    use_governance: bool,
-    chain_axelar_id: &str,
-    env: &str,
-    proposal_key: &str,
-) -> Result<()> {
+pub(super) async fn run_instantiate(ctx: &mut DeployContext, tx: StepTxContext<'_>) -> Result<()> {
+    let StepTxContext {
+        signing_key,
+        axelar_address,
+        lcd,
+        chain_id,
+        fee_denom,
+        gas_price,
+        use_governance,
+        chain_axelar_id,
+        env,
+        proposal_key,
+    } = tx;
     ui::info(&format!(
         "instantiating chain contracts for {chain_axelar_id}..."
     ));

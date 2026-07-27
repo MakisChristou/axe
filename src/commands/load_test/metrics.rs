@@ -117,7 +117,6 @@ pub(super) struct ReportInput {
 }
 
 impl LoadTestReport {
-    #[allow(clippy::cast_precision_loss, clippy::float_arithmetic)]
     pub(super) fn from_transactions(input: ReportInput, transactions: Vec<TxMetrics>) -> Self {
         let total_confirmed = transactions.iter().filter(|metric| metric.success).count() as u64;
         let total_failed = transactions.iter().filter(|metric| !metric.success).count() as u64;
@@ -176,7 +175,6 @@ impl LoadTestReport {
     }
 }
 
-#[allow(clippy::cast_precision_loss, clippy::float_arithmetic)]
 fn summarize(values: impl Iterator<Item = u64>) -> (Option<f64>, Option<u64>, Option<u64>) {
     let values: Vec<_> = values.collect();
     if values.is_empty() {
