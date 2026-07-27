@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use futures::future::join_all;
 use tokio::sync::Mutex;
 
-use super::metrics::{LoadTestReport, TxMetrics};
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
 use crate::ui;
 
 /// Result of the sustained send loop (before verification).
@@ -183,57 +183,17 @@ pub(super) fn build_sustained_report(
     total_expected: u64,
     num_keys: usize,
 ) -> LoadTestReport {
-    let total_confirmed = result.metrics.iter().filter(|m| m.success).count() as u64;
-    let total_failed = result.metrics.iter().filter(|m| !m.success).count() as u64;
-    let d = result.test_duration_secs;
-    let s = result.total_submitted;
-
-    let latencies: Vec<u64> = result.metrics.iter().filter_map(|m| m.latency_ms).collect();
-    let compute_units: Vec<u64> = result
-        .metrics
-        .iter()
-        .filter_map(|m| m.compute_units)
-        .collect();
-
-    LoadTestReport {
-        source_chain: source_chain.to_string(),
-        destination_chain: destination_chain.to_string(),
-        destination_address: destination_address.to_string(),
-        protocol: String::new(),
-        tps: None,
-        duration_secs: None,
-        num_txs: total_expected,
-        num_keys,
-        total_submitted: s,
-        total_confirmed,
-        total_failed,
-        test_duration_secs: d,
-        tps_submitted: if d > 0.0 { s as f64 / d } else { 0.0 },
-        tps_confirmed: if d > 0.0 {
-            total_confirmed as f64 / d
-        } else {
-            0.0
+    LoadTestReport::from_transactions(
+        ReportInput {
+            source_chain: source_chain.to_string(),
+            destination_chain: destination_chain.to_string(),
+            destination_address: destination_address.to_string(),
+            num_txs: total_expected,
+            num_keys,
+            total_submitted: result.total_submitted,
+            test_duration_secs: result.test_duration_secs,
+            compute_unit_summary: ComputeUnitSummary::Include,
         },
-        landing_rate: if s > 0 {
-            total_confirmed as f64 / s as f64
-        } else {
-            0.0
-        },
-        avg_latency_ms: if latencies.is_empty() {
-            None
-        } else {
-            Some(latencies.iter().sum::<u64>() as f64 / latencies.len() as f64)
-        },
-        min_latency_ms: latencies.iter().min().copied(),
-        max_latency_ms: latencies.iter().max().copied(),
-        avg_compute_units: if compute_units.is_empty() {
-            None
-        } else {
-            Some(compute_units.iter().sum::<u64>() as f64 / compute_units.len() as f64)
-        },
-        min_compute_units: compute_units.iter().min().copied(),
-        max_compute_units: compute_units.iter().max().copied(),
-        verification: None,
-        transactions: result.metrics,
-    }
+        result.metrics,
+    )
 }

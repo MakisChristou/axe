@@ -20,7 +20,7 @@ use futures::future::join_all;
 use tokio::sync::{Mutex, Semaphore};
 
 use super::keypairs;
-use super::metrics::{LoadTestReport, TxMetrics};
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
 use super::{LoadTestArgs, check_evm_balance, finish_report, read_its_cache, validate_evm_rpc};
 use crate::config::ChainsConfig;
 use crate::evm::{ERC20, InterchainTokenService};
@@ -829,51 +829,19 @@ async fn run_burst_pipeline(
     ));
 
     let metrics = metrics_list.lock().await.clone();
-    let total_confirmed = metrics.iter().filter(|m| m.success).count() as u64;
-    let total_failed = metrics.iter().filter(|m| !m.success).count() as u64;
-    let latencies: Vec<u64> = metrics.iter().filter_map(|m| m.latency_ms).collect();
-
-    let mut report = LoadTestReport {
-        source_chain: src.to_string(),
-        destination_chain: dest.to_string(),
-        destination_address: stellar_recipient_addr.to_string(),
-        protocol: String::new(),
-        tps: None,
-        duration_secs: None,
-        num_txs: args.num_txs,
-        num_keys: num_txs,
-        total_submitted,
-        total_confirmed,
-        total_failed,
-        test_duration_secs: test_duration,
-        tps_submitted: if test_duration > 0.0 {
-            total_submitted as f64 / test_duration
-        } else {
-            0.0
+    let mut report = LoadTestReport::from_transactions(
+        ReportInput {
+            source_chain: src.to_string(),
+            destination_chain: dest.to_string(),
+            destination_address: stellar_recipient_addr.to_string(),
+            num_txs: args.num_txs,
+            num_keys: num_txs,
+            total_submitted,
+            test_duration_secs: test_duration,
+            compute_unit_summary: ComputeUnitSummary::Omit,
         },
-        tps_confirmed: if test_duration > 0.0 {
-            total_confirmed as f64 / test_duration
-        } else {
-            0.0
-        },
-        landing_rate: if total_submitted > 0 {
-            total_confirmed as f64 / total_submitted as f64
-        } else {
-            0.0
-        },
-        avg_latency_ms: if latencies.is_empty() {
-            None
-        } else {
-            Some(latencies.iter().sum::<u64>() as f64 / latencies.len() as f64)
-        },
-        min_latency_ms: latencies.iter().min().copied(),
-        max_latency_ms: latencies.iter().max().copied(),
-        avg_compute_units: None,
-        min_compute_units: None,
-        max_compute_units: None,
-        verification: None,
-        transactions: metrics,
-    };
+        metrics,
+    );
 
     let verification = super::verify::verify_onchain_stellar_its(
         &args.config,

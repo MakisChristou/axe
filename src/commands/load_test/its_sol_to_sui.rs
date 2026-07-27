@@ -25,7 +25,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
 use tokio::sync::Mutex;
 
-use super::metrics::{LoadTestReport, TxMetrics};
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
 use super::{
     LoadTestArgs, finalize_sui_dest_run_its, load_sui_main_wallet, read_sui_axe_token_id,
     sui_its_dest_lookup, validate_solana_rpc,
@@ -165,28 +165,29 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
 
     let total_submitted = metrics.len() as u64;
     let total_confirmed = metrics.iter().filter(|m| m.success).count() as u64;
-    let total_failed = total_submitted - total_confirmed;
     ui::success(&format!(
         "sent {total_confirmed}/{total_submitted} confirmed"
     ));
 
     #[allow(clippy::cast_precision_loss, clippy::float_arithmetic)]
     let test_duration = test_start.elapsed().as_secs_f64();
-    let latencies: Vec<u64> = metrics.iter().filter_map(|m| m.latency_ms).collect();
-    let mut report = build_report(
-        &args,
-        src,
-        dest,
-        &sui_wallet.address_hex(),
-        total_submitted as usize,
-        total_submitted,
-        total_confirmed,
-        total_failed,
-        test_duration,
-        &latencies,
+    let mut report = LoadTestReport::from_transactions(
+        ReportInput {
+            source_chain: src.to_string(),
+            destination_chain: dest.to_string(),
+            destination_address: sui_wallet.address_hex(),
+            num_txs: args.num_txs,
+            num_keys: total_submitted as usize,
+            total_submitted,
+            test_duration_secs: test_duration,
+            compute_unit_summary: ComputeUnitSummary::Omit,
+        },
         metrics,
-        sustained_params,
     );
+    if let Some((tps, duration_secs)) = sustained_params {
+        report.tps = Some(tps);
+        report.duration_secs = Some(duration_secs);
+    }
 
     finalize_sui_dest_run_its(&args, &mut report, &sui_rpc, test_start).await
 }
@@ -384,68 +385,5 @@ fn failed_metric(src: String, err: String) -> TxMetrics {
         gmp_destination_address: String::new(),
         send_instant: None,
         amplifier_timing: None,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_report(
-    args: &LoadTestArgs,
-    src: &str,
-    dest: &str,
-    destination_address: &str,
-    num_keys: usize,
-    total_submitted: u64,
-    total_confirmed: u64,
-    total_failed: u64,
-    test_duration: f64,
-    latencies: &[u64],
-    metrics: Vec<TxMetrics>,
-    sustained_params: Option<(u64, u64)>,
-) -> LoadTestReport {
-    let (tps, duration_secs) = match sustained_params {
-        Some((t, d)) => (Some(t), Some(d)),
-        None => (None, None),
-    };
-    #[allow(clippy::cast_precision_loss, clippy::float_arithmetic)]
-    LoadTestReport {
-        source_chain: src.to_string(),
-        destination_chain: dest.to_string(),
-        destination_address: destination_address.to_string(),
-        protocol: String::new(),
-        tps,
-        duration_secs,
-        num_txs: args.num_txs,
-        num_keys,
-        total_submitted,
-        total_confirmed,
-        total_failed,
-        test_duration_secs: test_duration,
-        tps_submitted: if test_duration > 0.0 {
-            total_submitted as f64 / test_duration
-        } else {
-            0.0
-        },
-        tps_confirmed: if test_duration > 0.0 {
-            total_confirmed as f64 / test_duration
-        } else {
-            0.0
-        },
-        landing_rate: if total_submitted > 0 {
-            total_confirmed as f64 / total_submitted as f64
-        } else {
-            0.0
-        },
-        avg_latency_ms: if latencies.is_empty() {
-            None
-        } else {
-            Some(latencies.iter().sum::<u64>() as f64 / latencies.len() as f64)
-        },
-        min_latency_ms: latencies.iter().min().copied(),
-        max_latency_ms: latencies.iter().max().copied(),
-        avg_compute_units: None,
-        min_compute_units: None,
-        max_compute_units: None,
-        verification: None,
-        transactions: metrics,
     }
 }

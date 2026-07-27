@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 
 use super::LoadTestArgs;
 use super::keypairs;
-use super::metrics::{LoadTestReport, TxMetrics};
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
 use super::sustained;
 use crate::solana;
 use crate::types::Network;
@@ -178,57 +178,19 @@ pub async fn run_load_test_with_metrics(
     ));
 
     let metrics = metrics_list.lock().await.clone();
-    let total_confirmed = metrics.iter().filter(|m| m.success).count() as u64;
-    let total_failed = metrics.iter().filter(|m| !m.success).count() as u64;
-
-    let latencies: Vec<u64> = metrics.iter().filter_map(|m| m.latency_ms).collect();
-    let compute_units: Vec<u64> = metrics.iter().filter_map(|m| m.compute_units).collect();
-
-    let report = LoadTestReport {
-        source_chain: args.source_chain.clone(),
-        destination_chain: args.destination_chain.clone(),
-        destination_address: destination_address.to_string(),
-        protocol: String::new(),
-        tps: None,
-        duration_secs: None,
-        num_txs: args.num_txs,
-        num_keys: key_count,
-        total_submitted,
-        total_confirmed,
-        total_failed,
-        test_duration_secs: test_duration,
-        tps_submitted: if test_duration > 0.0 {
-            total_submitted as f64 / test_duration
-        } else {
-            0.0
+    let report = LoadTestReport::from_transactions(
+        ReportInput {
+            source_chain: args.source_chain.clone(),
+            destination_chain: args.destination_chain.clone(),
+            destination_address: destination_address.to_string(),
+            num_txs: args.num_txs,
+            num_keys: key_count,
+            total_submitted,
+            test_duration_secs: test_duration,
+            compute_unit_summary: ComputeUnitSummary::Include,
         },
-        tps_confirmed: if test_duration > 0.0 {
-            total_confirmed as f64 / test_duration
-        } else {
-            0.0
-        },
-        landing_rate: if total_submitted > 0 {
-            total_confirmed as f64 / total_submitted as f64
-        } else {
-            0.0
-        },
-        avg_latency_ms: if latencies.is_empty() {
-            Option::None
-        } else {
-            Some(latencies.iter().sum::<u64>() as f64 / latencies.len() as f64)
-        },
-        min_latency_ms: latencies.iter().min().copied(),
-        max_latency_ms: latencies.iter().max().copied(),
-        avg_compute_units: if compute_units.is_empty() {
-            Option::None
-        } else {
-            Some(compute_units.iter().sum::<u64>() as f64 / compute_units.len() as f64)
-        },
-        min_compute_units: compute_units.iter().min().copied(),
-        max_compute_units: compute_units.iter().max().copied(),
-        verification: Option::None,
-        transactions: metrics,
-    };
+        metrics,
+    );
 
     Ok(report)
 }

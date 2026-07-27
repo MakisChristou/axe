@@ -13,7 +13,7 @@ use indicatif::ProgressBar;
 use rand::Rng;
 use tokio::sync::Mutex;
 
-use super::metrics::{LoadTestReport, TxMetrics};
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
 use super::sustained;
 use crate::stellar::{
     StellarClient, StellarWallet, scval_address_account, scval_bytes, scval_string, scval_token,
@@ -257,50 +257,19 @@ fn build_burst_report(
     test_duration: f64,
     key_count: usize,
 ) -> LoadTestReport {
-    let total_confirmed = metrics.iter().filter(|m| m.success).count() as u64;
-    let total_failed = metrics.iter().filter(|m| !m.success).count() as u64;
-    let latencies: Vec<u64> = metrics.iter().filter_map(|m| m.latency_ms).collect();
-    LoadTestReport {
-        source_chain: source_chain.to_string(),
-        destination_chain: destination_chain.to_string(),
-        destination_address: destination_address.to_string(),
-        protocol: String::new(),
-        tps: None,
-        duration_secs: None,
-        num_txs: total_submitted,
-        num_keys: key_count,
-        total_submitted,
-        total_confirmed,
-        total_failed,
-        test_duration_secs: test_duration,
-        tps_submitted: if test_duration > 0.0 {
-            total_submitted as f64 / test_duration
-        } else {
-            0.0
+    LoadTestReport::from_transactions(
+        ReportInput {
+            source_chain: source_chain.to_string(),
+            destination_chain: destination_chain.to_string(),
+            destination_address: destination_address.to_string(),
+            num_txs: total_submitted,
+            num_keys: key_count,
+            total_submitted,
+            test_duration_secs: test_duration,
+            compute_unit_summary: ComputeUnitSummary::Omit,
         },
-        tps_confirmed: if test_duration > 0.0 {
-            total_confirmed as f64 / test_duration
-        } else {
-            0.0
-        },
-        landing_rate: if total_submitted > 0 {
-            total_confirmed as f64 / total_submitted as f64
-        } else {
-            0.0
-        },
-        avg_latency_ms: if latencies.is_empty() {
-            None
-        } else {
-            Some(latencies.iter().sum::<u64>() as f64 / latencies.len() as f64)
-        },
-        min_latency_ms: latencies.iter().min().copied(),
-        max_latency_ms: latencies.iter().max().copied(),
-        avg_compute_units: None,
-        min_compute_units: None,
-        max_compute_units: None,
-        verification: None,
-        transactions: metrics,
-    }
+        metrics,
+    )
 }
 
 // ---------------------------------------------------------------------------

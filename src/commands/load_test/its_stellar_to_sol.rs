@@ -18,7 +18,11 @@ use rand::RngCore;
 use solana_sdk::signer::Signer;
 use tokio::sync::Mutex;
 
-use super::metrics::{LoadTestReport, TxMetrics};
+use super::its_stellar_source::{
+    self, SustainedTransferArgs, SustainedTransferContext, TransferRequest,
+};
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+use super::run_sizing::RunSizing;
 use super::sustained;
 use super::{LoadTestArgs, finish_report, read_its_cache, save_its_cache, validate_solana_rpc};
 use crate::config::ChainsConfig;
@@ -54,7 +58,7 @@ fn scale_to_decimals(whole_tokens: u128, decimals: u32) -> u128 {
 /// runner's default — overridable via `--gas-value`.
 const DEFAULT_GAS_STROOPS: u64 = 100_000_000;
 
-pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
+pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
@@ -77,7 +81,6 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
     .await?;
     let solana = resolve_solana_target(args.keypair.as_deref(), args.network)?;
     let gas_stroops = parse_gas_stroops(args.gas_value.as_deref())?;
-    let sizing = compute_run_sizing(&args);
 
     let (token_id, wallets, amount_per_tx) = prepare_token_and_wallets(
         &args,
@@ -99,7 +102,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
         amount_per_tx,
     };
 
-    if !sizing.burst_mode {
+    if !sizing.is_burst() {
         run_sustained_pipeline(&args, &stellar, &solana, wallets, &transfer, &sizing).await
     } else {
         run_burst_pipeline(&args, &stellar, &solana, wallets, &transfer, &sizing).await
@@ -122,15 +125,6 @@ struct StellarSetup {
 struct SolanaTarget {
     recipient: solana_sdk::pubkey::Pubkey,
     address_bytes: Vec<u8>,
-}
-
-/// Sizing parameters derived from CLI flags: chooses burst vs sustained,
-/// number of ephemeral wallets, and total tx count expected.
-struct RunSizing {
-    burst_mode: bool,
-    sustained_params: Option<(u64, u64)>,
-    num_keys: usize,
-    total_expected: u64,
 }
 
 /// Per-transfer payload bits common to burst and sustained modes: the
@@ -262,40 +256,16 @@ fn parse_gas_stroops(gas_value: Option<&str>) -> Result<u64> {
     Ok(gas_stroops)
 }
 
-/// Decide burst vs sustained, ephemeral wallet count, and total expected tx
-/// count.
-fn compute_run_sizing(args: &LoadTestArgs) -> RunSizing {
-    let sustained_params = args.tps.zip(args.duration_secs);
-    let burst_mode = sustained_params.is_none();
-    let (num_keys, total_expected) = if burst_mode {
-        let n = args.num_txs.max(1) as usize;
-        (n, args.num_txs.max(1))
-    } else {
-        let (tps, dur) = sustained_params.expect("burst_mode is false");
-        let tps = tps as usize;
-        (tps * args.key_cycle as usize, tps as u64 * dur)
-    };
-    RunSizing {
-        burst_mode,
-        sustained_params,
-        num_keys,
-        total_expected,
-    }
-}
-
 /// Compute the AXE amount each ephemeral wallet should hold so it can run all
 /// of its planned transfers, scaled to the resolved token's `decimals`
 /// (sustained budgets 2x the txs-per-key cap to absorb retries; burst uses the
 /// static per-key amount).
 fn compute_amount_per_key(sizing: &RunSizing, key_cycle: u64, decimals: u32) -> u128 {
-    if sizing.burst_mode {
+    if sizing.is_burst() {
         scale_to_decimals(WHOLE_TOKENS_PER_KEY, decimals) / 100
     } else {
-        let txs_per_key = sizing
-            .sustained_params
-            .expect("burst_mode is false")
-            .1
-            .div_ceil(key_cycle) as u128;
+        let (_, duration_secs, _) = sizing.sustained().expect("sustained mode");
+        let txs_per_key = duration_secs.div_ceil(key_cycle) as u128;
         (scale_to_decimals(WHOLE_TOKENS_PER_TX, decimals) / 100)
             .saturating_mul(txs_per_key)
             .saturating_mul(2)
@@ -363,7 +333,7 @@ async fn prepare_token_and_wallets(
     ui::kv("token ID", &hex::encode(token_id));
     ui::address("token contract (Stellar)", &token_address);
 
-    let txs_per_key = if sizing.burst_mode { 1 } else { args.key_cycle };
+    let txs_per_key = if sizing.is_burst() { 1 } else { args.key_cycle };
     let wallets = derive_and_fund_ephemeral_wallets(
         &stellar.client,
         main_wallet,
@@ -402,9 +372,7 @@ async fn run_sustained_pipeline(
 ) -> Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
-    let tps_n = sizing.sustained_params.expect("burst_mode is false").0 as usize;
-    let duration_secs = sizing.sustained_params.expect("burst_mode is false").1;
-    let key_cycle = args.key_cycle as usize;
+    let (tps_n, duration_secs, key_cycle) = sizing.sustained().expect("sustained mode");
 
     let (verify_tx, verify_rx) = tokio::sync::mpsc::unbounded_channel();
     let send_done = Arc::new(AtomicBool::new(false));
@@ -430,25 +398,27 @@ async fn run_sustained_pipeline(
     let _ = spinner_tx.send(spinner.clone());
 
     let test_start = Instant::now();
-    let result = run_sustained_loop(
-        &stellar.client,
-        wallets,
-        stellar.its_addr.clone(),
-        stellar.gateway_addr.clone(),
-        transfer.token_id,
-        args.destination_axelar_id.clone(),
-        solana.address_bytes.clone(),
-        stellar.xlm_addr.clone(),
-        transfer.gas_stroops,
-        transfer.amount_per_tx,
-        tps_n,
+    let result = its_stellar_source::run_sustained(SustainedTransferArgs {
+        context: SustainedTransferContext {
+            client: stellar.client.clone(),
+            wallets,
+            its_contract: stellar.its_addr.clone(),
+            gateway_contract: stellar.gateway_addr.clone(),
+            token_id: transfer.token_id,
+            destination_chain: args.destination_axelar_id.clone(),
+            destination_address_bytes: solana.address_bytes.clone(),
+            gas_token: stellar.xlm_addr.clone(),
+            gas_stroops: transfer.gas_stroops,
+            amount_per_tx: transfer.amount_per_tx,
+            axelarnet_gw_addr: transfer.axelarnet_gw_addr.clone(),
+        },
+        tps: tps_n,
         duration_secs,
         key_cycle,
-        Some(verify_tx),
-        Some(send_done),
+        verify_tx: Some(verify_tx),
+        send_done: Some(send_done),
         spinner,
-        transfer.axelarnet_gw_addr.clone(),
-    )
+    })
     .await;
 
     let mut report = sustained::build_sustained_report(
@@ -519,19 +489,19 @@ async fn run_burst_pipeline(
         let total = num_keys;
 
         let handle = tokio::spawn(async move {
-            let m = submit_its_transfer(
-                &c,
-                &w,
-                &its,
-                &gw,
+            let m = its_stellar_source::submit_transfer(TransferRequest {
+                client: &c,
+                wallet: &w,
+                its_contract: &its,
+                gateway_contract: &gw,
                 token_id,
-                &dc,
-                &da,
-                &xlm,
-                gas_stroops,
-                amount_per_tx,
-                &gmp_dest_addr,
-            )
+                destination_chain: &dc,
+                destination_address_bytes: &da,
+                gas_token: &xlm,
+                gas_amount_stroops: gas_stroops,
+                transfer_amount: amount_per_tx,
+                gmp_dest_address: &gmp_dest_addr,
+            })
             .await;
             if m.success {
                 let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -552,51 +522,19 @@ async fn run_burst_pipeline(
     ));
 
     let metrics = metrics_list.lock().await.clone();
-    let total_confirmed = metrics.iter().filter(|m| m.success).count() as u64;
-    let total_failed = metrics.iter().filter(|m| !m.success).count() as u64;
-    let latencies: Vec<u64> = metrics.iter().filter_map(|m| m.latency_ms).collect();
-
-    let mut report = LoadTestReport {
-        source_chain: src.to_string(),
-        destination_chain: dest.to_string(),
-        destination_address: solana.recipient.to_string(),
-        protocol: String::new(),
-        tps: None,
-        duration_secs: None,
-        num_txs: total_submitted,
-        num_keys,
-        total_submitted,
-        total_confirmed,
-        total_failed,
-        test_duration_secs: test_duration,
-        tps_submitted: if test_duration > 0.0 {
-            total_submitted as f64 / test_duration
-        } else {
-            0.0
+    let mut report = LoadTestReport::from_transactions(
+        ReportInput {
+            source_chain: src.to_string(),
+            destination_chain: dest.to_string(),
+            destination_address: solana.recipient.to_string(),
+            num_txs: total_submitted,
+            num_keys,
+            total_submitted,
+            test_duration_secs: test_duration,
+            compute_unit_summary: ComputeUnitSummary::Omit,
         },
-        tps_confirmed: if test_duration > 0.0 {
-            total_confirmed as f64 / test_duration
-        } else {
-            0.0
-        },
-        landing_rate: if total_submitted > 0 {
-            total_confirmed as f64 / total_submitted as f64
-        } else {
-            0.0
-        },
-        avg_latency_ms: if latencies.is_empty() {
-            None
-        } else {
-            Some(latencies.iter().sum::<u64>() as f64 / latencies.len() as f64)
-        },
-        min_latency_ms: latencies.iter().min().copied(),
-        max_latency_ms: latencies.iter().max().copied(),
-        avg_compute_units: None,
-        min_compute_units: None,
-        max_compute_units: None,
-        verification: None,
-        transactions: metrics,
-    };
+        metrics,
+    );
 
     let verification = super::verify::verify_onchain_solana_its(
         &args.config,
@@ -880,177 +818,4 @@ async fn distribute_token_balances(
         to_fund.len()
     ));
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Single ITS transfer + sustained loop wrapper
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::too_many_arguments)]
-async fn submit_its_transfer(
-    client: &StellarClient,
-    wallet: &StellarWallet,
-    its_contract: &str,
-    gateway_contract: &str,
-    token_id: [u8; 32],
-    destination_chain: &str,
-    destination_address_bytes: &[u8],
-    gas_token: &str,
-    gas_amount_stroops: u64,
-    transfer_amount: u128,
-    gmp_dest_address: &str,
-) -> TxMetrics {
-    let submit_start = Instant::now();
-    // ITS emits the `ContractCall` event from the AxelarGateway contract,
-    // so the message's source_address (as recorded by VotingVerifier) is the
-    // ITS contract address (which calls the gateway). Match that.
-    let source_addr = its_contract.to_string();
-    match client
-        .its_interchain_transfer(
-            wallet,
-            its_contract,
-            gateway_contract,
-            token_id,
-            destination_chain,
-            destination_address_bytes,
-            transfer_amount,
-            None,
-            gas_token,
-            gas_amount_stroops,
-        )
-        .await
-    {
-        Ok(invoked) => {
-            let submit_time_ms = submit_start.elapsed().as_millis() as u64;
-            let event_index = invoked.event_index.unwrap_or(0);
-            let message_id = format!("0x{}-{event_index}", invoked.tx_hash_hex.to_lowercase());
-            TxMetrics {
-                signature: message_id,
-                submit_time_ms,
-                confirm_time_ms: Some(submit_time_ms),
-                latency_ms: Some(submit_time_ms),
-                compute_units: None,
-                slot: None,
-                success: invoked.success,
-                error: if invoked.success {
-                    None
-                } else {
-                    Some("interchain_transfer reverted".to_string())
-                },
-                payload: Vec::new(),
-                payload_hash: String::new(),
-                source_address: source_addr,
-                gmp_destination_chain: "axelar".to_string(),
-                gmp_destination_address: gmp_dest_address.to_string(),
-                send_instant: Some(submit_start),
-                amplifier_timing: None,
-            }
-        }
-        Err(e) => {
-            let elapsed_ms = submit_start.elapsed().as_millis() as u64;
-            TxMetrics {
-                signature: String::new(),
-                submit_time_ms: elapsed_ms,
-                confirm_time_ms: None,
-                latency_ms: None,
-                compute_units: None,
-                slot: None,
-                success: false,
-                error: Some(e.to_string()),
-                payload: Vec::new(),
-                payload_hash: String::new(),
-                source_address: source_addr,
-                gmp_destination_chain: String::new(),
-                gmp_destination_address: String::new(),
-                send_instant: None,
-                amplifier_timing: None,
-            }
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_sustained_loop(
-    client: &StellarClient,
-    wallets: Vec<StellarWallet>,
-    its_contract: String,
-    gateway_contract: String,
-    token_id: [u8; 32],
-    destination_chain: String,
-    destination_address_bytes: Vec<u8>,
-    gas_token: String,
-    gas_stroops: u64,
-    amount_per_tx: u128,
-    tps: usize,
-    duration_secs: u64,
-    key_cycle: usize,
-    verify_tx: Option<tokio::sync::mpsc::UnboundedSender<super::verify::PendingTx>>,
-    send_done: Option<Arc<AtomicBool>>,
-    spinner: indicatif::ProgressBar,
-    axelarnet_gw_addr: String,
-) -> sustained::SustainedResult {
-    let client = Arc::new(client.clone());
-    let wallets = Arc::new(wallets);
-    let its = Arc::new(its_contract);
-    let gw = Arc::new(gateway_contract);
-    let dc = Arc::new(destination_chain);
-    let da = Arc::new(destination_address_bytes);
-    let xlm = Arc::new(gas_token);
-    let gmp_dst = Arc::new(axelarnet_gw_addr);
-
-    let make_task: sustained::MakeTask = Box::new(move |key_idx: usize, _nonce: Option<u64>| {
-        let c = Arc::clone(&client);
-        let ws = Arc::clone(&wallets);
-        let its = Arc::clone(&its);
-        let gw = Arc::clone(&gw);
-        let dc = Arc::clone(&dc);
-        let da = Arc::clone(&da);
-        let xlm = Arc::clone(&xlm);
-        let gmp_dst = Arc::clone(&gmp_dst);
-        let vtx = verify_tx.clone();
-
-        Box::pin(async move {
-            let wallet = &ws[key_idx % ws.len()];
-            let mut m = submit_its_transfer(
-                &c,
-                wallet,
-                &its,
-                &gw,
-                token_id,
-                &dc,
-                &da,
-                &xlm,
-                gas_stroops,
-                amount_per_tx,
-                &gmp_dst,
-            )
-            .await;
-            if m.success
-                && let Some(ref tx_sender) = vtx
-            {
-                // ITS pipeline: starts at Voted (Stellar VotingVerifier).
-                match super::verify::tx_to_pending_its(&m, true) {
-                    Ok(pending) => {
-                        let _ = tx_sender.send(pending);
-                    }
-                    Err(e) => {
-                        m.success = false;
-                        m.error = Some(format!("failed to build verification state: {e}"));
-                    }
-                }
-            }
-            m
-        })
-    });
-
-    sustained::run_sustained_loop(
-        tps,
-        duration_secs,
-        key_cycle,
-        None,
-        make_task,
-        send_done,
-        spinner,
-    )
-    .await
 }

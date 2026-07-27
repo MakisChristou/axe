@@ -23,7 +23,7 @@ use serde_json::json;
 
 use super::evm_sender;
 use super::helpers::list_gateway_chains;
-use super::metrics::TxMetrics;
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
 use super::sol_sender;
 use super::stellar_sender;
 use super::sustained;
@@ -1539,55 +1539,24 @@ pub(super) async fn run_sui_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
     spinner.finish_and_clear();
     let total_submitted = metrics.len() as u64;
     let total_confirmed = metrics.iter().filter(|m| m.success).count() as u64;
-    let total_failed = total_submitted - total_confirmed;
     ui::success(&format!(
         "sent {total_confirmed}/{total_submitted} confirmed"
     ));
 
     let test_duration = test_start.elapsed().as_secs_f64();
-    let latencies: Vec<u64> = metrics.iter().filter_map(|m| m.latency_ms).collect();
-
-    let mut report = crate::commands::load_test::metrics::LoadTestReport {
-        source_chain: src.to_string(),
-        destination_chain: dest.to_string(),
-        destination_address: destination_address.clone(),
-        protocol: String::new(),
-        tps: None,
-        duration_secs: None,
-        num_txs: total_submitted,
-        num_keys: 1,
-        total_submitted,
-        total_confirmed,
-        total_failed,
-        test_duration_secs: test_duration,
-        tps_submitted: if test_duration > 0.0 {
-            total_submitted as f64 / test_duration
-        } else {
-            0.0
+    let mut report = LoadTestReport::from_transactions(
+        ReportInput {
+            source_chain: src.to_string(),
+            destination_chain: dest.to_string(),
+            destination_address: destination_address.clone(),
+            num_txs: total_submitted,
+            num_keys: 1,
+            total_submitted,
+            test_duration_secs: test_duration,
+            compute_unit_summary: ComputeUnitSummary::Omit,
         },
-        tps_confirmed: if test_duration > 0.0 {
-            total_confirmed as f64 / test_duration
-        } else {
-            0.0
-        },
-        landing_rate: if total_submitted > 0 {
-            total_confirmed as f64 / total_submitted as f64
-        } else {
-            0.0
-        },
-        avg_latency_ms: if latencies.is_empty() {
-            None
-        } else {
-            Some(latencies.iter().sum::<u64>() as f64 / latencies.len() as f64)
-        },
-        min_latency_ms: latencies.iter().min().copied(),
-        max_latency_ms: latencies.iter().max().copied(),
-        avg_compute_units: None,
-        min_compute_units: None,
-        max_compute_units: None,
-        verification: None,
-        transactions: metrics,
-    };
+        metrics,
+    );
 
     let verification = verify::verify_onchain(
         &args.config,
@@ -1792,56 +1761,24 @@ pub(super) async fn run_sui_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
     spinner.finish_and_clear();
     let total_submitted = metrics.len() as u64;
     let total_confirmed = metrics.iter().filter(|m| m.success).count() as u64;
-    let total_failed = total_submitted - total_confirmed;
     ui::success(&format!(
         "sent {total_confirmed}/{total_submitted} confirmed"
     ));
 
     let test_duration = test_start.elapsed().as_secs_f64();
-    let latencies: Vec<u64> = metrics.iter().filter_map(|m| m.latency_ms).collect();
-
-    #[allow(clippy::cast_precision_loss, clippy::float_arithmetic)]
-    let mut report = crate::commands::load_test::metrics::LoadTestReport {
-        source_chain: src.to_string(),
-        destination_chain: dest.to_string(),
-        destination_address: destination_address.clone(),
-        protocol: String::new(),
-        tps: None,
-        duration_secs: None,
-        num_txs: total_submitted,
-        num_keys: 1,
-        total_submitted,
-        total_confirmed,
-        total_failed,
-        test_duration_secs: test_duration,
-        tps_submitted: if test_duration > 0.0 {
-            total_submitted as f64 / test_duration
-        } else {
-            0.0
+    let mut report = LoadTestReport::from_transactions(
+        ReportInput {
+            source_chain: src.to_string(),
+            destination_chain: dest.to_string(),
+            destination_address: destination_address.clone(),
+            num_txs: total_submitted,
+            num_keys: 1,
+            total_submitted,
+            test_duration_secs: test_duration,
+            compute_unit_summary: ComputeUnitSummary::Omit,
         },
-        tps_confirmed: if test_duration > 0.0 {
-            total_confirmed as f64 / test_duration
-        } else {
-            0.0
-        },
-        landing_rate: if total_submitted > 0 {
-            total_confirmed as f64 / total_submitted as f64
-        } else {
-            0.0
-        },
-        avg_latency_ms: if latencies.is_empty() {
-            None
-        } else {
-            Some(latencies.iter().sum::<u64>() as f64 / latencies.len() as f64)
-        },
-        min_latency_ms: latencies.iter().min().copied(),
-        max_latency_ms: latencies.iter().max().copied(),
-        avg_compute_units: None,
-        min_compute_units: None,
-        max_compute_units: None,
-        verification: None,
-        transactions: metrics,
-    };
+        metrics,
+    );
 
     let verification = verify::verify_onchain_solana(
         &args.config,

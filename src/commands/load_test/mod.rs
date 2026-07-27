@@ -12,6 +12,7 @@ mod its_evm_to_sui;
 mod its_evm_to_xrpl;
 mod its_sol_to_evm;
 mod its_sol_to_sui;
+mod its_stellar_source;
 mod its_stellar_to_evm;
 mod its_stellar_to_sol;
 mod its_stellar_to_sui;
@@ -21,6 +22,7 @@ mod its_xrpl_to_evm;
 mod keypairs;
 pub mod metrics;
 mod resolve;
+mod run_sizing;
 mod sol_sender;
 mod stellar_sender;
 mod sustained;
@@ -193,6 +195,7 @@ pub struct LoadTestArgs {
 
 #[allow(clippy::cognitive_complexity)] // wide match over (protocol, test-type) pairs; flat by design
 pub async fn run(args: LoadTestArgs) -> Result<()> {
+    let run_sizing = run_sizing::RunSizing::new(&args)?;
     let run_start = Instant::now();
 
     ui::section(&format!(
@@ -285,7 +288,9 @@ pub async fn run(args: LoadTestArgs) -> Result<()> {
         (Protocol::Gmp, TestType::EvmToStellar) => gmp::run_evm_to_stellar(args, run_start).await,
         (Protocol::Gmp, TestType::StellarToSol) => gmp::run_stellar_to_sol(args, run_start).await,
         (Protocol::Gmp, TestType::SolToStellar) => gmp::run_sol_to_stellar(args, run_start).await,
-        (Protocol::Its, TestType::StellarToEvm) => its_stellar_to_evm::run(args, run_start).await,
+        (Protocol::Its, TestType::StellarToEvm) => {
+            its_stellar_to_evm::run(args, run_start, run_sizing).await
+        }
         (Protocol::Its, TestType::EvmToStellar) => its_evm_to_stellar::run(args, run_start).await,
         // Stellar -> Solana ITS: code is in place, but the destination chain
         // must be in the Stellar ITS contract's trusted-chains list. On
@@ -293,7 +298,9 @@ pub async fn run(args: LoadTestArgs) -> Result<()> {
         // simulation reverts with Contract Error #7. The runner will surface
         // that clearly. We leave it dispatched so the run becomes possible
         // automatically once the trusted-chain config is updated upstream.
-        (Protocol::Its, TestType::StellarToSol) => its_stellar_to_sol::run(args, run_start).await,
+        (Protocol::Its, TestType::StellarToSol) => {
+            its_stellar_to_sol::run(args, run_start, run_sizing).await
+        }
         (Protocol::Its, TestType::SolToStellar) => {
             eyre::bail!(
                 "ITS sol -> stellar is not implemented yet. Use --protocol gmp for this pair."
