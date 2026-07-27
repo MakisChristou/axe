@@ -26,8 +26,10 @@
 use std::time::{Duration, Instant};
 
 use alloy::{
+    consensus::Transaction as _,
     primitives::{Address, Bytes, FixedBytes, TxHash, U256},
     providers::{Provider, ProviderBuilder},
+    rpc::types::TransactionReceipt,
     signers::local::PrivateKeySigner,
 };
 use eyre::eyre;
@@ -539,89 +541,154 @@ pub(super) async fn execute_interchain_transfer<P: Provider>(
         hub_gas / U256::from(10).pow(U256::from(gas_arg_scaling_factor))
     };
     let its = InterchainTokenService::new(its_proxy, provider);
-    let base_call = its
-        .interchainTransfer(
-            token_id,
-            dest_chain.to_string(),
-            receiver_bytes.clone(),
-            amount,
-            Bytes::new(),
-            gas_value_arg,
-        )
-        .value(hub_gas);
-    let call = match explicit_nonce {
-        Some(n) => base_call.nonce(n),
-        None => base_call,
-    };
 
-    match call.send().await {
-        Ok(pending) => {
-            let tx_hash = *pending.tx_hash();
-            match tokio::time::timeout(EVM_RECEIPT_TIMEOUT, pending.get_receipt()).await {
-                Ok(Ok(receipt)) => {
-                    let latency_ms = submit_start.elapsed().as_millis() as u64;
+    // A receipt timeout on an EVM chain (all mine within seconds) almost always
+    // means the tx was dropped from the mempool — not that it is slow — e.g. an
+    // RPC that accepted `eth_sendRawTransaction` but never broadcast it
+    // (observed on Avalanche via QuikNode). Resubmit, but only ever at the SAME
+    // nonce (learned from the first send) so at most one tx can land: a dropped
+    // tx's nonce is free and the resubmit fills it; a still-pending tx makes the
+    // resubmit a same-nonce replacement, never a second transfer.
+    const MAX_SUBMIT_ATTEMPTS: u32 = 3;
+    let mut pinned_nonce = explicit_nonce;
+    let mut last_hash: Option<TxHash> = None;
+    for attempt in 0..MAX_SUBMIT_ATTEMPTS {
+        let base_call = its
+            .interchainTransfer(
+                token_id,
+                dest_chain.to_string(),
+                receiver_bytes.clone(),
+                amount,
+                Bytes::new(),
+                gas_value_arg,
+            )
+            .value(hub_gas);
+        let call = match pinned_nonce {
+            Some(n) => base_call.nonce(n),
+            None => base_call,
+        };
 
-                    // EVM receipts come back even for reverted txs — `status:
-                    // 0x0` means the tx mined but failed and its logs are
-                    // empty. Without this short-circuit, extract_contract_call
-                    // returns "ContractCall event not found in receipt logs"
-                    // and the user can't tell whether it was a missing event
-                    // or just a revert. Surface the revert (with tx hash) so
-                    // the explorer link in the report points at the right tx.
-                    if !receipt.status() {
-                        return make_failure_with_hash(
-                            submit_start,
-                            &format!(
-                                "source-side interchainTransfer reverted (status 0x0, \
-                                 gas_used {})",
-                                receipt.gas_used
-                            ),
-                            Some(tx_hash),
-                        );
-                    }
-
-                    match extract_contract_call_event(&receipt) {
-                        Ok((
-                            event_index,
-                            _payload,
-                            payload_hash_bytes,
-                            dest_chain,
-                            dest_address,
-                        )) => {
-                            let message_id = format!("{tx_hash:#x}-{event_index}");
-                            let source_address = format!("{its_proxy}");
-                            let payload_hash = alloy::hex::encode(payload_hash_bytes.as_slice());
-
-                            TxMetrics {
-                                signature: message_id,
-                                submit_time_ms: 0,
-                                confirm_time_ms: Some(latency_ms),
-                                latency_ms: Some(latency_ms),
-                                compute_units: Some(receipt.gas_used),
-                                slot: receipt.block_number,
-                                success: true,
-                                error: None,
-                                payload: Vec::new(),
-                                payload_hash,
-                                source_address,
-                                gmp_destination_chain: dest_chain,
-                                gmp_destination_address: dest_address,
-                                send_instant: Some(submit_start),
-                                amplifier_timing: None,
-                            }
-                        }
-                        Err(e) => make_failure_with_hash(
-                            submit_start,
-                            &format!("no ContractCall event: {e}"),
-                            Some(tx_hash),
-                        ),
-                    }
+        let pending = match call.send().await {
+            Ok(p) => p,
+            Err(e) => {
+                let es = e.to_string();
+                // "nonce too low" / "already known" ⇒ a prior attempt actually
+                // landed; return its receipt instead of a spurious failure.
+                if let Some(h) = last_hash
+                    && (es.contains("nonce too low")
+                        || es.contains("already known")
+                        || es.contains("replacement transaction underpriced"))
+                    && let Ok(Some(receipt)) = provider.get_transaction_receipt(h).await
+                {
+                    return receipt_to_metrics(&receipt, h, its_proxy, submit_start);
                 }
-                Ok(Err(e)) => make_failure_with_hash(submit_start, &e.to_string(), Some(tx_hash)),
-                Err(_) => make_failure_with_hash(submit_start, "tx timed out", Some(tx_hash)),
+                return make_failure(submit_start, &es);
+            }
+        };
+
+        let tx_hash = *pending.tx_hash();
+        last_hash = Some(tx_hash);
+        if pinned_nonce.is_none() {
+            pinned_nonce = learn_nonce(provider, tx_hash).await;
+        }
+
+        match tokio::time::timeout(EVM_RECEIPT_TIMEOUT, pending.get_receipt()).await {
+            Ok(Ok(receipt)) => {
+                return receipt_to_metrics(&receipt, tx_hash, its_proxy, submit_start);
+            }
+            Ok(Err(e)) => {
+                return make_failure_with_hash(submit_start, &e.to_string(), Some(tx_hash));
+            }
+            Err(_) => {
+                // Deadline hit — did it land just after?
+                if let Ok(Some(receipt)) = provider.get_transaction_receipt(tx_hash).await {
+                    return receipt_to_metrics(&receipt, tx_hash, its_proxy, submit_start);
+                }
+                // Not mined. Resubmit only if the nonce is pinned (else a
+                // resubmit could double-send) and attempts remain.
+                if pinned_nonce.is_none() || attempt + 1 == MAX_SUBMIT_ATTEMPTS {
+                    return make_failure_with_hash(
+                        submit_start,
+                        &format!(
+                            "tx timed out (no receipt in {}s)",
+                            EVM_RECEIPT_TIMEOUT.as_secs()
+                        ),
+                        Some(tx_hash),
+                    );
+                }
+                ui::warn(&format!(
+                    "source tx {tx_hash:#x} not mined in {}s — resubmitting at nonce {} \
+                     (attempt {}/{MAX_SUBMIT_ATTEMPTS})",
+                    EVM_RECEIPT_TIMEOUT.as_secs(),
+                    pinned_nonce.unwrap_or_default(),
+                    attempt + 2,
+                ));
             }
         }
-        Err(e) => make_failure(submit_start, &e.to_string()),
+    }
+    make_failure_with_hash(
+        submit_start,
+        &format!("tx timed out after {MAX_SUBMIT_ATTEMPTS} submit attempts"),
+        last_hash,
+    )
+}
+
+/// Build success (or revert) metrics from a mined receipt. Shared by the
+/// happy-path receipt and the post-timeout "did it land late?" recheck.
+fn receipt_to_metrics(
+    receipt: &TransactionReceipt,
+    tx_hash: TxHash,
+    its_proxy: Address,
+    submit_start: Instant,
+) -> TxMetrics {
+    let latency_ms = submit_start.elapsed().as_millis() as u64;
+    // EVM receipts come back even for reverted txs — `status: 0x0` means the tx
+    // mined but failed; surface the revert (with hash) rather than a confusing
+    // "ContractCall event not found".
+    if !receipt.status() {
+        return make_failure_with_hash(
+            submit_start,
+            &format!(
+                "source-side interchainTransfer reverted (status 0x0, gas_used {})",
+                receipt.gas_used
+            ),
+            Some(tx_hash),
+        );
+    }
+    match extract_contract_call_event(receipt) {
+        Ok((event_index, _payload, payload_hash_bytes, dest_chain, dest_address)) => TxMetrics {
+            signature: format!("{tx_hash:#x}-{event_index}"),
+            submit_time_ms: 0,
+            confirm_time_ms: Some(latency_ms),
+            latency_ms: Some(latency_ms),
+            compute_units: Some(receipt.gas_used),
+            slot: receipt.block_number,
+            success: true,
+            error: None,
+            payload: Vec::new(),
+            payload_hash: alloy::hex::encode(payload_hash_bytes.as_slice()),
+            source_address: format!("{its_proxy}"),
+            gmp_destination_chain: dest_chain,
+            gmp_destination_address: dest_address,
+            send_instant: Some(submit_start),
+            amplifier_timing: None,
+        },
+        Err(e) => make_failure_with_hash(
+            submit_start,
+            &format!("no ContractCall event: {e}"),
+            Some(tx_hash),
+        ),
+    }
+}
+
+/// Best-effort read of a just-submitted tx's nonce so resubmits reuse it
+/// (a replacement, never a duplicate). Returns `None` if the RPC can't return
+/// the tx yet — the caller then declines to resubmit rather than risk a
+/// double-send.
+async fn learn_nonce<P: Provider>(provider: &P, tx_hash: TxHash) -> Option<u64> {
+    match provider.get_transaction_by_hash(tx_hash).await {
+        Ok(Some(tx)) => Some(tx.inner.nonce()),
+        _ => None,
     }
 }
 

@@ -418,73 +418,123 @@ impl StellarClient {
             args: args_vec,
         };
 
-        // A shared `STELLAR_PRIVATE_KEY` (parallel cron jobs) and sequential
-        // Soroban txs whose sequence bump the RPC hasn't reflected yet both
-        // leave the fetched sequence stale, so a submit races another `seq + 1`
-        // and gets TxBadSeq. Re-fetch + re-simulate + resubmit up to 4 times —
-        // the same recovery `pay_native_classic` uses for classic payments.
-        const MAX_SEQ_RETRIES: u8 = 4;
-        let mut attempt: u8 = 0;
-        let hash = loop {
-            match self.submit_invoke_once(wallet, &invoke, base_fee).await {
-                Ok(hash) => break hash,
-                Err(e) if attempt + 1 < MAX_SEQ_RETRIES && format!("{e}").contains("TxBadSeq") => {
-                    crate::ui::warn(&format!(
-                        "stellar invoke_contract: TxBadSeq on attempt {} \
-                         (stale/racing sequence? re-simulating)",
-                        attempt + 1,
-                    ));
-                    // Brief backoff so the colliding tx settles.
-                    tokio::time::sleep(Duration::from_millis(500u64 << attempt)).await;
-                    attempt += 1;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        };
-        let tx_hash_hex = hex::encode(hash.0);
-
-        // 6. Poll for validation.
-        let start = Instant::now();
+        // Submit, poll for validation, and — if the tx is *dropped* (accepted
+        // by the RPC but never validated within VALIDATE_TIMEOUT) — resubmit,
+        // but only when the account sequence proves nothing landed. EVM chains
+        // resubmit dropped source txs the same way; the sequence guard makes it
+        // safe for the shared deploy path too — a resubmit can never become a
+        // second transfer, because an advanced sequence means the slot was
+        // already consumed (so we stop instead).
+        const MAX_VALIDATE_RESUBMITS: u8 = 2;
+        let mut resubmit: u8 = 0;
         loop {
-            match self.rpc.get_transaction(&hash).await {
-                Ok(resp) => {
-                    // 23.x uses status string: "SUCCESS"/"FAILED"/"NOT_FOUND"
-                    if let Some(status) = extract_status(&resp) {
-                        match status.as_str() {
-                            "SUCCESS" => {
-                                let event_index = event_filter
-                                    .as_ref()
-                                    .and_then(|filter| find_event_index(&resp, filter));
-                                let return_value = extract_return_value(&resp);
-                                return Ok(InvokedTx {
-                                    tx_hash_hex,
-                                    success: true,
-                                    event_index,
-                                    return_value,
-                                });
-                            }
-                            "FAILED" => {
-                                return Ok(InvokedTx {
-                                    tx_hash_hex,
-                                    success: false,
-                                    event_index: None,
-                                    return_value: None,
-                                });
-                            }
-                            _ => {} // NOT_FOUND → keep polling
-                        }
+            let seq_before = self
+                .account_sequence(&wallet.address())
+                .await
+                .ok()
+                .flatten();
+
+            // A shared `STELLAR_PRIVATE_KEY` (parallel cron jobs) and sequential
+            // Soroban txs whose sequence bump the RPC hasn't reflected yet both
+            // leave the fetched sequence stale, so a submit races another
+            // `seq + 1` and gets TxBadSeq. Re-fetch + re-simulate + resubmit up
+            // to 4 times — the same recovery `pay_native_classic` uses.
+            const MAX_SEQ_RETRIES: u8 = 4;
+            let mut attempt: u8 = 0;
+            let hash = loop {
+                match self.submit_invoke_once(wallet, &invoke, base_fee).await {
+                    Ok(hash) => break hash,
+                    Err(e)
+                        if attempt + 1 < MAX_SEQ_RETRIES && format!("{e}").contains("TxBadSeq") =>
+                    {
+                        crate::ui::warn(&format!(
+                            "stellar invoke_contract: TxBadSeq on attempt {} \
+                             (stale/racing sequence? re-simulating)",
+                            attempt + 1,
+                        ));
+                        // Brief backoff so the colliding tx settles.
+                        tokio::time::sleep(Duration::from_millis(500u64 << attempt)).await;
+                        attempt += 1;
+                        continue;
                     }
+                    Err(e) => return Err(e),
                 }
-                Err(_) => {
-                    // Transient; keep polling until timeout.
-                }
+            };
+            let tx_hash_hex = hex::encode(hash.0);
+
+            if let Some(tx) = self
+                .poll_tx_validation(&hash, tx_hash_hex.clone(), event_filter.as_ref())
+                .await?
+            {
+                return Ok(tx);
             }
-            if start.elapsed() >= VALIDATE_TIMEOUT {
+
+            // Poll timed out. Resubmit only if the account sequence did NOT
+            // advance — proof that no tx from this account landed, so ours is
+            // genuinely dropped and a resubmit can't double-send.
+            let seq_after = self
+                .account_sequence(&wallet.address())
+                .await
+                .ok()
+                .flatten();
+            let sequence_advanced = match (seq_before, seq_after) {
+                (Some(before), Some(after)) => after > before,
+                _ => true, // couldn't read the sequence → don't risk a resubmit
+            };
+            if sequence_advanced || resubmit + 1 >= MAX_VALIDATE_RESUBMITS {
                 return Err(eyre!(
                     "Stellar tx {tx_hash_hex} not validated within {:?}",
                     VALIDATE_TIMEOUT
                 ));
+            }
+            crate::ui::warn(&format!(
+                "stellar invoke_contract: tx {tx_hash_hex} not validated in {:?}, account \
+                 sequence unchanged (dropped) — resubmitting ({}/{MAX_VALIDATE_RESUBMITS})",
+                VALIDATE_TIMEOUT,
+                resubmit + 2,
+            ));
+            resubmit += 1;
+        }
+    }
+
+    /// Poll a submitted tx until the ledger reports SUCCESS/FAILED, or
+    /// `VALIDATE_TIMEOUT` elapses. `Ok(Some(_))` = validated (either outcome);
+    /// `Ok(None)` = the deadline passed without the tx appearing (dropped) —
+    /// the caller decides whether to resubmit.
+    async fn poll_tx_validation(
+        &self,
+        hash: &Hash,
+        tx_hash_hex: String,
+        event_filter: Option<&Hash>,
+    ) -> Result<Option<InvokedTx>> {
+        let start = Instant::now();
+        loop {
+            if let Ok(resp) = self.rpc.get_transaction(hash).await
+                && let Some(status) = extract_status(&resp)
+            {
+                match status.as_str() {
+                    "SUCCESS" => {
+                        let event_index = event_filter.and_then(|f| find_event_index(&resp, f));
+                        return Ok(Some(InvokedTx {
+                            tx_hash_hex,
+                            success: true,
+                            event_index,
+                            return_value: extract_return_value(&resp),
+                        }));
+                    }
+                    "FAILED" => {
+                        return Ok(Some(InvokedTx {
+                            tx_hash_hex,
+                            success: false,
+                            event_index: None,
+                            return_value: None,
+                        }));
+                    }
+                    _ => {} // NOT_FOUND → keep polling
+                }
+            }
+            if start.elapsed() >= VALIDATE_TIMEOUT {
+                return Ok(None);
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }

@@ -164,35 +164,53 @@ impl<P: Provider> DestinationChecker<'_, P> {
 // Final GMP-API recheck for timed-out txs
 // ---------------------------------------------------------------------------
 
-/// Bound the final GMP-API recheck so a slow or unreachable API can never hang
-/// the end of a verification run.
+/// Bound each GMP-API recheck attempt so a slow or unreachable API can never
+/// hang the end of a verification run.
 const GMP_API_RECHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Recheck attempts. The safety net is only worth anything if a transient API
+/// blip — or a message still transitioning `executing → executed` at the
+/// inactivity timeout — doesn't get read as a permanent failure. A few spaced
+/// attempts turn "one bad poll fails the route" into "the route is only failed
+/// if it's genuinely not executed."
+const GMP_API_RECHECK_ATTEMPTS: u32 = 3;
+/// Gap between recheck attempts (gives an in-flight final leg time to land and
+/// Axelarscan time to index it).
+const GMP_API_RECHECK_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Best-effort, non-fatal final check: ask the Axelarscan GMP API whether this
 /// message actually executed on-chain. A slow final leg or a missed poll can
 /// leave an executed transfer looking failed at the inactivity timeout (the
 /// MOU-3/MOU-4 failure mode); this is the safety net layered on top of those
-/// fixes. Any error or timeout falls back to `false` (keep the failed verdict).
+/// fixes. Retries a few times so a momentary API error/timeout — or a message
+/// that finishes executing during the recheck — is still recovered; only a
+/// consistently not-executed answer keeps the failed verdict.
 async fn gmp_api_reports_executed(network: crate::types::Network, message_id: &str) -> bool {
     let base = crate::gmp_api::base_url(network);
-    let lookup = async {
-        // Prefer the exact `message_id` Axelarscan keys on. If it isn't indexed
-        // in that form for this source chain, fall back to the source tx id
-        // (the portion before the event-index suffix).
-        if let Some(rec) = crate::gmp_api::search_by_message_id(base, message_id).await? {
-            return Ok::<bool, eyre::Report>(rec.is_executed());
+    for attempt in 0..GMP_API_RECHECK_ATTEMPTS {
+        let lookup = async {
+            // Prefer the exact `message_id` Axelarscan keys on. If it isn't
+            // indexed in that form for this source chain, fall back to the
+            // source tx id (the portion before the event-index suffix).
+            if let Some(rec) = crate::gmp_api::search_by_message_id(base, message_id).await? {
+                return Ok::<bool, eyre::Report>(rec.is_executed());
+            }
+            if let Some((source_tx, _)) = message_id.rsplit_once('-')
+                && let Some(rec) = crate::gmp_api::search_by_tx(base, source_tx).await?
+            {
+                return Ok(rec.is_executed());
+            }
+            Ok(false)
+        };
+        // Executed ⇒ done. Not-executed / not-found / API error ⇒ retry: the
+        // final leg may still be landing, or the API may be momentarily flaky.
+        if let Ok(Ok(true)) = tokio::time::timeout(GMP_API_RECHECK_TIMEOUT, lookup).await {
+            return true;
         }
-        if let Some((source_tx, _)) = message_id.rsplit_once('-')
-            && let Some(rec) = crate::gmp_api::search_by_tx(base, source_tx).await?
-        {
-            return Ok(rec.is_executed());
+        if attempt + 1 < GMP_API_RECHECK_ATTEMPTS {
+            tokio::time::sleep(GMP_API_RECHECK_BACKOFF).await;
         }
-        Ok(false)
-    };
-    match tokio::time::timeout(GMP_API_RECHECK_TIMEOUT, lookup).await {
-        Ok(Ok(executed)) => executed,
-        Ok(Err(_)) | Err(_) => false,
     }
+    false
 }
 
 /// Apply the final verdict to a tx that didn't reach [`Phase::Done`] before the
@@ -614,7 +632,23 @@ pub(super) async fn poll_pipeline<P: Provider>(
                         .collect()
                         .await;
                     for result in results {
-                        let (i, phase, approved, executed) = result?;
+                        // A persistent destination-RPC error (transient retries
+                        // already exhausted in `check_evm_*`) must NOT abort the
+                        // whole run — the message may well have executed on-chain
+                        // (e.g. a flaky/archive-gated dest RPC). Skip this tx for
+                        // this cycle and keep polling; `finalize_timed_out_txs`
+                        // does an authoritative GMP-API recheck at the inactivity
+                        // timeout and recovers it if it actually executed.
+                        let (i, phase, approved, executed) = match result {
+                            Ok(v) => v,
+                            Err(e) => {
+                                ui::warn(&format!(
+                                    "destination check RPC error (keeping in-flight for \
+                                     GMP-API recheck): {e}"
+                                ));
+                                continue;
+                            }
+                        };
                         match phase {
                             // Authoritative fast-path: the message is already
                             // executed on the destination gateway. Catches the
