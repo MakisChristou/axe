@@ -2,22 +2,21 @@
 //! Stellar-sourced `AxelarGateway.call_contract` invocations.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-use alloy::primitives::keccak256;
-use alloy::sol_types::SolValue;
-use eyre::{Result, eyre};
-use indicatif::ProgressBar;
-use rand::Rng;
-use tokio::sync::Mutex;
-
 use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+use super::submitter::TransactionSubmitter;
 use super::sustained;
 use crate::stellar::{
     StellarClient, StellarWallet, scval_address_account, scval_bytes, scval_string, scval_token,
 };
 use crate::ui;
+use alloy::primitives::keccak256;
+use alloy::sol_types::SolValue;
+use eyre::{Result, eyre};
+use indicatif::ProgressBar;
+use rand::Rng;
 
 /// Stellar classic-op base fee in stroops, plus the simulated Soroban
 /// resource fee added by the client. Set above the network's surge-pricing
@@ -144,6 +143,40 @@ async fn submit_single(request: SubmitRequest<'_>) -> TxMetrics {
     }
 }
 
+struct StellarSubmitter {
+    client: StellarClient,
+    example_contract: String,
+    gateway_contract: String,
+    destination_chain: String,
+    destination_address: String,
+    gas_token_contract: String,
+    gas_amount_stroops: u64,
+}
+
+struct StellarSubmitJob {
+    wallet: StellarWallet,
+    payload: Vec<u8>,
+}
+
+impl TransactionSubmitter for StellarSubmitter {
+    type Job = StellarSubmitJob;
+
+    async fn submit(&self, job: Self::Job) -> TxMetrics {
+        submit_single(SubmitRequest {
+            client: &self.client,
+            wallet: &job.wallet,
+            example_contract: &self.example_contract,
+            gateway_contract: &self.gateway_contract,
+            destination_chain: &self.destination_chain,
+            destination_address: &self.destination_address,
+            payload: &job.payload,
+            gas_token_contract: &self.gas_token_contract,
+            gas_amount_stroops: self.gas_amount_stroops,
+        })
+        .await
+    }
+}
+
 fn build_send_args(
     wallet: &StellarWallet,
     destination_chain: &str,
@@ -212,67 +245,35 @@ pub async fn run_burst(request: BurstRequest<'_>) -> Result<LoadTestReport> {
         gas_amount_stroops,
     } = request;
     let key_count = wallets.len();
-    let metrics_list: Arc<Mutex<Vec<TxMetrics>>> = Arc::new(Mutex::new(Vec::new()));
-    let confirmed = Arc::new(AtomicU64::new(0));
-    let spinner = ui::wait_spinner(&format!("sending (0/{key_count} confirmed)..."));
-    let test_start = Instant::now();
-
-    let client = Arc::new(client.clone());
-
-    let mut tasks = Vec::with_capacity(key_count);
-    for w in wallets {
-        let c = Arc::clone(&client);
-        let w = w.clone();
-        let ex = example_contract.clone();
-        let gw = gateway_contract.clone();
-        let dc = destination_chain.to_string();
-        let da = destination_address.to_string();
-        let payload = make_payload(&payload_override);
-        let gas_token = gas_token_contract.clone();
-        let gas = gas_amount_stroops;
-        let metrics_clone = Arc::clone(&metrics_list);
-        let counter = Arc::clone(&confirmed);
-        let sp = spinner.clone();
-        let total = key_count;
-        let handle = tokio::spawn(async move {
-            let m = submit_single(SubmitRequest {
-                client: &c,
-                wallet: &w,
-                example_contract: &ex,
-                gateway_contract: &gw,
-                destination_chain: &dc,
-                destination_address: &da,
-                payload: &payload,
-                gas_token_contract: &gas_token,
-                gas_amount_stroops: gas,
-            })
-            .await;
-            if m.is_success() {
-                let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                sp.set_message(format!("sending ({done}/{total} confirmed)..."));
-            }
-            metrics_clone.lock().await.push(m);
-        });
-        tasks.push(handle);
-    }
-
-    let total_submitted = tasks.len() as u64;
-    super::task_group::join_all(tasks).await?;
-    let test_duration = test_start.elapsed().as_secs_f64();
-    let confirmed_count = confirmed.load(Ordering::Relaxed);
-    spinner.finish_and_clear();
-    ui::success(&format!(
-        "sent {confirmed_count}/{total_submitted} confirmed"
-    ));
-
-    let metrics = metrics_list.lock().await.clone();
+    let jobs = wallets
+        .iter()
+        .cloned()
+        .map(|wallet| StellarSubmitJob {
+            wallet,
+            payload: make_payload(&payload_override),
+        })
+        .collect();
+    let burst = super::submitter::run_burst(
+        StellarSubmitter {
+            client: client.clone(),
+            example_contract,
+            gateway_contract,
+            destination_chain: destination_chain.to_string(),
+            destination_address: destination_address.to_string(),
+            gas_token_contract,
+            gas_amount_stroops,
+        },
+        jobs,
+        key_count,
+    )
+    .await?;
     Ok(build_burst_report(
-        metrics,
+        burst.metrics,
         source_chain,
         destination_chain,
         destination_address,
-        total_submitted,
-        test_duration,
+        burst.total_submitted,
+        burst.test_duration_secs,
         key_count,
     ))
 }

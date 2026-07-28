@@ -1,0 +1,132 @@
+//! Chain-neutral source transaction submission.
+//!
+//! A submitter owns the chain client and confirmation policy for one route.
+//! The shared driver owns concurrency, progress, task lifetime, and metric
+//! collection. Wallet preparation and transaction construction stay with the
+//! chain-specific module.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+use eyre::Result;
+use tokio::sync::Semaphore;
+
+use super::metrics::TxMetrics;
+use crate::ui;
+
+/// Submit and confirm one chain-specific, fully prepared transaction.
+pub(super) trait TransactionSubmitter: Send + Sync + 'static {
+    type Job: Send + 'static;
+
+    fn submit(&self, job: Self::Job) -> impl std::future::Future<Output = TxMetrics> + Send;
+}
+
+/// Chain-neutral output of a burst submission run.
+pub(super) struct BurstResult {
+    pub metrics: Vec<TxMetrics>,
+    pub total_submitted: u64,
+    pub test_duration_secs: f64,
+}
+
+/// Submit prepared jobs concurrently and collect their normalized metrics.
+pub(super) async fn run_burst<S>(
+    submitter: S,
+    jobs: Vec<S::Job>,
+    max_concurrent: usize,
+) -> Result<BurstResult>
+where
+    S: TransactionSubmitter,
+{
+    let total = jobs.len();
+    let total_submitted = total as u64;
+    let submitter = Arc::new(submitter);
+    let semaphore = Arc::new(Semaphore::new(max_concurrent.max(1)));
+    let confirmed = Arc::new(AtomicU64::new(0));
+    let spinner = ui::wait_spinner(&format!("sending (0/{total} confirmed)..."));
+    let test_start = Instant::now();
+
+    let tasks = jobs
+        .into_iter()
+        .map(|job| {
+            let submitter = Arc::clone(&submitter);
+            let semaphore = Arc::clone(&semaphore);
+            let confirmed = Arc::clone(&confirmed);
+            let spinner = spinner.clone();
+            tokio::spawn(async move {
+                let _permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .expect("burst semaphore closed unexpectedly");
+                let metrics = submitter.submit(job).await;
+                if metrics.is_success() {
+                    let done = confirmed.fetch_add(1, Ordering::Relaxed) + 1;
+                    spinner.set_message(format!("sending ({done}/{total} confirmed)..."));
+                }
+                metrics
+            })
+        })
+        .collect();
+
+    let metrics = super::task_group::join_all(tasks).await?;
+    let test_duration_secs = test_start.elapsed().as_secs_f64();
+    let confirmed_count = confirmed.load(Ordering::Relaxed);
+    spinner.finish_and_clear();
+    ui::success(&format!(
+        "sent {confirmed_count}/{total_submitted} confirmed"
+    ));
+
+    Ok(BurstResult {
+        metrics,
+        total_submitted,
+        test_duration_secs,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TransactionSubmitter, run_burst};
+    use crate::commands::load_test::metrics::TxMetrics;
+
+    struct FakeSubmitter;
+
+    impl TransactionSubmitter for FakeSubmitter {
+        type Job = u64;
+
+        async fn submit(&self, job: Self::Job) -> TxMetrics {
+            TxMetrics {
+                signature: job.to_string(),
+                submit_time_ms: 0,
+                confirm_time_ms: Some(0),
+                latency_ms: Some(0),
+                compute_units: None,
+                slot: None,
+                outcome: TxMetrics::succeeded_outcome(),
+                payload: Vec::new(),
+                payload_hash: String::new(),
+                source_address: String::new(),
+                gmp_destination_chain: String::new(),
+                gmp_destination_address: String::new(),
+                send_instant: None,
+                amplifier_timing: None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn burst_collects_each_submitted_job() {
+        let result = run_burst(FakeSubmitter, vec![1, 2, 3], 2)
+            .await
+            .expect("fake burst should succeed");
+
+        assert_eq!(result.total_submitted, 3);
+        assert_eq!(
+            result
+                .metrics
+                .iter()
+                .map(|metrics| metrics.signature.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "2", "3"]
+        );
+    }
+}

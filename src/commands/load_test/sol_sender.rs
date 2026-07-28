@@ -1,25 +1,21 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use alloy::primitives::keccak256;
+use super::LoadTestArgs;
+use super::keypairs;
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+use super::submitter::TransactionSubmitter;
+use super::sustained;
+use crate::solana;
+use crate::types::Network;
+use crate::ui;
 use alloy::sol_types::SolValue;
 use eyre::eyre;
-use indicatif::ProgressBar;
 use rand::Rng;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
-use tokio::sync::Mutex;
-
-use super::LoadTestArgs;
-use super::keypairs;
-use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
-use super::sustained;
-use crate::solana;
-use crate::types::Network;
-use crate::ui;
 
 /// Per-network funding hint for an empty Solana wallet. `solana airdrop`
 /// only works on devnet/testnet; on mainnet users have to source SOL
@@ -42,6 +38,43 @@ pub(super) fn make_payload(custom: &Option<Vec<u8>>) -> Vec<u8> {
             let suffix = hex::encode(buf);
             let message = format!("hello from axe load test {suffix}");
             (message,).abi_encode_params()
+        }
+    }
+}
+
+struct SolanaSubmitter {
+    rpc_url: String,
+    network: Network,
+    destination_chain: String,
+    destination_address: String,
+}
+
+struct SolanaSubmitJob {
+    signer: Arc<dyn Signer + Send + Sync>,
+    payload: Vec<u8>,
+}
+
+impl TransactionSubmitter for SolanaSubmitter {
+    type Job = SolanaSubmitJob;
+
+    fn submit(&self, job: Self::Job) -> impl std::future::Future<Output = TxMetrics> + Send {
+        let rpc_url = self.rpc_url.clone();
+        let network = self.network;
+        let destination_chain = self.destination_chain.clone();
+        let destination_address = self.destination_address.clone();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                send_sol_tx(
+                    &rpc_url,
+                    job.signer.as_ref(),
+                    network,
+                    &destination_chain,
+                    &destination_address,
+                    &job.payload,
+                )
+            })
+            .await
+            .expect("Solana submit task panicked")
         }
     }
 }
@@ -122,61 +155,28 @@ pub async fn run_load_test_with_metrics(
     let memo_program_id = super::evm_sender::memo_program_id(args.network);
     let (counter_pda, _) = Pubkey::find_program_address(&[b"counter"], &memo_program_id);
 
-    let metrics_list: Arc<Mutex<Vec<TxMetrics>>> = Arc::new(Mutex::new(Vec::new()));
-    let mut pending_tasks = Vec::new();
-
-    let test_start = Instant::now();
-    let solana_rpc = args.source_rpc.clone();
-
-    let confirmed_counter = Arc::new(AtomicU64::new(0));
-    let spinner = ui::wait_spinner(&format!("sending (0/{key_count} confirmed)..."));
-
-    // Fire all txs in parallel (one per keypair)
-    for i in 0..key_count {
-        let kp = Arc::clone(&keypairs[i]);
-        let dest_chain = args.destination_chain.clone();
-        let dest_addr = destination_address.to_string();
-        let tx_payload = if evm_destination {
-            make_payload(&payload)
-        } else {
-            super::evm_sender::make_executable_payload(&payload, &counter_pda)
-        };
-        let metrics_clone = Arc::clone(&metrics_list);
-        let rpc = solana_rpc.clone();
-        let counter = Arc::clone(&confirmed_counter);
-        let sp = spinner.clone();
-        let total = key_count;
-        let network = args.network;
-
-        let handle = tokio::spawn(async move {
-            execute_and_record(ExecuteRequest {
-                solana_rpc: &rpc,
-                keypair: kp,
-                network,
-                destination_chain: &dest_chain,
-                destination_address: &dest_addr,
-                payload: &tx_payload,
-                metrics: metrics_clone,
-                confirmed: counter,
-                spinner: sp,
-                total,
-            })
-            .await;
-        });
-        pending_tasks.push(handle);
-    }
-
-    let total_submitted = pending_tasks.len() as u64;
-    let test_duration = test_start.elapsed().as_secs_f64();
-
-    super::task_group::join_all(pending_tasks).await?;
-    let confirmed_count = confirmed_counter.load(Ordering::Relaxed);
-    spinner.finish_and_clear();
-    ui::success(&format!(
-        "sent {confirmed_count}/{total_submitted} confirmed"
-    ));
-
-    let metrics = metrics_list.lock().await.clone();
+    let jobs = keypairs
+        .iter()
+        .map(|keypair| SolanaSubmitJob {
+            signer: Arc::clone(keypair),
+            payload: if evm_destination {
+                make_payload(&payload)
+            } else {
+                super::evm_sender::make_executable_payload(&payload, &counter_pda)
+            },
+        })
+        .collect();
+    let burst = super::submitter::run_burst(
+        SolanaSubmitter {
+            rpc_url: args.source_rpc.clone(),
+            network: args.network,
+            destination_chain: args.destination_chain.clone(),
+            destination_address: destination_address.to_string(),
+        },
+        jobs,
+        key_count,
+    )
+    .await?;
     let report = LoadTestReport::from_transactions(
         ReportInput {
             source_chain: args.source_chain.clone(),
@@ -184,11 +184,11 @@ pub async fn run_load_test_with_metrics(
             destination_address: destination_address.to_string(),
             num_txs: args.num_txs,
             num_keys: key_count,
-            total_submitted,
-            test_duration_secs: test_duration,
+            total_submitted: burst.total_submitted,
+            test_duration_secs: burst.test_duration_secs,
             compute_unit_summary: ComputeUnitSummary::Include,
         },
-        metrics,
+        burst.metrics,
     );
 
     Ok(report)
@@ -406,75 +406,4 @@ pub(super) async fn run_sustained_load_test_with_metrics(
         total_expected,
         pool_size,
     ))
-}
-
-struct ExecuteRequest<'a> {
-    solana_rpc: &'a str,
-    keypair: Arc<dyn Signer + Send + Sync>,
-    network: Network,
-    destination_chain: &'a str,
-    destination_address: &'a str,
-    payload: &'a [u8],
-    metrics: Arc<Mutex<Vec<TxMetrics>>>,
-    confirmed: Arc<AtomicU64>,
-    spinner: ProgressBar,
-    total: usize,
-}
-
-async fn execute_and_record(request: ExecuteRequest<'_>) {
-    let ExecuteRequest {
-        solana_rpc,
-        keypair,
-        network,
-        destination_chain: dest_chain,
-        destination_address: dest_addr,
-        payload,
-        metrics: metrics_list,
-        confirmed: confirmed_counter,
-        spinner,
-        total,
-    } = request;
-    let submit_start = Instant::now();
-
-    let source_addr = keypair.pubkey().to_string();
-    let payload_hash = alloy::hex::encode(keccak256(payload));
-
-    match solana::send_call_contract(
-        solana_rpc,
-        keypair.as_ref(),
-        network,
-        dest_chain,
-        dest_addr,
-        payload,
-    ) {
-        Ok((_sig, mut metrics)) => {
-            metrics.payload = payload.to_vec();
-            metrics.payload_hash = payload_hash;
-            metrics.source_address = source_addr;
-            metrics.send_instant = Some(submit_start);
-            let done = confirmed_counter.fetch_add(1, Ordering::Relaxed) + 1;
-            spinner.set_message(format!("sending ({done}/{total} confirmed)..."));
-            metrics_list.lock().await.push(metrics);
-        }
-        Err(e) => {
-            let elapsed_ms = submit_start.elapsed().as_millis() as u64;
-            let metrics = TxMetrics {
-                signature: String::new(),
-                submit_time_ms: elapsed_ms,
-                confirm_time_ms: Option::None,
-                latency_ms: Option::None,
-                compute_units: Option::None,
-                slot: Option::None,
-                outcome: TxMetrics::failed_outcome(e.to_string()),
-                payload: Vec::new(),
-                payload_hash: String::new(),
-                source_address: String::new(),
-                gmp_destination_chain: String::new(),
-                gmp_destination_address: String::new(),
-                send_instant: None,
-                amplifier_timing: None,
-            };
-            metrics_list.lock().await.push(metrics);
-        }
-    }
 }

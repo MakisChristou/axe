@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 /// How long to wait for an EVM tx receipt before giving up.
@@ -7,6 +7,13 @@ use std::time::{Duration, Instant};
 /// networks enough room while still catching silently-dropped txs.
 const EVM_RECEIPT_TIMEOUT: Duration = Duration::from_secs(60);
 
+use super::LoadTestArgs;
+use super::keypairs;
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+use super::submitter::TransactionSubmitter;
+use crate::evm::{ContractCall, SenderReceiver};
+use crate::types::Network;
+use crate::ui;
 use alloy::{
     primitives::{Address, Bytes, FixedBytes, keccak256},
     providers::{Provider, ProviderBuilder},
@@ -17,15 +24,6 @@ use alloy::{
 use eyre::eyre;
 use rand::Rng;
 use solana_sdk::pubkey::Pubkey;
-use tokio::sync::Mutex;
-use tokio::sync::Semaphore;
-
-use super::LoadTestArgs;
-use super::keypairs;
-use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
-use crate::evm::{ContractCall, SenderReceiver};
-use crate::types::Network;
-use crate::ui;
 
 /// Solana memo program address for the target network.
 pub fn memo_program_id(network: Network) -> Pubkey {
@@ -117,6 +115,45 @@ pub fn make_executable_payload(custom: &Option<Vec<u8>>, counter_pda: &Pubkey) -
     full_payload
 }
 
+struct EvmSubmitter {
+    rpc_url: reqwest::Url,
+    sender_receiver: Address,
+    destination_chain: String,
+    destination_address: String,
+    gas_value_wei: u128,
+    fee_mode: super::gas_mode::EvmFeeMode,
+}
+
+struct EvmSubmitJob {
+    signer: PrivateKeySigner,
+    payload: Vec<u8>,
+}
+
+impl TransactionSubmitter for EvmSubmitter {
+    type Job = EvmSubmitJob;
+
+    async fn submit(&self, job: Self::Job) -> TxMetrics {
+        let provider = ProviderBuilder::new()
+            .wallet(job.signer)
+            .connect_http(self.rpc_url.clone());
+        super::retry::rate_limited(|| {
+            execute_and_record_evm(
+                &provider,
+                self.sender_receiver,
+                &self.destination_chain,
+                &self.destination_address,
+                &job.payload,
+                self.gas_value_wei,
+                EvmTxOpts {
+                    nonce: None,
+                    fee_mode: self.fee_mode,
+                },
+            )
+        })
+        .await
+    }
+}
+
 /// Run EVM load test with parallel sends from derived wallets.
 ///
 /// Derives N EVM signers from the main private key, funds them, then fires
@@ -187,79 +224,36 @@ pub async fn run_load_test_with_metrics(
     // to each send. No-op on 1559 chains.
     let fee_mode = super::gas_mode::EvmFeeMode::detect(&funding_provider).await?;
 
-    // Fire txs in parallel, capped to avoid overwhelming the RPC.
     // Each send does multiple RPC calls (estimate gas, nonce, send, receipt),
-    // so even 10 concurrent senders means ~40+ RPC calls in flight.
+    // so cap concurrency to avoid overwhelming the RPC.
     const MAX_CONCURRENT_SENDS: usize = 100;
-
-    let metrics_list: Arc<Mutex<Vec<TxMetrics>>> = Arc::new(Mutex::new(Vec::new()));
-    let confirmed_counter = Arc::new(AtomicU64::new(0));
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SENDS));
-    let spinner = ui::wait_spinner(&format!("sending (0/{num_txs} confirmed)..."));
-    let test_start = Instant::now();
-
-    let mut tasks = Vec::with_capacity(num_txs);
     let dest_chain = args.destination_chain.clone();
     let dest_addr = destination_address.to_string();
-
-    for signer in &derived {
-        let tx_payload = if evm_destination {
-            super::sol_sender::make_payload(&payload)
-        } else {
-            make_executable_payload(&payload, &counter_pda)
-        };
-        let metrics_clone = Arc::clone(&metrics_list);
-        let counter = Arc::clone(&confirmed_counter);
-        let sem = Arc::clone(&semaphore);
-        let sp = spinner.clone();
-        let total = num_txs;
-        let dc = dest_chain.clone();
-        let da = dest_addr.clone();
-        let sr = sender_receiver_addr;
-        let gv = gas_value_wei;
-
-        // Each task gets its own provider with its own signer — no nonce contention
-        let provider = ProviderBuilder::new()
-            .wallet(signer.clone())
-            .connect_http(evm_rpc_url.parse()?);
-        let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-
-            let m = super::retry::rate_limited(|| {
-                execute_and_record_evm(
-                    &provider,
-                    sr,
-                    &dc,
-                    &da,
-                    &tx_payload,
-                    gv,
-                    EvmTxOpts {
-                        nonce: None,
-                        fee_mode,
-                    },
-                )
-            })
-            .await;
-            if m.is_success() {
-                let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                sp.set_message(format!("sending ({done}/{total} confirmed)..."));
-            }
-            metrics_clone.lock().await.push(m);
-        });
-        tasks.push(handle);
-    }
-
-    let total_submitted = tasks.len() as u64;
-    super::task_group::join_all(tasks).await?;
-    let test_duration = test_start.elapsed().as_secs_f64();
-
-    let confirmed_count = confirmed_counter.load(Ordering::Relaxed);
-    spinner.finish_and_clear();
-    ui::success(&format!(
-        "sent {confirmed_count}/{total_submitted} confirmed"
-    ));
-
-    let metrics = metrics_list.lock().await.clone();
+    let jobs = derived
+        .into_iter()
+        .map(|signer| EvmSubmitJob {
+            signer,
+            payload: if evm_destination {
+                super::sol_sender::make_payload(&payload)
+            } else {
+                make_executable_payload(&payload, &counter_pda)
+            },
+        })
+        .collect();
+    let burst = super::submitter::run_burst(
+        EvmSubmitter {
+            rpc_url: evm_rpc_url.parse()?,
+            sender_receiver: sender_receiver_addr,
+            destination_chain: dest_chain.clone(),
+            destination_address: dest_addr.clone(),
+            gas_value_wei,
+            fee_mode,
+        },
+        jobs,
+        MAX_CONCURRENT_SENDS,
+    )
+    .await?;
+    let metrics = burst.metrics;
     let total_failed = metrics.iter().filter(|m| !m.is_success()).count() as u64;
 
     // Show error breakdown if there were failures
@@ -287,8 +281,8 @@ pub async fn run_load_test_with_metrics(
             destination_address: dest_addr,
             num_txs: args.num_txs,
             num_keys: num_txs,
-            total_submitted,
-            test_duration_secs: test_duration,
+            total_submitted: burst.total_submitted,
+            test_duration_secs: burst.test_duration_secs,
             compute_unit_summary: ComputeUnitSummary::Omit,
         },
         metrics,

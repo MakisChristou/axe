@@ -27,6 +27,7 @@ mod retry;
 mod run_sizing;
 mod sol_sender;
 mod stellar_sender;
+mod submitter;
 mod sustained;
 mod task_group;
 mod verify;
