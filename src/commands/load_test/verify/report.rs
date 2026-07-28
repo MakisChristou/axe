@@ -92,13 +92,13 @@ pub(super) fn compute_verification_report(
         if tx.idx < metrics.len() {
             metrics[tx.idx].amplifier_timing = Some(tx.timing.clone());
         }
-        if tx.recovered_via_api {
+        if tx.recovered_via_api() {
             recovered_via_api += 1;
         }
-        if tx.failed {
+        if tx.is_failed() {
             failed += 1;
-            if let Some(ref reason) = tx.fail_reason {
-                *failure_reasons.entry(reason.clone()).or_insert(0) += 1;
+            if let Some(reason) = tx.failure_reason() {
+                *failure_reasons.entry(reason.to_string()).or_insert(0) += 1;
 
                 // Categorize stuck txs by the phase they got stuck at
                 if reason.contains("timed out") {
@@ -178,14 +178,13 @@ pub(super) fn compute_verification_report(
 
 /// Determine which phase a timed-out tx got stuck at (the last phase it didn't complete).
 fn stuck_phase(tx: &PendingTx) -> String {
-    match tx.phase {
+    match tx.phase().expect("failed tx retains its last active phase") {
         Phase::Voted => "voted".into(),
         Phase::Routed => "routed".into(),
         Phase::HubApproved => "hub approved".into(),
         Phase::DiscoverSecondLeg => "second-leg discovery".into(),
         Phase::Approved => "approved".into(),
         Phase::Executed => "executed".into(),
-        Phase::Done => "done".into(),
     }
 }
 

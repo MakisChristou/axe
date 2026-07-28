@@ -13,49 +13,21 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use eyre::{Result, eyre};
-use futures::future::join_all;
-use rand::RngCore;
 use tokio::sync::Mutex;
 
+use super::its_prerequisites::{self, GatewayRequirement};
 use super::its_stellar_source::{
-    self, SustainedTransferArgs, SustainedTransferContext, TransferRequest,
+    self, RemoteDeploymentVerifier, SustainedTransferArgs, SustainedTransferContext,
+    TokenSetupRequest, TransferRequest, amount_per_key, derive_and_fund_wallets,
+    distribute_token_balances, parse_gas_stroops, setup_token, transfer_amount,
 };
 use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
 use super::run_sizing::RunSizing;
 use super::sustained;
-use super::{LoadTestArgs, finish_report, read_its_cache, save_its_cache, validate_evm_rpc};
+use super::{LoadTestArgs, finish_report, validate_evm_rpc};
 use crate::config::ChainsConfig;
 use crate::stellar::{StellarClient, StellarWallet};
 use crate::ui;
-
-/// AXE token parameters on Stellar — match the EVM/Solana siblings so the
-/// human-facing name is consistent across runs.
-const TOKEN_NAME: &str = "AXE";
-const TOKEN_SYMBOL: &str = "AXE";
-/// 7 decimals matches Stellar's native XLM convention. Used only for the
-/// FRESH-deploy path; the reuse path adopts the existing token's decimals
-/// (queried via `StellarClient::token_decimals`). Token amounts on the
-/// destination chain are scaled by ITS during routing.
-const TOKEN_DECIMALS: u32 = 7;
-
-/// Whole tokens transferred per tx / seeded per key. Scaled by the resolved
-/// token's actual on-chain decimals at runtime — the reused canonical AXE is
-/// 18 decimals (100 AXE = 1e20, which overflows u64), so amounts are u128.
-const WHOLE_TOKENS_PER_TX: u128 = 1;
-/// Distribute 100x per key so cached tokens last across many runs.
-const WHOLE_TOKENS_PER_KEY: u128 = WHOLE_TOKENS_PER_TX * 100;
-/// Initial supply minted to the deployer at deploy time (fresh-deploy path,
-/// TOKEN_DECIMALS = 7). Plenty for many runs without redeploying.
-const INITIAL_SUPPLY: u128 = 1_000_000 * 10_000_000;
-
-/// Scale a whole-token count to a token's on-chain decimals (`n * 10^decimals`).
-fn scale_to_decimals(whole_tokens: u128, decimals: u32) -> u128 {
-    whole_tokens * 10u128.pow(decimals)
-}
-
-/// Default cross-chain gas payment in stroops (10 XLM). Matches the GMP
-/// runner's default — overridable via `--gas-value`.
-const DEFAULT_GAS_STROOPS: u64 = 100_000_000;
 
 pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> Result<()> {
     let src = &args.source_chain;
@@ -65,7 +37,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
     validate_evm_rpc(&evm_rpc_url).await?;
 
     let cfg = ChainsConfig::load(&args.config)?;
-    verify_axelar_prerequisites(&cfg, dest)?;
+    its_prerequisites::verify(&cfg, dest, GatewayRequirement::AmplifierOnly)?;
 
     ui::kv("source", src);
     ui::kv("destination", dest);
@@ -75,27 +47,30 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
     let evm = resolve_evm_targets(&cfg, dest)?;
     let gas_stroops = parse_gas_stroops(args.gas_value.as_deref())?;
 
-    let (token_id, _salt, token_address, decimals) = setup_its_token(TokenSetupRequest {
+    let remote_verifier = EvmRemoteDeployment {
+        gateway: evm.evm_gateway_addr,
+        rpc_url: &evm_rpc_url,
+    };
+    let token = setup_token(TokenSetupRequest {
         client: &stellar.client,
         main_wallet: &stellar.main_wallet,
         its_contract: &stellar.its_addr,
         gateway_contract: &stellar.gateway_addr,
-        xlm_token: &stellar.xlm_addr,
+        gas_token: &stellar.xlm_addr,
         gas_stroops,
         source_chain: src,
         destination_chain: dest,
         destination_axelar_id: &args.destination_axelar_id,
         token_id_override: args.token_id.as_deref(),
         config: &args.config,
-        evm_gateway: evm.evm_gateway_addr,
-        evm_rpc_url: &evm_rpc_url,
-        num_txs: sizing.num_keys,
+        required_transfers: sizing.num_keys,
+        remote_verifier: &remote_verifier,
     })
     .await?;
-    ui::kv("token ID", &hex::encode(token_id));
-    ui::address("token contract (Stellar)", &token_address);
+    ui::kv("token ID", &hex::encode(token.token_id));
+    ui::address("token contract (Stellar)", &token.token_address);
     // /100 → 0.01 whole tokens per tx so the cron's source-side supply lasts.
-    let amount_per_tx = scale_to_decimals(WHOLE_TOKENS_PER_TX, decimals) / 100;
+    let amount_per_tx = transfer_amount(token.decimals);
 
     // Burst: 1 tx/key. Sustained: each derived key serves `key_cycle` txs in
     // its rotation slot before rotating out, so fund it for that many gas
@@ -111,11 +86,11 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
     )
     .await?;
 
-    let amount_per_key = compute_amount_per_key(&sizing, args.key_cycle, decimals);
+    let amount_per_key = amount_per_key(&sizing, args.key_cycle, token.decimals);
     distribute_token_balances(
         &stellar.client,
         &stellar.main_wallet,
-        &token_address,
+        &token.token_address,
         &wallets,
         amount_per_key,
     )
@@ -126,7 +101,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
         stellar: &stellar,
         evm: &evm,
         sizing: &sizing,
-        token_id,
+        token_id: token.token_id,
         gas_stroops,
         amount_per_tx,
     };
@@ -156,28 +131,41 @@ struct EvmTargets {
     axelarnet_gw_addr: String,
 }
 
+struct EvmRemoteDeployment<'a> {
+    gateway: alloy::primitives::Address,
+    rpc_url: &'a str,
+}
+
+impl RemoteDeploymentVerifier for EvmRemoteDeployment<'_> {
+    async fn wait_for_remote_deploy(
+        &self,
+        config: &std::path::Path,
+        source_axelar_id: &str,
+        destination_axelar_id: &str,
+        message_id: &str,
+    ) -> Result<()> {
+        super::verify::wait_for_its_remote_deploy(
+            config,
+            source_axelar_id,
+            destination_axelar_id,
+            message_id,
+            self.gateway,
+            self.rpc_url,
+        )
+        .await
+    }
+
+    fn after_remote_deploy(&self, source_chain: &str, token_id: [u8; 32]) {
+        super::helpers::hint_persist_axe_token(
+            source_chain,
+            &alloy::primitives::FixedBytes::from(token_id),
+        );
+    }
+}
+
 /// Verify Axelar-side prerequisites (cosmos Gateway for `dest`, global
 /// AxelarnetGateway). Bails with the existing error strings if either is
 /// missing.
-fn verify_axelar_prerequisites(cfg: &ChainsConfig, dest: &str) -> Result<()> {
-    // A legacy (consensus) destination has no Cosmos Gateway and is verified on
-    // its on-chain gateway instead; only amplifier dests need the Cosmos Gateway.
-    let dest_amplifier = cfg.axelar.contract_address("VotingVerifier", dest).is_ok();
-    if dest_amplifier && cfg.axelar.contract_address("Gateway", dest).is_err() {
-        eyre::bail!(
-            "destination chain '{dest}' has no Cosmos Gateway in the config — verification would fail."
-        );
-    }
-    if cfg
-        .axelar
-        .global_contract_address("AxelarnetGateway")
-        .is_err()
-    {
-        eyre::bail!("no AxelarnetGateway address in config — required for ITS load test");
-    }
-    Ok(())
-}
-
 /// Read Stellar source-chain config (network type, contract addresses), build
 /// the RPC client, load the main wallet, and ensure it is activated
 /// (Friendbot on testnet/futurenet, else bail).
@@ -261,71 +249,6 @@ fn resolve_evm_targets(cfg: &ChainsConfig, dest: &str) -> Result<EvmTargets> {
     })
 }
 
-/// Parse the user-supplied gas value (XLM stroops), defaulting to
-/// `DEFAULT_GAS_STROOPS`, and emit the matching UI line. ITS routes via the
-/// hub (two commands: source→hub, hub→destination), so we pay 2× the
-/// per-command gas value.
-fn parse_gas_stroops(gas_value: Option<&str>) -> Result<u64> {
-    let gas_stroops: u64 = match gas_value {
-        Some(v) => v
-            .parse::<u64>()
-            .map_err(|e| eyre!("invalid --gas-value: {e}"))?,
-        None => DEFAULT_GAS_STROOPS,
-    }
-    .saturating_mul(2);
-    ui::kv(
-        "gas",
-        &format!(
-            "{gas_stroops} stroops ({:.4} XLM)",
-            gas_stroops as f64 / 10_000_000.0
-        ),
-    );
-    Ok(gas_stroops)
-}
-
-/// Derive ephemeral Stellar wallets from the main wallet's seed and ensure
-/// each one is activated.
-async fn derive_and_fund_wallets(
-    stellar_client: &StellarClient,
-    main_wallet: &StellarWallet,
-    num_keys: usize,
-    use_friendbot: bool,
-    gas_stroops: u64,
-    txs_per_key: u64,
-) -> Result<Vec<StellarWallet>> {
-    ui::info(&format!("deriving {num_keys} Stellar keys..."));
-    let main_seed = main_wallet.signing_key.to_bytes();
-    let wallets = super::stellar_sender::derive_wallets(&main_seed, num_keys)?;
-    let _ = main_seed;
-    let mainnet_starting_balance =
-        super::stellar_sender::mainnet_per_key_balance_stroops(gas_stroops, txs_per_key);
-    super::stellar_sender::ensure_funded(
-        stellar_client,
-        &wallets,
-        use_friendbot,
-        main_wallet,
-        mainnet_starting_balance,
-    )
-    .await?;
-    Ok(wallets)
-}
-
-/// Compute per-key AXE distribution amount, scaled to the resolved token's
-/// `decimals`: a fixed per-key amount in burst mode, or
-/// `2 * amount_per_tx * txs_per_key` in sustained so each wallet has
-/// double-headroom for the planned cycle.
-fn compute_amount_per_key(sizing: &RunSizing, key_cycle: u64, decimals: u32) -> u128 {
-    if sizing.is_burst() {
-        scale_to_decimals(WHOLE_TOKENS_PER_KEY, decimals) / 100
-    } else {
-        let (_, duration_secs, _) = sizing.sustained().expect("sustained mode");
-        let txs_per_key = duration_secs.div_ceil(key_cycle) as u128;
-        (scale_to_decimals(WHOLE_TOKENS_PER_TX, decimals) / 100)
-            .saturating_mul(txs_per_key)
-            .saturating_mul(2)
-    }
-}
-
 /// Drive the sustained-mode pipeline: spawn the streaming verifier, run the
 /// Stellar ITS sustained loop, stitch amplifier timings back into the report,
 /// and hand off to `finish_report`.
@@ -370,9 +293,21 @@ async fn run_sustained_pipeline(
     let vnetwork = args.network;
     let verify_handle = tokio::spawn(async move {
         let spinner = spinner_rx.await.expect("spinner channel dropped");
-        super::verify::verify_onchain_evm_its_streaming(
-            &vconfig, &vsource, &vdest, vnetwork, vgw, &vdest_rpc, verify_rx, vdone, spinner,
-        )
+        super::verify::verify_onchain_evm_its_streaming(super::verify::StreamingVerification {
+            route: super::verify::VerificationRoute {
+                config: &vconfig,
+                source_chain: &vsource,
+                destination_chain: &vdest,
+                network: vnetwork,
+            },
+            destination: super::verify::EvmItsDestination {
+                gateway_addr: vgw,
+                rpc_url: &vdest_rpc,
+            },
+            rx: verify_rx,
+            send_done: vdone,
+            spinner,
+        })
         .await
     });
 
@@ -403,7 +338,7 @@ async fn run_sustained_pipeline(
         send_done: Some(send_done),
         spinner,
     })
-    .await;
+    .await?;
 
     let mut report = sustained::build_sustained_report(
         result,
@@ -488,7 +423,7 @@ async fn run_burst_pipeline(
                 gmp_dest_address: &gmp_dest_addr,
             })
             .await;
-            if m.success {
+            if m.is_success() {
                 let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 sp.set_message(format!("sending ({done}/{total} confirmed)..."));
             }
@@ -498,7 +433,7 @@ async fn run_burst_pipeline(
     }
 
     let total_submitted = tasks.len() as u64;
-    join_all(tasks).await;
+    super::task_group::join_all(tasks).await?;
     let test_duration = test_start.elapsed().as_secs_f64();
     let confirmed_count = confirmed.load(Ordering::Relaxed);
     spinner.finish_and_clear();
@@ -521,308 +456,21 @@ async fn run_burst_pipeline(
         metrics,
     );
 
-    let verification = super::verify::verify_onchain_evm_its(
-        &args.config,
-        &args.source_axelar_id,
-        &args.destination_axelar_id,
-        args.network,
-        &format!("{}", evm.evm_its_addr),
-        evm.evm_gateway_addr,
-        &args.destination_rpc,
-        &mut report.transactions,
-    )
+    let verification = super::verify::verify_onchain_evm_its(super::verify::ItsBatchVerification {
+        route: super::verify::VerificationRoute {
+            config: &args.config,
+            source_chain: &args.source_axelar_id,
+            destination_chain: &args.destination_axelar_id,
+            network: args.network,
+        },
+        destination: super::verify::EvmItsDestination {
+            gateway_addr: evm.evm_gateway_addr,
+            rpc_url: &args.destination_rpc,
+        },
+        metrics: &mut report.transactions,
+    })
     .await?;
     report.verification = Some(verification);
 
     finish_report(args, &mut report, test_start)
-}
-
-// ---------------------------------------------------------------------------
-// Token setup
-// ---------------------------------------------------------------------------
-
-struct TokenSetupRequest<'a> {
-    client: &'a StellarClient,
-    main_wallet: &'a StellarWallet,
-    its_contract: &'a str,
-    gateway_contract: &'a str,
-    xlm_token: &'a str,
-    gas_stroops: u64,
-    source_chain: &'a str,
-    destination_chain: &'a str,
-    destination_axelar_id: &'a str,
-    token_id_override: Option<&'a str>,
-    config: &'a std::path::Path,
-    evm_gateway: alloy::primitives::Address,
-    evm_rpc_url: &'a str,
-    num_txs: usize,
-}
-
-async fn setup_its_token(
-    request: TokenSetupRequest<'_>,
-) -> Result<([u8; 32], [u8; 32], String, u32)> {
-    let TokenSetupRequest {
-        client,
-        main_wallet,
-        its_contract,
-        gateway_contract,
-        xlm_token,
-        gas_stroops,
-        source_chain: src,
-        destination_chain: dest,
-        destination_axelar_id: dest_axelar_id,
-        token_id_override,
-        config,
-        evm_gateway: evm_gateway_addr,
-        evm_rpc_url,
-        num_txs,
-    } = request;
-    if let Some(tid_hex) = token_id_override {
-        let tid_bytes = hex::decode(tid_hex.strip_prefix("0x").unwrap_or(tid_hex))
-            .map_err(|e| eyre!("invalid --token-id: {e}"))?;
-        if tid_bytes.len() != 32 {
-            return Err(eyre!("--token-id must be 32 bytes"));
-        }
-        let mut token_id = [0u8; 32];
-        token_id.copy_from_slice(&tid_bytes);
-        let token_addr = client
-            .its_query_token_address(main_wallet, its_contract, token_id)
-            .await?
-            .ok_or_else(|| eyre!("token id {tid_hex} not registered on Stellar ITS"))?;
-        let decimals = client
-            .token_decimals(&main_wallet.public_key_bytes, &token_addr)
-            .await?;
-        ui::kv("token ID (provided)", tid_hex);
-        return Ok((token_id, [0u8; 32], token_addr, decimals));
-    }
-
-    // chains-config pre-registered AXE: per-source override that lets CI skip
-    // the full deploy + hub-routed remote-deploy and collapse to a single
-    // interchainTransfer — but only when the configured wallet actually holds
-    // enough AXE. A wallet with no balance falls through to the local cache /
-    // fresh-deploy path, exactly like the manual deploy case. Salt is unknown
-    // when we adopt a pre-registered token, so the second return value is the
-    // zero salt.
-    if let Some(tid) = super::helpers::read_pre_registered_axe_token(config, src)?
-        && let Some(token_addr) = client
-            .its_query_token_address(main_wallet, its_contract, tid.0)
-            .await?
-    {
-        let decimals = client
-            .token_decimals(&main_wallet.public_key_bytes, &token_addr)
-            .await?;
-        let needed =
-            scale_to_decimals(WHOLE_TOKENS_PER_KEY, decimals).saturating_mul(num_txs as u128);
-        let bal = client
-            .token_balance(main_wallet, &token_addr, &main_wallet.public_key_bytes)
-            .await
-            .unwrap_or(0);
-        if bal >= needed {
-            ui::kv("token ID (chains-config)", &format!("{tid}"));
-            ui::address("token contract (Stellar)", &token_addr);
-            return Ok((tid.0, [0u8; 32], token_addr, decimals));
-        }
-        ui::warn(&format!(
-            "chains-config AXE balance too low ({bal} < {needed}); configured wallet \
-             isn't the workflow deployer — deploying fresh..."
-        ));
-    }
-
-    let cache = read_its_cache(src, dest);
-    if let Some(tid_hex) = cache.get("tokenId").and_then(|v| v.as_str())
-        && let Some(salt_hex) = cache.get("salt").and_then(|v| v.as_str())
-    {
-        let tid_bytes = hex::decode(tid_hex.strip_prefix("0x").unwrap_or(tid_hex)).ok();
-        let salt_bytes_v = hex::decode(salt_hex.strip_prefix("0x").unwrap_or(salt_hex)).ok();
-        if let (Some(tid), Some(s)) = (tid_bytes, salt_bytes_v)
-            && tid.len() == 32
-            && s.len() == 32
-        {
-            let mut token_id = [0u8; 32];
-            token_id.copy_from_slice(&tid);
-            let mut salt = [0u8; 32];
-            salt.copy_from_slice(&s);
-            // Verify token still exists + deployer has enough supply.
-            if let Ok(Some(token_addr)) = client
-                .its_query_token_address(main_wallet, its_contract, token_id)
-                .await
-            {
-                let decimals = client
-                    .token_decimals(&main_wallet.public_key_bytes, &token_addr)
-                    .await?;
-                let needed = scale_to_decimals(WHOLE_TOKENS_PER_KEY, decimals)
-                    .saturating_mul(num_txs as u128);
-                let bal = client
-                    .token_balance(main_wallet, &token_addr, &main_wallet.public_key_bytes)
-                    .await
-                    .unwrap_or(0);
-                if bal >= needed {
-                    ui::info(&format!("reusing cached ITS token: {token_addr}"));
-                    return Ok((token_id, salt, token_addr, decimals));
-                }
-                ui::warn(&format!(
-                    "cached AXE token has insufficient supply ({bal} < {needed}), deploying fresh..."
-                ));
-            } else {
-                ui::warn(
-                    "cached AXE token no longer registered on Stellar ITS, deploying fresh...",
-                );
-            }
-        }
-    }
-
-    // Deploy fresh.
-    let mut salt = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut salt);
-
-    ui::info("deploying new ITS token on Stellar...");
-    ui::kv("name", TOKEN_NAME);
-    ui::kv("symbol", TOKEN_SYMBOL);
-    ui::kv("decimals", &TOKEN_DECIMALS.to_string());
-    ui::kv("supply", &INITIAL_SUPPLY.to_string());
-
-    let (deploy_invoked, token_id_opt) = client
-        .its_deploy_interchain_token(crate::stellar::DeployInterchainTokenRequest {
-            wallet: main_wallet,
-            its_contract,
-            salt,
-            decimals: TOKEN_DECIMALS,
-            name: TOKEN_NAME,
-            symbol: TOKEN_SYMBOL,
-            initial_supply: INITIAL_SUPPLY,
-        })
-        .await?;
-    if !deploy_invoked.success {
-        return Err(eyre!("Stellar deploy_interchain_token failed"));
-    }
-    let token_id =
-        token_id_opt.ok_or_else(|| eyre!("deploy_interchain_token returned no token_id"))?;
-    ui::tx_hash("Stellar deploy", &deploy_invoked.tx_hash_hex);
-    ui::kv("token ID", &hex::encode(token_id));
-
-    let token_address = client
-        .its_query_token_address(main_wallet, its_contract, token_id)
-        .await?
-        .ok_or_else(|| eyre!("could not resolve interchain_token_address after deploy"))?;
-    ui::address("token contract", &token_address);
-
-    // Register on EVM destination via ITS hub.
-    ui::info(&format!("deploying remote AXE token to {dest}..."));
-    let remote_invoked = client
-        .its_deploy_remote_interchain_token(crate::stellar::DeployRemoteInterchainTokenRequest {
-            wallet: main_wallet,
-            its_contract,
-            gateway_contract,
-            salt,
-            destination_chain: dest_axelar_id,
-            gas_token: xlm_token,
-            gas_amount: gas_stroops,
-        })
-        .await?;
-    if !remote_invoked.success {
-        return Err(eyre!("Stellar deploy_remote_interchain_token failed"));
-    }
-    ui::tx_hash("Stellar remote-deploy", &remote_invoked.tx_hash_hex);
-    let event_index = remote_invoked.event_index.unwrap_or(0);
-    let deploy_message_id = format!(
-        "0x{}-{event_index}",
-        remote_invoked.tx_hash_hex.to_lowercase()
-    );
-
-    // Wait for it to land on EVM.
-    super::verify::wait_for_its_remote_deploy(
-        config,
-        &super::axelar_id_for_chain(config, src)?,
-        dest_axelar_id,
-        &deploy_message_id,
-        evm_gateway_addr,
-        evm_rpc_url,
-    )
-    .await?;
-
-    // Cache.
-    let mut cache = cache;
-    cache["tokenId"] = serde_json::json!(format!("0x{}", hex::encode(token_id)));
-    cache["salt"] = serde_json::json!(format!("0x{}", hex::encode(salt)));
-    cache["tokenAddress"] = serde_json::json!(token_address);
-    save_its_cache(src, dest, &cache)?;
-
-    super::helpers::hint_persist_axe_token(src, &alloy::primitives::FixedBytes::from(token_id));
-
-    Ok((token_id, salt, token_address, TOKEN_DECIMALS))
-}
-
-// ---------------------------------------------------------------------------
-// Distribution
-// ---------------------------------------------------------------------------
-
-async fn distribute_token_balances(
-    client: &StellarClient,
-    main_wallet: &StellarWallet,
-    token_contract: &str,
-    wallets: &[StellarWallet],
-    amount_per_key: u128,
-) -> Result<()> {
-    // First, see who needs topping up (skip wallets that already have enough).
-    let pb_check = indicatif::ProgressBar::new(wallets.len() as u64);
-    pb_check.set_style(
-        indicatif::ProgressStyle::with_template("  {bar:40.cyan/dim} {pos}/{len} balances checked")
-            .unwrap()
-            .progress_chars("=> "),
-    );
-    let mut to_fund: Vec<usize> = Vec::new();
-    for (i, w) in wallets.iter().enumerate() {
-        let bal = client
-            .token_balance(main_wallet, token_contract, &w.public_key_bytes)
-            .await
-            .unwrap_or(0);
-        if bal < amount_per_key {
-            to_fund.push(i);
-        }
-        pb_check.inc(1);
-    }
-    pb_check.finish_and_clear();
-
-    if to_fund.is_empty() {
-        ui::success(&format!(
-            "all {} ephemeral wallets already hold ≥ {amount_per_key} AXE",
-            wallets.len()
-        ));
-        return Ok(());
-    }
-
-    ui::info(&format!(
-        "distributing AXE to {}/{} keys...",
-        to_fund.len(),
-        wallets.len()
-    ));
-    let pb = indicatif::ProgressBar::new(to_fund.len() as u64);
-    pb.set_style(
-        indicatif::ProgressStyle::with_template("  {bar:40.cyan/dim} {pos}/{len} keys funded")
-            .unwrap()
-            .progress_chars("=> "),
-    );
-    for &i in &to_fund {
-        let invoked = client
-            .token_transfer(
-                main_wallet,
-                token_contract,
-                &wallets[i].public_key_bytes,
-                amount_per_key,
-            )
-            .await?;
-        if !invoked.success {
-            return Err(eyre!(
-                "AXE transfer failed for key {i} (tx {})",
-                invoked.tx_hash_hex
-            ));
-        }
-        pb.inc(1);
-    }
-    pb.finish_and_clear();
-    ui::success(&format!(
-        "distributed AXE to {} ephemeral keys",
-        to_fund.len()
-    ));
-    Ok(())
 }

@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use alloy::{
     primitives::{Address, Bytes, FixedBytes, U256},
@@ -16,52 +16,19 @@ use alloy::{
     signers::local::PrivateKeySigner,
 };
 use eyre::eyre;
-use futures::future::join_all;
 use tokio::sync::{Mutex, Semaphore};
 
+use super::its_evm_source::EvmTokenRunSizing as RunSizing;
+use super::its_prerequisites::{self, GatewayRequirement};
 use super::keypairs;
 use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+use super::run_sizing::RunSizing as ValidatedRunSizing;
 use super::{LoadTestArgs, check_evm_balance, finish_report, read_its_cache, validate_evm_rpc};
 use crate::config::ChainsConfig;
 use crate::evm::{ERC20, InterchainTokenService};
 use crate::ui;
 
 const MAX_CONCURRENT_SENDS: usize = 100;
-const MAX_RETRIES: u32 = 5;
-
-/// Default gas value: tries the Axelarscan `estimateGasFee` quote for the
-/// route (× 1.5); falls back to a route-agnostic constant when the API
-/// can't be reached.
-async fn default_gas_value_wei(args: &LoadTestArgs) -> u128 {
-    if let Some(quoted) = quote_route_gas(args).await {
-        return quoted;
-    }
-    fallback_gas_value_wei(args.network, &args.source_chain)
-}
-
-async fn quote_route_gas(args: &LoadTestArgs) -> Option<u128> {
-    let cfg = crate::config::ChainsConfig::load(&args.config).ok()?;
-    let symbol = cfg
-        .chains
-        .get(&args.source_chain)?
-        .token_symbol
-        .as_deref()?;
-    super::gas_estimate::estimate_route_gas(
-        args.network,
-        &args.source_axelar_id,
-        &args.destination_axelar_id,
-        symbol,
-        super::gas_estimate::DEFAULT_DEST_GAS_LIMIT,
-    )
-    .await
-}
-
-fn fallback_gas_value_wei(network: crate::types::Network, _source_chain: &str) -> u128 {
-    match network {
-        crate::types::Network::DevnetAmplifier => 0,
-        _ => 10_000_000_000_000_000,
-    }
-}
 
 pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
     let src = &args.source_chain;
@@ -71,7 +38,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
     validate_evm_rpc(&evm_rpc_url).await?;
 
     let cfg = ChainsConfig::load(&args.config)?;
-    verify_axelar_prerequisites(&cfg, dest)?;
+    its_prerequisites::verify(&cfg, dest, GatewayRequirement::Required)?;
 
     ui::kv("source", src);
     ui::kv("destination", dest);
@@ -80,9 +47,9 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
     let evm_src = init_evm_source_context(args.private_key.as_deref(), evm_rpc_url.clone()).await?;
     let evm_targets = resolve_evm_targets(&cfg, src)?;
     let stellar = resolve_stellar_targets(&args, evm_src.deployer_address)?;
-    let gas_value_wei = parse_gas_value_wei(&args).await?;
+    let gas_value_wei = super::its_evm_source::standard_gas_value_wei(&args).await?;
     let gas_value = U256::from(gas_value_wei);
-    let mut sizing = compute_run_sizing(&args);
+    let mut sizing = RunSizing::standard(ValidatedRunSizing::new(&args)?);
 
     let token =
         resolve_or_deploy_token(&args, &evm_src, &evm_targets, &stellar, gas_value, &sizing)
@@ -121,7 +88,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
         .await?;
     }
 
-    let derived = derive_and_fund_signers(&args, &evm_src, &sizing, gas_value_wei).await?;
+    let derived = derive_and_fund_signers(&evm_src, &sizing, gas_value_wei).await?;
     distribute_axe_tokens(&evm_src, token.token_addr, &derived, sizing.amount_per_key).await?;
 
     let (stellar_recipient_addr, receiver_bytes) =
@@ -141,7 +108,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
         gas_arg_scaling_factor,
     };
 
-    if !sizing.burst_mode {
+    if !sizing.is_burst() {
         run_sustained_pipeline(
             &args,
             &cfg,
@@ -181,19 +148,6 @@ struct StellarTargets {
     signer_pk: [u8; 32],
 }
 
-/// Sizing parameters derived from CLI flags: burst vs sustained, key counts,
-/// expected transfer total, and per-tx / per-key / total-supply amounts.
-struct RunSizing {
-    burst_mode: bool,
-    sustained_params: Option<(u64, u64)>,
-    num_keys: usize,
-    num_txs: usize,
-    total_expected: u64,
-    amount_per_tx: U256,
-    amount_per_key: U256,
-    total_supply: U256,
-}
-
 /// Bundle of values consumed by both the burst and sustained pipelines when
 /// firing `interchainTransfer` calls from the derived EVM signers.
 struct TransferContext {
@@ -215,25 +169,6 @@ struct TokenIdentity {
     token_id: FixedBytes<32>,
     token_addr: Address,
     deploy_message_id: Option<String>,
-}
-
-/// Verify Axelar-side prerequisites (cosmos Gateway for `dest`, global
-/// AxelarnetGateway). Bails with the existing error strings if either is
-/// missing.
-fn verify_axelar_prerequisites(cfg: &ChainsConfig, dest: &str) -> eyre::Result<()> {
-    if cfg.axelar.contract_address("Gateway", dest).is_err() {
-        eyre::bail!(
-            "destination chain '{dest}' has no Cosmos Gateway in the config — verification would fail."
-        );
-    }
-    if cfg
-        .axelar
-        .global_contract_address("AxelarnetGateway")
-        .is_err()
-    {
-        eyre::bail!("no AxelarnetGateway address in config — required for ITS load test");
-    }
-    Ok(())
 }
 
 /// Parse the EVM private key, check the funding balance, and emit the
@@ -326,54 +261,6 @@ fn resolve_stellar_targets(
 /// Parse the user-supplied gas value (wei), defaulting via the Axelarscan
 /// `estimateGasFee` quote and falling back to a route-agnostic constant when
 /// the API can't be reached.
-async fn parse_gas_value_wei(args: &LoadTestArgs) -> eyre::Result<u128> {
-    let gas_value_wei: u128 = match args.gas_value.as_deref() {
-        Some(v) => v.parse().map_err(|e| eyre!("invalid --gas-value: {e}"))?,
-        None => default_gas_value_wei(args).await,
-    };
-    {
-        ui::kv(
-            "gas value",
-            &format!(
-                "{gas_value_wei} wei ({:.6} ETH)",
-                gas_value_wei as f64 / 1e18
-            ),
-        );
-    }
-    Ok(gas_value_wei)
-}
-
-/// Decide burst vs sustained, key/tx counts, and amounts.
-fn compute_run_sizing(args: &LoadTestArgs) -> RunSizing {
-    let sustained_params = args.tps.zip(args.duration_secs);
-    let burst_mode = sustained_params.is_none();
-    let (num_keys, total_expected) = if burst_mode {
-        let n = args.num_txs.max(1) as usize;
-        (n, args.num_txs.max(1))
-    } else {
-        let (tps, dur) = sustained_params.expect("burst_mode is false");
-        let tps = tps as usize;
-        (tps * args.key_cycle as usize, tps as u64 * dur)
-    };
-    let num_txs = num_keys;
-    // 0.01 token per tx (10^16 at 18 decimals); ITS hub truncates to 100_000
-    // sub-units on Stellar's 7-decimal AXE, still safely non-zero.
-    let amount_per_tx = U256::from(10_000_000_000_000_000u128);
-    let amount_per_key = amount_per_tx * U256::from(100);
-    let total_supply = U256::from(1_000_000) * U256::from(1_000_000_000_000_000_000u128);
-
-    RunSizing {
-        burst_mode,
-        sustained_params,
-        num_keys,
-        num_txs,
-        total_expected,
-        amount_per_tx,
-        amount_per_key,
-        total_supply,
-    }
-}
-
 /// Resolve the ITS token to use: either the user-supplied `--token-id`, a
 /// cached deployment that still has source balance and is registered on
 /// Stellar, or a fresh `deploy_its_token` call.
@@ -397,7 +284,7 @@ async fn resolve_or_deploy_token(
     // registered on Stellar) → local file cache → fresh deploy. Pre-registration
     // via chains-config lets CI skip the source + remote deploy; a wallet with
     // no AXE balance falls through to a fresh deploy (see reusable_config_axe).
-    let needed = sizing.amount_per_tx * U256::from(sizing.num_txs);
+    let needed = sizing.amount_per_tx * U256::from(sizing.num_keys);
     let config_axe = match super::helpers::reusable_config_axe(
         &args.config,
         src,
@@ -449,7 +336,7 @@ async fn resolve_or_deploy_token(
             );
         if let Some((tid, addr)) = cached {
             let token = ERC20::new(addr, &write_provider);
-            let needed = sizing.amount_per_tx * U256::from(sizing.num_txs);
+            let needed = sizing.amount_per_tx * U256::from(sizing.num_keys);
             let balance = token
                 .balanceOf(evm_src.deployer_address)
                 .call()
@@ -535,7 +422,6 @@ async fn registered_stellar_token_address(
 /// with enough native gas to cover the planned send rounds plus the gas
 /// value passed to ITS.
 async fn derive_and_fund_signers(
-    args: &LoadTestArgs,
     evm_src: &EvmSourceContext,
     sizing: &RunSizing,
     gas_value_wei: u128,
@@ -548,11 +434,10 @@ async fn derive_and_fund_signers(
         .connect_http(evm_src.rpc_url.parse()?);
     // ITS hub routing pays 2× gas_value per transfer (two commands).
     let hub_gas_value_wei = gas_value_wei.saturating_mul(2);
-    let gas_extra_per_key = if sizing.burst_mode {
+    let gas_extra_per_key = if sizing.is_burst() {
         hub_gas_value_wei
     } else {
-        let dur = sizing.sustained_params.expect("burst_mode is false").1;
-        let rounds = dur.div_ceil(args.key_cycle);
+        let rounds = sizing.transactions_per_key();
         let buffered = rounds + rounds / 5 + 1;
         hub_gas_value_wei.saturating_mul(buffered as u128)
     };
@@ -611,9 +496,7 @@ async fn run_sustained_pipeline(
 ) -> eyre::Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
-    let tps = sizing.sustained_params.expect("burst_mode is false").0 as usize;
-    let duration_secs = sizing.sustained_params.expect("burst_mode is false").1;
-    let key_cycle = args.key_cycle as usize;
+    let (tps, duration_secs, key_cycle) = sizing.sustained().expect("sustained mode");
     let rpc_url_str = transfer.rpc_url.clone();
 
     let nonce_provider = ProviderBuilder::new().connect_http(transfer.rpc_url.parse()?);
@@ -643,19 +526,23 @@ async fn run_sustained_pipeline(
     let vnetwork = args.network;
     let verify_handle = tokio::spawn(async move {
         let spinner = spinner_rx.await.expect("spinner channel dropped");
-        super::verify::verify_onchain_stellar_its_streaming(
-            &vconfig,
-            &vsource,
-            &vdest,
-            vnetwork,
-            &vstellar_rpc,
-            &vstellar_net,
-            &vstellar_gw,
-            vsigner_pk,
-            verify_rx,
-            vdone,
+        super::verify::verify_onchain_stellar_its_streaming(super::verify::StreamingVerification {
+            route: super::verify::VerificationRoute {
+                config: &vconfig,
+                source_chain: &vsource,
+                destination_chain: &vdest,
+                network: vnetwork,
+            },
+            destination: super::verify::StellarItsDestination {
+                rpc_url: &vstellar_rpc,
+                network_type: &vstellar_net,
+                gateway_contract: &vstellar_gw,
+                signer_pk: vsigner_pk,
+            },
+            rx: verify_rx,
+            send_done: vdone,
             spinner,
-        )
+        })
         .await
     });
 
@@ -709,14 +596,13 @@ async fn run_sustained_pipeline(
                     },
                 )
                 .await;
-                if result.success {
+                if result.is_success() {
                     match super::verify::tx_to_pending_its(&result, has_vv) {
                         Ok(pending) => {
                             let _ = vtx.send(pending);
                         }
                         Err(e) => {
-                            result.success = false;
-                            result.error = Some(format!("failed to build verification state: {e}"));
+                            result.mark_failed(format!("failed to build verification state: {e}"));
                         }
                     }
                 }
@@ -733,7 +619,7 @@ async fn run_sustained_pipeline(
         Some(send_done),
         spinner,
     )
-    .await;
+    .await?;
 
     let mut report = super::sustained::build_sustained_report(
         result,
@@ -770,7 +656,9 @@ async fn run_burst_pipeline(
 ) -> eyre::Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
-    let num_txs = sizing.num_txs;
+    let num_txs = sizing
+        .burst_count()
+        .expect("burst pipeline requires burst sizing");
 
     let metrics_list: Arc<Mutex<Vec<TxMetrics>>> = Arc::new(Mutex::new(Vec::new()));
     let confirmed_counter = Arc::new(AtomicU64::new(0));
@@ -801,9 +689,8 @@ async fn run_burst_pipeline(
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
-            let mut m = None;
-            for attempt in 0..=MAX_RETRIES {
-                let result = super::its_evm_source::execute_interchain_transfer(
+            let m = super::retry::rate_limited(|| {
+                super::its_evm_source::execute_interchain_transfer(
                     super::its_evm_source::InterchainTransferRequest {
                         provider: &provider,
                         its_proxy,
@@ -816,21 +703,9 @@ async fn run_burst_pipeline(
                         explicit_nonce: None,
                     },
                 )
-                .await;
-                if result.success || attempt == MAX_RETRIES {
-                    m = Some(result);
-                    break;
-                }
-                let is_rate_limited = result.error.as_deref().is_some_and(|e| e.contains("429"));
-                if !is_rate_limited {
-                    m = Some(result);
-                    break;
-                }
-                let backoff = Duration::from_secs(1 << attempt);
-                tokio::time::sleep(backoff).await;
-            }
-            let m = m.unwrap();
-            if m.success {
+            })
+            .await;
+            if m.is_success() {
                 let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 sp.set_message(format!("sending ({done}/{total} confirmed)..."));
             }
@@ -840,7 +715,7 @@ async fn run_burst_pipeline(
     }
 
     let total_submitted = tasks.len() as u64;
-    join_all(tasks).await;
+    super::task_group::join_all(tasks).await?;
     let test_duration = test_start.elapsed().as_secs_f64();
     let confirmed_count = confirmed_counter.load(Ordering::Relaxed);
     spinner.finish_and_clear();
@@ -863,19 +738,23 @@ async fn run_burst_pipeline(
         metrics,
     );
 
-    let verification = super::verify::verify_onchain_stellar_its(
-        &args.config,
-        &args.source_axelar_id,
-        &args.destination_axelar_id,
-        args.network,
-        stellar_recipient_addr,
-        &stellar.rpc,
-        &stellar.network_type,
-        &stellar.gateway_addr,
-        stellar.signer_pk,
-        &mut report.transactions,
-    )
-    .await?;
+    let verification =
+        super::verify::verify_onchain_stellar_its(super::verify::ItsBatchVerification {
+            route: super::verify::VerificationRoute {
+                config: &args.config,
+                source_chain: &args.source_axelar_id,
+                destination_chain: &args.destination_axelar_id,
+                network: args.network,
+            },
+            destination: super::verify::StellarItsDestination {
+                rpc_url: &stellar.rpc,
+                network_type: &stellar.network_type,
+                gateway_contract: &stellar.gateway_addr,
+                signer_pk: stellar.signer_pk,
+            },
+            metrics: &mut report.transactions,
+        })
+        .await?;
     report.verification = Some(verification);
 
     finish_report(args, &mut report, test_start)

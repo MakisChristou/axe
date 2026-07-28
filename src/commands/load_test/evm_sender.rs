@@ -15,7 +15,6 @@ use alloy::{
     sol_types::{SolEvent, SolValue},
 };
 use eyre::eyre;
-use futures::future::join_all;
 use rand::Rng;
 use solana_sdk::pubkey::Pubkey;
 use tokio::sync::Mutex;
@@ -192,7 +191,6 @@ pub async fn run_load_test_with_metrics(
     // Each send does multiple RPC calls (estimate gas, nonce, send, receipt),
     // so even 10 concurrent senders means ~40+ RPC calls in flight.
     const MAX_CONCURRENT_SENDS: usize = 100;
-    const MAX_RETRIES: u32 = 5;
 
     let metrics_list: Arc<Mutex<Vec<TxMetrics>>> = Arc::new(Mutex::new(Vec::new()));
     let confirmed_counter = Arc::new(AtomicU64::new(0));
@@ -227,10 +225,8 @@ pub async fn run_load_test_with_metrics(
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
 
-            // Retry with exponential backoff on rate-limit (429) errors
-            let mut m = None;
-            for attempt in 0..=MAX_RETRIES {
-                let result = execute_and_record_evm(
+            let m = super::retry::rate_limited(|| {
+                execute_and_record_evm(
                     &provider,
                     sr,
                     &dc,
@@ -242,27 +238,9 @@ pub async fn run_load_test_with_metrics(
                         fee_mode,
                     },
                 )
-                .await;
-
-                if result.success || attempt == MAX_RETRIES {
-                    m = Some(result);
-                    break;
-                }
-
-                // Only retry on 429 errors
-                let is_rate_limited = result.error.as_deref().is_some_and(|e| e.contains("429"));
-                if !is_rate_limited {
-                    m = Some(result);
-                    break;
-                }
-
-                // Exponential backoff: 1s, 2s, 4s, 8s, 16s
-                let backoff = Duration::from_secs(1 << attempt);
-                tokio::time::sleep(backoff).await;
-            }
-
-            let m = m.unwrap();
-            if m.success {
+            })
+            .await;
+            if m.is_success() {
                 let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 sp.set_message(format!("sending ({done}/{total} confirmed)..."));
             }
@@ -272,7 +250,7 @@ pub async fn run_load_test_with_metrics(
     }
 
     let total_submitted = tasks.len() as u64;
-    join_all(tasks).await;
+    super::task_group::join_all(tasks).await?;
     let test_duration = test_start.elapsed().as_secs_f64();
 
     let confirmed_count = confirmed_counter.load(Ordering::Relaxed);
@@ -282,16 +260,15 @@ pub async fn run_load_test_with_metrics(
     ));
 
     let metrics = metrics_list.lock().await.clone();
-    let total_failed = metrics.iter().filter(|m| !m.success).count() as u64;
+    let total_failed = metrics.iter().filter(|m| !m.is_success()).count() as u64;
 
     // Show error breakdown if there were failures
     if total_failed > 0 {
         let mut error_counts: std::collections::HashMap<String, u64> =
             std::collections::HashMap::new();
-        for m in metrics.iter().filter(|m| !m.success) {
+        for m in metrics.iter().filter(|m| !m.is_success()) {
             let reason = m
-                .error
-                .as_deref()
+                .error()
                 .unwrap_or("unknown")
                 .chars()
                 .take(120)
@@ -399,8 +376,7 @@ async fn execute_and_record_evm<P: Provider>(
                         latency_ms: Some(latency_ms),
                         compute_units: Some(receipt.gas_used),
                         slot: receipt.block_number,
-                        success: true,
-                        error: None,
+                        outcome: TxMetrics::succeeded_outcome(),
                         payload: payload.to_vec(),
                         payload_hash,
                         source_address: format!("{sender_receiver_addr}"),
@@ -577,7 +553,7 @@ pub(super) async fn run_sustained_load_test_with_metrics(
                 )
                 .await;
                 // Stream successful txs to the concurrent verification pipeline.
-                if result.success
+                if result.is_success()
                     && let Some(ref tx_sender) = vtx
                 {
                     // Use signature length as a proxy for idx — the verify task
@@ -599,8 +575,7 @@ pub(super) async fn run_sustained_load_test_with_metrics(
                             }
                         }
                         Err(e) => {
-                            result.success = false;
-                            result.error = Some(format!("failed to build verification state: {e}"));
+                            result.mark_failed(format!("failed to build verification state: {e}"));
                         }
                     }
                 }
@@ -617,7 +592,7 @@ pub(super) async fn run_sustained_load_test_with_metrics(
         send_done,
         spinner,
     )
-    .await;
+    .await?;
 
     Ok(super::sustained::build_sustained_report(
         result,
@@ -646,8 +621,7 @@ fn make_failure_with_hash(
         latency_ms: None,
         compute_units: None,
         slot: None,
-        success: false,
-        error: Some(error.to_string()),
+        outcome: TxMetrics::failed_outcome(error.to_string()),
         payload: Vec::new(),
         payload_hash: String::new(),
         source_address: String::new(),

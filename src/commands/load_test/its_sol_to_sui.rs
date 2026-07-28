@@ -26,6 +26,7 @@ use solana_sdk::signature::{Keypair, Signer};
 use tokio::sync::Mutex;
 
 use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+use super::run_sizing::RunSizing;
 use super::{
     LoadTestArgs, finalize_sui_dest_run_its, load_sui_main_wallet, read_sui_axe_token_id,
     sui_its_dest_lookup, validate_solana_rpc,
@@ -51,11 +52,11 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
     );
 
     // ----- Sizing -----
-    let sustained_params = args.tps.zip(args.duration_secs);
-    let total_to_send: u64 = match sustained_params {
-        Some((tps, dur)) => tps * dur,
-        None => args.num_txs.max(1),
-    };
+    let sizing = RunSizing::new(&args)?;
+    let sustained_params = sizing
+        .sustained()
+        .map(|(tps, duration_secs, _)| (tps as u64, duration_secs));
+    let total_to_send = sizing.total_expected;
 
     // ----- Main keypair -----
     let main_keypair = solana::load_keypair(args.keypair.as_deref())?;
@@ -145,7 +146,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
             tps,
             duration_secs,
         })
-        .await
+        .await?
     } else {
         run_burst(BurstRequest {
             sol_rpc: &sol_rpc,
@@ -158,13 +159,15 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
             dest_chain_id: &dest_chain_id,
             sui_recipient_bytes: &sui_recipient_bytes,
             gas_value,
-            num_txs: args.num_txs.max(1) as usize,
+            num_txs: sizing
+                .burst_count()
+                .expect("burst path requires burst sizing"),
         })
         .await
     };
 
     let total_submitted = metrics.len() as u64;
-    let total_confirmed = metrics.iter().filter(|m| m.success).count() as u64;
+    let total_confirmed = metrics.iter().filter(|m| m.is_success()).count() as u64;
     ui::success(&format!(
         "sent {total_confirmed}/{total_submitted} confirmed"
     ));
@@ -256,7 +259,7 @@ async fn run_burst(request: BurstRequest<'_>) -> Vec<TxMetrics> {
                 metrics.push(failed_metric(main_pubkey.clone(), e.to_string()));
             }
         }
-        let confirmed = metrics.iter().filter(|m| m.success).count();
+        let confirmed = metrics.iter().filter(|m| m.is_success()).count();
         spinner.set_message(format!("sending ({confirmed}/{num_txs} confirmed)..."));
     }
     spinner.finish_and_clear();
@@ -287,7 +290,7 @@ struct SustainedRequest {
     duration_secs: u64,
 }
 
-async fn run_sustained(request: SustainedRequest) -> Vec<TxMetrics> {
+async fn run_sustained(request: SustainedRequest) -> eyre::Result<Vec<TxMetrics>> {
     let SustainedRequest {
         sol_rpc,
         main_kp_secret,
@@ -388,13 +391,11 @@ async fn run_sustained(request: SustainedRequest) -> Vec<TxMetrics> {
     }
 
     // Wait for all in-flight tasks
-    for h in tasks {
-        let _ = h.await;
-    }
+    super::task_group::join_all(tasks).await?;
     spinner.finish_and_clear();
-    Arc::try_unwrap(metrics_list)
+    Ok(Arc::try_unwrap(metrics_list)
         .map(|m| m.into_inner())
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 fn failed_metric(src: String, err: String) -> TxMetrics {
@@ -405,8 +406,7 @@ fn failed_metric(src: String, err: String) -> TxMetrics {
         latency_ms: None,
         compute_units: None,
         slot: None,
-        success: false,
-        error: Some(err),
+        outcome: TxMetrics::failed_outcome(err),
         payload: Vec::new(),
         payload_hash: String::new(),
         source_address: src,

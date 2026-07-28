@@ -5,7 +5,6 @@ use std::time::Instant;
 use alloy::primitives::keccak256;
 use alloy::sol_types::SolValue;
 use eyre::eyre;
-use futures::future::join_all;
 use indicatif::ProgressBar;
 use rand::Rng;
 use solana_client::rpc_client::RpcClient;
@@ -170,7 +169,7 @@ pub async fn run_load_test_with_metrics(
     let total_submitted = pending_tasks.len() as u64;
     let test_duration = test_start.elapsed().as_secs_f64();
 
-    join_all(pending_tasks).await;
+    super::task_group::join_all(pending_tasks).await?;
     let confirmed_count = confirmed_counter.load(Ordering::Relaxed);
     spinner.finish_and_clear();
     ui::success(&format!(
@@ -224,8 +223,7 @@ fn send_sol_tx(
                 latency_ms: None,
                 compute_units: None,
                 slot: None,
-                success: false,
-                error: Some(e.to_string()),
+                outcome: TxMetrics::failed_outcome(e.to_string()),
                 payload: Vec::new(),
                 payload_hash: String::new(),
                 source_address: String::new(),
@@ -353,8 +351,7 @@ pub(super) async fn run_sustained_load_test_with_metrics(
                 latency_ms: None,
                 compute_units: None,
                 slot: None,
-                success: false,
-                error: Some(format!("task panicked: {e}")),
+                outcome: TxMetrics::failed_outcome(format!("task panicked: {e}")),
                 payload: Vec::new(),
                 payload_hash: String::new(),
                 source_address: String::new(),
@@ -364,7 +361,7 @@ pub(super) async fn run_sustained_load_test_with_metrics(
                 amplifier_timing: None,
             });
             // Stream successful txs to the concurrent verification pipeline.
-            if result.success
+            if result.is_success()
                 && let Some(ref tx_sender) = vtx
             {
                 match super::verify::tx_to_pending_solana(
@@ -382,8 +379,7 @@ pub(super) async fn run_sustained_load_test_with_metrics(
                         }
                     }
                     Err(e) => {
-                        result.success = false;
-                        result.error = Some(format!("failed to build verification state: {e}"));
+                        result.mark_failed(format!("failed to build verification state: {e}"));
                     }
                 }
             }
@@ -400,7 +396,7 @@ pub(super) async fn run_sustained_load_test_with_metrics(
         send_done.clone(),
         spinner,
     )
-    .await;
+    .await?;
 
     Ok(sustained::build_sustained_report(
         result,
@@ -469,8 +465,7 @@ async fn execute_and_record(request: ExecuteRequest<'_>) {
                 latency_ms: Option::None,
                 compute_units: Option::None,
                 slot: Option::None,
-                success: false,
-                error: Some(e.to_string()),
+                outcome: TxMetrics::failed_outcome(e.to_string()),
                 payload: Vec::new(),
                 payload_hash: String::new(),
                 source_address: String::new(),

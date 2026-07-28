@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use eyre::{Result, eyre};
-use futures::future::join_all;
 use indicatif::ProgressBar;
 use tokio::sync::Mutex;
 
@@ -142,8 +141,7 @@ async fn submit_single(submission: TransferSubmission<'_>) -> TxMetrics {
         latency_ms: Some(submit_time_ms),
         compute_units: None,
         slot: None,
-        success: true,
-        error: None,
+        outcome: TxMetrics::succeeded_outcome(),
         payload: payload.map(|p| p.to_vec()).unwrap_or_default(),
         payload_hash: payload_hash_hex.to_string(),
         source_address: source_addr,
@@ -163,8 +161,7 @@ fn fail_metrics(submit_start: Instant, source: &str, err: &str) -> TxMetrics {
         latency_ms: None,
         compute_units: None,
         slot: None,
-        success: false,
-        error: Some(err.to_string()),
+        outcome: TxMetrics::failed_outcome(err.to_string()),
         payload: Vec::new(),
         payload_hash: String::new(),
         source_address: source.to_string(),
@@ -244,7 +241,7 @@ pub async fn run_burst(request: BurstRequest<'_>) -> Result<LoadTestReport> {
                 gmp_dest_address: &gmp_a,
             })
             .await;
-            if m.success {
+            if m.is_success() {
                 let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 sp.set_message(format!("sending ({done}/{total} confirmed)..."));
             }
@@ -254,7 +251,7 @@ pub async fn run_burst(request: BurstRequest<'_>) -> Result<LoadTestReport> {
     }
 
     let total_submitted = tasks.len() as u64;
-    join_all(tasks).await;
+    super::task_group::join_all(tasks).await?;
     let test_duration = test_start.elapsed().as_secs_f64();
     let confirmed_count = confirmed.load(Ordering::Relaxed);
     spinner.finish_and_clear();
@@ -322,7 +319,7 @@ pub(super) struct SustainedRequest {
     pub has_voting_verifier: bool,
 }
 
-pub(super) async fn run_sustained(request: SustainedRequest) -> sustained::SustainedResult {
+pub(super) async fn run_sustained(request: SustainedRequest) -> Result<sustained::SustainedResult> {
     let SustainedRequest {
         client,
         wallets,
@@ -373,7 +370,7 @@ pub(super) async fn run_sustained(request: SustainedRequest) -> sustained::Susta
             })
             .await;
 
-            if m.success
+            if m.is_success()
                 && let Some(ref tx_sender) = vtx
             {
                 match super::verify::tx_to_pending_xrpl(&m, has_vv) {
@@ -381,8 +378,7 @@ pub(super) async fn run_sustained(request: SustainedRequest) -> sustained::Susta
                         let _ = tx_sender.send(pending);
                     }
                     Err(e) => {
-                        m.success = false;
-                        m.error = Some(format!("failed to build verification state: {e}"));
+                        m.mark_failed(format!("failed to build verification state: {e}"));
                     }
                 }
             }

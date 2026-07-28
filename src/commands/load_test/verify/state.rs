@@ -18,7 +18,41 @@ pub(super) enum Phase {
     DiscoverSecondLeg,
     Approved,
     Executed,
-    Done,
+}
+
+impl Phase {
+    fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (
+                Self::Voted,
+                Self::Routed | Self::HubApproved | Self::Approved
+            ) | (Self::Routed, Self::HubApproved | Self::Approved)
+                | (Self::HubApproved, Self::DiscoverSecondLeg | Self::Approved)
+                | (Self::DiscoverSecondLeg, Self::Routed | Self::Approved)
+                | (Self::Approved, Self::Executed)
+        )
+    }
+}
+
+/// Terminal-aware state for a transaction under verification. A transaction
+/// cannot be both failed and successful, and terminal states cannot carry an
+/// unrelated active phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum VerificationState {
+    Active(Phase),
+    Succeeded { recovered_via_api: bool },
+    Failed { phase: Phase, reason: String },
+}
+
+/// Fully-discovered ITS hub→destination leg. Keeping these fields together
+/// prevents later stages from observing only a partial discovery result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SecondLeg {
+    pub(super) message_id: String,
+    pub(super) payload_hash: String,
+    pub(super) source_address: String,
+    pub(super) destination_address: String,
 }
 
 /// Per-tx state tracked during batch verification.
@@ -43,22 +77,80 @@ pub(in crate::commands::load_test) struct PendingTx {
     /// GMP-level destination address from ContractCall event (e.g. ITS Hub contract).
     pub(super) gmp_destination_address: String,
     pub(super) timing: AmplifierTiming,
-    pub(super) failed: bool,
-    pub(super) fail_reason: Option<String>,
-    pub(super) phase: Phase,
-    /// Second-leg message_id discovered from hub execution tx (ITS only).
-    pub(super) second_leg_message_id: Option<String>,
-    /// Second-leg payload_hash discovered from hub execution tx (ITS only).
-    pub(super) second_leg_payload_hash: Option<String>,
-    /// Second-leg source_address (e.g. ITS Hub contract on Axelar).
-    pub(super) second_leg_source_address: Option<String>,
-    /// Second-leg destination_address (e.g. ITS proxy on destination chain).
-    pub(super) second_leg_destination_address: Option<String>,
-    /// Set when a tx that timed out in the polling loop was reclassified as
-    /// successful by the final Axelarscan GMP-API check (the message actually
-    /// executed on-chain). Surfaced as a distinct "recovered" count so the
-    /// reliability save is visible in CI/cron logs.
-    pub(super) recovered_via_api: bool,
+    pub(super) state: VerificationState,
+    /// Populated atomically when the ITS hub→destination leg is discovered.
+    pub(super) second_leg: Option<SecondLeg>,
+}
+
+impl PendingTx {
+    pub(super) fn phase(&self) -> Option<Phase> {
+        match self.state {
+            VerificationState::Active(phase) | VerificationState::Failed { phase, .. } => {
+                Some(phase)
+            }
+            VerificationState::Succeeded { .. } => None,
+        }
+    }
+
+    pub(super) fn is_phase(&self, phase: Phase) -> bool {
+        self.state == VerificationState::Active(phase)
+    }
+
+    pub(super) fn is_active(&self) -> bool {
+        matches!(self.state, VerificationState::Active(_))
+    }
+
+    pub(super) fn transition_to(&mut self, phase: Phase) {
+        let current = self
+            .phase()
+            .expect("cannot transition a successful transaction");
+        assert!(
+            self.is_active(),
+            "cannot transition a failed transaction from {current:?} to {phase:?}"
+        );
+        assert!(
+            current.can_transition_to(phase),
+            "invalid verification transition from {current:?} to {phase:?}"
+        );
+        self.state = VerificationState::Active(phase);
+    }
+
+    pub(super) fn succeed(&mut self, recovered_via_api: bool) {
+        assert!(
+            self.is_active(),
+            "only an active transaction can be marked successful"
+        );
+        self.state = VerificationState::Succeeded { recovered_via_api };
+    }
+
+    pub(super) fn fail(&mut self, reason: String) {
+        assert!(
+            self.is_active(),
+            "only an active transaction can be marked failed"
+        );
+        let phase = self.phase().expect("active transaction must have a phase");
+        self.state = VerificationState::Failed { phase, reason };
+    }
+
+    pub(super) fn is_failed(&self) -> bool {
+        matches!(self.state, VerificationState::Failed { .. })
+    }
+
+    pub(super) fn failure_reason(&self) -> Option<&str> {
+        match &self.state {
+            VerificationState::Failed { reason, .. } => Some(reason),
+            VerificationState::Active(_) | VerificationState::Succeeded { .. } => None,
+        }
+    }
+
+    pub(super) fn recovered_via_api(&self) -> bool {
+        matches!(
+            self.state,
+            VerificationState::Succeeded {
+                recovered_via_api: true
+            }
+        )
+    }
 }
 
 /// Real-time stats (throughput + latency) for spinner display.
@@ -229,4 +321,58 @@ pub(super) fn phase_counts(txs: &[PendingTx]) -> (usize, usize, usize, usize, us
         }
     }
     (voted, routed, hub_approved, approved, executed)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use alloy::primitives::Address;
+
+    use super::{PendingTx, Phase, VerificationState};
+    use crate::commands::load_test::metrics::AmplifierTiming;
+
+    fn pending(phase: Phase) -> PendingTx {
+        PendingTx {
+            idx: 0,
+            message_id: "message-1".to_string(),
+            send_instant: Instant::now(),
+            source_address: String::new(),
+            contract_addr: Address::ZERO,
+            payload_hash: None,
+            payload_hash_hex: String::new(),
+            command_id: None,
+            gmp_destination_chain: String::new(),
+            gmp_destination_address: String::new(),
+            timing: AmplifierTiming::default(),
+            state: VerificationState::Active(phase),
+            second_leg: None,
+        }
+    }
+
+    #[test]
+    fn accepts_each_supported_pipeline_branch() {
+        for (from, to) in [
+            (Phase::Voted, Phase::Routed),
+            (Phase::Voted, Phase::HubApproved),
+            (Phase::Voted, Phase::Approved),
+            (Phase::Routed, Phase::HubApproved),
+            (Phase::Routed, Phase::Approved),
+            (Phase::HubApproved, Phase::DiscoverSecondLeg),
+            (Phase::HubApproved, Phase::Approved),
+            (Phase::DiscoverSecondLeg, Phase::Routed),
+            (Phase::DiscoverSecondLeg, Phase::Approved),
+            (Phase::Approved, Phase::Executed),
+        ] {
+            let mut tx = pending(from);
+            tx.transition_to(to);
+            assert!(tx.is_phase(to));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid verification transition")]
+    fn rejects_out_of_order_transition() {
+        pending(Phase::Voted).transition_to(Phase::Executed);
+    }
 }

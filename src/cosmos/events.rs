@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::error::{AxeError, AxeResult};
 
-use super::rpc::{lcd_cosmwasm_smart_query, rpc_tx_search_event};
+use super::rpc::{CosmwasmQueryPending, lcd_cosmwasm_smart_query_typed, rpc_tx_search_event};
 
 /// Outer envelope for an LCD `tx_response` payload (the body returned by
 /// `/cosmos/tx/v1beta1/txs/{hash}`). Only the events sub-list is needed by
@@ -188,7 +188,11 @@ pub async fn check_cosmos_routed(
         }]
     });
 
-    let resp = lcd_cosmwasm_smart_query(lcd, cosm_gateway, &query).await?;
+    let resp = match lcd_cosmwasm_smart_query_typed(lcd, cosm_gateway, &query).await {
+        Ok(response) => response,
+        Err(error) if error.is_pending(CosmwasmQueryPending::OutgoingMessage) => return Ok(false),
+        Err(error) => return Err(error).wrap_err("Cosmos routing query failed"),
+    };
     let data = resp.get("data").or_else(|| resp.as_array().map(|_| &resp));
     Ok(match data {
         Some(arr) if arr.is_array() => {
@@ -217,18 +221,15 @@ pub async fn check_hub_approved(
         }
     });
 
-    let resp = match lcd_cosmwasm_smart_query(lcd, axelarnet_gateway, &query).await {
-        Ok(resp) => resp,
-        Err(e) if is_hub_not_approved_error(&e) => return Ok(false),
-        Err(e) => return Err(e),
+    let resp = match lcd_cosmwasm_smart_query_typed(lcd, axelarnet_gateway, &query).await {
+        Ok(response) => response,
+        Err(error) if error.is_pending(CosmwasmQueryPending::ExecutableMessage) => {
+            return Ok(false);
+        }
+        Err(error) => return Err(error).wrap_err("Axelarnet hub approval query failed"),
     };
     let resp_str = serde_json::to_string(&resp)?;
     Ok(!resp_str.contains("null") && resp_str.contains(message_id))
-}
-
-fn is_hub_not_approved_error(error: &eyre::Report) -> bool {
-    let message = error.to_string().to_lowercase();
-    message.contains("not approved") || message.contains("failed to query executable messages")
 }
 
 #[cfg(test)]

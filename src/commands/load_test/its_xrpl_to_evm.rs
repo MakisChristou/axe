@@ -13,6 +13,8 @@ use std::time::Instant;
 use eyre::{Result, eyre};
 use xrpl_types::AccountId;
 
+use super::its_prerequisites::{self, GatewayRequirement};
+use super::run_sizing::RunSizing;
 use super::{LoadTestArgs, finish_report, validate_evm_rpc, xrpl_sender};
 use crate::config::ChainsConfig;
 use crate::ui;
@@ -27,7 +29,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
     validate_evm_rpc(&args.destination_rpc).await?;
 
     let cfg = ChainsConfig::load(&args.config)?;
-    verify_axelar_prerequisites(&cfg, dest)?;
+    its_prerequisites::verify(&cfg, dest, GatewayRequirement::AmplifierOnly)?;
 
     ui::kv("source", src);
     ui::kv("destination", dest);
@@ -43,7 +45,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
     let evm_targets = resolve_evm_targets(&cfg, dest)?;
 
     let gas_fee_drops = parse_gas_fee_drops(args.gas_value.as_deref())?;
-    let sizing = compute_run_sizing(&args);
+    let sizing = RunSizing::new(&args)?;
     let wallets = fund_ephemeral_wallets(
         &xrpl_client,
         &main_wallet,
@@ -55,7 +57,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
     .await?;
     let multisig = parse_address(&xrpl_multisig_addr)?;
 
-    if !sizing.burst_mode {
+    if !sizing.is_burst() {
         run_sustained_pipeline(
             &args,
             &xrpl_client,
@@ -85,37 +87,6 @@ struct EvmTargets {
     dest_address_hex: String,
     evm_gateway_addr: alloy::primitives::Address,
     axelarnet_gw_addr: String,
-}
-
-/// Sizing parameters derived from CLI flags: chooses burst vs sustained,
-/// number of ephemeral wallets, and per-wallet tx count.
-struct RunSizing {
-    burst_mode: bool,
-    sustained_params: Option<(u64, u64)>,
-    num_keys: usize,
-    txs_per_key: u64,
-}
-
-/// Verify Axelar-side prerequisites (cosmos Gateway for `dest`, global
-/// AxelarnetGateway). Bails with the existing error strings if either is
-/// missing.
-fn verify_axelar_prerequisites(cfg: &ChainsConfig, dest: &str) -> Result<()> {
-    // A legacy (consensus) destination has no Cosmos Gateway and is verified on
-    // its on-chain gateway instead; only amplifier dests need the Cosmos Gateway.
-    let dest_amplifier = cfg.axelar.contract_address("VotingVerifier", dest).is_ok();
-    if dest_amplifier && cfg.axelar.contract_address("Gateway", dest).is_err() {
-        eyre::bail!(
-            "destination chain '{dest}' has no Cosmos Gateway in the config — verification would fail."
-        );
-    }
-    if cfg
-        .axelar
-        .global_contract_address("AxelarnetGateway")
-        .is_err()
-    {
-        eyre::bail!("no AxelarnetGateway address in config — required for ITS load test");
-    }
-    Ok(())
 }
 
 /// Build the XRPL HTTP client and load the main funding wallet, logging the
@@ -195,36 +166,6 @@ fn parse_gas_fee_drops(gas_value: Option<&str>) -> Result<u64> {
     Ok(gas_fee_drops)
 }
 
-/// Decide burst vs sustained, ephemeral wallet count, and per-wallet tx count.
-fn compute_run_sizing(args: &LoadTestArgs) -> RunSizing {
-    let sustained_params = args.tps.zip(args.duration_secs);
-    let burst_mode = sustained_params.is_none();
-    let (num_keys, _total_expected) = if burst_mode {
-        let n = args.num_txs.max(1) as usize;
-        (n, args.num_txs.max(1))
-    } else {
-        let (tps, dur) = sustained_params.expect("burst_mode is false");
-        let tps = tps as usize;
-        (tps * args.key_cycle as usize, tps as u64 * dur)
-    };
-
-    let txs_per_key = if burst_mode {
-        1u64
-    } else {
-        sustained_params
-            .expect("burst_mode is false")
-            .1
-            .div_ceil(args.key_cycle)
-    };
-
-    RunSizing {
-        burst_mode,
-        sustained_params,
-        num_keys,
-        txs_per_key,
-    }
-}
-
 /// Derive ephemeral wallets and ensure each one is funded for the planned
 /// number of transfers.
 async fn fund_ephemeral_wallets(
@@ -240,7 +181,7 @@ async fn fund_ephemeral_wallets(
     // `gas_fee_drops` and forwards the remainder); +100 covers the XRPL base txn fee.
     let per_wallet_drops: u64 = 10_000_000u64
         + sizing
-            .txs_per_key
+            .transactions_per_key()
             .saturating_mul(gas_fee_drops + xrpl_sender::NET_TRANSFER_DROPS + 100);
 
     // Pass RPC URL so devnet vs testnet vs mainnet is inferred from the
@@ -273,9 +214,7 @@ async fn run_sustained_pipeline(
 ) -> Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
-    let tps_n = sizing.sustained_params.expect("burst_mode is false").0 as usize;
-    let duration_secs = sizing.sustained_params.expect("burst_mode is false").1;
-    let key_cycle = args.key_cycle as usize;
+    let (tps_n, duration_secs, key_cycle) = sizing.sustained().expect("sustained mode");
 
     let (verify_tx, verify_rx) = tokio::sync::mpsc::unbounded_channel();
     let send_done = Arc::new(AtomicBool::new(false));
@@ -290,9 +229,21 @@ async fn run_sustained_pipeline(
     let vnetwork = args.network;
     let verify_handle = tokio::spawn(async move {
         let spinner = spinner_rx.await.expect("spinner channel dropped");
-        super::verify::verify_onchain_evm_its_streaming(
-            &vconfig, &vsource, &vdest, vnetwork, vgw, &vdest_rpc, verify_rx, vdone, spinner,
-        )
+        super::verify::verify_onchain_evm_its_streaming(super::verify::StreamingVerification {
+            route: super::verify::VerificationRoute {
+                config: &vconfig,
+                source_chain: &vsource,
+                destination_chain: &vdest,
+                network: vnetwork,
+            },
+            destination: super::verify::EvmItsDestination {
+                gateway_addr: vgw,
+                rpc_url: &vdest_rpc,
+            },
+            rx: verify_rx,
+            send_done: vdone,
+            spinner,
+        })
         .await
     });
 
@@ -326,7 +277,7 @@ async fn run_sustained_pipeline(
         spinner,
         has_voting_verifier,
     })
-    .await;
+    .await?;
 
     let mut report = super::sustained::build_sustained_report(
         result,
@@ -380,16 +331,19 @@ async fn run_burst_pipeline(
     report.destination_address = format!("{}", evm.its_proxy_addr);
 
     // Reuse the existing EVM-destination ITS verifier on the batch of confirmed txs.
-    let verification = super::verify::verify_onchain_evm_its(
-        &args.config,
-        &args.source_axelar_id,
-        &args.destination_axelar_id,
-        args.network,
-        &format!("{}", evm.its_proxy_addr),
-        evm.evm_gateway_addr,
-        &args.destination_rpc,
-        &mut report.transactions,
-    )
+    let verification = super::verify::verify_onchain_evm_its(super::verify::ItsBatchVerification {
+        route: super::verify::VerificationRoute {
+            config: &args.config,
+            source_chain: &args.source_axelar_id,
+            destination_chain: &args.destination_axelar_id,
+            network: args.network,
+        },
+        destination: super::verify::EvmItsDestination {
+            gateway_addr: evm.evm_gateway_addr,
+            rpc_url: &args.destination_rpc,
+        },
+        metrics: &mut report.transactions,
+    })
     .await?;
     report.verification = Some(verification);
 

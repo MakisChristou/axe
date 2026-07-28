@@ -6,7 +6,6 @@ use std::time::Instant;
 use alloy::primitives::Address;
 use alloy::signers::local::PrivateKeySigner;
 use eyre::eyre;
-use futures::future::join_all;
 use rand::Rng;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::instruction::{AccountMeta, Instruction};
@@ -17,8 +16,10 @@ use solana_sdk::transaction::Transaction;
 use tokio::sync::Mutex;
 
 use super::LoadTestArgs;
+use super::its_prerequisites::{self, GatewayRequirement};
 use super::keypairs;
 use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+use super::run_sizing::RunSizing;
 use super::{finish_report, read_its_cache, save_its_cache, validate_evm_rpc, validate_solana_rpc};
 use crate::config::ChainsConfig;
 use crate::solana;
@@ -82,7 +83,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
     validate_evm_rpc(&evm_rpc_url).await?;
 
     let cfg = ChainsConfig::load(&args.config)?;
-    verify_axelar_prerequisites(&cfg, dest)?;
+    its_prerequisites::verify(&cfg, dest, GatewayRequirement::AmplifierOnly)?;
 
     ui::kv("source", src);
     ui::kv("destination", dest);
@@ -98,7 +99,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
     let (evm, dest_address_bytes) =
         resolve_evm_targets_and_receiver(&cfg, dest, args.private_key.as_deref())?;
 
-    let sizing = compute_run_sizing(&args);
+    let sizing = RunSizing::new(&args)?;
 
     let (token_id, _salt, mint) = setup_its_token(TokenSetupRequest {
         solana_rpc: &args.source_rpc,
@@ -137,7 +138,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
         &keypairs,
         &mint,
         &token_id,
-        compute_distribution_amount(&args, &sizing, amount_per_tx, amount_per_key),
+        compute_distribution_amount(sizing, amount_per_tx, amount_per_key),
     )?;
 
     let transfer = ItsTransferSpec {
@@ -148,7 +149,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
         amount_per_tx,
     };
 
-    if !sizing.burst_mode {
+    if !sizing.is_burst() {
         run_sustained_pipeline(&args, &evm, &sizing, keypairs, &transfer).await
     } else {
         run_burst_pipeline(&args, &evm, &keypairs, &transfer, &evm_rpc_url).await
@@ -163,15 +164,6 @@ struct EvmTargets {
     axelarnet_gw_addr: String,
 }
 
-/// Sizing parameters derived from CLI flags: chooses burst vs sustained,
-/// number of ephemeral keys, and total expected tx count.
-struct RunSizing {
-    burst_mode: bool,
-    sustained_params: Option<(u64, u64)>,
-    num_keys: usize,
-    total_expected: u64,
-}
-
 /// Per-transfer payload bits that are common to burst and sustained modes:
 /// the deployed ITS token, its mint, the gas value, and the EVM receiver
 /// (already encoded as bytes).
@@ -182,28 +174,6 @@ struct ItsTransferSpec {
     dest_address_bytes: Vec<u8>,
     /// Per-transfer amount, already scaled to the mint's on-chain decimals.
     amount_per_tx: u64,
-}
-
-/// Verify Axelar-side prerequisites (cosmos Gateway for `dest`, global
-/// AxelarnetGateway). Bails with the existing error strings if either is
-/// missing.
-fn verify_axelar_prerequisites(cfg: &ChainsConfig, dest: &str) -> eyre::Result<()> {
-    // A legacy (consensus) destination has no Cosmos Gateway and is verified on
-    // its on-chain gateway instead; only amplifier dests need the Cosmos Gateway.
-    let dest_amplifier = cfg.axelar.contract_address("VotingVerifier", dest).is_ok();
-    if dest_amplifier && cfg.axelar.contract_address("Gateway", dest).is_err() {
-        eyre::bail!(
-            "destination chain '{dest}' has no Cosmos Gateway in the config — verification would fail."
-        );
-    }
-    if cfg
-        .axelar
-        .global_contract_address("AxelarnetGateway")
-        .is_err()
-    {
-        eyre::bail!("no AxelarnetGateway address in config — required for ITS load test");
-    }
-    Ok(())
 }
 
 /// Build the Solana RPC client, load the main funding keypair, and log the
@@ -307,45 +277,15 @@ fn resolve_evm_targets_and_receiver(
     ))
 }
 
-/// Decide burst vs sustained, ephemeral key count, and total-expected tx count.
-fn compute_run_sizing(args: &LoadTestArgs) -> RunSizing {
-    let sustained_params = args.tps.zip(args.duration_secs);
-    let burst_mode = sustained_params.is_none();
-    let (num_keys, total_expected) = if burst_mode {
-        let n = args.num_txs.max(1) as usize;
-        (n, args.num_txs.max(1))
-    } else {
-        let (tps, dur) = sustained_params.expect("burst_mode is false");
-        let tps = tps as usize;
-        (tps * args.key_cycle as usize, tps as u64 * dur)
-    };
-    RunSizing {
-        burst_mode,
-        sustained_params,
-        num_keys,
-        total_expected,
-    }
-}
-
 /// Per-key token amount to seed the ephemeral wallets with: `amount_per_key`
 /// for burst mode, otherwise enough headroom for the sustained per-key cycle.
 /// Both `amount_per_tx` and `amount_per_key` are already scaled to the mint's
 /// on-chain decimals.
-fn compute_distribution_amount(
-    args: &LoadTestArgs,
-    sizing: &RunSizing,
-    amount_per_tx: u64,
-    amount_per_key: u64,
-) -> u64 {
-    if sizing.burst_mode {
+fn compute_distribution_amount(sizing: RunSizing, amount_per_tx: u64, amount_per_key: u64) -> u64 {
+    if sizing.is_burst() {
         amount_per_key
     } else {
-        let txs_per_key = sizing
-            .sustained_params
-            .expect("burst_mode is false")
-            .1
-            .div_ceil(args.key_cycle);
-        amount_per_tx * txs_per_key * 2
+        amount_per_tx * sizing.transactions_per_key() * 2
     }
 }
 
@@ -362,9 +302,7 @@ async fn run_sustained_pipeline(
     let src = &args.source_chain;
     let dest = &args.destination_chain;
     let evm_rpc_url = args.destination_rpc.clone();
-    let tps_n = sizing.sustained_params.expect("burst_mode is false").0 as usize;
-    let duration_secs = sizing.sustained_params.expect("burst_mode is false").1;
-    let key_cycle = args.key_cycle as usize;
+    let (tps_n, duration_secs, key_cycle) = sizing.sustained().expect("sustained mode");
 
     // Streaming verification: run concurrently with sends.
     let (verify_tx, verify_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -380,9 +318,21 @@ async fn run_sustained_pipeline(
     let vnetwork = args.network;
     let verify_handle = tokio::spawn(async move {
         let spinner = spinner_rx.await.expect("spinner channel dropped");
-        super::verify::verify_onchain_evm_its_streaming(
-            &vconfig, &vsource, &vdest, vnetwork, vgw, &vdest_rpc, verify_rx, vdone, spinner,
-        )
+        super::verify::verify_onchain_evm_its_streaming(super::verify::StreamingVerification {
+            route: super::verify::VerificationRoute {
+                config: &vconfig,
+                source_chain: &vsource,
+                destination_chain: &vdest,
+                network: vnetwork,
+            },
+            destination: super::verify::EvmItsDestination {
+                gateway_addr: vgw,
+                rpc_url: &vdest_rpc,
+            },
+            rx: verify_rx,
+            send_done: vdone,
+            spinner,
+        })
         .await
     });
 
@@ -451,15 +401,15 @@ async fn run_sustained_pipeline(
                         metrics.gmp_destination_chain = crate::types::HubChain::NAME.to_string();
                         metrics.gmp_destination_address = gmp_dest;
                         // Stream to concurrent verification
-                        if metrics.success {
+                        if metrics.is_success() {
                             match super::verify::tx_to_pending_its(&metrics, false) {
                                 Ok(pending) => {
                                     let _ = vtx.send(pending);
                                 }
                                 Err(e) => {
-                                    metrics.success = false;
-                                    metrics.error =
-                                        Some(format!("failed to build verification state: {e}"));
+                                    metrics.mark_failed(format!(
+                                        "failed to build verification state: {e}"
+                                    ));
                                 }
                             }
                         }
@@ -474,8 +424,7 @@ async fn run_sustained_pipeline(
                             latency_ms: None,
                             compute_units: None,
                             slot: None,
-                            success: false,
-                            error: Some(e.to_string()),
+                            outcome: TxMetrics::failed_outcome(e.to_string()),
                             payload: Vec::new(),
                             payload_hash: String::new(),
                             source_address: String::new(),
@@ -498,7 +447,7 @@ async fn run_sustained_pipeline(
         Some(send_done),
         spinner,
     )
-    .await;
+    .await?;
 
     let mut report = super::sustained::build_sustained_report(
         result,
@@ -617,8 +566,7 @@ async fn run_burst_pipeline(
                         latency_ms: None,
                         compute_units: None,
                         slot: None,
-                        success: false,
-                        error: Some(e.to_string()),
+                        outcome: TxMetrics::failed_outcome(e.to_string()),
                         payload: Vec::new(),
                         payload_hash: String::new(),
                         source_address: String::new(),
@@ -635,7 +583,7 @@ async fn run_burst_pipeline(
     }
 
     let total_submitted = tasks.len() as u64;
-    join_all(tasks).await;
+    super::task_group::join_all(tasks).await?;
     let test_duration = test_start.elapsed().as_secs_f64();
 
     let confirmed_count = confirmed_counter.load(Ordering::Relaxed);
@@ -645,16 +593,16 @@ async fn run_burst_pipeline(
     ));
 
     let metrics = metrics_list.lock().await.clone();
-    let total_failed = metrics.iter().filter(|m| !m.success).count() as u64;
+    let total_failed = metrics.iter().filter(|m| !m.is_success()).count() as u64;
 
     if total_failed > 0 {
         let mut error_counts: std::collections::HashMap<String, (u64, String)> =
             std::collections::HashMap::new();
-        for m in metrics.iter().filter(|m| !m.success) {
+        for m in metrics.iter().filter(|m| !m.is_success()) {
             // Group by a short key (deduplicates identical failures) but
             // print the full error message — Solana program-log dumps are
             // multi-line and a 120-char cap drops the actionable part.
-            let full = m.error.as_deref().unwrap_or("unknown").to_string();
+            let full = m.error().unwrap_or("unknown").to_string();
             let key: String = full.chars().take(80).collect();
             error_counts.entry(key).or_insert((0u64, full)).0 += 1;
         }
@@ -678,16 +626,19 @@ async fn run_burst_pipeline(
     );
 
     // --- Verify ---
-    let verification = super::verify::verify_onchain_evm_its(
-        &args.config,
-        &args.source_axelar_id,
-        &args.destination_axelar_id,
-        args.network,
-        &format!("{}", evm.its_proxy_addr),
-        evm.evm_gateway_addr,
-        evm_rpc_url,
-        &mut report.transactions,
-    )
+    let verification = super::verify::verify_onchain_evm_its(super::verify::ItsBatchVerification {
+        route: super::verify::VerificationRoute {
+            config: &args.config,
+            source_chain: &args.source_axelar_id,
+            destination_chain: &args.destination_axelar_id,
+            network: args.network,
+        },
+        destination: super::verify::EvmItsDestination {
+            gateway_addr: evm.evm_gateway_addr,
+            rpc_url: evm_rpc_url,
+        },
+        metrics: &mut report.transactions,
+    })
     .await?;
     report.verification = Some(verification);
 

@@ -206,8 +206,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
                     latency_ms: Some(latency_ms),
                     compute_units: None,
                     slot: None,
-                    success: true,
-                    error: None,
+                    outcome: TxMetrics::succeeded_outcome(),
                     payload: Vec::new(),
                     payload_hash: r.payload_hash_hex.clone(),
                     source_address: format!("0x{}", r.source_address_hex),
@@ -229,8 +228,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
                     latency_ms: None,
                     compute_units: None,
                     slot: None,
-                    success: false,
-                    error: r.error.or_else(|| Some("Sui ITS tx failed".to_string())),
+                    outcome: TxMetrics::external_outcome(false, r.error, "Sui ITS tx failed"),
                     payload: Vec::new(),
                     payload_hash: String::new(),
                     source_address: String::new(),
@@ -248,8 +246,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
                     latency_ms: None,
                     compute_units: None,
                     slot: None,
-                    success: false,
-                    error: Some(e.to_string()),
+                    outcome: TxMetrics::failed_outcome(e.to_string()),
                     payload: Vec::new(),
                     payload_hash: String::new(),
                     source_address: String::new(),
@@ -264,7 +261,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
 
     spinner.finish_and_clear();
     let total_submitted = metrics.len() as u64;
-    let total_confirmed = metrics.iter().filter(|m| m.success).count() as u64;
+    let total_confirmed = metrics.iter().filter(|m| m.is_success()).count() as u64;
     ui::success(&format!(
         "sent {total_confirmed}/{total_submitted} confirmed"
     ));
@@ -284,16 +281,19 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
         metrics,
     );
 
-    let verification = super::verify::verify_onchain_evm_its(
-        &args.config,
-        &args.source_axelar_id,
-        &args.destination_axelar_id,
-        args.network,
-        &destination_address,
-        evm_gateway_addr,
-        &evm_rpc_url,
-        &mut report.transactions,
-    )
+    let verification = super::verify::verify_onchain_evm_its(super::verify::ItsBatchVerification {
+        route: super::verify::VerificationRoute {
+            config: &args.config,
+            source_chain: &args.source_axelar_id,
+            destination_chain: &args.destination_axelar_id,
+            network: args.network,
+        },
+        destination: super::verify::EvmItsDestination {
+            gateway_addr: evm_gateway_addr,
+            rpc_url: &evm_rpc_url,
+        },
+        metrics: &mut report.transactions,
+    })
     .await?;
     report.verification = Some(verification);
 

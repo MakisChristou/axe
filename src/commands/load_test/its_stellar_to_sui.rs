@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use eyre::{Result, eyre};
 
 use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+use super::run_sizing::RunSizing;
 use super::{
     LoadTestArgs, finalize_sui_dest_run_its, load_stellar_main_wallet, load_sui_main_wallet,
     read_stellar_contract_address, read_stellar_network_type, read_stellar_token_address,
@@ -50,7 +51,10 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
         "ITS (interchainTransfer via hub, Sui destination)",
     );
 
-    let sustained_params = args.tps.zip(args.duration_secs);
+    let sizing = RunSizing::new(&args)?;
+    let sustained_params = sizing
+        .sustained()
+        .map(|(tps, duration_secs, _)| (tps as u64, duration_secs));
 
     // ----- Stellar source setup -----
     let stellar_rpc = &args.source_rpc;
@@ -112,10 +116,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
     ui::kv("gas", &format!("{gas_stroops} stroops ({gas_xlm:.4} XLM)"));
 
     // ----- Send loop: burst (sequential N) or sustained (rate-paced) -----
-    let total_to_send: u64 = match sustained_params {
-        Some((tps, dur)) => tps * dur,
-        None => args.num_txs.max(1),
-    };
+    let total_to_send = sizing.total_expected;
     let pacing: Option<Duration> = sustained_params.map(|(tps, _)| {
         // Per-tx interval = 1s / tps. Stellar's single-wallet throughput is
         // bounded by ledger close (~5s), so requesting tps>0.2 just queues
@@ -175,8 +176,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
                     latency_ms: Some(elapsed_ms),
                     compute_units: None,
                     slot: None,
-                    success: true,
-                    error: None,
+                    outcome: TxMetrics::succeeded_outcome(),
                     payload: Vec::new(),
                     payload_hash: String::new(),
                     source_address: its_addr.clone(),
@@ -187,7 +187,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
                     send_instant: Some(submit_start),
                     amplifier_timing: None,
                 });
-                let confirmed = metrics.iter().filter(|m| m.success).count();
+                let confirmed = metrics.iter().filter(|m| m.is_success()).count();
                 let msg = if sustained_params.is_some() {
                     format!("[sustained] {confirmed}/{total_to_send} confirmed")
                 } else {
@@ -210,7 +210,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
     spinner.finish_and_clear();
 
     let total_submitted = metrics.len() as u64;
-    let total_confirmed = metrics.iter().filter(|m| m.success).count() as u64;
+    let total_confirmed = metrics.iter().filter(|m| m.is_success()).count() as u64;
     ui::success(&format!(
         "sent {total_confirmed}/{total_submitted} confirmed"
     ));
@@ -245,8 +245,7 @@ fn failed_metric(source_addr: String, err: String, elapsed_ms: u64) -> TxMetrics
         latency_ms: None,
         compute_units: None,
         slot: None,
-        success: false,
-        error: Some(err),
+        outcome: TxMetrics::failed_outcome(err),
         payload: Vec::new(),
         payload_hash: String::new(),
         source_address: source_addr,

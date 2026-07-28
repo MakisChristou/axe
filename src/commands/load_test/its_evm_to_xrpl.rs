@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use alloy::{
     primitives::{Bytes, FixedBytes, U256},
@@ -21,11 +21,12 @@ use alloy::{
     signers::local::PrivateKeySigner,
 };
 use eyre::eyre;
-use futures::future::join_all;
 use tokio::sync::{Mutex, Semaphore};
 
+use super::its_prerequisites::{self, GatewayRequirement};
 use super::keypairs;
 use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+use super::run_sizing::RunSizing;
 use super::{LoadTestArgs, check_evm_balance, finish_report, validate_evm_rpc};
 use crate::config::ChainsConfig;
 use crate::cosmos::lcd_cosmwasm_smart_query;
@@ -46,42 +47,7 @@ fn default_xrpl_recipient(network: crate::types::Network) -> &'static str {
     }
 }
 
-/// Default gas value: tries the Axelarscan `estimateGasFee` quote for the
-/// route (× 1.5); falls back to a route-agnostic constant when the API
-/// can't be reached.
-async fn default_gas_value_wei(args: &LoadTestArgs) -> u128 {
-    if let Some(quoted) = quote_route_gas(args).await {
-        return quoted;
-    }
-    fallback_gas_value_wei(args.network, &args.source_chain)
-}
-
-async fn quote_route_gas(args: &LoadTestArgs) -> Option<u128> {
-    let cfg = crate::config::ChainsConfig::load(&args.config).ok()?;
-    let symbol = cfg
-        .chains
-        .get(&args.source_chain)?
-        .token_symbol
-        .as_deref()?;
-    super::gas_estimate::estimate_route_gas(
-        args.network,
-        &args.source_axelar_id,
-        &args.destination_axelar_id,
-        symbol,
-        super::gas_estimate::DEFAULT_DEST_GAS_LIMIT,
-    )
-    .await
-}
-
-fn fallback_gas_value_wei(network: crate::types::Network, _source_chain: &str) -> u128 {
-    match network {
-        crate::types::Network::DevnetAmplifier => 0,
-        _ => 10_000_000_000_000_000,
-    }
-}
-
 const MAX_CONCURRENT_SENDS: usize = 100;
-const MAX_RETRIES: u32 = 5;
 
 /// Per-tx transfer amount (in token's smallest unit). Kept tiny so a
 /// 3000-tx run costs minimal real funds on mainnet. axlXRP on EVM has 18
@@ -97,7 +63,13 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
     validate_evm_rpc(&evm_rpc_url).await?;
 
     let cfg = ChainsConfig::load(&args.config)?;
-    verify_axelar_prerequisites(&cfg, dest, &args.destination_axelar_id)?;
+    its_prerequisites::verify(
+        &cfg,
+        dest,
+        GatewayRequirement::Xrpl {
+            axelar_id: &args.destination_axelar_id,
+        },
+    )?;
 
     ui::kv("source", src);
     ui::kv("destination", dest);
@@ -112,12 +84,12 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
 
     let xrpl = setup_xrpl_recipient(&args.config, dest, args.network).await?;
 
-    let (gas_value_wei, gas_value) = parse_gas_value_wei(&args).await?;
+    let (gas_value_wei, gas_value) = super::its_evm_source::standard_gas_value(&args).await?;
 
-    let sizing = compute_run_sizing(&args);
+    let sizing = RunSizing::new(&args)?;
 
     let derived =
-        derive_and_fund_evm_signers(&evm_src, &evm_rpc_url, gas_value_wei, &args, &sizing).await?;
+        derive_and_fund_evm_signers(&evm_src, &evm_rpc_url, gas_value_wei, &sizing).await?;
 
     distribute_and_approve_tokens(
         &evm_src,
@@ -126,7 +98,6 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
         token_id,
         &derived,
         &sizing,
-        &args,
     )
     .await?;
 
@@ -148,7 +119,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
         amount_per_tx: U256::from(AMOUNT_PER_TX_WEI),
     };
 
-    if !sizing.burst_mode {
+    if !sizing.is_burst() {
         run_sustained_pipeline(&args, &cfg, &evm_rpc_url, &xrpl, derived, &its_ctx, &sizing).await
     } else {
         run_burst_pipeline(&args, &evm_rpc_url, &xrpl, &derived, &its_ctx, &sizing).await
@@ -170,15 +141,6 @@ struct XrplDest {
     recipient_addr: String,
 }
 
-/// Sizing parameters derived from CLI flags: chooses burst vs sustained,
-/// number of ephemeral keys, expected total tx count, and per-key tx counts.
-struct RunSizing {
-    burst_mode: bool,
-    sustained_params: Option<(u64, u64)>,
-    num_keys: usize,
-    total_expected: u64,
-}
-
 /// Per-call inputs for `interchainTransfer`: ITS proxy, token id, gas value
 /// (msg.value), pre-encoded recipient bytes, and per-tx token amount.
 struct ItsCallCtx {
@@ -190,38 +152,6 @@ struct ItsCallCtx {
     gas_arg_scaling_factor: u32,
     receiver_bytes: Bytes,
     amount_per_tx: U256,
-}
-
-/// Verify Axelar-side prerequisites for the EVM → XRPL hop. XRPL uses
-/// `XrplGateway/{xrpl_axelar_id}` rather than the standard
-/// `Gateway/{chain}` — accept either. Also requires a global
-/// `AxelarnetGateway`. Bails with the existing error strings if either is
-/// missing.
-fn verify_axelar_prerequisites(
-    cfg: &ChainsConfig,
-    dest: &str,
-    destination_axelar_id: &str,
-) -> eyre::Result<()> {
-    // XRPL uses `XrplGateway/{xrpl_axelar_id}` instead of the standard
-    // `Gateway/{chain}` — accept either.
-    let has_dest_gateway = cfg.axelar.contract_address("Gateway", dest).is_ok()
-        || cfg
-            .axelar
-            .contract_address("XrplGateway", destination_axelar_id)
-            .is_ok();
-    if !has_dest_gateway {
-        eyre::bail!(
-            "destination chain '{dest}' has no Cosmos Gateway (or XrplGateway) in the config — verification would fail."
-        );
-    }
-    if cfg
-        .axelar
-        .global_contract_address("AxelarnetGateway")
-        .is_err()
-    {
-        eyre::bail!("no AxelarnetGateway address in config — required for ITS load test");
-    }
-    Ok(())
 }
 
 /// Resolve the interchain token id: prefer the user-supplied `--token-id`,
@@ -396,44 +326,6 @@ async fn setup_xrpl_recipient(
 /// Parse the user-supplied gas value (wei), defaulting via
 /// `default_gas_value_wei`. Returns both the raw `u128` and `U256`
 /// representations; emits the matching UI line.
-async fn parse_gas_value_wei(args: &LoadTestArgs) -> eyre::Result<(u128, U256)> {
-    let gas_value_wei: u128 = match args.gas_value.as_deref() {
-        Some(v) => v.parse().map_err(|e| eyre!("invalid --gas-value: {e}"))?,
-        None => default_gas_value_wei(args).await,
-    };
-    let gas_value = U256::from(gas_value_wei);
-    {
-        ui::kv(
-            "gas value",
-            &format!(
-                "{gas_value_wei} wei ({:.6} ETH)",
-                gas_value_wei as f64 / 1e18
-            ),
-        );
-    }
-    Ok((gas_value_wei, gas_value))
-}
-
-/// Decide burst vs sustained, ephemeral key count, and total expected txs.
-fn compute_run_sizing(args: &LoadTestArgs) -> RunSizing {
-    let sustained_params = args.tps.zip(args.duration_secs);
-    let burst_mode = sustained_params.is_none();
-    let (num_keys, total_expected) = if burst_mode {
-        let n = args.num_txs.max(1) as usize;
-        (n, args.num_txs.max(1))
-    } else {
-        let (tps, dur) = sustained_params.expect("burst_mode is false");
-        let tps = tps as usize;
-        (tps * args.key_cycle as usize, tps as u64 * dur)
-    };
-    RunSizing {
-        burst_mode,
-        sustained_params,
-        num_keys,
-        total_expected,
-    }
-}
-
 /// Derive ephemeral EVM signers and ensure each is funded for the planned
 /// number of `interchainTransfer` calls (gas + msg.value × txs_per_key, ×2
 /// safety multiplier).
@@ -441,7 +333,6 @@ async fn derive_and_fund_evm_signers(
     evm_src: &EvmSource,
     evm_rpc_url: &str,
     gas_value_wei: u128,
-    args: &LoadTestArgs,
     sizing: &RunSizing,
 ) -> eyre::Result<Vec<PrivateKeySigner>> {
     let derived = keypairs::derive_evm_signers(&evm_src.main_key, sizing.num_keys)?;
@@ -461,11 +352,10 @@ async fn derive_and_fund_evm_signers(
     // ITS hub routing pays 2× gas_value per transfer (two commands).
     let hub_gas_value_wei = gas_value_wei.saturating_mul(2);
     let per_tx_native_cost = gas_price_wei.saturating_mul(ITS_GAS_LIMIT) + hub_gas_value_wei;
-    let txs_per_key: u128 = if sizing.burst_mode {
+    let txs_per_key: u128 = if sizing.is_burst() {
         1
     } else {
-        let dur = sizing.sustained_params.expect("burst_mode is false").1;
-        let rounds = dur.div_ceil(args.key_cycle);
+        let rounds = sizing.transactions_per_key();
         (rounds + rounds / 5 + 1) as u128
     };
     // 2× safety multiplier in case gas price doubles mid-test.
@@ -509,18 +399,12 @@ async fn distribute_and_approve_tokens(
     token_id: FixedBytes<32>,
     derived: &[PrivateKeySigner],
     sizing: &RunSizing,
-    args: &LoadTestArgs,
 ) -> eyre::Result<()> {
     let amount_per_tx = U256::from(AMOUNT_PER_TX_WEI);
-    let amount_per_key = if sizing.burst_mode {
+    let amount_per_key = if sizing.is_burst() {
         amount_per_tx
     } else {
-        let txs_per_key = sizing
-            .sustained_params
-            .expect("burst_mode is false")
-            .1
-            .div_ceil(args.key_cycle)
-            + 1;
+        let txs_per_key = sizing.transactions_per_key() + 1;
         amount_per_tx * U256::from(txs_per_key)
     };
     let token_provider = ProviderBuilder::new()
@@ -555,9 +439,7 @@ async fn run_sustained_pipeline(
 ) -> eyre::Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
-    let tps = sizing.sustained_params.expect("burst_mode is false").0 as usize;
-    let duration_secs = sizing.sustained_params.expect("burst_mode is false").1;
-    let key_cycle = args.key_cycle as usize;
+    let (tps, duration_secs, key_cycle) = sizing.sustained().expect("sustained mode");
     let rpc_url_str = evm_rpc_url.to_string();
 
     let nonce_provider = ProviderBuilder::new().connect_http(evm_rpc_url.parse()?);
@@ -585,17 +467,21 @@ async fn run_sustained_pipeline(
     let vnetwork = args.network;
     let verify_handle = tokio::spawn(async move {
         let spinner = spinner_rx.await.expect("spinner channel dropped");
-        super::verify::verify_onchain_xrpl_its_streaming(
-            &vconfig,
-            &vsource,
-            &vdest,
-            vnetwork,
-            &vxrpl_rpc,
-            &vrecipient,
-            verify_rx,
-            vdone,
+        super::verify::verify_onchain_xrpl_its_streaming(super::verify::StreamingVerification {
+            route: super::verify::VerificationRoute {
+                config: &vconfig,
+                source_chain: &vsource,
+                destination_chain: &vdest,
+                network: vnetwork,
+            },
+            destination: super::verify::XrplItsDestination {
+                rpc_url: &vxrpl_rpc,
+                recipient: &vrecipient,
+            },
+            rx: verify_rx,
+            send_done: vdone,
             spinner,
-        )
+        })
         .await
     });
 
@@ -645,14 +531,13 @@ async fn run_sustained_pipeline(
                     },
                 )
                 .await;
-                if result.success {
+                if result.is_success() {
                     match super::verify::tx_to_pending_its(&result, has_vv) {
                         Ok(pending) => {
                             let _ = vtx.send(pending);
                         }
                         Err(e) => {
-                            result.success = false;
-                            result.error = Some(format!("failed to build verification state: {e}"));
+                            result.mark_failed(format!("failed to build verification state: {e}"));
                         }
                     }
                 }
@@ -669,7 +554,7 @@ async fn run_sustained_pipeline(
         Some(send_done),
         spinner,
     )
-    .await;
+    .await?;
 
     let mut report = super::sustained::build_sustained_report(
         result,
@@ -738,9 +623,8 @@ async fn run_burst_pipeline(
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
-            let mut m = None;
-            for attempt in 0..=MAX_RETRIES {
-                let result = super::its_evm_source::execute_interchain_transfer(
+            let m = super::retry::rate_limited(|| {
+                super::its_evm_source::execute_interchain_transfer(
                     super::its_evm_source::InterchainTransferRequest {
                         provider: &provider,
                         its_proxy,
@@ -753,21 +637,9 @@ async fn run_burst_pipeline(
                         explicit_nonce: None,
                     },
                 )
-                .await;
-                if result.success || attempt == MAX_RETRIES {
-                    m = Some(result);
-                    break;
-                }
-                let is_rate_limited = result.error.as_deref().is_some_and(|e| e.contains("429"));
-                if !is_rate_limited {
-                    m = Some(result);
-                    break;
-                }
-                let backoff = Duration::from_secs(1 << attempt);
-                tokio::time::sleep(backoff).await;
-            }
-            let m = m.unwrap();
-            if m.success {
+            })
+            .await;
+            if m.is_success() {
                 let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 sp.set_message(format!("sending ({done}/{total} confirmed)..."));
             }
@@ -777,7 +649,7 @@ async fn run_burst_pipeline(
     }
 
     let total_submitted = tasks.len() as u64;
-    join_all(tasks).await;
+    super::task_group::join_all(tasks).await?;
     let test_duration = test_start.elapsed().as_secs_f64();
     let confirmed_count = confirmed_counter.load(Ordering::Relaxed);
     spinner.finish_and_clear();
@@ -800,16 +672,21 @@ async fn run_burst_pipeline(
         metrics,
     );
 
-    let verification = super::verify::verify_onchain_xrpl_its(
-        &args.config,
-        &args.source_axelar_id,
-        &args.destination_axelar_id,
-        args.network,
-        &xrpl.xrpl_rpc,
-        &xrpl.recipient_addr,
-        &mut report.transactions,
-    )
-    .await?;
+    let verification =
+        super::verify::verify_onchain_xrpl_its(super::verify::ItsBatchVerification {
+            route: super::verify::VerificationRoute {
+                config: &args.config,
+                source_chain: &args.source_axelar_id,
+                destination_chain: &args.destination_axelar_id,
+                network: args.network,
+            },
+            destination: super::verify::XrplItsDestination {
+                rpc_url: &xrpl.xrpl_rpc,
+                recipient: &xrpl.recipient_addr,
+            },
+            metrics: &mut report.transactions,
+        })
+        .await?;
     report.verification = Some(verification);
 
     finish_report(args, &mut report, test_start)

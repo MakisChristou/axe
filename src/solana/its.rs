@@ -378,8 +378,7 @@ pub fn send_its_interchain_transfer(
         latency_ms: Some(latency_ms),
         compute_units,
         slot,
-        success: true,
-        error: None,
+        outcome: TxMetrics::succeeded_outcome(),
         // CosmWasm VotingVerifier rejects `0x`-prefixed hex (sees it as
         // invalid hex). Match the Sui/EVM convention (no prefix) so the
         // amplifier `messages_status` query parses.

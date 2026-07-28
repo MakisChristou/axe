@@ -24,6 +24,7 @@ use serde_json::json;
 use super::evm_sender;
 use super::helpers::list_gateway_chains;
 use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+use super::run_sizing::RunSizing;
 use super::sol_sender;
 use super::stellar_sender;
 use super::sustained;
@@ -177,7 +178,7 @@ pub(super) async fn run_sol_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
     let destination_address = format!("{sender_receiver_addr}");
 
     let test_start = Instant::now();
-    let sustained = args.tps.is_some() && args.duration_secs.is_some();
+    let sustained = !RunSizing::new(&args)?.is_burst();
 
     let mut report = if sustained {
         // Streaming verification: run concurrently with sends.
@@ -195,18 +196,22 @@ pub(super) async fn run_sol_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
         let vnetwork = args.network;
         let verify_handle = tokio::spawn(async move {
             let spinner = spinner_rx.await.expect("spinner channel dropped");
-            verify::verify_onchain_evm_streaming(
-                &vconfig,
-                &vsource,
-                &vdest,
-                vnetwork,
-                &vdest_addr,
-                vgw,
-                &vdest_rpc,
-                verify_rx,
-                vdone,
+            verify::verify_onchain_evm_streaming(verify::StreamingVerification {
+                route: verify::VerificationRoute {
+                    config: &vconfig,
+                    source_chain: &vsource,
+                    destination_chain: &vdest,
+                    network: vnetwork,
+                },
+                destination: verify::EvmGmpStreamingDestination {
+                    address: &vdest_addr,
+                    gateway_addr: vgw,
+                    rpc_url: &vdest_rpc,
+                },
+                rx: verify_rx,
+                send_done: vdone,
                 spinner,
-            )
+            })
             .await
         });
 
@@ -238,17 +243,21 @@ pub(super) async fn run_sol_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
     } else {
         let mut report =
             sol_sender::run_load_test_with_metrics(&args, &destination_address, true).await?;
-        let verification = verify::verify_onchain(
-            &args.config,
-            &args.source_axelar_id,
-            &args.destination_axelar_id,
-            &destination_address,
-            gateway_addr,
-            &provider,
-            &mut report.transactions,
-            verify::SourceChainType::Svm,
-            args.network,
-        )
+        let verification = verify::verify_onchain(verify::GmpBatchVerification {
+            route: verify::VerificationRoute {
+                config: &args.config,
+                source_chain: &args.source_axelar_id,
+                destination_chain: &args.destination_axelar_id,
+                network: args.network,
+            },
+            destination: verify::EvmGmpDestination {
+                address: &destination_address,
+                gateway_addr,
+                provider: &provider,
+            },
+            metrics: &mut report.transactions,
+            source_type: verify::SourceChainType::Svm,
+        })
         .await?;
         report.verification = Some(verification);
         report
@@ -338,7 +347,7 @@ pub(super) async fn run_evm_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
     ui::kv("destination program", destination_address);
 
     let test_start = Instant::now();
-    let sustained = args.tps.is_some() && args.duration_secs.is_some();
+    let sustained = !RunSizing::new(&args)?.is_burst();
 
     let mut report = if sustained {
         // Sustained mode: run verification concurrently with the send phase.
@@ -360,17 +369,21 @@ pub(super) async fn run_evm_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
         let vnetwork = args.network;
         let verify_handle = tokio::spawn(async move {
             let spinner = spinner_rx.await.expect("spinner channel dropped");
-            verify::verify_onchain_solana_streaming(
-                &vconfig,
-                &vsource,
-                &vdest,
-                &vdest_addr,
-                &vdest_rpc,
-                vnetwork,
-                verify_rx,
-                vdone,
+            verify::verify_onchain_solana_streaming(verify::StreamingVerification {
+                route: verify::VerificationRoute {
+                    config: &vconfig,
+                    source_chain: &vsource,
+                    destination_chain: &vdest,
+                    network: vnetwork,
+                },
+                destination: verify::SolanaGmpDestination {
+                    address: &vdest_addr,
+                    rpc_url: &vdest_rpc,
+                },
+                rx: verify_rx,
+                send_done: vdone,
                 spinner,
-            )
+            })
             .await
         });
 
@@ -417,16 +430,20 @@ pub(super) async fn run_evm_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
         )
         .await?;
 
-        let verification = verify::verify_onchain_solana(
-            &args.config,
-            &args.source_axelar_id,
-            &args.destination_axelar_id,
-            destination_address,
-            &args.destination_rpc,
-            &mut report.transactions,
-            verify::SourceChainType::Evm,
-            args.network,
-        )
+        let verification = verify::verify_onchain_solana(verify::GmpBatchVerification {
+            route: verify::VerificationRoute {
+                config: &args.config,
+                source_chain: &args.source_axelar_id,
+                destination_chain: &args.destination_axelar_id,
+                network: args.network,
+            },
+            destination: verify::SolanaGmpDestination {
+                address: destination_address,
+                rpc_url: &args.destination_rpc,
+            },
+            metrics: &mut report.transactions,
+            source_type: verify::SourceChainType::Evm,
+        })
         .await?;
         report.verification = Some(verification);
         report
@@ -579,7 +596,7 @@ pub(super) async fn run_evm_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
     let destination_address = format!("{dest_sender_receiver}");
 
     let test_start = Instant::now();
-    let sustained = args.tps.is_some() && args.duration_secs.is_some();
+    let sustained = !RunSizing::new(&args)?.is_burst();
 
     let mut report = if sustained {
         // Streaming verification: run concurrently with sends.
@@ -599,32 +616,40 @@ pub(super) async fn run_evm_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
         let verify_handle = tokio::spawn(async move {
             let spinner = spinner_rx.await.expect("spinner channel dropped");
             if vlegacy {
-                verify::verify_onchain_evm_legacy_streaming(
-                    &vconfig,
-                    &vsource,
-                    &vdest,
-                    vnetwork,
-                    &vdest_addr,
-                    vgw,
-                    &vdest_rpc,
-                    verify_rx,
-                    vdone,
+                verify::verify_onchain_evm_legacy_streaming(verify::StreamingVerification {
+                    route: verify::VerificationRoute {
+                        config: &vconfig,
+                        source_chain: &vsource,
+                        destination_chain: &vdest,
+                        network: vnetwork,
+                    },
+                    destination: verify::EvmGmpStreamingDestination {
+                        address: &vdest_addr,
+                        gateway_addr: vgw,
+                        rpc_url: &vdest_rpc,
+                    },
+                    rx: verify_rx,
+                    send_done: vdone,
                     spinner,
-                )
+                })
                 .await
             } else {
-                verify::verify_onchain_evm_streaming(
-                    &vconfig,
-                    &vsource,
-                    &vdest,
-                    vnetwork,
-                    &vdest_addr,
-                    vgw,
-                    &vdest_rpc,
-                    verify_rx,
-                    vdone,
+                verify::verify_onchain_evm_streaming(verify::StreamingVerification {
+                    route: verify::VerificationRoute {
+                        config: &vconfig,
+                        source_chain: &vsource,
+                        destination_chain: &vdest,
+                        network: vnetwork,
+                    },
+                    destination: verify::EvmGmpStreamingDestination {
+                        address: &vdest_addr,
+                        gateway_addr: vgw,
+                        rpc_url: &vdest_rpc,
+                    },
+                    rx: verify_rx,
+                    send_done: vdone,
                     spinner,
-                )
+                })
                 .await
             }
         });
@@ -667,30 +692,38 @@ pub(super) async fn run_evm_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
         .await?;
 
         let verification = if legacy_route {
-            verify::verify_onchain_evm_legacy(
-                &args.config,
-                &args.source_axelar_id,
-                &args.destination_axelar_id,
-                &destination_address,
-                dest_gateway_addr,
-                &dest_read_provider,
-                &mut report.transactions,
-                args.network,
-                verify::SourceChainType::Evm,
-            )
+            verify::verify_onchain_evm_legacy(verify::GmpBatchVerification {
+                route: verify::VerificationRoute {
+                    config: &args.config,
+                    source_chain: &args.source_axelar_id,
+                    destination_chain: &args.destination_axelar_id,
+                    network: args.network,
+                },
+                destination: verify::EvmGmpDestination {
+                    address: &destination_address,
+                    gateway_addr: dest_gateway_addr,
+                    provider: &dest_read_provider,
+                },
+                metrics: &mut report.transactions,
+                source_type: verify::SourceChainType::Evm,
+            })
             .await?
         } else {
-            verify::verify_onchain(
-                &args.config,
-                &args.source_axelar_id,
-                &args.destination_axelar_id,
-                &destination_address,
-                dest_gateway_addr,
-                &dest_read_provider,
-                &mut report.transactions,
-                verify::SourceChainType::Evm,
-                args.network,
-            )
+            verify::verify_onchain(verify::GmpBatchVerification {
+                route: verify::VerificationRoute {
+                    config: &args.config,
+                    source_chain: &args.source_axelar_id,
+                    destination_chain: &args.destination_axelar_id,
+                    network: args.network,
+                },
+                destination: verify::EvmGmpDestination {
+                    address: &destination_address,
+                    gateway_addr: dest_gateway_addr,
+                    provider: &dest_read_provider,
+                },
+                metrics: &mut report.transactions,
+                source_type: verify::SourceChainType::Evm,
+            })
             .await?
         };
         report.verification = Some(verification);
@@ -728,7 +761,7 @@ pub(super) async fn run_sol_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
     ui::kv("destination program", destination_address);
 
     let test_start = Instant::now();
-    let sustained = args.tps.is_some() && args.duration_secs.is_some();
+    let sustained = !RunSizing::new(&args)?.is_burst();
 
     let mut report = if sustained {
         // Sustained mode: run verification concurrently with the send phase.
@@ -746,17 +779,21 @@ pub(super) async fn run_sol_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
         let vnetwork = args.network;
         let verify_handle = tokio::spawn(async move {
             let spinner = spinner_rx.await.expect("spinner channel dropped");
-            verify::verify_onchain_solana_streaming(
-                &vconfig,
-                &vsource,
-                &vdest,
-                &vdest_addr,
-                &vdest_rpc,
-                vnetwork,
-                verify_rx,
-                vdone,
+            verify::verify_onchain_solana_streaming(verify::StreamingVerification {
+                route: verify::VerificationRoute {
+                    config: &vconfig,
+                    source_chain: &vsource,
+                    destination_chain: &vdest,
+                    network: vnetwork,
+                },
+                destination: verify::SolanaGmpDestination {
+                    address: &vdest_addr,
+                    rpc_url: &vdest_rpc,
+                },
+                rx: verify_rx,
+                send_done: vdone,
                 spinner,
-            )
+            })
             .await
         });
 
@@ -790,16 +827,20 @@ pub(super) async fn run_sol_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
         let mut report =
             sol_sender::run_load_test_with_metrics(&args, destination_address, false).await?;
 
-        let verification = verify::verify_onchain_solana(
-            &args.config,
-            &args.source_axelar_id,
-            &args.destination_axelar_id,
-            destination_address,
-            &args.destination_rpc,
-            &mut report.transactions,
-            verify::SourceChainType::Svm,
-            args.network,
-        )
+        let verification = verify::verify_onchain_solana(verify::GmpBatchVerification {
+            route: verify::VerificationRoute {
+                config: &args.config,
+                source_chain: &args.source_axelar_id,
+                destination_chain: &args.destination_axelar_id,
+                network: args.network,
+            },
+            destination: verify::SolanaGmpDestination {
+                address: destination_address,
+                rpc_url: &args.destination_rpc,
+            },
+            metrics: &mut report.transactions,
+            source_type: verify::SourceChainType::Svm,
+        })
         .await?;
         report.verification = Some(verification);
         report
@@ -914,19 +955,12 @@ pub(super) async fn run_stellar_to_evm(args: LoadTestArgs, _run_start: Instant) 
     let destination_address = format!("{sender_receiver_addr}");
 
     // --- Burst vs sustained ---
-    // Destructure the sustained-mode params once; later branches rely on
-    // `Some(...)` here instead of brittle `.unwrap()` calls.
-    let sustained_params = args.tps.zip(args.duration_secs);
-    let num_keys = match sustained_params {
-        Some((tps, _)) => tps as usize * args.key_cycle as usize,
-        None => args.num_txs.max(1) as usize,
-    };
+    let run_sizing = RunSizing::new(&args)?;
+    let sustained_params = run_sizing.sustained();
+    let num_keys = run_sizing.num_keys;
     ui::info(&format!("deriving {num_keys} Stellar keys..."));
     let wallets = crate::commands::load_test::stellar_sender::derive_wallets(&main_seed, num_keys)?;
-    let txs_per_key = match sustained_params {
-        Some(_) => args.key_cycle,
-        None => 1,
-    };
+    let txs_per_key = run_sizing.transactions_per_key();
     let mainnet_starting_balance =
         crate::commands::load_test::stellar_sender::mainnet_per_key_balance_stroops(
             gas_stroops,
@@ -947,7 +981,7 @@ pub(super) async fn run_stellar_to_evm(args: LoadTestArgs, _run_start: Instant) 
     };
 
     let test_start = Instant::now();
-    let mut report = if let Some((tps, duration_secs)) = sustained_params {
+    let mut report = if let Some((tps, duration_secs, key_cycle)) = sustained_params {
         let (verify_tx, verify_rx) = tokio::sync::mpsc::unbounded_channel();
         let send_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (spinner_tx, spinner_rx) = tokio::sync::oneshot::channel::<indicatif::ProgressBar>();
@@ -962,18 +996,22 @@ pub(super) async fn run_stellar_to_evm(args: LoadTestArgs, _run_start: Instant) 
         let vnetwork = args.network;
         let verify_handle = tokio::spawn(async move {
             let spinner = spinner_rx.await.expect("spinner channel dropped");
-            verify::verify_onchain_evm_streaming(
-                &vconfig,
-                &vsource,
-                &vdest,
-                vnetwork,
-                &vdest_addr,
-                vgw,
-                &vdest_rpc,
-                verify_rx,
-                vdone,
+            verify::verify_onchain_evm_streaming(verify::StreamingVerification {
+                route: verify::VerificationRoute {
+                    config: &vconfig,
+                    source_chain: &vsource,
+                    destination_chain: &vdest,
+                    network: vnetwork,
+                },
+                destination: verify::EvmGmpStreamingDestination {
+                    address: &vdest_addr,
+                    gateway_addr: vgw,
+                    rpc_url: &vdest_rpc,
+                },
+                rx: verify_rx,
+                send_done: vdone,
                 spinner,
-            )
+            })
             .await
         });
 
@@ -996,9 +1034,9 @@ pub(super) async fn run_stellar_to_evm(args: LoadTestArgs, _run_start: Instant) 
                 destination_chain: args.destination_axelar_id.clone(),
                 destination_address: destination_address.clone(),
                 payload_override,
-                tps: tps as usize,
+                tps,
                 duration_secs,
-                key_cycle: args.key_cycle as usize,
+                key_cycle,
                 verify_tx: Some(verify_tx),
                 send_done: Some(send_done),
                 spinner,
@@ -1008,14 +1046,14 @@ pub(super) async fn run_stellar_to_evm(args: LoadTestArgs, _run_start: Instant) 
                 gas_amount_stroops: gas_stroops,
             },
         )
-        .await;
+        .await?;
 
         let mut report = sustained::build_sustained_report(
             result,
             src,
             dest,
             &destination_address,
-            tps * duration_secs,
+            run_sizing.total_expected,
             num_keys,
         );
         let (verification, timings) = verify_handle.await??;
@@ -1046,17 +1084,21 @@ pub(super) async fn run_stellar_to_evm(args: LoadTestArgs, _run_start: Instant) 
             },
         )
         .await?;
-        let verification = verify::verify_onchain(
-            &args.config,
-            &args.source_axelar_id,
-            &args.destination_axelar_id,
-            &destination_address,
-            gateway_addr,
-            &provider,
-            &mut report.transactions,
-            verify::SourceChainType::Stellar,
-            args.network,
-        )
+        let verification = verify::verify_onchain(verify::GmpBatchVerification {
+            route: verify::VerificationRoute {
+                config: &args.config,
+                source_chain: &args.source_axelar_id,
+                destination_chain: &args.destination_axelar_id,
+                network: args.network,
+            },
+            destination: verify::EvmGmpDestination {
+                address: &destination_address,
+                gateway_addr,
+                provider: &provider,
+            },
+            metrics: &mut report.transactions,
+            source_type: verify::SourceChainType::Stellar,
+        })
         .await?;
         report.verification = Some(verification);
         report
@@ -1146,19 +1188,23 @@ pub(super) async fn run_evm_to_stellar(args: LoadTestArgs, _run_start: Instant) 
     .await?;
 
     let signer_pk: [u8; 32] = alloy::primitives::keccak256(signer.address().as_slice()).into();
-    let verification = verify::verify_onchain_stellar_gmp(
-        &args.config,
-        &args.source_axelar_id,
-        &args.destination_axelar_id,
-        &stellar_example_addr,
-        stellar_rpc,
-        &stellar_network_type,
-        &stellar_gateway_addr,
-        signer_pk,
-        &mut report.transactions,
-        verify::SourceChainType::Evm,
-        args.network,
-    )
+    let verification = verify::verify_onchain_stellar_gmp(verify::GmpBatchVerification {
+        route: verify::VerificationRoute {
+            config: &args.config,
+            source_chain: &args.source_axelar_id,
+            destination_chain: &args.destination_axelar_id,
+            network: args.network,
+        },
+        destination: verify::StellarGmpDestination {
+            contract: &stellar_example_addr,
+            rpc_url: stellar_rpc,
+            network_type: &stellar_network_type,
+            gateway_contract: &stellar_gateway_addr,
+            signer_pk,
+        },
+        metrics: &mut report.transactions,
+        source_type: verify::SourceChainType::Evm,
+    })
     .await?;
     report.verification = Some(verification);
 
@@ -1256,16 +1302,20 @@ pub(super) async fn run_stellar_to_sol(args: LoadTestArgs, _run_start: Instant) 
     .await?;
     report.destination_address = destination_address.clone();
 
-    let verification = verify::verify_onchain_solana(
-        &args.config,
-        &args.source_axelar_id,
-        &args.destination_axelar_id,
-        &destination_address,
-        &solana_rpc,
-        &mut report.transactions,
-        verify::SourceChainType::Stellar,
-        args.network,
-    )
+    let verification = verify::verify_onchain_solana(verify::GmpBatchVerification {
+        route: verify::VerificationRoute {
+            config: &args.config,
+            source_chain: &args.source_axelar_id,
+            destination_chain: &args.destination_axelar_id,
+            network: args.network,
+        },
+        destination: verify::SolanaGmpDestination {
+            address: &destination_address,
+            rpc_url: &solana_rpc,
+        },
+        metrics: &mut report.transactions,
+        source_type: verify::SourceChainType::Stellar,
+    })
     .await?;
     report.verification = Some(verification);
 
@@ -1309,19 +1359,23 @@ pub(super) async fn run_sol_to_stellar(args: LoadTestArgs, _run_start: Instant) 
         out
     };
 
-    let verification = verify::verify_onchain_stellar_gmp(
-        &args.config,
-        &args.source_axelar_id,
-        &args.destination_axelar_id,
-        &stellar_example_addr,
-        stellar_rpc,
-        &stellar_network_type,
-        &stellar_gateway_addr,
-        signer_pk,
-        &mut report.transactions,
-        verify::SourceChainType::Svm,
-        args.network,
-    )
+    let verification = verify::verify_onchain_stellar_gmp(verify::GmpBatchVerification {
+        route: verify::VerificationRoute {
+            config: &args.config,
+            source_chain: &args.source_axelar_id,
+            destination_chain: &args.destination_axelar_id,
+            network: args.network,
+        },
+        destination: verify::StellarGmpDestination {
+            contract: &stellar_example_addr,
+            rpc_url: stellar_rpc,
+            network_type: &stellar_network_type,
+            gateway_contract: &stellar_gateway_addr,
+            signer_pk,
+        },
+        metrics: &mut report.transactions,
+        source_type: verify::SourceChainType::Svm,
+    })
     .await?;
     report.verification = Some(verification);
 
@@ -1489,8 +1543,7 @@ pub(super) async fn run_sui_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
                     latency_ms: Some(latency_ms),
                     compute_units: None,
                     slot: None,
-                    success: true,
-                    error: None,
+                    outcome: TxMetrics::succeeded_outcome(),
                     payload: payload_bytes.clone(),
                     payload_hash: r.payload_hash_hex.clone(),
                     source_address: format!("0x{}", r.source_address_hex),
@@ -1509,8 +1562,7 @@ pub(super) async fn run_sui_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
                     latency_ms: None,
                     compute_units: None,
                     slot: None,
-                    success: false,
-                    error: r.error.or_else(|| Some("Sui tx failed".to_string())),
+                    outcome: TxMetrics::external_outcome(false, r.error, "Sui tx failed"),
                     payload: payload_bytes.clone(),
                     payload_hash: String::new(),
                     source_address: String::new(),
@@ -1528,8 +1580,7 @@ pub(super) async fn run_sui_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
                     latency_ms: None,
                     compute_units: None,
                     slot: None,
-                    success: false,
-                    error: Some(e.to_string()),
+                    outcome: TxMetrics::failed_outcome(e.to_string()),
                     payload: payload_bytes.clone(),
                     payload_hash: String::new(),
                     source_address: String::new(),
@@ -1544,7 +1595,7 @@ pub(super) async fn run_sui_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
 
     spinner.finish_and_clear();
     let total_submitted = metrics.len() as u64;
-    let total_confirmed = metrics.iter().filter(|m| m.success).count() as u64;
+    let total_confirmed = metrics.iter().filter(|m| m.is_success()).count() as u64;
     ui::success(&format!(
         "sent {total_confirmed}/{total_submitted} confirmed"
     ));
@@ -1564,17 +1615,21 @@ pub(super) async fn run_sui_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
         metrics,
     );
 
-    let verification = verify::verify_onchain(
-        &args.config,
-        &args.source_axelar_id,
-        &args.destination_axelar_id,
-        &destination_address,
-        gateway_addr,
-        &provider,
-        &mut report.transactions,
-        verify::SourceChainType::Sui,
-        args.network,
-    )
+    let verification = verify::verify_onchain(verify::GmpBatchVerification {
+        route: verify::VerificationRoute {
+            config: &args.config,
+            source_chain: &args.source_axelar_id,
+            destination_chain: &args.destination_axelar_id,
+            network: args.network,
+        },
+        destination: verify::EvmGmpDestination {
+            address: &destination_address,
+            gateway_addr,
+            provider: &provider,
+        },
+        metrics: &mut report.transactions,
+        source_type: verify::SourceChainType::Sui,
+    })
     .await?;
     report.verification = Some(verification);
 
@@ -1713,8 +1768,7 @@ pub(super) async fn run_sui_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
                     latency_ms: Some(latency_ms),
                     compute_units: None,
                     slot: None,
-                    success: true,
-                    error: None,
+                    outcome: TxMetrics::succeeded_outcome(),
                     payload: payload_bytes.clone(),
                     payload_hash: r.payload_hash_hex.clone(),
                     source_address: format!("0x{}", r.source_address_hex),
@@ -1733,8 +1787,7 @@ pub(super) async fn run_sui_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
                     latency_ms: None,
                     compute_units: None,
                     slot: None,
-                    success: false,
-                    error: r.error.or_else(|| Some("Sui tx failed".to_string())),
+                    outcome: TxMetrics::external_outcome(false, r.error, "Sui tx failed"),
                     payload: payload_bytes.clone(),
                     payload_hash: String::new(),
                     source_address: String::new(),
@@ -1752,8 +1805,7 @@ pub(super) async fn run_sui_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
                     latency_ms: None,
                     compute_units: None,
                     slot: None,
-                    success: false,
-                    error: Some(e.to_string()),
+                    outcome: TxMetrics::failed_outcome(e.to_string()),
                     payload: payload_bytes.clone(),
                     payload_hash: String::new(),
                     source_address: String::new(),
@@ -1768,7 +1820,7 @@ pub(super) async fn run_sui_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
 
     spinner.finish_and_clear();
     let total_submitted = metrics.len() as u64;
-    let total_confirmed = metrics.iter().filter(|m| m.success).count() as u64;
+    let total_confirmed = metrics.iter().filter(|m| m.is_success()).count() as u64;
     ui::success(&format!(
         "sent {total_confirmed}/{total_submitted} confirmed"
     ));
@@ -1788,16 +1840,20 @@ pub(super) async fn run_sui_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
         metrics,
     );
 
-    let verification = verify::verify_onchain_solana(
-        &args.config,
-        &args.source_axelar_id,
-        &args.destination_axelar_id,
-        &destination_address,
-        &solana_rpc,
-        &mut report.transactions,
-        verify::SourceChainType::Sui,
-        args.network,
-    )
+    let verification = verify::verify_onchain_solana(verify::GmpBatchVerification {
+        route: verify::VerificationRoute {
+            config: &args.config,
+            source_chain: &args.source_axelar_id,
+            destination_chain: &args.destination_axelar_id,
+            network: args.network,
+        },
+        destination: verify::SolanaGmpDestination {
+            address: &destination_address,
+            rpc_url: &solana_rpc,
+        },
+        metrics: &mut report.transactions,
+        source_type: verify::SourceChainType::Sui,
+    })
     .await?;
     report.verification = Some(verification);
 

@@ -201,7 +201,7 @@ pub(crate) fn finish_report(
     // refactor: private RPC URLs (from repo secrets) must not appear in the
     // JSON artifact, regardless of where the underlying error came from.
     for tx in &mut report.transactions {
-        if let Some(err) = tx.error.as_mut() {
+        if let Some(err) = tx.error_mut() {
             *err = scrub_urls(err);
         }
     }
@@ -1173,16 +1173,20 @@ pub(crate) async fn finalize_sui_dest_run(
     source_type: verify::SourceChainType,
     test_start: Instant,
 ) -> Result<()> {
-    let verification = verify::verify_onchain_sui_gmp(
-        &args.config,
-        &args.source_axelar_id,
-        &args.destination_axelar_id,
-        sui_channel,
-        sui_rpc,
-        &mut report.transactions,
+    let verification = verify::verify_onchain_sui_gmp(verify::GmpBatchVerification {
+        route: verify::VerificationRoute {
+            config: &args.config,
+            source_chain: &args.source_axelar_id,
+            destination_chain: &args.destination_axelar_id,
+            network: args.network,
+        },
+        destination: verify::SuiGmpDestination {
+            address: sui_channel,
+            rpc_url: sui_rpc,
+        },
+        metrics: &mut report.transactions,
         source_type,
-        args.network,
-    )
+    })
     .await?;
     report.verification = Some(verification);
     finish_report(args, report, test_start)
@@ -1198,14 +1202,16 @@ pub(crate) async fn finalize_sui_dest_run_its(
     sui_rpc: &str,
     test_start: Instant,
 ) -> Result<()> {
-    let verification = verify::verify_onchain_sui_its(
-        &args.config,
-        &args.source_axelar_id,
-        &args.destination_axelar_id,
-        args.network,
-        sui_rpc,
-        &mut report.transactions,
-    )
+    let verification = verify::verify_onchain_sui_its(verify::ItsBatchVerification {
+        route: verify::VerificationRoute {
+            config: &args.config,
+            source_chain: &args.source_axelar_id,
+            destination_chain: &args.destination_axelar_id,
+            network: args.network,
+        },
+        destination: verify::SuiItsDestination { rpc_url: sui_rpc },
+        metrics: &mut report.transactions,
+    })
     .await?;
     report.verification = Some(verification);
     finish_report(args, report, test_start)

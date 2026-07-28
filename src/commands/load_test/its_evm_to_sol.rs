@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use alloy::{
     primitives::{Address, Bytes, FixedBytes, U256},
@@ -8,29 +8,23 @@ use alloy::{
     signers::local::PrivateKeySigner,
 };
 use eyre::eyre;
-use futures::future::join_all;
 use solana_sdk::signer::Signer;
 use tokio::sync::{Mutex, Semaphore};
 
 use super::its_evm_source::{
-    self, EvmSource, ItsContracts, deploy_its_token, derive_and_fund_keys, distribute_tokens,
-    execute_interchain_transfer, init_evm_source, resolve_its_contracts,
-    verify_axelar_prerequisites,
+    self, EvmSource, EvmTokenRunSizing as RunSizing, ItsContracts, deploy_its_token,
+    derive_and_fund_keys, distribute_tokens, execute_interchain_transfer, init_evm_source,
+    resolve_its_contracts,
 };
+use super::its_prerequisites::{self, GatewayRequirement};
 use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+use super::run_sizing::RunSizing as ValidatedRunSizing;
 use super::{LoadTestArgs, finish_report, read_its_cache, validate_evm_rpc, validate_solana_rpc};
 use crate::config::ChainsConfig;
 use crate::evm::{ERC20, InterchainTokenService};
 use crate::ui;
 
-fn fallback_gas_value_wei(network: crate::types::Network, _source_chain: &str) -> u128 {
-    match network {
-        crate::types::Network::DevnetAmplifier => 0,
-        _ => 10_000_000_000_000_000, // 0.01 ETH
-    }
-}
 const MAX_CONCURRENT_SENDS: usize = 100;
-const MAX_RETRIES: u32 = 5;
 
 pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
     let src = &args.source_chain;
@@ -41,7 +35,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
     validate_solana_rpc(&args.destination_rpc).await?;
 
     let cfg = ChainsConfig::load(&args.config)?;
-    verify_axelar_prerequisites(&cfg, dest)?;
+    its_prerequisites::verify(&cfg, dest, GatewayRequirement::AmplifierOnly)?;
 
     ui::kv("source", src);
     ui::kv("destination", dest);
@@ -49,9 +43,9 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
 
     let evm_source = init_evm_source(&args, &evm_rpc_url).await?;
     let its = resolve_its_contracts(&cfg, src)?;
-    let gas_value_wei = parse_gas_value_wei(&args).await?;
+    let gas_value_wei = its_evm_source::standard_gas_value_wei(&args).await?;
     let gas_value = U256::from(gas_value_wei);
-    let mut sizing = compute_run_sizing(&args);
+    let mut sizing = RunSizing::standard(ValidatedRunSizing::new(&args)?);
 
     let token =
         resolve_or_deploy_token(&args, &evm_source, &its, &evm_rpc_url, &sizing, gas_value).await?;
@@ -87,7 +81,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
         &evm_source.main_key,
         &evm_rpc_url,
         sizing.num_keys,
-        hub_gas_extra_per_key(&args, &sizing, gas_value_wei),
+        hub_gas_extra_per_key(&sizing, gas_value_wei),
         &args.source_axelar_id,
     )
     .await?;
@@ -117,24 +111,11 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
         receiver_bytes,
     };
 
-    if !sizing.burst_mode {
+    if !sizing.is_burst() {
         run_sustained_pipeline(&args, &cfg, &evm_rpc_url, &derived, &sizing, &targets).await
     } else {
         run_burst_pipeline(&args, &evm_rpc_url, &derived, &sizing, &targets).await
     }
-}
-
-/// Sizing parameters derived from CLI flags: chooses burst vs sustained,
-/// number of ephemeral wallets, per-tx amount, and supply parameters.
-struct RunSizing {
-    burst_mode: bool,
-    sustained_params: Option<(u64, u64)>,
-    num_keys: usize,
-    num_txs: usize,
-    total_expected: u64,
-    amount_per_tx: U256,
-    amount_per_key: U256,
-    total_supply: U256,
 }
 
 /// Resolved interchain token: cached, user-supplied, or freshly deployed.
@@ -161,63 +142,6 @@ struct TransferTargets {
 
 /// Parse the user-supplied gas value (wei), defaulting via the relayer-aware
 /// `estimateGasFee` quote for the route, and emit the matching UI line.
-async fn parse_gas_value_wei(args: &LoadTestArgs) -> eyre::Result<u128> {
-    let gas_value_wei: u128 = match args.gas_value.as_deref() {
-        Some(v) => v.parse().map_err(|e| eyre!("invalid --gas-value: {e}"))?,
-        None => {
-            its_evm_source::default_gas_value_wei(
-                args,
-                fallback_gas_value_wei(args.network, &args.source_chain),
-            )
-            .await
-        }
-    };
-
-    ui::kv(
-        "gas value",
-        &format!(
-            "{gas_value_wei} wei ({:.6} ETH)",
-            gas_value_wei as f64 / 1e18
-        ),
-    );
-    Ok(gas_value_wei)
-}
-
-/// Decide burst vs sustained, ephemeral wallet count, expected tx count, and
-/// per-tx / per-key / total-supply amounts.
-fn compute_run_sizing(args: &LoadTestArgs) -> RunSizing {
-    let sustained_params = args.tps.zip(args.duration_secs);
-    let burst_mode = sustained_params.is_none();
-    let (num_keys, total_expected) = if burst_mode {
-        let n = args.num_txs.max(1) as usize;
-        (n, args.num_txs.max(1))
-    } else {
-        let (tps, dur) = sustained_params.expect("burst_mode is false");
-        let tps = tps as usize;
-        (tps * args.key_cycle as usize, tps as u64 * dur)
-    };
-    // Keep num_txs as alias for burst compat (equals num_keys in burst mode)
-    let num_txs = num_keys;
-    // 0.01 token per tx (10^16 at 18 decimals). Still well above ITS hub
-    // decimal truncation between EVM-18 and Solana-6 (truncated to 10_000).
-    let amount_per_tx = U256::from(10_000_000_000_000_000u128);
-    // Distribute 100x per key so cached tokens last across many runs.
-    let amount_per_key = amount_per_tx * U256::from(100);
-    // Mint a large fixed supply so the token can be reused across runs without redeploying.
-    let total_supply = U256::from(1_000_000) * U256::from(1_000_000_000_000_000_000u128); // 1M tokens
-
-    RunSizing {
-        burst_mode,
-        sustained_params,
-        num_keys,
-        num_txs,
-        total_expected,
-        amount_per_tx,
-        amount_per_key,
-        total_supply,
-    }
-}
-
 /// Resolve the ITS token to use this run: honour `--token-id`, then fall back
 /// to the source/dest cache (deploying fresh if the cached token has
 /// insufficient supply or no longer exists), and finally deploy a brand-new
@@ -250,7 +174,7 @@ async fn resolve_or_deploy_token(
     // upstream — see TODOs in the workflow + script). For Hedera-source we
     // require an explicit pre-registered token; the error message points at
     // the deployments-repo Hedera setup.
-    let needed = sizing.amount_per_tx * U256::from(sizing.num_txs);
+    let needed = sizing.amount_per_tx * U256::from(sizing.num_keys);
     let config_axe = super::helpers::reusable_config_axe(
         &args.config,
         src,
@@ -308,7 +232,7 @@ async fn resolve_or_deploy_token(
         if let Some((tid, addr)) = cached {
             // Verify token still exists and deployer has enough balance
             let token = ERC20::new(addr, &write_provider);
-            let needed = sizing.amount_per_tx * U256::from(sizing.num_txs);
+            let needed = sizing.amount_per_tx * U256::from(sizing.num_keys);
             let balance = token
                 .balanceOf(evm_source.deployer_address)
                 .call()
@@ -369,13 +293,12 @@ async fn resolve_or_deploy_token(
 /// Compute the per-key hub-gas funding amount for this run. Burst mode fires
 /// each key once; sustained mode fires each key `ceil(duration / key_cycle)`
 /// times with a 20% buffer.
-fn hub_gas_extra_per_key(args: &LoadTestArgs, sizing: &RunSizing, gas_value_wei: u128) -> u128 {
+fn hub_gas_extra_per_key(sizing: &RunSizing, gas_value_wei: u128) -> u128 {
     let hub_gas_value_wei = gas_value_wei.saturating_mul(2);
-    if sizing.burst_mode {
+    if sizing.is_burst() {
         hub_gas_value_wei
     } else {
-        let dur = sizing.sustained_params.expect("burst_mode is false").1;
-        let rounds = dur.div_ceil(args.key_cycle);
+        let rounds = sizing.transactions_per_key();
         let buffered = rounds + rounds / 5 + 1;
         hub_gas_value_wei.saturating_mul(buffered as u128)
     }
@@ -394,9 +317,7 @@ async fn run_sustained_pipeline(
 ) -> eyre::Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
-    let tps = sizing.sustained_params.expect("burst_mode is false").0 as usize;
-    let duration_secs = sizing.sustained_params.expect("burst_mode is false").1;
-    let key_cycle = args.key_cycle as usize;
+    let (tps, duration_secs, key_cycle) = sizing.sustained().expect("sustained mode");
     let rpc_url_str = evm_rpc_url.to_string();
 
     // Pre-fetch nonces.
@@ -427,9 +348,20 @@ async fn run_sustained_pipeline(
     let vnetwork = args.network;
     let verify_handle = tokio::spawn(async move {
         let spinner = spinner_rx.await.expect("spinner channel dropped");
-        super::verify::verify_onchain_solana_its_streaming(
-            &vconfig, &vsource, &vdest, &vdest_rpc, vnetwork, verify_rx, vdone, spinner,
-        )
+        super::verify::verify_onchain_solana_its_streaming(super::verify::StreamingVerification {
+            route: super::verify::VerificationRoute {
+                config: &vconfig,
+                source_chain: &vsource,
+                destination_chain: &vdest,
+                network: vnetwork,
+            },
+            destination: super::verify::SolanaItsDestination {
+                rpc_url: &vdest_rpc,
+            },
+            rx: verify_rx,
+            send_done: vdone,
+            spinner,
+        })
         .await
     });
 
@@ -479,14 +411,13 @@ async fn run_sustained_pipeline(
                         explicit_nonce: nonce,
                     })
                     .await;
-                if result.success {
+                if result.is_success() {
                     match super::verify::tx_to_pending_its(&result, has_vv) {
                         Ok(pending) => {
                             let _ = vtx.send(pending);
                         }
                         Err(e) => {
-                            result.success = false;
-                            result.error = Some(format!("failed to build verification state: {e}"));
+                            result.mark_failed(format!("failed to build verification state: {e}"));
                         }
                     }
                 }
@@ -503,7 +434,7 @@ async fn run_sustained_pipeline(
         Some(send_done),
         spinner,
     )
-    .await;
+    .await?;
 
     let mut report = super::sustained::build_sustained_report(
         result,
@@ -541,7 +472,9 @@ async fn run_burst_pipeline(
 ) -> eyre::Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
-    let num_txs = sizing.num_txs;
+    let num_txs = sizing
+        .burst_count()
+        .expect("burst pipeline requires burst sizing");
 
     // --- Parallel interchainTransfer sends via ITS Service ---
     // Each derived key calls ITS.interchainTransfer(tokenId, destChain, destAddr, amount, metadata, gasValue)
@@ -576,39 +509,21 @@ async fn run_burst_pipeline(
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
 
-            let mut m = None;
-            for attempt in 0..=MAX_RETRIES {
-                let result =
-                    execute_interchain_transfer(super::its_evm_source::InterchainTransferRequest {
-                        provider: &provider,
-                        its_proxy,
-                        token_id: tid,
-                        destination_chain: &dc,
-                        receiver: &rb,
-                        amount: amt,
-                        gas_value: gv,
-                        gas_arg_scaling_factor: gsf,
-                        explicit_nonce: None,
-                    })
-                    .await;
-
-                if result.success || attempt == MAX_RETRIES {
-                    m = Some(result);
-                    break;
-                }
-
-                let is_rate_limited = result.error.as_deref().is_some_and(|e| e.contains("429"));
-                if !is_rate_limited {
-                    m = Some(result);
-                    break;
-                }
-
-                let backoff = Duration::from_secs(1 << attempt);
-                tokio::time::sleep(backoff).await;
-            }
-
-            let m = m.unwrap();
-            if m.success {
+            let m = super::retry::rate_limited(|| {
+                execute_interchain_transfer(super::its_evm_source::InterchainTransferRequest {
+                    provider: &provider,
+                    its_proxy,
+                    token_id: tid,
+                    destination_chain: &dc,
+                    receiver: &rb,
+                    amount: amt,
+                    gas_value: gv,
+                    gas_arg_scaling_factor: gsf,
+                    explicit_nonce: None,
+                })
+            })
+            .await;
+            if m.is_success() {
                 let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 sp.set_message(format!("sending ({done}/{total} confirmed)..."));
             }
@@ -618,7 +533,7 @@ async fn run_burst_pipeline(
     }
 
     let total_submitted = tasks.len() as u64;
-    join_all(tasks).await;
+    super::task_group::join_all(tasks).await?;
     let test_duration = test_start.elapsed().as_secs_f64();
 
     let confirmed_count = confirmed_counter.load(Ordering::Relaxed);
@@ -628,15 +543,14 @@ async fn run_burst_pipeline(
     ));
 
     let metrics = metrics_list.lock().await.clone();
-    let total_failed = metrics.iter().filter(|m| !m.success).count() as u64;
+    let total_failed = metrics.iter().filter(|m| !m.is_success()).count() as u64;
 
     if total_failed > 0 {
         let mut error_counts: std::collections::HashMap<String, u64> =
             std::collections::HashMap::new();
-        for m in metrics.iter().filter(|m| !m.success) {
+        for m in metrics.iter().filter(|m| !m.is_success()) {
             let reason = m
-                .error
-                .as_deref()
+                .error()
                 .unwrap_or("unknown")
                 .chars()
                 .take(120)
@@ -663,16 +577,20 @@ async fn run_burst_pipeline(
     );
 
     // --- Verify ---
-    let verification = super::verify::verify_onchain_solana_its(
-        &args.config,
-        &args.source_axelar_id,
-        &args.destination_axelar_id,
-        &format!("{}", targets.its_proxy_addr),
-        &args.destination_rpc,
-        args.network,
-        &mut report.transactions,
-    )
-    .await?;
+    let verification =
+        super::verify::verify_onchain_solana_its(super::verify::ItsBatchVerification {
+            route: super::verify::VerificationRoute {
+                config: &args.config,
+                source_chain: &args.source_axelar_id,
+                destination_chain: &args.destination_axelar_id,
+                network: args.network,
+            },
+            destination: super::verify::SolanaItsDestination {
+                rpc_url: &args.destination_rpc,
+            },
+            metrics: &mut report.transactions,
+        })
+        .await?;
     report.verification = Some(verification);
 
     finish_report(args, &mut report, test_start)

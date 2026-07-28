@@ -10,6 +10,7 @@ mod its_evm_to_sol_with_data;
 mod its_evm_to_stellar;
 mod its_evm_to_sui;
 mod its_evm_to_xrpl;
+mod its_prerequisites;
 mod its_sol_to_evm;
 mod its_sol_to_sui;
 mod its_stellar_source;
@@ -22,10 +23,12 @@ mod its_xrpl_to_evm;
 mod keypairs;
 pub mod metrics;
 mod resolve;
+mod retry;
 mod run_sizing;
 mod sol_sender;
 mod stellar_sender;
 mod sustained;
+mod task_group;
 mod verify;
 mod xrpl_sender;
 
@@ -193,10 +196,6 @@ pub struct LoadTestArgs {
     pub extra_accounts: u32,
 }
 
-#[expect(
-    clippy::cognitive_complexity,
-    reason = "the protocol/test-type dispatch matrix is intentionally flat and exhaustive"
-)]
 pub async fn run(args: LoadTestArgs) -> Result<()> {
     let run_sizing = run_sizing::RunSizing::new(&args)?;
     let run_start = Instant::now();
@@ -206,37 +205,44 @@ pub async fn run(args: LoadTestArgs) -> Result<()> {
         args.protocol, args.test_type, args.source_chain, args.destination_chain
     ));
 
+    enable_hyperliquid_big_blocks(&args).await;
+    validate_source_support(&args)?;
+    dispatch(args, run_start, run_sizing).await
+}
+
+async fn enable_hyperliquid_big_blocks(args: &LoadTestArgs) {
     // Hyperliquid requires the deploying wallet to be opted into "big blocks"
     // before any contract-deploy tx is accepted. axe deploys SenderReceiver
     // (GMP) and a fresh ITS token (ITS source-side) on first run, so we
     // pre-emptively enable big blocks whenever Hyperliquid is on either side.
     // Idempotent on the API side: calling enable twice in a row is a no-op.
-    if args.source_axelar_id.starts_with("hyperliquid")
-        || args.destination_axelar_id.starts_with("hyperliquid")
+    if !args.source_axelar_id.starts_with("hyperliquid")
+        && !args.destination_axelar_id.starts_with("hyperliquid")
     {
-        let key = args
-            .private_key
-            .clone()
-            .or_else(|| std::env::var("EVM_PRIVATE_KEY").ok());
-        if let Some(key) = key {
-            let env = crate::hyperliquid::env_for(args.network);
-            match crate::hyperliquid::enable_big_blocks_from_key(&key, env).await {
-                Ok(addr) => {
-                    ui::info(&format!("Hyperliquid big-blocks enabled for {addr}"));
-                }
-                Err(e) => {
-                    ui::warn(&format!(
-                        "Hyperliquid big-blocks opt-in failed: {e} — contract deploys on Hyperliquid may be rejected"
-                    ));
-                }
-            }
-        } else {
-            ui::warn(
-                "Hyperliquid is in this route but EVM_PRIVATE_KEY is not set; big-blocks opt-in skipped",
-            );
-        }
+        return;
     }
 
+    let key = args
+        .private_key
+        .clone()
+        .or_else(|| std::env::var("EVM_PRIVATE_KEY").ok());
+    let Some(key) = key else {
+        ui::warn(
+            "Hyperliquid is in this route but EVM_PRIVATE_KEY is not set; big-blocks opt-in skipped",
+        );
+        return;
+    };
+
+    let env = crate::hyperliquid::env_for(args.network);
+    match crate::hyperliquid::enable_big_blocks_from_key(&key, env).await {
+        Ok(addr) => ui::info(&format!("Hyperliquid big-blocks enabled for {addr}")),
+        Err(error) => ui::warn(&format!(
+            "Hyperliquid big-blocks opt-in failed: {error} — contract deploys on Hyperliquid may be rejected"
+        )),
+    }
+}
+
+fn validate_source_support(args: &LoadTestArgs) -> Result<()> {
     // A consensus (legacy) source has no VotingVerifier. XRPL uses
     // `XrplVotingVerifier` (not `VotingVerifier`), so we also accept that as
     // evidence of a verifiable Amplifier source. Stellar shares the
@@ -255,25 +261,30 @@ pub async fn run(args: LoadTestArgs) -> Result<()> {
     // appears on an `Evm -> X` route. Allow those (destination-side verification
     // handles legacy or Amplifier dests on-chain); bail on anything else, which
     // would mean a non-EVM source with no voting verifier (unsupported).
-    if !has_standard_vv && !has_xrpl_vv {
-        let legacy_evm_source = matches!(
-            args.test_type,
-            TestType::EvmToEvm
-                | TestType::EvmToSol
-                | TestType::EvmToSui
-                | TestType::EvmToStellar
-                | TestType::EvmToXrpl
+    let legacy_evm_source = matches!(
+        args.test_type,
+        TestType::EvmToEvm
+            | TestType::EvmToSol
+            | TestType::EvmToSui
+            | TestType::EvmToStellar
+            | TestType::EvmToXrpl
+    );
+    if !has_standard_vv && !has_xrpl_vv && !legacy_evm_source {
+        eyre::bail!(
+            "source chain '{src}' is a legacy (consensus) chain with no VotingVerifier. \
+             Legacy support requires an EVM source — the {}/{} route is not supported.",
+            args.protocol,
+            args.test_type
         );
-        if !legacy_evm_source {
-            eyre::bail!(
-                "source chain '{src}' is a legacy (consensus) chain with no VotingVerifier. \
-                 Legacy support requires an EVM source — the {}/{} route is not supported.",
-                args.protocol,
-                args.test_type
-            );
-        }
     }
+    Ok(())
+}
 
+async fn dispatch(
+    args: LoadTestArgs,
+    run_start: Instant,
+    run_sizing: run_sizing::RunSizing,
+) -> Result<()> {
     match (args.protocol, args.test_type) {
         (Protocol::Gmp, TestType::SolToEvm) => gmp::run_sol_to_evm(args, run_start).await,
         (Protocol::Gmp, TestType::EvmToSol) => gmp::run_evm_to_sol(args, run_start).await,

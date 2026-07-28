@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use alloy::{
     primitives::{Address, Bytes, FixedBytes, U256},
@@ -29,11 +29,12 @@ use alloy::{
     signers::local::PrivateKeySigner,
 };
 use eyre::eyre;
-use futures::future::join_all;
 use tokio::sync::{Mutex, Semaphore};
 
+use super::its_prerequisites::{self, GatewayRequirement};
 use super::keypairs;
 use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+use super::run_sizing::RunSizing;
 use super::{
     LoadTestArgs, check_evm_balance, finalize_sui_dest_run_its, load_sui_main_wallet,
     read_sui_axe_token_id, sui_its_dest_lookup, validate_evm_rpc,
@@ -43,51 +44,6 @@ use crate::evm::{ERC20, InterchainTokenService};
 use crate::ui;
 
 const MAX_CONCURRENT_SENDS: usize = 100;
-const MAX_RETRIES: u32 = 5;
-
-/// Default gas value: tries the Axelarscan `estimateGasFee` quote for the
-/// route (× 1.5); falls back to a route-agnostic constant when the API
-/// can't be reached.
-async fn default_gas_value_wei(args: &LoadTestArgs) -> u128 {
-    if let Some(quoted) = quote_route_gas(args).await {
-        return quoted;
-    }
-    fallback_gas_value_wei(args.network, &args.source_chain)
-}
-
-async fn quote_route_gas(args: &LoadTestArgs) -> Option<u128> {
-    let cfg = crate::config::ChainsConfig::load(&args.config).ok()?;
-    let symbol = cfg
-        .chains
-        .get(&args.source_chain)?
-        .token_symbol
-        .as_deref()?;
-    super::gas_estimate::estimate_route_gas(
-        args.network,
-        &args.source_axelar_id,
-        &args.destination_axelar_id,
-        symbol,
-        super::gas_estimate::DEFAULT_DEST_GAS_LIMIT,
-    )
-    .await
-}
-
-fn fallback_gas_value_wei(network: crate::types::Network, _source_chain: &str) -> u128 {
-    match network {
-        crate::types::Network::DevnetAmplifier => 0,
-        _ => 10_000_000_000_000_000,
-    }
-}
-
-/// Sizing parameters derived from CLI flags: burst vs sustained, key counts,
-/// expected transfer total.
-struct RunSizing {
-    burst_mode: bool,
-    sustained_params: Option<(u64, u64)>,
-    num_keys: usize,
-    num_txs: usize,
-    total_expected: u64,
-}
 
 /// Resolved EVM source-chain context: signer, ITS proxy + linked token, RPC.
 struct EvmContext {
@@ -116,7 +72,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
     validate_evm_rpc(&evm_rpc_url).await?;
 
     let cfg = ChainsConfig::load(&args.config)?;
-    verify_axelar_prerequisites(&cfg, dest)?;
+    its_prerequisites::verify(&cfg, dest, GatewayRequirement::Required)?;
 
     ui::kv("source", src);
     ui::kv("destination", dest);
@@ -127,32 +83,16 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
 
     let evm = resolve_evm_context(&args, &cfg, evm_rpc_url.clone()).await?;
     let sui = resolve_sui_context(&args)?;
-    let sizing = compute_run_sizing(&args);
+    let sizing = RunSizing::new(&args)?;
 
     let derived = derive_and_fund_signers(&evm, &sizing).await?;
     let amount_per_tx = U256::from(1u64);
 
-    if sizing.burst_mode {
+    if sizing.is_burst() {
         run_burst_pipeline(&args, &evm, &sui, &derived, &sizing, amount_per_tx).await
     } else {
         run_sustained_pipeline(&args, &evm, &sui, derived, &sizing, amount_per_tx).await
     }
-}
-
-fn verify_axelar_prerequisites(cfg: &ChainsConfig, dest: &str) -> eyre::Result<()> {
-    if cfg.axelar.contract_address("Gateway", dest).is_err() {
-        eyre::bail!(
-            "destination chain '{dest}' has no Cosmos Gateway in the config — verification would fail."
-        );
-    }
-    if cfg
-        .axelar
-        .global_contract_address("AxelarnetGateway")
-        .is_err()
-    {
-        eyre::bail!("no AxelarnetGateway address in config — required for ITS load test");
-    }
-    Ok(())
 }
 
 async fn resolve_evm_context(
@@ -215,7 +155,11 @@ async fn resolve_evm_context(
         &main_token_balance.to_string(),
     );
 
-    let gas_value_wei = parse_gas_value_wei(args).await?;
+    let gas_value_wei = super::its_evm_source::parse_gas_value_wei(
+        args,
+        super::its_evm_source::standard_gas_fallback(args.network),
+    )
+    .await?;
     ui::kv(
         "gas value",
         &format!("{gas_value_wei} wei (per-leg, x2 for hub)"),
@@ -248,31 +192,6 @@ fn resolve_sui_context(args: &LoadTestArgs) -> eyre::Result<SuiContext> {
     })
 }
 
-fn compute_run_sizing(args: &LoadTestArgs) -> RunSizing {
-    let sustained_params = args.tps.zip(args.duration_secs);
-    let burst_mode = sustained_params.is_none();
-    let (num_keys, num_txs, total_expected) = if burst_mode {
-        let n = args.num_txs.max(1) as usize;
-        (n, n, n as u64)
-    } else {
-        let (tps, dur) = sustained_params.expect("burst_mode is false");
-        let tps_usize = tps as usize;
-        let total = tps * dur;
-        (
-            tps_usize * args.key_cycle as usize,
-            tps_usize * args.key_cycle as usize,
-            total,
-        )
-    };
-    RunSizing {
-        burst_mode,
-        sustained_params,
-        num_keys,
-        num_txs,
-        total_expected,
-    }
-}
-
 async fn derive_and_fund_signers(
     evm: &EvmContext,
     sizing: &RunSizing,
@@ -296,15 +215,7 @@ async fn derive_and_fund_signers(
     // Distribute linked AXE: each derived signer receives enough for its
     // share of the run. Burst: 1 per tx. Sustained: `key_cycle` per key,
     // since each key serves `key_cycle` rotations.
-    let txs_per_key = if sizing.burst_mode {
-        1u64
-    } else {
-        let (_, dur) = sizing.sustained_params.expect("burst_mode is false");
-        // total = tps * dur. tps * key_cycle = num_keys. So txs_per_key = dur / key_cycle.
-        let key_cycle = (sizing.num_keys as u64).max(1) / sizing.sustained_params.unwrap().0;
-        // Round up to ensure derived keys never run dry mid-cycle.
-        dur.div_ceil(key_cycle)
-    };
+    let txs_per_key = sizing.transactions_per_key();
     let amount_per_key = U256::from(txs_per_key);
 
     let write_provider = ProviderBuilder::new()
@@ -331,7 +242,9 @@ async fn run_burst_pipeline(
 ) -> eyre::Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
-    let num_txs = sizing.num_txs;
+    let num_txs = sizing
+        .burst_count()
+        .expect("burst pipeline requires burst sizing");
     let test_start = Instant::now();
     let metrics_list: Arc<Mutex<Vec<TxMetrics>>> = Arc::new(Mutex::new(Vec::new()));
     let confirmed_counter = Arc::new(AtomicU64::new(0));
@@ -359,9 +272,8 @@ async fn run_burst_pipeline(
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
-            let mut last = None;
-            for attempt in 0..=MAX_RETRIES {
-                let result = super::its_evm_source::execute_interchain_transfer(
+            let m = super::retry::rate_limited(|| {
+                super::its_evm_source::execute_interchain_transfer(
                     super::its_evm_source::InterchainTransferRequest {
                         provider: &provider,
                         its_proxy,
@@ -374,20 +286,9 @@ async fn run_burst_pipeline(
                         explicit_nonce: None,
                     },
                 )
-                .await;
-                if result.success || attempt == MAX_RETRIES {
-                    last = Some(result);
-                    break;
-                }
-                let rate_limited = result.error.as_deref().is_some_and(|e| e.contains("429"));
-                if !rate_limited {
-                    last = Some(result);
-                    break;
-                }
-                tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
-            }
-            let m = last.expect("exited retry loop with no result");
-            if m.success {
+            })
+            .await;
+            if m.is_success() {
                 let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 sp.set_message(format!("sending ({done}/{total} confirmed)..."));
             }
@@ -396,7 +297,7 @@ async fn run_burst_pipeline(
         tasks.push(handle);
     }
     let total_submitted = tasks.len() as u64;
-    join_all(tasks).await;
+    super::task_group::join_all(tasks).await?;
     spinner.finish_and_clear();
     let confirmed_count = confirmed_counter.load(Ordering::Relaxed);
     ui::success(&format!(
@@ -432,9 +333,7 @@ async fn run_sustained_pipeline(
 ) -> eyre::Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
-    let (tps, duration_secs) = sizing.sustained_params.expect("burst_mode is false");
-    let tps_usize = tps as usize;
-    let key_cycle = args.key_cycle as usize;
+    let (tps_usize, duration_secs, key_cycle) = sizing.sustained().expect("sustained mode");
 
     // Pre-fetch each derived signer's nonce so the rate-limited loop can
     // bump them locally per dispatch (avoids RPC round-trips on each tx).
@@ -494,7 +393,7 @@ async fn run_sustained_pipeline(
         None,
         spinner,
     )
-    .await;
+    .await?;
 
     let mut report = super::sustained::build_sustained_report(
         result,
@@ -504,7 +403,7 @@ async fn run_sustained_pipeline(
         sizing.total_expected,
         sizing.num_keys,
     );
-    report.tps = Some(tps);
+    report.tps = Some(tps_usize as u64);
     report.duration_secs = Some(duration_secs);
 
     finalize_sui_dest_run_its(args, &mut report, &sui.rpc, test_start).await
@@ -516,13 +415,4 @@ fn parse_main_signer(private_key: Option<&str>) -> eyre::Result<PrivateKeySigner
     })?;
     key.parse::<PrivateKeySigner>()
         .map_err(|e| eyre!("invalid EVM private key: {e}"))
-}
-
-async fn parse_gas_value_wei(args: &LoadTestArgs) -> eyre::Result<u128> {
-    match args.gas_value.as_deref() {
-        Some(s) if !s.is_empty() => s
-            .parse::<u128>()
-            .map_err(|e| eyre!("invalid --gas-value: {e}")),
-        _ => Ok(default_gas_value_wei(args).await),
-    }
 }

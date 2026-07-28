@@ -1,6 +1,81 @@
 use std::time::Instant;
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+/// A transaction either succeeded or failed with a reason.
+///
+/// The custom serde representation deliberately preserves the public report
+/// schema (`success: bool`, `error: string | null`) while preventing invalid
+/// combinations inside the load-test implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TxOutcome {
+    Succeeded,
+    Failed(String),
+}
+
+impl TxOutcome {
+    pub(crate) fn from_external(
+        success: bool,
+        error: Option<String>,
+        fallback: impl Into<String>,
+    ) -> Self {
+        if success {
+            Self::Succeeded
+        } else {
+            Self::Failed(error.unwrap_or_else(|| fallback.into()))
+        }
+    }
+
+    fn is_success(&self) -> bool {
+        matches!(self, Self::Succeeded)
+    }
+
+    fn error(&self) -> Option<&str> {
+        match self {
+            Self::Succeeded => None,
+            Self::Failed(error) => Some(error),
+        }
+    }
+}
+
+impl Serialize for TxOutcome {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("TxOutcome", 2)?;
+        state.serialize_field("success", &self.is_success())?;
+        state.serialize_field("error", &self.error())?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TxOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Fields {
+            success: bool,
+            error: Option<String>,
+        }
+
+        let fields = Fields::deserialize(deserializer)?;
+        match (fields.success, fields.error) {
+            (true, None) => Ok(Self::Succeeded),
+            (false, Some(error)) => Ok(Self::Failed(error)),
+            (true, Some(_)) => Err(D::Error::custom(
+                "successful transaction cannot contain an error",
+            )),
+            (false, None) => Err(D::Error::custom(
+                "failed transaction must contain an error reason",
+            )),
+        }
+    }
+}
 
 /// Per-transaction metrics collected during load testing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11,8 +86,8 @@ pub struct TxMetrics {
     pub latency_ms: Option<u64>,
     pub compute_units: Option<u64>,
     pub slot: Option<u64>,
-    pub success: bool,
-    pub error: Option<String>,
+    #[serde(flatten)]
+    pub(crate) outcome: TxOutcome,
 
     /// keccak256 of the payload, hex-encoded (no 0x prefix).
     #[serde(default)]
@@ -34,6 +109,43 @@ pub struct TxMetrics {
     pub gmp_destination_address: String,
     /// Amplifier pipeline timing (populated during verification phase).
     pub amplifier_timing: Option<AmplifierTiming>,
+}
+
+impl TxMetrics {
+    pub(crate) const fn succeeded_outcome() -> TxOutcome {
+        TxOutcome::Succeeded
+    }
+
+    pub(crate) fn failed_outcome(error: impl Into<String>) -> TxOutcome {
+        TxOutcome::Failed(error.into())
+    }
+
+    pub(crate) fn external_outcome(
+        success: bool,
+        error: Option<String>,
+        fallback: impl Into<String>,
+    ) -> TxOutcome {
+        TxOutcome::from_external(success, error, fallback)
+    }
+
+    pub(crate) fn is_success(&self) -> bool {
+        self.outcome.is_success()
+    }
+
+    pub(crate) fn error(&self) -> Option<&str> {
+        self.outcome.error()
+    }
+
+    pub(crate) fn mark_failed(&mut self, error: impl Into<String>) {
+        self.outcome = TxOutcome::Failed(error.into());
+    }
+
+    pub(crate) fn error_mut(&mut self) -> Option<&mut String> {
+        match &mut self.outcome {
+            TxOutcome::Succeeded => None,
+            TxOutcome::Failed(error) => Some(error),
+        }
+    }
 }
 
 /// Per-step timing through the Amplifier pipeline, relative to tx send time.
@@ -118,8 +230,14 @@ pub(super) struct ReportInput {
 
 impl LoadTestReport {
     pub(super) fn from_transactions(input: ReportInput, transactions: Vec<TxMetrics>) -> Self {
-        let total_confirmed = transactions.iter().filter(|metric| metric.success).count() as u64;
-        let total_failed = transactions.iter().filter(|metric| !metric.success).count() as u64;
+        let total_confirmed = transactions
+            .iter()
+            .filter(|metric| metric.is_success())
+            .count() as u64;
+        let total_failed = transactions
+            .iter()
+            .filter(|metric| !metric.is_success())
+            .count() as u64;
         let (avg_latency_ms, min_latency_ms, max_latency_ms) =
             summarize(transactions.iter().filter_map(|metric| metric.latency_ms));
         let (avg_compute_units, min_compute_units, max_compute_units) =
@@ -238,7 +356,7 @@ pub struct FailureCategory {
 
 #[cfg(test)]
 mod tests {
-    use super::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+    use super::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics, TxOutcome};
 
     fn metric(success: bool, latency_ms: Option<u64>, compute_units: Option<u64>) -> TxMetrics {
         TxMetrics {
@@ -248,8 +366,11 @@ mod tests {
             latency_ms,
             compute_units,
             slot: None,
-            success,
-            error: None,
+            outcome: if success {
+                TxOutcome::Succeeded
+            } else {
+                TxOutcome::Failed("test failure".to_string())
+            },
             payload_hash: String::new(),
             source_address: String::new(),
             payload: Vec::new(),
@@ -325,5 +446,31 @@ mod tests {
         assert_eq!(report.landing_rate, 0.0);
         assert_eq!(report.avg_latency_ms, None);
         assert_eq!(report.avg_compute_units, None);
+    }
+
+    #[test]
+    fn transaction_outcome_preserves_report_json_shape() {
+        let success = metric(true, Some(10), None);
+        let success_json = serde_json::to_value(&success).unwrap();
+        assert_eq!(success_json["success"], true);
+        assert_eq!(success_json["error"], serde_json::Value::Null);
+
+        let failed = metric(false, None, None);
+        let failed_json = serde_json::to_value(&failed).unwrap();
+        assert_eq!(failed_json["success"], false);
+        assert_eq!(failed_json["error"], "test failure");
+
+        let round_trip: TxMetrics = serde_json::from_value(failed_json).unwrap();
+        assert_eq!(
+            round_trip.outcome,
+            TxOutcome::Failed("test failure".to_string())
+        );
+    }
+
+    #[test]
+    fn transaction_outcome_rejects_invalid_json_combinations() {
+        let mut invalid = serde_json::to_value(metric(true, None, None)).unwrap();
+        invalid["success"] = serde_json::Value::Bool(false);
+        assert!(serde_json::from_value::<TxMetrics>(invalid).is_err());
     }
 }

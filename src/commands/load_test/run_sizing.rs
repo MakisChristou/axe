@@ -85,6 +85,13 @@ impl RunSizing {
         matches!(self.mode, RunMode::Burst { .. })
     }
 
+    pub fn burst_count(self) -> Option<usize> {
+        match self.mode {
+            RunMode::Burst { .. } => Some(self.num_keys),
+            RunMode::Sustained { .. } => None,
+        }
+    }
+
     pub fn sustained(self) -> Option<(usize, u64, usize)> {
         match self.mode {
             RunMode::Burst { .. } => None,
@@ -93,6 +100,17 @@ impl RunSizing {
                 duration_secs,
                 key_cycle,
             } => Some((tps, duration_secs, key_cycle)),
+        }
+    }
+
+    pub fn transactions_per_key(self) -> u64 {
+        match self.mode {
+            RunMode::Burst { .. } => 1,
+            RunMode::Sustained {
+                duration_secs,
+                key_cycle,
+                ..
+            } => duration_secs.div_ceil(key_cycle as u64),
         }
     }
 }

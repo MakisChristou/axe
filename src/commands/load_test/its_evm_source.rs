@@ -34,6 +34,7 @@ use eyre::eyre;
 
 use super::keypairs;
 use super::metrics::TxMetrics;
+use super::run_sizing::RunSizing;
 use super::{LoadTestArgs, check_evm_balance, save_its_cache};
 use crate::commands::test_its::{
     extract_contract_call_event, extract_token_deployed_event, generate_salt,
@@ -56,6 +57,35 @@ const EVM_RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 const TOKEN_NAME: &str = "AXE";
 const TOKEN_SYMBOL: &str = "AXE";
 const TOKEN_DECIMALS: u8 = 18;
+
+/// Validated run shape plus the shared token economics used by EVM-source
+/// ITS routes.
+pub(super) struct EvmTokenRunSizing {
+    pub run: RunSizing,
+    pub amount_per_tx: U256,
+    pub amount_per_key: U256,
+    pub total_supply: U256,
+}
+
+impl EvmTokenRunSizing {
+    pub fn standard(run: RunSizing) -> Self {
+        let amount_per_tx = U256::from(10_000_000_000_000_000u128);
+        Self {
+            run,
+            amount_per_tx,
+            amount_per_key: amount_per_tx * U256::from(100),
+            total_supply: U256::from(1_000_000) * U256::from(1_000_000_000_000_000_000u128),
+        }
+    }
+}
+
+impl std::ops::Deref for EvmTokenRunSizing {
+    type Target = RunSizing;
+
+    fn deref(&self) -> &Self::Target {
+        &self.run
+    }
+}
 
 /// Source-chain EVM signer state: the user's signer plus its address and
 /// raw private-key bytes (used for deriving ephemeral signers).
@@ -83,6 +113,42 @@ pub(super) async fn default_gas_value_wei(args: &LoadTestArgs, fallback_wei: u12
     fallback_wei
 }
 
+pub(super) fn standard_gas_fallback(network: crate::types::Network) -> u128 {
+    match network {
+        crate::types::Network::DevnetAmplifier => 0,
+        _ => 10_000_000_000_000_000,
+    }
+}
+
+pub(super) async fn parse_gas_value_wei(
+    args: &LoadTestArgs,
+    fallback_wei: u128,
+) -> eyre::Result<u128> {
+    match args.gas_value.as_deref() {
+        Some(value) => value
+            .parse()
+            .map_err(|error| eyre!("invalid --gas-value: {error}")),
+        None => Ok(default_gas_value_wei(args, fallback_wei).await),
+    }
+}
+
+pub(super) async fn standard_gas_value_wei(args: &LoadTestArgs) -> eyre::Result<u128> {
+    let gas_value_wei = parse_gas_value_wei(args, standard_gas_fallback(args.network)).await?;
+    ui::kv(
+        "gas value",
+        &format!(
+            "{gas_value_wei} wei ({:.6} ETH)",
+            gas_value_wei as f64 / 1e18
+        ),
+    );
+    Ok(gas_value_wei)
+}
+
+pub(super) async fn standard_gas_value(args: &LoadTestArgs) -> eyre::Result<(u128, U256)> {
+    let gas_value_wei = standard_gas_value_wei(args).await?;
+    Ok((gas_value_wei, U256::from(gas_value_wei)))
+}
+
 async fn quote_route_gas(args: &LoadTestArgs) -> Option<u128> {
     let cfg = ChainsConfig::load(&args.config).ok()?;
     let symbol = cfg
@@ -105,34 +171,6 @@ async fn quote_route_gas(args: &LoadTestArgs) -> Option<u128> {
 /// is verified on its on-chain gateway instead. The global AxelarnetGateway
 /// (the ITS Hub) is always required. `dest_axelar_id` is the destination's
 /// axelarId (not the config key — they differ for consensus chains).
-pub(super) fn verify_axelar_prerequisites(
-    cfg: &ChainsConfig,
-    dest_axelar_id: &str,
-) -> eyre::Result<()> {
-    let dest_amplifier = cfg
-        .axelar
-        .contract_address("VotingVerifier", dest_axelar_id)
-        .is_ok();
-    if dest_amplifier
-        && cfg
-            .axelar
-            .contract_address("Gateway", dest_axelar_id)
-            .is_err()
-    {
-        eyre::bail!(
-            "destination chain '{dest_axelar_id}' has no Cosmos Gateway in the config — verification would fail."
-        );
-    }
-    if cfg
-        .axelar
-        .global_contract_address("AxelarnetGateway")
-        .is_err()
-    {
-        eyre::bail!("no AxelarnetGateway address in config — required for ITS load test");
-    }
-    Ok(())
-}
-
 /// Parse the EVM private key, log the wallet balance, and return the signer
 /// state used by every downstream phase.
 pub(super) async fn init_evm_source(
@@ -613,8 +651,7 @@ pub(super) async fn execute_interchain_transfer<P: Provider>(
                                 latency_ms: Some(latency_ms),
                                 compute_units: Some(receipt.gas_used),
                                 slot: receipt.block_number,
-                                success: true,
-                                error: None,
+                                outcome: TxMetrics::succeeded_outcome(),
                                 payload: Vec::new(),
                                 payload_hash,
                                 source_address,
@@ -708,8 +745,7 @@ fn make_failure_with_hash(
         latency_ms: None,
         compute_units: None,
         slot: None,
-        success: false,
-        error: Some(error.to_string()),
+        outcome: TxMetrics::failed_outcome(error.to_string()),
         payload: Vec::new(),
         payload_hash: String::new(),
         source_address: String::new(),
