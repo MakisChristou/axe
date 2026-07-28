@@ -247,7 +247,17 @@ impl<P: Provider> DestinationVerifier for EvmDestinationVerifier<'_, P> {
                         .buffer_unordered(20)
                         .collect()
                         .await;
-                    results.into_iter().collect()
+                    let mut observations = Vec::with_capacity(results.len());
+                    for result in results {
+                        match result {
+                            Ok(observation) => observations.push(observation),
+                            Err(error) => ui::warn(&format!(
+                                "destination check RPC error (keeping in-flight for \
+                                 GMP-API recheck): {error}"
+                            )),
+                        }
+                    }
+                    Ok(observations)
                 }
                 Self::Legacy {
                     gw_contract,
@@ -664,35 +674,43 @@ impl PhaseIndices {
 // Final GMP-API recheck for timed-out txs
 // ---------------------------------------------------------------------------
 
-/// Bound the final GMP-API recheck so a slow or unreachable API can never hang
-/// the end of a verification run.
+/// Bound each GMP-API recheck attempt so a slow or unreachable API can never
+/// hang the end of a verification run.
 const GMP_API_RECHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const GMP_API_RECHECK_ATTEMPTS: u32 = 3;
+const GMP_API_RECHECK_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Best-effort, non-fatal final check: ask the Axelarscan GMP API whether this
 /// message actually executed on-chain. A slow final leg or a missed poll can
 /// leave an executed transfer looking failed at the inactivity timeout (the
 /// MOU-3/MOU-4 failure mode); this is the safety net layered on top of those
-/// fixes. Any error or timeout falls back to `false` (keep the failed verdict).
+/// fixes. Retries so a transient API error or a message still transitioning to
+/// executed does not become a permanent failed verdict.
 async fn gmp_api_reports_executed(network: crate::types::Network, message_id: &str) -> bool {
     let base = crate::gmp_api::base_url(network);
-    let lookup = async {
-        // Prefer the exact `message_id` Axelarscan keys on. If it isn't indexed
-        // in that form for this source chain, fall back to the source tx id
-        // (the portion before the event-index suffix).
-        if let Some(rec) = crate::gmp_api::search_by_message_id(base, message_id).await? {
-            return Ok::<bool, eyre::Report>(rec.is_executed());
+    for attempt in 0..GMP_API_RECHECK_ATTEMPTS {
+        let lookup = async {
+            // Prefer the exact `message_id` Axelarscan keys on. If it isn't
+            // indexed in that form for this source chain, fall back to the
+            // source tx id (the portion before the event-index suffix).
+            if let Some(rec) = crate::gmp_api::search_by_message_id(base, message_id).await? {
+                return Ok::<bool, eyre::Report>(rec.is_executed());
+            }
+            if let Some((source_tx, _)) = message_id.rsplit_once('-')
+                && let Some(rec) = crate::gmp_api::search_by_tx(base, source_tx).await?
+            {
+                return Ok(rec.is_executed());
+            }
+            Ok(false)
+        };
+        if let Ok(Ok(true)) = tokio::time::timeout(GMP_API_RECHECK_TIMEOUT, lookup).await {
+            return true;
         }
-        if let Some((source_tx, _)) = message_id.rsplit_once('-')
-            && let Some(rec) = crate::gmp_api::search_by_tx(base, source_tx).await?
-        {
-            return Ok(rec.is_executed());
+        if attempt + 1 < GMP_API_RECHECK_ATTEMPTS {
+            tokio::time::sleep(GMP_API_RECHECK_BACKOFF).await;
         }
-        Ok(false)
-    };
-    match tokio::time::timeout(GMP_API_RECHECK_TIMEOUT, lookup).await {
-        Ok(Ok(executed)) => executed,
-        Ok(Err(_)) | Err(_) => false,
     }
+    false
 }
 
 /// Apply the final verdict to a tx that was still active at the
