@@ -1,7 +1,16 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use super::its_evm_source::{
+    self, EvmSource, EvmTokenRunSizing as RunSizing, ItsContracts, deploy_its_token,
+    derive_and_fund_keys, distribute_tokens, init_evm_source, resolve_its_contracts,
+};
+use super::its_prerequisites::{self, GatewayRequirement};
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput};
+use super::run_sizing::RunSizing as ValidatedRunSizing;
+use super::{LoadTestArgs, finish_report, read_its_cache, validate_evm_rpc, validate_solana_rpc};
+use crate::config::ChainsConfig;
+use crate::evm::{ERC20, InterchainTokenService};
+use crate::ui;
 use alloy::{
     primitives::{Address, Bytes, FixedBytes, U256},
     providers::{Provider, ProviderBuilder},
@@ -9,22 +18,6 @@ use alloy::{
 };
 use eyre::eyre;
 use solana_sdk::signer::Signer;
-use tokio::sync::{Mutex, Semaphore};
-
-use super::its_evm_source::{
-    self, EvmSource, EvmTokenRunSizing as RunSizing, ItsContracts, deploy_its_token,
-    derive_and_fund_keys, distribute_tokens, execute_interchain_transfer, init_evm_source,
-    resolve_its_contracts,
-};
-use super::its_prerequisites::{self, GatewayRequirement};
-use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
-use super::run_sizing::RunSizing as ValidatedRunSizing;
-use super::{LoadTestArgs, finish_report, read_its_cache, validate_evm_rpc, validate_solana_rpc};
-use crate::config::ChainsConfig;
-use crate::evm::{ERC20, InterchainTokenService};
-use crate::ui;
-
-const MAX_CONCURRENT_SENDS: usize = 100;
 
 pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
     let src = &args.source_chain;
@@ -318,7 +311,6 @@ async fn run_sustained_pipeline(
     let src = &args.source_chain;
     let dest = &args.destination_chain;
     let (tps, duration_secs, key_cycle) = sizing.sustained().expect("sustained mode");
-    let rpc_url_str = evm_rpc_url.to_string();
 
     // Pre-fetch nonces.
     let nonce_provider = ProviderBuilder::new().connect_http(evm_rpc_url.parse()?);
@@ -371,59 +363,21 @@ async fn run_sustained_pipeline(
     let _ = spinner_tx.send(spinner.clone());
 
     let test_start = Instant::now();
-    let dest_chain_s = dest.to_string();
-    let derived_owned: Vec<PrivateKeySigner> = derived.to_vec();
-    let amount_per_tx = sizing.amount_per_tx;
-    let its_proxy_addr = targets.its_proxy_addr;
-    let token_id = targets.token_id;
-    let gas_value = targets.gas_value;
-    let gas_arg_scaling_factor = targets.gas_arg_scaling_factor;
-    let receiver_bytes = targets.receiver_bytes.clone();
-
-    let make_task: super::sustained::MakeTask =
-        Box::new(move |key_idx: usize, nonce: Option<u64>| {
-            let dc = dest_chain_s.clone();
-            let gv = gas_value;
-            let gsf = gas_arg_scaling_factor;
-            let rb = receiver_bytes.clone();
-            let amt = amount_per_tx;
-            let its_proxy = its_proxy_addr;
-            let tid = token_id;
-            let url = rpc_url_str.clone();
-            let vtx = verify_tx.clone();
-            let has_vv = has_voting_verifier;
-
-            let provider = ProviderBuilder::new()
-                .wallet(derived_owned[key_idx].clone())
-                .connect_http(url.parse().expect("invalid RPC URL"));
-
-            Box::pin(async move {
-                let mut result =
-                    execute_interchain_transfer(super::its_evm_source::InterchainTransferRequest {
-                        provider: &provider,
-                        its_proxy,
-                        token_id: tid,
-                        destination_chain: &dc,
-                        receiver: &rb,
-                        amount: amt,
-                        gas_value: gv,
-                        gas_arg_scaling_factor: gsf,
-                        explicit_nonce: nonce,
-                    })
-                    .await;
-                if result.is_success() {
-                    match super::verify::tx_to_pending_its(&result, has_vv) {
-                        Ok(pending) => {
-                            let _ = vtx.send(pending);
-                        }
-                        Err(e) => {
-                            result.mark_failed(format!("failed to build verification state: {e}"));
-                        }
-                    }
-                }
-                result
-            })
-        });
+    let make_task = its_evm_source::its_sustained_tasks(
+        its_evm_source::ItsEvmSubmitter {
+            rpc_url: evm_rpc_url.parse()?,
+            its_proxy: targets.its_proxy_addr,
+            token_id: targets.token_id,
+            destination_chain: dest.to_string(),
+            receiver: targets.receiver_bytes.clone(),
+            amount: sizing.amount_per_tx,
+            gas_value: targets.gas_value,
+            gas_arg_scaling_factor: targets.gas_arg_scaling_factor,
+        },
+        derived.to_vec(),
+        Some(verify_tx),
+        has_voting_verifier,
+    );
 
     let result = super::sustained::run_sustained_loop(
         tps,
@@ -476,73 +430,22 @@ async fn run_burst_pipeline(
         .burst_count()
         .expect("burst pipeline requires burst sizing");
 
-    // --- Parallel interchainTransfer sends via ITS Service ---
-    // Each derived key calls ITS.interchainTransfer(tokenId, destChain, destAddr, amount, metadata, gasValue)
-    // The ITS Service handles hub wrapping (SEND_TO_HUB) and emits ContractCall to "axelar".
-    let metrics_list: Arc<Mutex<Vec<TxMetrics>>> = Arc::new(Mutex::new(Vec::new()));
-    let confirmed_counter = Arc::new(AtomicU64::new(0));
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SENDS));
-    let spinner = ui::wait_spinner(&format!("sending (0/{num_txs} confirmed)..."));
     let test_start = Instant::now();
-
-    let mut tasks = Vec::with_capacity(num_txs);
-    let dest_chain = dest.to_string();
-
-    for derived_signer in derived {
-        let metrics_clone = Arc::clone(&metrics_list);
-        let counter = Arc::clone(&confirmed_counter);
-        let sem = Arc::clone(&semaphore);
-        let sp = spinner.clone();
-        let total = num_txs;
-        let dc = dest_chain.clone();
-        let gv = targets.gas_value;
-        let gsf = targets.gas_arg_scaling_factor;
-        let rb = targets.receiver_bytes.clone();
-        let amt = sizing.amount_per_tx;
-        let its_proxy = targets.its_proxy_addr;
-        let tid = targets.token_id;
-
-        let provider = ProviderBuilder::new()
-            .wallet(derived_signer.clone())
-            .connect_http(evm_rpc_url.parse()?);
-
-        let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-
-            let m = super::retry::rate_limited(|| {
-                execute_interchain_transfer(super::its_evm_source::InterchainTransferRequest {
-                    provider: &provider,
-                    its_proxy,
-                    token_id: tid,
-                    destination_chain: &dc,
-                    receiver: &rb,
-                    amount: amt,
-                    gas_value: gv,
-                    gas_arg_scaling_factor: gsf,
-                    explicit_nonce: None,
-                })
-            })
-            .await;
-            if m.is_success() {
-                let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                sp.set_message(format!("sending ({done}/{total} confirmed)..."));
-            }
-            metrics_clone.lock().await.push(m);
-        });
-        tasks.push(handle);
-    }
-
-    let total_submitted = tasks.len() as u64;
-    super::task_group::join_all(tasks).await?;
-    let test_duration = test_start.elapsed().as_secs_f64();
-
-    let confirmed_count = confirmed_counter.load(Ordering::Relaxed);
-    spinner.finish_and_clear();
-    ui::success(&format!(
-        "sent {confirmed_count}/{total_submitted} confirmed"
-    ));
-
-    let metrics = metrics_list.lock().await.clone();
+    let burst = its_evm_source::run_its_burst(
+        its_evm_source::ItsEvmSubmitter {
+            rpc_url: evm_rpc_url.parse()?,
+            its_proxy: targets.its_proxy_addr,
+            token_id: targets.token_id,
+            destination_chain: dest.to_string(),
+            receiver: targets.receiver_bytes.clone(),
+            amount: sizing.amount_per_tx,
+            gas_value: targets.gas_value,
+            gas_arg_scaling_factor: targets.gas_arg_scaling_factor,
+        },
+        derived,
+    )
+    .await?;
+    let metrics = burst.metrics;
     let total_failed = metrics.iter().filter(|m| !m.is_success()).count() as u64;
 
     if total_failed > 0 {
@@ -569,8 +472,8 @@ async fn run_burst_pipeline(
             destination_address: format!("{}", targets.its_proxy_addr),
             num_txs: args.num_txs,
             num_keys: num_txs,
-            total_submitted,
-            test_duration_secs: test_duration,
+            total_submitted: burst.total_submitted,
+            test_duration_secs: burst.test_duration_secs,
             compute_unit_summary: ComputeUnitSummary::Omit,
         },
         metrics,

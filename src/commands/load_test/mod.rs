@@ -11,6 +11,7 @@ mod its_evm_to_stellar;
 mod its_evm_to_sui;
 mod its_evm_to_xrpl;
 mod its_prerequisites;
+mod its_sol_source;
 mod its_sol_to_evm;
 mod its_sol_to_sui;
 mod its_stellar_source;

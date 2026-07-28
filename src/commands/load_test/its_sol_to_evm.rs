@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use alloy::primitives::Address;
@@ -13,12 +13,12 @@ use solana_sdk::message::Message;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;
-use tokio::sync::Mutex;
 
 use super::LoadTestArgs;
 use super::its_prerequisites::{self, GatewayRequirement};
+use super::its_sol_source;
 use super::keypairs;
-use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput};
 use super::run_sizing::RunSizing;
 use super::{finish_report, read_its_cache, save_its_cache, validate_evm_rpc, validate_solana_rpc};
 use crate::config::ChainsConfig;
@@ -343,100 +343,30 @@ async fn run_sustained_pipeline(
 
     let test_start = Instant::now();
 
-    let dest_chain_s = dest.to_string();
-    let da_s = transfer.dest_address_bytes.clone();
-    let rpc_s = args.source_rpc.clone();
-    let axelarnet_gw_s = evm.axelarnet_gw_addr.clone();
-    let token_id = transfer.token_id;
-    let mint = transfer.mint;
-    let gas_value = transfer.gas_value;
-    let amount_per_tx = transfer.amount_per_tx;
-    let token_program_s =
-        solana_sdk::pubkey::Pubkey::from_str_const("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
-    let ata_program_s =
-        solana_sdk::pubkey::Pubkey::from_str_const("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
-    let network = args.network;
-
-    let make_task: super::sustained::MakeTask =
-        Box::new(move |key_idx: usize, _nonce: Option<u64>| {
-            let kp = keypairs[key_idx].clone();
-            let dc = dest_chain_s.clone();
-            let da = da_s.clone();
-            let rpc = rpc_s.clone();
-            let tid = token_id;
-            let m = mint;
-            let gv = hub_gas_value(gas_value);
-            let amt = amount_per_tx;
-            let gmp_dest = axelarnet_gw_s.clone();
-            let vtx = verify_tx.clone();
-
-            Box::pin(async move {
-                let submit_start = Instant::now();
-                let source_addr = kp.pubkey().to_string();
-
-                let source_ata = solana_sdk::pubkey::Pubkey::find_program_address(
-                    &[kp.pubkey().as_ref(), token_program_s.as_ref(), m.as_ref()],
-                    &ata_program_s,
-                )
-                .0;
-
-                match solana::send_its_interchain_transfer(solana::InterchainTransferRequest {
-                    rpc_url: &rpc,
-                    keypair: &kp,
-                    network,
-                    token_id: &tid,
-                    source_account: &source_ata,
-                    mint: &m,
-                    destination_chain: &dc,
-                    destination_address: &da,
-                    amount: amt,
-                    gas_value: gv,
-                }) {
-                    Ok((_sig, mut metrics)) => {
-                        metrics.signature =
-                            solana::extract_its_message_id(&rpc, network, &metrics.signature)
-                                .unwrap_or_else(|_| format!("{}-1.4", metrics.signature));
-                        metrics.source_address = source_addr;
-                        metrics.send_instant = Some(submit_start);
-                        metrics.gmp_destination_chain = crate::types::HubChain::NAME.to_string();
-                        metrics.gmp_destination_address = gmp_dest;
-                        // Stream to concurrent verification
-                        if metrics.is_success() {
-                            match super::verify::tx_to_pending_its(&metrics, false) {
-                                Ok(pending) => {
-                                    let _ = vtx.send(pending);
-                                }
-                                Err(e) => {
-                                    metrics.mark_failed(format!(
-                                        "failed to build verification state: {e}"
-                                    ));
-                                }
-                            }
-                        }
-                        metrics
-                    }
-                    Err(e) => {
-                        let elapsed_ms = submit_start.elapsed().as_millis() as u64;
-                        TxMetrics {
-                            signature: String::new(),
-                            submit_time_ms: elapsed_ms,
-                            confirm_time_ms: None,
-                            latency_ms: None,
-                            compute_units: None,
-                            slot: None,
-                            outcome: TxMetrics::failed_outcome(e.to_string()),
-                            payload: Vec::new(),
-                            payload_hash: String::new(),
-                            source_address: String::new(),
-                            gmp_destination_chain: String::new(),
-                            gmp_destination_address: String::new(),
-                            send_instant: None,
-                            amplifier_timing: None,
-                        }
-                    }
-                }
-            })
-        });
+    let jobs = keypairs
+        .iter()
+        .map(|keypair| its_sol_source::ItsSolanaSubmitJob {
+            keypair: Arc::clone(keypair),
+            source_account: its_sol_source::source_account(keypair, &transfer.mint),
+        })
+        .collect();
+    let make_task = its_sol_source::its_sustained_tasks(
+        its_sol_source::ItsSolanaSubmitter {
+            rpc_url: args.source_rpc.clone(),
+            network: args.network,
+            token_id: transfer.token_id,
+            mint: transfer.mint,
+            destination_chain: dest.to_string(),
+            destination_address: transfer.dest_address_bytes.clone(),
+            amount: transfer.amount_per_tx,
+            gas_value: hub_gas_value(transfer.gas_value),
+            metric_context: its_sol_source::MetricContext::HubRouted {
+                hub_address: evm.axelarnet_gw_addr.clone(),
+            },
+        },
+        jobs,
+        Some(verify_tx),
+    );
 
     let result = super::sustained::run_sustained_loop(
         tps_n,
@@ -485,114 +415,33 @@ async fn run_burst_pipeline(
     let src = &args.source_chain;
     let dest = &args.destination_chain;
     let key_count = keypairs.len();
-    let token_id = transfer.token_id;
-    let mint = transfer.mint;
-    let gas_value = transfer.gas_value;
-    let amount_per_tx = transfer.amount_per_tx;
-
-    // --- Parallel sends ---
-    let metrics_list: Arc<Mutex<Vec<TxMetrics>>> = Arc::new(Mutex::new(Vec::new()));
-    let confirmed_counter = Arc::new(AtomicU64::new(0));
-    let spinner = ui::wait_spinner(&format!("sending (0/{key_count} confirmed)..."));
     let test_start = Instant::now();
-
-    let mut tasks = Vec::with_capacity(key_count);
-
-    for kp in keypairs {
-        let metrics_clone = Arc::clone(&metrics_list);
-        let counter = Arc::clone(&confirmed_counter);
-        let sp = spinner.clone();
-        let total = key_count;
-        let rpc = args.source_rpc.clone();
-        let dc = dest.to_string();
-        let da = transfer.dest_address_bytes.clone();
-        let tid = token_id;
-        let m = mint;
-        let gv = gas_value;
-        let amt = amount_per_tx;
-        let kp = kp.clone();
-        let gmp_dest_addr = evm.axelarnet_gw_addr.clone();
-        let network = args.network;
-
-        let handle = tokio::spawn(async move {
-            let submit_start = Instant::now();
-            let source_addr = kp.pubkey().to_string();
-
-            // Compute source ATA
-            let token_program = solana_sdk::pubkey::Pubkey::from_str_const(
-                "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
-            );
-            let source_ata = solana_sdk::pubkey::Pubkey::find_program_address(
-                &[kp.pubkey().as_ref(), token_program.as_ref(), m.as_ref()],
-                &solana_sdk::pubkey::Pubkey::from_str_const(
-                    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
-                ),
-            )
-            .0;
-
-            match solana::send_its_interchain_transfer(solana::InterchainTransferRequest {
-                rpc_url: &rpc,
-                keypair: &kp,
-                network,
-                token_id: &tid,
-                source_account: &source_ata,
-                mint: &m,
-                destination_chain: &dc,
-                destination_address: &da,
-                amount: amt,
-                gas_value: gv,
-            }) {
-                Ok((_sig, mut metrics)) => {
-                    // Format message_id: the ITS program CPI's gateway.call_contract
-                    // at inner instruction index 1.4 (discovered empirically).
-                    metrics.signature =
-                        solana::extract_its_message_id(&rpc, network, &metrics.signature)
-                            .unwrap_or_else(|_| format!("{}-1.4", metrics.signature));
-                    metrics.source_address = source_addr;
-                    metrics.send_instant = Some(submit_start);
-                    // ITS always routes through the hub
-                    metrics.gmp_destination_chain = "axelar".to_string();
-                    metrics.gmp_destination_address = gmp_dest_addr.clone();
-                    let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    sp.set_message(format!("sending ({done}/{total} confirmed)..."));
-                    metrics_clone.lock().await.push(metrics);
-                }
-                Err(e) => {
-                    let elapsed_ms = submit_start.elapsed().as_millis() as u64;
-                    let metrics = TxMetrics {
-                        signature: String::new(),
-                        submit_time_ms: elapsed_ms,
-                        confirm_time_ms: None,
-                        latency_ms: None,
-                        compute_units: None,
-                        slot: None,
-                        outcome: TxMetrics::failed_outcome(e.to_string()),
-                        payload: Vec::new(),
-                        payload_hash: String::new(),
-                        source_address: String::new(),
-                        gmp_destination_chain: String::new(),
-                        gmp_destination_address: String::new(),
-                        send_instant: None,
-                        amplifier_timing: None,
-                    };
-                    metrics_clone.lock().await.push(metrics);
-                }
-            }
-        });
-        tasks.push(handle);
-    }
-
-    let total_submitted = tasks.len() as u64;
-    super::task_group::join_all(tasks).await?;
-    let test_duration = test_start.elapsed().as_secs_f64();
-
-    let confirmed_count = confirmed_counter.load(Ordering::Relaxed);
-    spinner.finish_and_clear();
-    ui::success(&format!(
-        "sent {confirmed_count}/{total_submitted} confirmed"
-    ));
-
-    let metrics = metrics_list.lock().await.clone();
+    let jobs = keypairs
+        .iter()
+        .map(|keypair| its_sol_source::ItsSolanaSubmitJob {
+            keypair: Arc::clone(keypair),
+            source_account: its_sol_source::source_account(keypair, &transfer.mint),
+        })
+        .collect();
+    let burst = its_sol_source::run_its_burst(
+        its_sol_source::ItsSolanaSubmitter {
+            rpc_url: args.source_rpc.clone(),
+            network: args.network,
+            token_id: transfer.token_id,
+            mint: transfer.mint,
+            destination_chain: dest.to_string(),
+            destination_address: transfer.dest_address_bytes.clone(),
+            amount: transfer.amount_per_tx,
+            gas_value: transfer.gas_value,
+            metric_context: its_sol_source::MetricContext::HubRouted {
+                hub_address: evm.axelarnet_gw_addr.clone(),
+            },
+        },
+        jobs,
+        100,
+    )
+    .await?;
+    let metrics = burst.metrics;
     let total_failed = metrics.iter().filter(|m| !m.is_success()).count() as u64;
 
     if total_failed > 0 {
@@ -618,8 +467,8 @@ async fn run_burst_pipeline(
             destination_address: format!("{}", evm.its_proxy_addr),
             num_txs: args.num_txs,
             num_keys: key_count,
-            total_submitted,
-            test_duration_secs: test_duration,
+            total_submitted: burst.total_submitted,
+            test_duration_secs: burst.test_duration_secs,
             compute_unit_summary: ComputeUnitSummary::Include,
         },
         metrics,

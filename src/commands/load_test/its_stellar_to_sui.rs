@@ -20,11 +20,13 @@
 //! `its_stellar_to_evm.rs` would need to land here (create_account per
 //! derived key + linked-token distribution); not yet implemented.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eyre::{Result, eyre};
 
-use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+use super::its_stellar_source::{ItsStellarSubmitJob, ItsStellarSubmitter};
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput};
 use super::run_sizing::RunSizing;
 use super::{
     LoadTestArgs, finalize_sui_dest_run_its, load_stellar_main_wallet, load_sui_main_wallet,
@@ -124,98 +126,32 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
         // structure consistent with the EVM/Sol variants.
         Duration::from_millis(1_000 / tps.max(1))
     });
-    let test_start = Instant::now();
-    let dest_chain_id = args.destination_axelar_id.clone();
-    let label = if sustained_params.is_some() {
-        format!("[sustained] 0/{total_to_send} confirmed")
-    } else {
-        format!("sending (0/{total_to_send} confirmed)...")
-    };
-    let spinner = ui::wait_spinner(&label);
     let capacity = usize::try_from(total_to_send).unwrap_or(0);
-    let mut metrics: Vec<TxMetrics> = Vec::with_capacity(capacity);
-    let mut interval = pacing.map(|p| {
-        let mut i = tokio::time::interval(p);
-        i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        i
-    });
-
-    for _ in 0..total_to_send {
-        if let Some(ref mut i) = interval {
-            i.tick().await;
-        }
-        let submit_start = Instant::now();
-        let result = stellar_client
-            .its_interchain_transfer(crate::stellar::InterchainTransferRequest {
-                wallet: &main_wallet,
-                its_contract: &its_addr,
-                gateway_contract: &gateway_addr,
-                token_id,
-                destination_chain: &dest_chain_id,
-                destination_address_bytes: &sui_recipient_bytes,
-                amount: u128::from(AMOUNT_PER_TX),
-                data: None,
-                gas_token: &xlm_addr,
-                gas_amount: gas_stroops,
-            })
-            .await;
-
-        let elapsed_ms = submit_start
-            .elapsed()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX);
-        match result {
-            Ok(invoked) if invoked.success => {
-                let event_idx = invoked.event_index.unwrap_or(0);
-                let message_id = format!("0x{}-{event_idx}", invoked.tx_hash_hex.to_lowercase());
-                metrics.push(TxMetrics {
-                    signature: message_id,
-                    submit_time_ms: elapsed_ms,
-                    confirm_time_ms: Some(elapsed_ms),
-                    latency_ms: Some(elapsed_ms),
-                    compute_units: None,
-                    slot: None,
-                    outcome: TxMetrics::succeeded_outcome(),
-                    payload: Vec::new(),
-                    payload_hash: String::new(),
-                    source_address: its_addr.clone(),
-                    // ITS hub-routes: book the second leg dest as `axelar`
-                    // so the verifier picks up the hub-forwarded message id.
-                    gmp_destination_chain: "axelar".to_string(),
-                    gmp_destination_address: String::new(),
-                    send_instant: Some(submit_start),
-                    amplifier_timing: None,
-                });
-                let confirmed = metrics.iter().filter(|m| m.is_success()).count();
-                let msg = if sustained_params.is_some() {
-                    format!("[sustained] {confirmed}/{total_to_send} confirmed")
-                } else {
-                    format!("sending ({confirmed}/{total_to_send} confirmed)...")
-                };
-                spinner.set_message(msg);
-            }
-            Ok(invoked) => {
-                metrics.push(failed_metric(
-                    its_addr.clone(),
-                    format!("tx {} failed on-chain", invoked.tx_hash_hex),
-                    elapsed_ms,
-                ));
-            }
-            Err(e) => {
-                metrics.push(failed_metric(its_addr.clone(), e.to_string(), elapsed_ms));
-            }
-        }
-    }
-    spinner.finish_and_clear();
-
-    let total_submitted = metrics.len() as u64;
-    let total_confirmed = metrics.iter().filter(|m| m.is_success()).count() as u64;
-    ui::success(&format!(
-        "sent {total_confirmed}/{total_submitted} confirmed"
-    ));
-
-    let test_duration = test_start.elapsed().as_secs_f64();
+    let wallet = Arc::new(main_wallet);
+    let jobs = vec![
+        ItsStellarSubmitJob {
+            wallet: Arc::clone(&wallet),
+        };
+        capacity
+    ];
+    let test_start = Instant::now();
+    let send = super::submitter::run_serial(
+        ItsStellarSubmitter {
+            client: stellar_client,
+            its_contract: its_addr,
+            gateway_contract: gateway_addr,
+            token_id,
+            destination_chain: args.destination_axelar_id.clone(),
+            destination_address_bytes: sui_recipient_bytes,
+            gas_token: xlm_addr,
+            gas_stroops,
+            amount_per_tx: u128::from(AMOUNT_PER_TX),
+            axelarnet_gw_addr: String::new(),
+        },
+        jobs,
+        pacing,
+    )
+    .await?;
     let mut report = LoadTestReport::from_transactions(
         ReportInput {
             source_chain: src.to_string(),
@@ -223,11 +159,11 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
             destination_address: sui_wallet.address_hex(),
             num_txs: args.num_txs,
             num_keys: total_to_send as usize,
-            total_submitted,
-            test_duration_secs: test_duration,
+            total_submitted: send.total_submitted,
+            test_duration_secs: send.test_duration_secs,
             compute_unit_summary: ComputeUnitSummary::Omit,
         },
-        metrics,
+        send.metrics,
     );
     if let Some((tps, duration_secs)) = sustained_params {
         report.tps = Some(tps);
@@ -235,23 +171,4 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
     }
 
     finalize_sui_dest_run_its(&args, &mut report, &sui_rpc, test_start).await
-}
-
-fn failed_metric(source_addr: String, err: String, elapsed_ms: u64) -> TxMetrics {
-    TxMetrics {
-        signature: String::new(),
-        submit_time_ms: elapsed_ms,
-        confirm_time_ms: None,
-        latency_ms: None,
-        compute_units: None,
-        slot: None,
-        outcome: TxMetrics::failed_outcome(err),
-        payload: Vec::new(),
-        payload_hash: String::new(),
-        source_address: source_addr,
-        gmp_destination_chain: String::new(),
-        gmp_destination_address: String::new(),
-        send_instant: None,
-        amplifier_timing: None,
-    }
 }

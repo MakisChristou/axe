@@ -23,6 +23,7 @@
 //!   * Wait-for-remote-deploy on the destination chain.
 //!   * Final on-chain verification (Solana / EVM / Stellar / etc.).
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy::{
@@ -37,6 +38,7 @@ use eyre::eyre;
 use super::keypairs;
 use super::metrics::TxMetrics;
 use super::run_sizing::RunSizing;
+use super::submitter::TransactionSubmitter;
 use super::{LoadTestArgs, check_evm_balance, save_its_cache};
 use crate::commands::test_its::{
     extract_contract_call_event, extract_token_deployed_event, generate_salt,
@@ -568,6 +570,109 @@ pub(super) struct InterchainTransferRequest<'a, P> {
     pub gas_value: U256,
     pub gas_arg_scaling_factor: u32,
     pub explicit_nonce: Option<u64>,
+}
+
+/// Chain-specific ITS submission capability shared by every EVM-source route.
+#[derive(Clone)]
+pub(super) struct ItsEvmSubmitter {
+    pub rpc_url: reqwest::Url,
+    pub its_proxy: Address,
+    pub token_id: FixedBytes<32>,
+    pub destination_chain: String,
+    pub receiver: Bytes,
+    pub amount: U256,
+    pub gas_value: U256,
+    pub gas_arg_scaling_factor: u32,
+}
+
+/// One signer invocation of an EVM ITS transfer.
+pub(super) struct ItsEvmSubmitJob {
+    pub signer: PrivateKeySigner,
+    pub explicit_nonce: Option<u64>,
+    pub retry_rate_limits: bool,
+}
+
+impl TransactionSubmitter for ItsEvmSubmitter {
+    type Job = ItsEvmSubmitJob;
+
+    async fn submit(&self, job: Self::Job) -> TxMetrics {
+        let provider = ProviderBuilder::new()
+            .wallet(job.signer)
+            .connect_http(self.rpc_url.clone());
+        let submit = || {
+            execute_interchain_transfer(InterchainTransferRequest {
+                provider: &provider,
+                its_proxy: self.its_proxy,
+                token_id: self.token_id,
+                destination_chain: &self.destination_chain,
+                receiver: &self.receiver,
+                amount: self.amount,
+                gas_value: self.gas_value,
+                gas_arg_scaling_factor: self.gas_arg_scaling_factor,
+                explicit_nonce: job.explicit_nonce,
+            })
+        };
+        if job.retry_rate_limits {
+            super::retry::rate_limited(submit).await
+        } else {
+            submit().await
+        }
+    }
+}
+
+/// Submit an EVM-source ITS burst through the common chain-neutral driver.
+pub(super) async fn run_its_burst(
+    submitter: ItsEvmSubmitter,
+    signers: &[PrivateKeySigner],
+) -> eyre::Result<super::submitter::BurstResult> {
+    let jobs = signers
+        .iter()
+        .cloned()
+        .map(|signer| ItsEvmSubmitJob {
+            signer,
+            explicit_nonce: None,
+            retry_rate_limits: true,
+        })
+        .collect();
+    super::submitter::run_burst(submitter, jobs, 100).await
+}
+
+/// Adapt the same EVM ITS submitter to the shared sustained scheduler.
+pub(super) fn its_sustained_tasks(
+    submitter: ItsEvmSubmitter,
+    signers: Vec<PrivateKeySigner>,
+    verify_tx: Option<tokio::sync::mpsc::UnboundedSender<super::verify::PendingTx>>,
+    has_voting_verifier: bool,
+) -> super::sustained::MakeTask {
+    let submitter = Arc::new(submitter);
+    let signers = Arc::new(signers);
+    Box::new(move |key_idx: usize, nonce: Option<u64>| {
+        let submitter = Arc::clone(&submitter);
+        let signers = Arc::clone(&signers);
+        let verify_tx = verify_tx.clone();
+        Box::pin(async move {
+            let mut result = submitter
+                .submit(ItsEvmSubmitJob {
+                    signer: signers[key_idx].clone(),
+                    explicit_nonce: nonce,
+                    retry_rate_limits: false,
+                })
+                .await;
+            if result.is_success()
+                && let Some(verify_tx) = verify_tx
+            {
+                match super::verify::tx_to_pending_its(&result, has_voting_verifier) {
+                    Ok(pending) => {
+                        let _ = verify_tx.send(pending);
+                    }
+                    Err(error) => {
+                        result.mark_failed(format!("failed to build verification state: {error}"));
+                    }
+                }
+            }
+            result
+        })
+    })
 }
 
 pub(super) async fn execute_interchain_transfer<P: Provider>(

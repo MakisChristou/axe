@@ -9,19 +9,18 @@
 //!   6. Verify through Amplifier (voted → hub_approved → routed → approved → executed)
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use eyre::{Result, eyre};
-use tokio::sync::Mutex;
 
 use super::its_prerequisites::{self, GatewayRequirement};
 use super::its_stellar_source::{
-    self, RemoteDeploymentVerifier, SustainedTransferArgs, SustainedTransferContext,
-    TokenSetupRequest, TransferRequest, amount_per_key, derive_and_fund_wallets,
-    distribute_token_balances, parse_gas_stroops, setup_token, transfer_amount,
+    self, ItsStellarSubmitter, RemoteDeploymentVerifier, SustainedTransferArgs, TokenSetupRequest,
+    amount_per_key, derive_and_fund_wallets, distribute_token_balances, parse_gas_stroops,
+    setup_token, transfer_amount,
 };
-use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput};
 use super::run_sizing::RunSizing;
 use super::sustained;
 use super::{LoadTestArgs, finish_report, validate_evm_rpc};
@@ -318,9 +317,8 @@ async fn run_sustained_pipeline(
 
     let test_start = Instant::now();
     let result = its_stellar_source::run_sustained(SustainedTransferArgs {
-        context: SustainedTransferContext {
+        submitter: ItsStellarSubmitter {
             client: stellar.client.clone(),
-            wallets,
             its_contract: stellar.its_addr.clone(),
             gateway_contract: stellar.gateway_addr.clone(),
             token_id,
@@ -331,6 +329,7 @@ async fn run_sustained_pipeline(
             amount_per_tx,
             axelarnet_gw_addr: evm.axelarnet_gw_addr.clone(),
         },
+        wallets,
         tps: tps_n,
         duration_secs,
         key_cycle,
@@ -382,78 +381,35 @@ async fn run_burst_pipeline(
     let num_keys = sizing.num_keys;
 
     let test_start = Instant::now();
-    let metrics_list: Arc<Mutex<Vec<TxMetrics>>> = Arc::new(Mutex::new(Vec::new()));
-    let confirmed = Arc::new(AtomicU64::new(0));
-    let spinner = ui::wait_spinner(&format!("sending (0/{num_keys} confirmed)..."));
-
-    let client = Arc::new(stellar.client.clone());
-    let stellar_its_arc = Arc::new(stellar.its_addr.clone());
-    let stellar_gw_arc = Arc::new(stellar.gateway_addr.clone());
-    let stellar_xlm_arc = Arc::new(stellar.xlm_addr.clone());
-    let dest_chain_arc = Arc::new(args.destination_axelar_id.clone());
-    let dest_addr_arc = Arc::new(evm.dest_address_bytes.clone());
-    let axelarnet_gw_arc = Arc::new(evm.axelarnet_gw_addr.clone());
-
-    let mut tasks = Vec::with_capacity(num_keys);
-    for w in wallets {
-        let c = Arc::clone(&client);
-        let its = Arc::clone(&stellar_its_arc);
-        let gw = Arc::clone(&stellar_gw_arc);
-        let xlm = Arc::clone(&stellar_xlm_arc);
-        let dc = Arc::clone(&dest_chain_arc);
-        let da = Arc::clone(&dest_addr_arc);
-        let gmp_dest_addr = Arc::clone(&axelarnet_gw_arc);
-        let metrics_clone = Arc::clone(&metrics_list);
-        let counter = Arc::clone(&confirmed);
-        let sp = spinner.clone();
-        let total = num_keys;
-
-        let handle = tokio::spawn(async move {
-            let m = its_stellar_source::submit_transfer(TransferRequest {
-                client: &c,
-                wallet: &w,
-                its_contract: &its,
-                gateway_contract: &gw,
-                token_id,
-                destination_chain: &dc,
-                destination_address_bytes: &da,
-                gas_token: &xlm,
-                gas_amount_stroops: gas_stroops,
-                transfer_amount: amount_per_tx,
-                gmp_dest_address: &gmp_dest_addr,
-            })
-            .await;
-            if m.is_success() {
-                let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                sp.set_message(format!("sending ({done}/{total} confirmed)..."));
-            }
-            metrics_clone.lock().await.push(m);
-        });
-        tasks.push(handle);
-    }
-
-    let total_submitted = tasks.len() as u64;
-    super::task_group::join_all(tasks).await?;
-    let test_duration = test_start.elapsed().as_secs_f64();
-    let confirmed_count = confirmed.load(Ordering::Relaxed);
-    spinner.finish_and_clear();
-    ui::success(&format!(
-        "sent {confirmed_count}/{total_submitted} confirmed"
-    ));
-
-    let metrics = metrics_list.lock().await.clone();
+    let burst = its_stellar_source::run_its_burst(
+        ItsStellarSubmitter {
+            client: stellar.client.clone(),
+            its_contract: stellar.its_addr.clone(),
+            gateway_contract: stellar.gateway_addr.clone(),
+            token_id,
+            destination_chain: args.destination_axelar_id.clone(),
+            destination_address_bytes: evm.dest_address_bytes.clone(),
+            gas_token: stellar.xlm_addr.clone(),
+            gas_stroops,
+            amount_per_tx,
+            axelarnet_gw_addr: evm.axelarnet_gw_addr.clone(),
+        },
+        wallets,
+        100,
+    )
+    .await?;
     let mut report = LoadTestReport::from_transactions(
         ReportInput {
             source_chain: src.to_string(),
             destination_chain: dest.to_string(),
             destination_address: format!("{}", evm.evm_its_addr),
-            num_txs: total_submitted,
+            num_txs: burst.total_submitted,
             num_keys,
-            total_submitted,
-            test_duration_secs: test_duration,
+            total_submitted: burst.total_submitted,
+            test_duration_secs: burst.test_duration_secs,
             compute_unit_summary: ComputeUnitSummary::Omit,
         },
-        metrics,
+        burst.metrics,
     );
 
     let verification = super::verify::verify_onchain_evm_its(super::verify::ItsBatchVerification {

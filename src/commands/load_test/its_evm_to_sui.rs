@@ -19,21 +19,11 @@
 //! the gateway emits the same `MessageExecuted` event regardless of who
 //! called `gateway::execute`.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
-
-use alloy::{
-    primitives::{Address, Bytes, FixedBytes, U256},
-    providers::{Provider, ProviderBuilder},
-    signers::local::PrivateKeySigner,
-};
-use eyre::eyre;
-use tokio::sync::{Mutex, Semaphore};
 
 use super::its_prerequisites::{self, GatewayRequirement};
 use super::keypairs;
-use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput};
 use super::run_sizing::RunSizing;
 use super::{
     LoadTestArgs, check_evm_balance, finalize_sui_dest_run_its, load_sui_main_wallet,
@@ -42,8 +32,12 @@ use super::{
 use crate::config::ChainsConfig;
 use crate::evm::{ERC20, InterchainTokenService};
 use crate::ui;
-
-const MAX_CONCURRENT_SENDS: usize = 100;
+use alloy::{
+    primitives::{Address, Bytes, FixedBytes, U256},
+    providers::{Provider, ProviderBuilder},
+    signers::local::PrivateKeySigner,
+};
+use eyre::eyre;
 
 /// Resolved EVM source-chain context: signer, ITS proxy + linked token, RPC.
 struct EvmContext {
@@ -246,66 +240,23 @@ async fn run_burst_pipeline(
         .burst_count()
         .expect("burst pipeline requires burst sizing");
     let test_start = Instant::now();
-    let metrics_list: Arc<Mutex<Vec<TxMetrics>>> = Arc::new(Mutex::new(Vec::new()));
-    let confirmed_counter = Arc::new(AtomicU64::new(0));
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SENDS));
-    let spinner = ui::wait_spinner(&format!("sending (0/{num_txs} confirmed)..."));
-
-    let dest_chain_id = args.destination_axelar_id.clone();
     let gas_value = U256::from(evm.gas_value_wei);
     let gas_arg_scaling_factor =
         super::its_evm_source::read_gas_arg_scaling_factor(&args.config, &args.source_axelar_id);
-    let mut tasks = Vec::with_capacity(num_txs);
-    for derived_signer in derived {
-        let metrics_clone = Arc::clone(&metrics_list);
-        let counter = Arc::clone(&confirmed_counter);
-        let sem = Arc::clone(&semaphore);
-        let sp = spinner.clone();
-        let total = num_txs;
-        let dc = dest_chain_id.clone();
-        let rb = sui.recipient_bytes.clone();
-        let its_proxy = evm.its_proxy_addr;
-        let tid = evm.token_id;
-        let provider = ProviderBuilder::new()
-            .wallet(derived_signer.clone())
-            .connect_http(evm.rpc_url.parse()?);
-
-        let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            let m = super::retry::rate_limited(|| {
-                super::its_evm_source::execute_interchain_transfer(
-                    super::its_evm_source::InterchainTransferRequest {
-                        provider: &provider,
-                        its_proxy,
-                        token_id: tid,
-                        destination_chain: &dc,
-                        receiver: &rb,
-                        amount: amount_per_tx,
-                        gas_value,
-                        gas_arg_scaling_factor,
-                        explicit_nonce: None,
-                    },
-                )
-            })
-            .await;
-            if m.is_success() {
-                let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                sp.set_message(format!("sending ({done}/{total} confirmed)..."));
-            }
-            metrics_clone.lock().await.push(m);
-        });
-        tasks.push(handle);
-    }
-    let total_submitted = tasks.len() as u64;
-    super::task_group::join_all(tasks).await?;
-    spinner.finish_and_clear();
-    let confirmed_count = confirmed_counter.load(Ordering::Relaxed);
-    ui::success(&format!(
-        "sent {confirmed_count}/{total_submitted} confirmed"
-    ));
-
-    let test_duration = test_start.elapsed().as_secs_f64();
-    let metrics = metrics_list.lock().await.clone();
+    let burst = super::its_evm_source::run_its_burst(
+        super::its_evm_source::ItsEvmSubmitter {
+            rpc_url: evm.rpc_url.parse()?,
+            its_proxy: evm.its_proxy_addr,
+            token_id: evm.token_id,
+            destination_chain: args.destination_axelar_id.clone(),
+            receiver: sui.recipient_bytes.clone(),
+            amount: amount_per_tx,
+            gas_value,
+            gas_arg_scaling_factor,
+        },
+        derived,
+    )
+    .await?;
     let mut report = LoadTestReport::from_transactions(
         ReportInput {
             source_chain: src.to_string(),
@@ -313,11 +264,11 @@ async fn run_burst_pipeline(
             destination_address: sui.recipient_display.clone(),
             num_txs: args.num_txs,
             num_keys: num_txs,
-            total_submitted,
-            test_duration_secs: test_duration,
+            total_submitted: burst.total_submitted,
+            test_duration_secs: burst.test_duration_secs,
             compute_unit_summary: ComputeUnitSummary::Omit,
         },
-        metrics,
+        burst.metrics,
     );
 
     finalize_sui_dest_run_its(args, &mut report, &sui.rpc, test_start).await
@@ -348,41 +299,24 @@ async fn run_sustained_pipeline(
         "[0/{duration_secs}s] starting sustained ITS send..."
     ));
     let test_start = Instant::now();
-    let dest_chain_id = args.destination_axelar_id.clone();
-    let rpc_url = evm.rpc_url.clone();
-    let its_proxy = evm.its_proxy_addr;
-    let token_id = evm.token_id;
-    let recipient_bytes = sui.recipient_bytes.clone();
     let gas_value = U256::from(evm.gas_value_wei);
     let gas_arg_scaling_factor =
         super::its_evm_source::read_gas_arg_scaling_factor(&args.config, &args.source_axelar_id);
-
-    let make_task: super::sustained::MakeTask =
-        Box::new(move |key_idx: usize, nonce: Option<u64>| {
-            let dc = dest_chain_id.clone();
-            let rb = recipient_bytes.clone();
-            let amt = amount_per_tx;
-            let provider = ProviderBuilder::new()
-                .wallet(derived[key_idx].clone())
-                .connect_http(rpc_url.parse().expect("invalid RPC URL"));
-
-            Box::pin(async move {
-                super::its_evm_source::execute_interchain_transfer(
-                    super::its_evm_source::InterchainTransferRequest {
-                        provider: &provider,
-                        its_proxy,
-                        token_id,
-                        destination_chain: &dc,
-                        receiver: &rb,
-                        amount: amt,
-                        gas_value,
-                        gas_arg_scaling_factor,
-                        explicit_nonce: nonce,
-                    },
-                )
-                .await
-            })
-        });
+    let make_task = super::its_evm_source::its_sustained_tasks(
+        super::its_evm_source::ItsEvmSubmitter {
+            rpc_url: evm.rpc_url.parse()?,
+            its_proxy: evm.its_proxy_addr,
+            token_id: evm.token_id,
+            destination_chain: args.destination_axelar_id.clone(),
+            receiver: sui.recipient_bytes.clone(),
+            amount: amount_per_tx,
+            gas_value,
+            gas_arg_scaling_factor,
+        },
+        derived,
+        None,
+        false,
+    );
 
     let result = super::sustained::run_sustained_loop(
         tps_usize,

@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eyre::Result;
 use tokio::sync::Semaphore;
@@ -76,6 +76,52 @@ where
         "sent {confirmed_count}/{total_submitted} confirmed"
     ));
 
+    Ok(BurstResult {
+        metrics,
+        total_submitted,
+        test_duration_secs,
+    })
+}
+
+/// Submit jobs one at a time, optionally rate-pacing their start times.
+///
+/// This is the chain-neutral driver for account models such as Stellar where
+/// one wallet's sequence number makes concurrent submission invalid.
+pub(super) async fn run_serial<S>(
+    submitter: S,
+    jobs: Vec<S::Job>,
+    pacing: Option<Duration>,
+) -> Result<BurstResult>
+where
+    S: TransactionSubmitter,
+{
+    let total = jobs.len();
+    let total_submitted = total as u64;
+    let spinner = ui::wait_spinner(&format!("sending (0/{total} confirmed)..."));
+    let mut interval = pacing.map(|duration| {
+        let mut interval = tokio::time::interval(duration);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval
+    });
+    let test_start = Instant::now();
+    let mut metrics = Vec::with_capacity(total);
+    let mut confirmed = 0u64;
+
+    for job in jobs {
+        if let Some(interval) = &mut interval {
+            interval.tick().await;
+        }
+        let result = submitter.submit(job).await;
+        if result.is_success() {
+            confirmed += 1;
+        }
+        metrics.push(result);
+        spinner.set_message(format!("sending ({confirmed}/{total} confirmed)..."));
+    }
+
+    let test_duration_secs = test_start.elapsed().as_secs_f64();
+    spinner.finish_and_clear();
+    ui::success(&format!("sent {confirmed}/{total_submitted} confirmed"));
     Ok(BurstResult {
         metrics,
         total_submitted,

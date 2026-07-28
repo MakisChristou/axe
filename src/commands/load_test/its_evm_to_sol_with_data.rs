@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// How long to wait for an EVM tx receipt before giving up.
@@ -14,12 +13,12 @@ use eyre::eyre;
 use rand::Rng;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signer::Signer;
-use tokio::sync::{Mutex, Semaphore};
 
 use super::its_prerequisites::{self, GatewayRequirement};
 use super::keypairs;
 use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
 use super::run_sizing::RunSizing;
+use super::submitter::TransactionSubmitter;
 use super::{
     LoadTestArgs, check_evm_balance, finish_report, read_its_cache, save_its_cache,
     validate_evm_rpc, validate_solana_rpc,
@@ -34,8 +33,6 @@ use crate::ui;
 const TOKEN_NAME: &str = "AXE";
 const TOKEN_SYMBOL: &str = "AXE";
 const TOKEN_DECIMALS: u8 = 18;
-
-const MAX_CONCURRENT_SENDS: usize = 100;
 
 /// Build Borsh-encoded ITS metadata that triggers the memo program on Solana.
 ///
@@ -492,8 +489,6 @@ async fn run_sustained_pipeline(
     let src = &args.source_chain;
     let dest = &args.destination_chain;
     let (tps, duration_secs, key_cycle) = sizing.sustained().expect("sustained mode");
-    let rpc_url_str = evm_rpc_url.to_string();
-
     let nonce_provider = ProviderBuilder::new().connect_http(evm_rpc_url.parse()?);
     let mut nonces: Vec<u64> = Vec::with_capacity(sizing.num_keys);
     for signer in derived {
@@ -545,64 +540,12 @@ async fn run_sustained_pipeline(
     let _ = spinner_tx.send(spinner.clone());
 
     let test_start = Instant::now();
-    let dest_chain_s = dest.to_string();
-    let counter_pda_clone = transfer_ctx.counter_pda;
-    let ea = transfer_ctx.extra_accounts;
-    let tma = transfer_ctx.token_mint_ata;
-    let gas_value = transfer_ctx.gas_value;
-    let receiver_bytes = transfer_ctx.receiver_bytes.clone();
-    let amount_per_tx = transfer_ctx.amount_per_tx;
-    let its_proxy_addr = transfer_ctx.its_proxy_addr;
-    let token_id = transfer_ctx.token_id;
-    let derived_owned: Vec<PrivateKeySigner> = derived.to_vec();
-
-    let make_task: super::sustained::MakeTask =
-        Box::new(move |key_idx: usize, nonce: Option<u64>| {
-            let dc = dest_chain_s.clone();
-            let gv = gas_value;
-            let rb = receiver_bytes.clone();
-            let amt = amount_per_tx;
-            let its_proxy = its_proxy_addr;
-            let tid = token_id;
-            let url = rpc_url_str.clone();
-            let cpda = counter_pda_clone;
-            let vtx = verify_tx.clone();
-            let has_vv = has_voting_verifier;
-
-            let provider = ProviderBuilder::new()
-                .wallet(derived_owned[key_idx].clone())
-                .connect_http(url.parse().expect("invalid RPC URL"));
-
-            Box::pin(async move {
-                let mut result =
-                    execute_interchain_transfer_with_data(InterchainTransferWithDataRequest {
-                        provider: &provider,
-                        its_proxy,
-                        token_id: tid,
-                        destination_chain: &dc,
-                        receiver: &rb,
-                        amount: amt,
-                        gas_value: gv,
-                        counter_pda: &cpda,
-                        extra_accounts: ea,
-                        token_mint_ata: tma.as_ref(),
-                        explicit_nonce: nonce,
-                    })
-                    .await;
-                // Stream successful txs to the concurrent verification pipeline.
-                if result.is_success() {
-                    match super::verify::tx_to_pending_its(&result, has_vv) {
-                        Ok(pending) => {
-                            let _ = vtx.send(pending);
-                        }
-                        Err(e) => {
-                            result.mark_failed(format!("failed to build verification state: {e}"));
-                        }
-                    }
-                }
-                result
-            })
-        });
+    let make_task = its_with_data_sustained_tasks(
+        ItsEvmWithDataSubmitter::new(evm_rpc_url, dest, transfer_ctx)?,
+        derived.to_vec(),
+        verify_tx,
+        has_voting_verifier,
+    );
 
     let result = super::sustained::run_sustained_loop(
         tps,
@@ -656,76 +599,23 @@ async fn run_burst_pipeline(
         .expect("burst pipeline requires burst sizing");
     let its_proxy_addr = transfer_ctx.its_proxy_addr;
 
-    let metrics_list: Arc<Mutex<Vec<TxMetrics>>> = Arc::new(Mutex::new(Vec::new()));
-    let confirmed_counter = Arc::new(AtomicU64::new(0));
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SENDS));
-    let spinner = ui::wait_spinner(&format!("sending ITS-with-data (0/{num_txs} confirmed)..."));
     let test_start = Instant::now();
-
-    let mut tasks = Vec::with_capacity(num_txs);
-    let dest_chain = dest.to_string();
-
-    for derived_signer in derived {
-        let metrics_clone = Arc::clone(&metrics_list);
-        let counter = Arc::clone(&confirmed_counter);
-        let sem = Arc::clone(&semaphore);
-        let sp = spinner.clone();
-        let total = num_txs;
-        let dc = dest_chain.clone();
-        let gv = transfer_ctx.gas_value;
-        let rb = transfer_ctx.receiver_bytes.clone();
-        let amt = transfer_ctx.amount_per_tx;
-        let its_proxy = transfer_ctx.its_proxy_addr;
-        let tid = transfer_ctx.token_id;
-        let cpda = transfer_ctx.counter_pda;
-        let ea = transfer_ctx.extra_accounts;
-        let tma = transfer_ctx.token_mint_ata;
-
-        let provider = ProviderBuilder::new()
-            .wallet(derived_signer.clone())
-            .connect_http(evm_rpc_url.parse()?);
-
-        let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-
-            let m = super::retry::rate_limited(|| {
-                execute_interchain_transfer_with_data(InterchainTransferWithDataRequest {
-                    provider: &provider,
-                    its_proxy,
-                    token_id: tid,
-                    destination_chain: &dc,
-                    receiver: &rb,
-                    amount: amt,
-                    gas_value: gv,
-                    counter_pda: &cpda,
-                    extra_accounts: ea,
-                    token_mint_ata: tma.as_ref(),
-                    explicit_nonce: None,
-                })
-            })
-            .await;
-            if m.is_success() {
-                let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                sp.set_message(format!(
-                    "sending ITS-with-data ({done}/{total} confirmed)..."
-                ));
-            }
-            metrics_clone.lock().await.push(m);
-        });
-        tasks.push(handle);
-    }
-
-    let total_submitted = tasks.len() as u64;
-    super::task_group::join_all(tasks).await?;
-    let test_duration = test_start.elapsed().as_secs_f64();
-
-    let confirmed_count = confirmed_counter.load(Ordering::Relaxed);
-    spinner.finish_and_clear();
-    ui::success(&format!(
-        "sent {confirmed_count}/{total_submitted} ITS-with-data confirmed"
-    ));
-
-    let metrics = metrics_list.lock().await.clone();
+    let jobs = derived
+        .iter()
+        .cloned()
+        .map(|signer| ItsEvmWithDataSubmitJob {
+            signer,
+            explicit_nonce: None,
+            retry_rate_limits: true,
+        })
+        .collect();
+    let burst = super::submitter::run_burst(
+        ItsEvmWithDataSubmitter::new(evm_rpc_url, dest, transfer_ctx)?,
+        jobs,
+        100,
+    )
+    .await?;
+    let metrics = burst.metrics;
     let total_failed = metrics.iter().filter(|m| !m.is_success()).count() as u64;
 
     if total_failed > 0 {
@@ -752,8 +642,8 @@ async fn run_burst_pipeline(
             destination_address: format!("{its_proxy_addr}"),
             num_txs: args.num_txs,
             num_keys: num_txs,
-            total_submitted,
-            test_duration_secs: test_duration,
+            total_submitted: burst.total_submitted,
+            test_duration_secs: burst.test_duration_secs,
             compute_unit_summary: ComputeUnitSummary::Omit,
         },
         metrics,
@@ -860,6 +750,117 @@ async fn deploy_its_token<P: Provider>(
     save_its_cache(source_chain, dest_chain, &cache)?;
 
     Ok((token_id, token_addr, deploy_message_id))
+}
+
+/// EVM submission capability for the Solana ITS-with-data route.
+///
+/// The route still owns memo-account selection and destination verification;
+/// this adapter owns provider construction, transaction submission, and the
+/// route's rate-limit policy.
+#[derive(Clone)]
+struct ItsEvmWithDataSubmitter {
+    rpc_url: reqwest::Url,
+    its_proxy: Address,
+    token_id: FixedBytes<32>,
+    destination_chain: String,
+    receiver: Bytes,
+    amount: U256,
+    gas_value: U256,
+    counter_pda: Pubkey,
+    extra_accounts: u32,
+    token_mint_ata: Option<Pubkey>,
+}
+
+impl ItsEvmWithDataSubmitter {
+    fn new(
+        evm_rpc_url: &str,
+        destination_chain: &str,
+        transfer: &TransferContext,
+    ) -> eyre::Result<Self> {
+        Ok(Self {
+            rpc_url: evm_rpc_url.parse()?,
+            its_proxy: transfer.its_proxy_addr,
+            token_id: transfer.token_id,
+            destination_chain: destination_chain.to_string(),
+            receiver: transfer.receiver_bytes.clone(),
+            amount: transfer.amount_per_tx,
+            gas_value: transfer.gas_value,
+            counter_pda: transfer.counter_pda,
+            extra_accounts: transfer.extra_accounts,
+            token_mint_ata: transfer.token_mint_ata,
+        })
+    }
+}
+
+struct ItsEvmWithDataSubmitJob {
+    signer: PrivateKeySigner,
+    explicit_nonce: Option<u64>,
+    retry_rate_limits: bool,
+}
+
+impl TransactionSubmitter for ItsEvmWithDataSubmitter {
+    type Job = ItsEvmWithDataSubmitJob;
+
+    async fn submit(&self, job: Self::Job) -> TxMetrics {
+        let provider = ProviderBuilder::new()
+            .wallet(job.signer)
+            .connect_http(self.rpc_url.clone());
+        let submit = || {
+            execute_interchain_transfer_with_data(InterchainTransferWithDataRequest {
+                provider: &provider,
+                its_proxy: self.its_proxy,
+                token_id: self.token_id,
+                destination_chain: &self.destination_chain,
+                receiver: &self.receiver,
+                amount: self.amount,
+                gas_value: self.gas_value,
+                counter_pda: &self.counter_pda,
+                extra_accounts: self.extra_accounts,
+                token_mint_ata: self.token_mint_ata.as_ref(),
+                explicit_nonce: job.explicit_nonce,
+            })
+        };
+        if job.retry_rate_limits {
+            super::retry::rate_limited(submit).await
+        } else {
+            submit().await
+        }
+    }
+}
+
+fn its_with_data_sustained_tasks(
+    submitter: ItsEvmWithDataSubmitter,
+    signers: Vec<PrivateKeySigner>,
+    verify_tx: tokio::sync::mpsc::UnboundedSender<super::verify::PendingTx>,
+    has_voting_verifier: bool,
+) -> super::sustained::MakeTask {
+    let submitter = Arc::new(submitter);
+    let signers = Arc::new(signers);
+    Box::new(move |key_idx: usize, nonce: Option<u64>| {
+        let submitter = Arc::clone(&submitter);
+        let signers = Arc::clone(&signers);
+        let verify_tx = verify_tx.clone();
+        Box::pin(async move {
+            let mut result = submitter
+                .submit(ItsEvmWithDataSubmitJob {
+                    signer: signers[key_idx].clone(),
+                    explicit_nonce: nonce,
+                    retry_rate_limits: false,
+                })
+                .await;
+            if result.is_success() {
+                match super::verify::tx_to_pending_its(&result, has_voting_verifier) {
+                    Ok(pending) => {
+                        let _ = verify_tx.send(pending);
+                    }
+                    Err(error) => {
+                        result.mark_failed(format!("failed to build verification state: {error}"));
+                    }
+                }
+            }
+            result
+        })
+    })
 }
 
 /// Send a single interchainTransfer with metadata that triggers the memo program.

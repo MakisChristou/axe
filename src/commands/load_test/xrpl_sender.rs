@@ -150,6 +150,7 @@ async fn submit_single(submission: TransferSubmission<'_>) -> TxMetrics {
     }
 }
 
+#[derive(Clone)]
 struct XrplSubmitter {
     client: XrplClient,
     destination_multisig: AccountId,
@@ -160,6 +161,7 @@ struct XrplSubmitter {
     gmp_destination_address: String,
 }
 
+#[derive(Clone)]
 struct XrplSubmitJob {
     wallet: XrplWallet,
 }
@@ -334,38 +336,30 @@ pub(super) async fn run_sustained(request: SustainedRequest) -> Result<sustained
         spinner,
         has_voting_verifier,
     } = request;
-    let client = Arc::new(client.clone());
-    let wallets = Arc::new(wallets);
+    let submitter = Arc::new(XrplSubmitter {
+        client,
+        destination_multisig,
+        destination_chain,
+        destination_address_hex,
+        gas_fee_drops,
+        gmp_destination_chain: gmp_dest_chain,
+        gmp_destination_address: gmp_dest_address,
+    });
+    let jobs = Arc::new(
+        wallets
+            .into_iter()
+            .map(|wallet| XrplSubmitJob { wallet })
+            .collect::<Vec<_>>(),
+    );
 
     let make_task: sustained::MakeTask = Box::new(move |key_idx: usize, _nonce: Option<u64>| {
-        let c = Arc::clone(&client);
-        let ws = Arc::clone(&wallets);
-        let multisig = destination_multisig;
-        let dc = destination_chain.clone();
-        let da = destination_address_hex.clone();
-        let gmp_c = gmp_dest_chain.clone();
-        let gmp_a = gmp_dest_address.clone();
+        let submitter = Arc::clone(&submitter);
+        let job = jobs[key_idx % jobs.len()].clone();
         let vtx = verify_tx.clone();
         let has_vv = has_voting_verifier;
-        let gas = gas_fee_drops;
 
         Box::pin(async move {
-            let wallet = &ws[key_idx % ws.len()];
-            let total_drops = gas.saturating_add(NET_TRANSFER_DROPS);
-            let mut m = submit_single(TransferSubmission {
-                client: &c,
-                wallet,
-                destination_multisig: &multisig,
-                total_drops,
-                gas_fee_drops: gas,
-                destination_chain: &dc,
-                destination_address_hex: &da,
-                payload: None,
-                payload_hash_hex: "",
-                gmp_dest_chain: &gmp_c,
-                gmp_dest_address: &gmp_a,
-            })
-            .await;
+            let mut m = submitter.submit(job).await;
 
             if m.is_success()
                 && let Some(ref tx_sender) = vtx

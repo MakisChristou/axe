@@ -9,6 +9,7 @@ use rand::RngCore;
 
 use super::metrics::TxMetrics;
 use super::run_sizing::RunSizing;
+use super::submitter::TransactionSubmitter;
 use super::sustained;
 use crate::stellar::{StellarClient, StellarWallet};
 use crate::ui;
@@ -501,10 +502,10 @@ pub(super) async fn submit_transfer(request: TransferRequest<'_>) -> TxMetrics {
     }
 }
 
-/// Owned transaction context captured by the sustained task adapter.
-pub(super) struct SustainedTransferContext {
+/// Stellar ITS submission capability shared by every destination route.
+#[derive(Clone)]
+pub(super) struct ItsStellarSubmitter {
     pub client: StellarClient,
-    pub wallets: Vec<StellarWallet>,
     pub its_contract: String,
     pub gateway_contract: String,
     pub token_id: [u8; 32],
@@ -516,9 +517,50 @@ pub(super) struct SustainedTransferContext {
     pub axelarnet_gw_addr: String,
 }
 
+#[derive(Clone)]
+pub(super) struct ItsStellarSubmitJob {
+    pub wallet: Arc<StellarWallet>,
+}
+
+impl TransactionSubmitter for ItsStellarSubmitter {
+    type Job = ItsStellarSubmitJob;
+
+    async fn submit(&self, job: Self::Job) -> TxMetrics {
+        submit_transfer(TransferRequest {
+            client: &self.client,
+            wallet: &job.wallet,
+            its_contract: &self.its_contract,
+            gateway_contract: &self.gateway_contract,
+            token_id: self.token_id,
+            destination_chain: &self.destination_chain,
+            destination_address_bytes: &self.destination_address_bytes,
+            gas_token: &self.gas_token,
+            gas_amount_stroops: self.gas_stroops,
+            transfer_amount: self.amount_per_tx,
+            gmp_dest_address: &self.axelarnet_gw_addr,
+        })
+        .await
+    }
+}
+
+pub(super) async fn run_its_burst(
+    submitter: ItsStellarSubmitter,
+    wallets: Vec<StellarWallet>,
+    max_concurrent: usize,
+) -> Result<super::submitter::BurstResult> {
+    let jobs = wallets
+        .into_iter()
+        .map(|wallet| ItsStellarSubmitJob {
+            wallet: Arc::new(wallet),
+        })
+        .collect();
+    super::submitter::run_burst(submitter, jobs, max_concurrent).await
+}
+
 /// Pacing and reporting inputs for one sustained Stellar-source run.
 pub(super) struct SustainedTransferArgs {
-    pub context: SustainedTransferContext,
+    pub submitter: ItsStellarSubmitter,
+    pub wallets: Vec<StellarWallet>,
     pub tps: usize,
     pub duration_secs: u64,
     pub key_cycle: usize,
@@ -530,45 +572,14 @@ pub(super) struct SustainedTransferArgs {
 pub(super) async fn run_sustained(
     args: SustainedTransferArgs,
 ) -> Result<sustained::SustainedResult> {
-    let context = Arc::new(args.context);
-    let verify_tx = args.verify_tx;
-
-    let make_task: sustained::MakeTask = Box::new(move |key_idx: usize, _nonce: Option<u64>| {
-        let context = Arc::clone(&context);
-        let verify_tx = verify_tx.clone();
-
-        Box::pin(async move {
-            let wallet = &context.wallets[key_idx % context.wallets.len()];
-            let mut metrics = submit_transfer(TransferRequest {
-                client: &context.client,
-                wallet,
-                its_contract: &context.its_contract,
-                gateway_contract: &context.gateway_contract,
-                token_id: context.token_id,
-                destination_chain: &context.destination_chain,
-                destination_address_bytes: &context.destination_address_bytes,
-                gas_token: &context.gas_token,
-                gas_amount_stroops: context.gas_stroops,
-                transfer_amount: context.amount_per_tx,
-                gmp_dest_address: &context.axelarnet_gw_addr,
-            })
-            .await;
-            if metrics.is_success()
-                && let Some(ref tx_sender) = verify_tx
-            {
-                // Stellar ITS verification starts at the Voted stage.
-                match super::verify::tx_to_pending_its(&metrics, true) {
-                    Ok(pending) => {
-                        let _ = tx_sender.send(pending);
-                    }
-                    Err(error) => {
-                        metrics.mark_failed(format!("failed to build verification state: {error}"));
-                    }
-                }
-            }
-            metrics
+    let jobs = args
+        .wallets
+        .into_iter()
+        .map(|wallet| ItsStellarSubmitJob {
+            wallet: Arc::new(wallet),
         })
-    });
+        .collect();
+    let make_task = its_sustained_tasks(args.submitter, jobs, args.verify_tx);
 
     sustained::run_sustained_loop(
         args.tps,
@@ -580,4 +591,35 @@ pub(super) async fn run_sustained(
         args.spinner,
     )
     .await
+}
+
+fn its_sustained_tasks(
+    submitter: ItsStellarSubmitter,
+    jobs: Vec<ItsStellarSubmitJob>,
+    verify_tx: Option<tokio::sync::mpsc::UnboundedSender<super::verify::PendingTx>>,
+) -> sustained::MakeTask {
+    let submitter = Arc::new(submitter);
+    let jobs = Arc::new(jobs);
+    Box::new(move |key_idx: usize, _nonce: Option<u64>| {
+        let submitter = Arc::clone(&submitter);
+        let job = jobs[key_idx].clone();
+        let verify_tx = verify_tx.clone();
+        Box::pin(async move {
+            let mut metrics = submitter.submit(job).await;
+            if metrics.is_success()
+                && let Some(verify_tx) = verify_tx
+            {
+                // Stellar ITS verification starts at the Voted stage.
+                match super::verify::tx_to_pending_its(&metrics, true) {
+                    Ok(pending) => {
+                        let _ = verify_tx.send(pending);
+                    }
+                    Err(error) => {
+                        metrics.mark_failed(format!("failed to build verification state: {error}"));
+                    }
+                }
+            }
+            metrics
+        })
+    })
 }
