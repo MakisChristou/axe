@@ -20,6 +20,7 @@ mod its_stellar_to_sol;
 mod its_stellar_to_sui;
 mod its_sui_to_evm;
 mod its_sui_to_sol;
+mod its_verification;
 mod its_xrpl_to_evm;
 mod keypairs;
 pub mod metrics;

@@ -6,16 +6,17 @@
 //! the standard `interchain_transfer` memos; verification reuses the existing
 //! EVM destination checker.
 
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use eyre::{Result, eyre};
 use xrpl_types::AccountId;
 
 use super::its_prerequisites::{self, GatewayRequirement};
+use super::its_verification::{
+    EvmItsTarget, ItsVerificationRoute, ItsVerificationSession, finish_batch,
+};
 use super::run_sizing::RunSizing;
-use super::{LoadTestArgs, finish_report, validate_evm_rpc, xrpl_sender};
+use super::{LoadTestArgs, validate_evm_rpc, xrpl_sender};
 use crate::config::ChainsConfig;
 use crate::ui;
 use crate::xrpl::{
@@ -212,45 +213,20 @@ async fn run_sustained_pipeline(
     gas_fee_drops: u64,
     sizing: &RunSizing,
 ) -> Result<()> {
-    let src = &args.source_chain;
     let dest = &args.destination_chain;
     let (tps_n, duration_secs, key_cycle) = sizing.sustained().expect("sustained mode");
-
-    let (verify_tx, verify_rx) = tokio::sync::mpsc::unbounded_channel();
-    let send_done = Arc::new(AtomicBool::new(false));
-    let (spinner_tx, spinner_rx) = tokio::sync::oneshot::channel::<indicatif::ProgressBar>();
-
-    let vconfig = args.config.clone();
-    let vsource = args.source_axelar_id.clone();
-    let vdest = args.destination_axelar_id.clone();
-    let vdest_rpc = args.destination_rpc.clone();
-    let vdone = Arc::clone(&send_done);
-    let vgw = evm.evm_gateway_addr;
-    let vnetwork = args.network;
-    let verify_handle = tokio::spawn(async move {
-        let spinner = spinner_rx.await.expect("spinner channel dropped");
-        super::verify::verify_onchain_evm_its_streaming(super::verify::StreamingVerification {
-            route: super::verify::VerificationRoute {
-                config: &vconfig,
-                source_chain: &vsource,
-                destination_chain: &vdest,
-                network: vnetwork,
-            },
-            destination: super::verify::EvmItsDestination {
-                gateway_addr: vgw,
-                rpc_url: &vdest_rpc,
-            },
-            rx: verify_rx,
-            send_done: vdone,
-            spinner,
-        })
-        .await
-    });
+    let mut verification = ItsVerificationSession::start(
+        ItsVerificationRoute::from_args(args),
+        EvmItsTarget {
+            gateway_addr: evm.evm_gateway_addr,
+            rpc_url: args.destination_rpc.clone(),
+        },
+    );
 
     let spinner = ui::wait_spinner(&format!(
         "[0/{duration_secs}s] starting sustained XRPL ITS send..."
     ));
-    let _ = spinner_tx.send(spinner.clone());
+    verification.attach_spinner(spinner.clone())?;
 
     let test_start = Instant::now();
 
@@ -272,33 +248,22 @@ async fn run_sustained_pipeline(
         tps: tps_n,
         duration_secs,
         key_cycle,
-        verify_tx: Some(verify_tx),
-        send_done: Some(send_done),
+        verify_tx: Some(verification.sender()),
+        send_done: Some(verification.send_done()),
         spinner,
         has_voting_verifier,
     })
     .await?;
-
-    let mut report = super::sustained::build_sustained_report(
-        result,
-        src,
-        dest,
-        &format!("{}", evm.its_proxy_addr),
-        tps_n as u64 * duration_secs,
-        sizing.num_keys,
-    );
-    let (verification, timings) = verify_handle.await??;
-    for (msg_id, timing) in timings {
-        if let Some(tx) = report
-            .transactions
-            .iter_mut()
-            .find(|t| t.signature == msg_id)
-        {
-            tx.amplifier_timing = Some(timing);
-        }
-    }
-    report.verification = Some(verification);
-    finish_report(args, &mut report, test_start)
+    verification
+        .finish_sustained(
+            args,
+            result,
+            &format!("{}", evm.its_proxy_addr),
+            tps_n as u64 * duration_secs,
+            sizing.num_keys,
+            test_start,
+        )
+        .await
 }
 
 /// Drive the burst-mode pipeline: fan out the XRPL transfers, batch-verify on
@@ -330,27 +295,19 @@ async fn run_burst_pipeline(
     .await?;
     report.destination_address = format!("{}", evm.its_proxy_addr);
 
-    // Reuse the existing EVM-destination ITS verifier on the batch of confirmed txs.
-    let verification = super::verify::verify_onchain_evm_its(super::verify::ItsBatchVerification {
-        route: super::verify::VerificationRoute {
-            config: &args.config,
-            source_chain: &args.source_axelar_id,
-            destination_chain: &args.destination_axelar_id,
-            network: args.network,
-        },
-        destination: super::verify::EvmItsDestination {
-            gateway_addr: evm.evm_gateway_addr,
-            rpc_url: &args.destination_rpc,
-        },
-        metrics: &mut report.transactions,
-    })
-    .await?;
-    report.verification = Some(verification);
-
-    // Suppress unused warnings while the remaining hooks take shape.
+    // Keep the shared XRPL encoding helper available to future route variants.
     let _ = account_id_to_hex;
 
-    finish_report(args, &mut report, test_start)
+    finish_batch(
+        args,
+        &EvmItsTarget {
+            gateway_addr: evm.evm_gateway_addr,
+            rpc_url: args.destination_rpc.clone(),
+        },
+        &mut report,
+        test_start,
+    )
+    .await
 }
 
 /// Read `(rpc, multisig_address, network_type)` for an XRPL chain from config.

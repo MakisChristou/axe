@@ -1,6 +1,5 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use alloy::primitives::Address;
@@ -17,10 +16,13 @@ use solana_sdk::transaction::Transaction;
 use super::LoadTestArgs;
 use super::its_prerequisites::{self, GatewayRequirement};
 use super::its_sol_source;
+use super::its_verification::{
+    EvmItsTarget, ItsBurstReport, ItsVerificationRoute, ItsVerificationSession, finish_burst,
+};
 use super::keypairs;
-use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput};
+use super::metrics::ComputeUnitSummary;
 use super::run_sizing::RunSizing;
-use super::{finish_report, read_its_cache, save_its_cache, validate_evm_rpc, validate_solana_rpc};
+use super::{read_its_cache, save_its_cache, validate_evm_rpc, validate_solana_rpc};
 use crate::config::ChainsConfig;
 use crate::solana;
 use crate::ui;
@@ -299,47 +301,22 @@ async fn run_sustained_pipeline(
     keypairs: Vec<Arc<Keypair>>,
     transfer: &ItsTransferSpec,
 ) -> eyre::Result<()> {
-    let src = &args.source_chain;
     let dest = &args.destination_chain;
     let evm_rpc_url = args.destination_rpc.clone();
     let (tps_n, duration_secs, key_cycle) = sizing.sustained().expect("sustained mode");
 
-    // Streaming verification: run concurrently with sends.
-    let (verify_tx, verify_rx) = tokio::sync::mpsc::unbounded_channel();
-    let send_done = Arc::new(AtomicBool::new(false));
-    let (spinner_tx, spinner_rx) = tokio::sync::oneshot::channel::<indicatif::ProgressBar>();
-
-    let vconfig = args.config.clone();
-    let vsource = args.source_axelar_id.clone();
-    let vdest = args.destination_axelar_id.clone();
-    let vdest_rpc = evm_rpc_url.clone();
-    let vdone = Arc::clone(&send_done);
-    let vgw = evm.evm_gateway_addr;
-    let vnetwork = args.network;
-    let verify_handle = tokio::spawn(async move {
-        let spinner = spinner_rx.await.expect("spinner channel dropped");
-        super::verify::verify_onchain_evm_its_streaming(super::verify::StreamingVerification {
-            route: super::verify::VerificationRoute {
-                config: &vconfig,
-                source_chain: &vsource,
-                destination_chain: &vdest,
-                network: vnetwork,
-            },
-            destination: super::verify::EvmItsDestination {
-                gateway_addr: vgw,
-                rpc_url: &vdest_rpc,
-            },
-            rx: verify_rx,
-            send_done: vdone,
-            spinner,
-        })
-        .await
-    });
+    let mut verification = ItsVerificationSession::start(
+        ItsVerificationRoute::from_args(args),
+        EvmItsTarget {
+            gateway_addr: evm.evm_gateway_addr,
+            rpc_url: evm_rpc_url,
+        },
+    );
 
     let spinner = ui::wait_spinner(&format!(
         "[0/{duration_secs}s] starting sustained ITS send..."
     ));
-    let _ = spinner_tx.send(spinner.clone());
+    verification.attach_spinner(spinner.clone())?;
 
     let test_start = Instant::now();
 
@@ -365,7 +342,7 @@ async fn run_sustained_pipeline(
             },
         },
         jobs,
-        Some(verify_tx),
+        Some(verification.sender()),
     );
 
     let result = super::sustained::run_sustained_loop(
@@ -374,33 +351,20 @@ async fn run_sustained_pipeline(
         key_cycle,
         None,
         make_task,
-        Some(send_done),
+        Some(verification.send_done()),
         spinner,
     )
     .await?;
-
-    let mut report = super::sustained::build_sustained_report(
-        result,
-        src,
-        dest,
-        &format!("{}", evm.its_proxy_addr),
-        sizing.total_expected,
-        sizing.num_keys,
-    );
-
-    let (verification, timings) = verify_handle.await??;
-    for (msg_id, timing) in timings {
-        if let Some(tx) = report
-            .transactions
-            .iter_mut()
-            .find(|t| t.signature == msg_id)
-        {
-            tx.amplifier_timing = Some(timing);
-        }
-    }
-    report.verification = Some(verification);
-
-    finish_report(args, &mut report, test_start)
+    verification
+        .finish_sustained(
+            args,
+            result,
+            &format!("{}", evm.its_proxy_addr),
+            sizing.total_expected,
+            sizing.num_keys,
+            test_start,
+        )
+        .await
 }
 
 /// Drive the burst-mode pipeline: fan out the Solana ITS transfers, batch-
@@ -412,7 +376,6 @@ async fn run_burst_pipeline(
     transfer: &ItsTransferSpec,
     evm_rpc_url: &str,
 ) -> eyre::Result<()> {
-    let src = &args.source_chain;
     let dest = &args.destination_chain;
     let key_count = keypairs.len();
     let test_start = Instant::now();
@@ -441,13 +404,12 @@ async fn run_burst_pipeline(
         100,
     )
     .await?;
-    let metrics = burst.metrics;
-    let total_failed = metrics.iter().filter(|m| !m.is_success()).count() as u64;
+    let total_failed = burst.metrics.iter().filter(|m| !m.is_success()).count() as u64;
 
     if total_failed > 0 {
         let mut error_counts: std::collections::HashMap<String, (u64, String)> =
             std::collections::HashMap::new();
-        for m in metrics.iter().filter(|m| !m.is_success()) {
+        for m in burst.metrics.iter().filter(|m| !m.is_success()) {
             // Group by a short key (deduplicates identical failures) but
             // print the full error message — Solana program-log dumps are
             // multi-line and a 120-char cap drops the actionable part.
@@ -460,38 +422,22 @@ async fn run_burst_pipeline(
         }
     }
 
-    let mut report = LoadTestReport::from_transactions(
-        ReportInput {
-            source_chain: src.to_string(),
-            destination_chain: dest.to_string(),
+    finish_burst(
+        args,
+        &EvmItsTarget {
+            gateway_addr: evm.evm_gateway_addr,
+            rpc_url: evm_rpc_url.to_string(),
+        },
+        burst,
+        ItsBurstReport {
             destination_address: format!("{}", evm.its_proxy_addr),
             num_txs: args.num_txs,
             num_keys: key_count,
-            total_submitted: burst.total_submitted,
-            test_duration_secs: burst.test_duration_secs,
             compute_unit_summary: ComputeUnitSummary::Include,
         },
-        metrics,
-    );
-
-    // --- Verify ---
-    let verification = super::verify::verify_onchain_evm_its(super::verify::ItsBatchVerification {
-        route: super::verify::VerificationRoute {
-            config: &args.config,
-            source_chain: &args.source_axelar_id,
-            destination_chain: &args.destination_axelar_id,
-            network: args.network,
-        },
-        destination: super::verify::EvmItsDestination {
-            gateway_addr: evm.evm_gateway_addr,
-            rpc_url: evm_rpc_url,
-        },
-        metrics: &mut report.transactions,
-    })
-    .await?;
-    report.verification = Some(verification);
-
-    finish_report(args, &mut report, test_start)
+        test_start,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

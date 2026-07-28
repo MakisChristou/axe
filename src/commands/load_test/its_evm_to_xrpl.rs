@@ -14,10 +14,13 @@
 use std::time::Instant;
 
 use super::its_prerequisites::{self, GatewayRequirement};
+use super::its_verification::{
+    ItsBurstReport, ItsVerificationRoute, ItsVerificationSession, XrplItsTarget, finish_burst,
+};
 use super::keypairs;
-use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput};
+use super::metrics::ComputeUnitSummary;
 use super::run_sizing::RunSizing;
-use super::{LoadTestArgs, check_evm_balance, finish_report, validate_evm_rpc};
+use super::{LoadTestArgs, check_evm_balance, validate_evm_rpc};
 use crate::config::ChainsConfig;
 use crate::cosmos::lcd_cosmwasm_smart_query;
 use crate::evm::InterchainTokenService;
@@ -431,8 +434,6 @@ async fn run_sustained_pipeline(
     its_ctx: &ItsCallCtx,
     sizing: &RunSizing,
 ) -> eyre::Result<()> {
-    let src = &args.source_chain;
-    let dest = &args.destination_chain;
     let (tps, duration_secs, key_cycle) = sizing.sustained().expect("sustained mode");
 
     let nonce_provider = ProviderBuilder::new().connect_http(evm_rpc_url.parse()?);
@@ -442,46 +443,22 @@ async fn run_sustained_pipeline(
         nonces.push(n);
     }
 
-    let (verify_tx, verify_rx) = tokio::sync::mpsc::unbounded_channel();
-    let send_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (spinner_tx, spinner_rx) = tokio::sync::oneshot::channel::<indicatif::ProgressBar>();
-
     let has_voting_verifier = cfg
         .axelar
         .contract_address("VotingVerifier", &args.source_axelar_id)
         .is_ok();
-
-    let vconfig = args.config.clone();
-    let vsource = args.source_axelar_id.clone();
-    let vdest = args.destination_axelar_id.clone();
-    let vxrpl_rpc = xrpl.xrpl_rpc.clone();
-    let vrecipient = xrpl.recipient_addr.clone();
-    let vdone = std::sync::Arc::clone(&send_done);
-    let vnetwork = args.network;
-    let verify_handle = tokio::spawn(async move {
-        let spinner = spinner_rx.await.expect("spinner channel dropped");
-        super::verify::verify_onchain_xrpl_its_streaming(super::verify::StreamingVerification {
-            route: super::verify::VerificationRoute {
-                config: &vconfig,
-                source_chain: &vsource,
-                destination_chain: &vdest,
-                network: vnetwork,
-            },
-            destination: super::verify::XrplItsDestination {
-                rpc_url: &vxrpl_rpc,
-                recipient: &vrecipient,
-            },
-            rx: verify_rx,
-            send_done: vdone,
-            spinner,
-        })
-        .await
-    });
+    let mut verification = ItsVerificationSession::start(
+        ItsVerificationRoute::from_args(args),
+        XrplItsTarget {
+            rpc_url: xrpl.xrpl_rpc.clone(),
+            recipient: xrpl.recipient_addr.clone(),
+        },
+    );
 
     let spinner = ui::wait_spinner(&format!(
         "[0/{duration_secs}s] starting sustained ITS send..."
     ));
-    let _ = spinner_tx.send(spinner.clone());
+    verification.attach_spinner(spinner.clone())?;
 
     let test_start = Instant::now();
     let make_task = super::its_evm_source::its_sustained_tasks(
@@ -496,7 +473,7 @@ async fn run_sustained_pipeline(
             gas_arg_scaling_factor: its_ctx.gas_arg_scaling_factor,
         },
         derived,
-        Some(verify_tx),
+        Some(verification.sender()),
         has_voting_verifier,
     );
 
@@ -506,32 +483,20 @@ async fn run_sustained_pipeline(
         key_cycle,
         Some(nonces),
         make_task,
-        Some(send_done),
+        Some(verification.send_done()),
         spinner,
     )
     .await?;
-
-    let mut report = super::sustained::build_sustained_report(
-        result,
-        src,
-        dest,
-        &xrpl.recipient_addr,
-        sizing.total_expected,
-        sizing.num_keys,
-    );
-
-    let (verification, timings) = verify_handle.await??;
-    for (msg_id, timing) in timings {
-        if let Some(tx) = report
-            .transactions
-            .iter_mut()
-            .find(|t| t.signature == msg_id)
-        {
-            tx.amplifier_timing = Some(timing);
-        }
-    }
-    report.verification = Some(verification);
-    finish_report(args, &mut report, test_start)
+    verification
+        .finish_sustained(
+            args,
+            result,
+            &xrpl.recipient_addr,
+            sizing.total_expected,
+            sizing.num_keys,
+            test_start,
+        )
+        .await
 }
 
 /// Drive the burst-mode pipeline: fan out parallel `interchainTransfer`
@@ -545,8 +510,6 @@ async fn run_burst_pipeline(
     its_ctx: &ItsCallCtx,
     sizing: &RunSizing,
 ) -> eyre::Result<()> {
-    let src = &args.source_chain;
-    let dest = &args.destination_chain;
     let num_keys = sizing.num_keys;
 
     let test_start = Instant::now();
@@ -564,38 +527,22 @@ async fn run_burst_pipeline(
         derived,
     )
     .await?;
-    let mut report = LoadTestReport::from_transactions(
-        ReportInput {
-            source_chain: src.to_string(),
-            destination_chain: dest.to_string(),
+    finish_burst(
+        args,
+        &XrplItsTarget {
+            rpc_url: xrpl.xrpl_rpc.clone(),
+            recipient: xrpl.recipient_addr.clone(),
+        },
+        burst,
+        ItsBurstReport {
             destination_address: xrpl.recipient_addr.clone(),
             num_txs: args.num_txs,
             num_keys,
-            total_submitted: burst.total_submitted,
-            test_duration_secs: burst.test_duration_secs,
             compute_unit_summary: ComputeUnitSummary::Omit,
         },
-        burst.metrics,
-    );
-
-    let verification =
-        super::verify::verify_onchain_xrpl_its(super::verify::ItsBatchVerification {
-            route: super::verify::VerificationRoute {
-                config: &args.config,
-                source_chain: &args.source_axelar_id,
-                destination_chain: &args.destination_axelar_id,
-                network: args.network,
-            },
-            destination: super::verify::XrplItsDestination {
-                rpc_url: &xrpl.xrpl_rpc,
-                recipient: &xrpl.recipient_addr,
-            },
-            metrics: &mut report.transactions,
-        })
-        .await?;
-    report.verification = Some(verification);
-
-    finish_report(args, &mut report, test_start)
+        test_start,
+    )
+    .await
 }
 
 /// Query the `XrplGateway/{xrpl_axelar_id}` contract for the canonical XRP

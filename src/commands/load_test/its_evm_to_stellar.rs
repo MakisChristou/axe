@@ -6,16 +6,17 @@
 //! `is_message_approved` / `is_message_executed` view calls via the
 //! `verify_onchain_stellar_its[_streaming]` verifier.
 
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use super::its_evm_source::EvmTokenRunSizing as RunSizing;
 use super::its_prerequisites::{self, GatewayRequirement};
+use super::its_verification::{
+    ItsBurstReport, ItsVerificationRoute, ItsVerificationSession, StellarItsTarget, finish_burst,
+};
 use super::keypairs;
-use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput};
+use super::metrics::ComputeUnitSummary;
 use super::run_sizing::RunSizing as ValidatedRunSizing;
-use super::{LoadTestArgs, check_evm_balance, finish_report, read_its_cache, validate_evm_rpc};
+use super::{LoadTestArgs, check_evm_balance, read_its_cache, validate_evm_rpc};
 use crate::config::ChainsConfig;
 use crate::evm::{ERC20, InterchainTokenService};
 use crate::ui;
@@ -490,8 +491,6 @@ async fn run_sustained_pipeline(
     stellar_recipient_addr: &str,
     sizing: &RunSizing,
 ) -> eyre::Result<()> {
-    let src = &args.source_chain;
-    let dest = &args.destination_chain;
     let (tps, duration_secs, key_cycle) = sizing.sustained().expect("sustained mode");
 
     let nonce_provider = ProviderBuilder::new().connect_http(transfer.rpc_url.parse()?);
@@ -501,50 +500,24 @@ async fn run_sustained_pipeline(
         nonces.push(n);
     }
 
-    let (verify_tx, verify_rx) = tokio::sync::mpsc::unbounded_channel();
-    let send_done = Arc::new(AtomicBool::new(false));
-    let (spinner_tx, spinner_rx) = tokio::sync::oneshot::channel::<indicatif::ProgressBar>();
-
     let has_voting_verifier = cfg
         .axelar
         .contract_address("VotingVerifier", &args.source_axelar_id)
         .is_ok();
-
-    let vconfig = args.config.clone();
-    let vsource = args.source_axelar_id.clone();
-    let vdest = args.destination_axelar_id.clone();
-    let vstellar_rpc = stellar.rpc.clone();
-    let vstellar_net = stellar.network_type.clone();
-    let vstellar_gw = stellar.gateway_addr.clone();
-    let vsigner_pk = stellar.signer_pk;
-    let vdone = Arc::clone(&send_done);
-    let vnetwork = args.network;
-    let verify_handle = tokio::spawn(async move {
-        let spinner = spinner_rx.await.expect("spinner channel dropped");
-        super::verify::verify_onchain_stellar_its_streaming(super::verify::StreamingVerification {
-            route: super::verify::VerificationRoute {
-                config: &vconfig,
-                source_chain: &vsource,
-                destination_chain: &vdest,
-                network: vnetwork,
-            },
-            destination: super::verify::StellarItsDestination {
-                rpc_url: &vstellar_rpc,
-                network_type: &vstellar_net,
-                gateway_contract: &vstellar_gw,
-                signer_pk: vsigner_pk,
-            },
-            rx: verify_rx,
-            send_done: vdone,
-            spinner,
-        })
-        .await
-    });
+    let mut verification = ItsVerificationSession::start(
+        ItsVerificationRoute::from_args(args),
+        StellarItsTarget {
+            rpc_url: stellar.rpc.clone(),
+            network_type: stellar.network_type.clone(),
+            gateway_contract: stellar.gateway_addr.clone(),
+            signer_pk: stellar.signer_pk,
+        },
+    );
 
     let spinner = ui::wait_spinner(&format!(
         "[0/{duration_secs}s] starting sustained ITS send..."
     ));
-    let _ = spinner_tx.send(spinner.clone());
+    verification.attach_spinner(spinner.clone())?;
 
     let test_start = Instant::now();
     let TransferContext {
@@ -570,7 +543,7 @@ async fn run_sustained_pipeline(
             gas_arg_scaling_factor,
         },
         derived,
-        Some(verify_tx),
+        Some(verification.sender()),
         has_voting_verifier,
     );
 
@@ -580,32 +553,20 @@ async fn run_sustained_pipeline(
         key_cycle,
         Some(nonces),
         make_task,
-        Some(send_done),
+        Some(verification.send_done()),
         spinner,
     )
     .await?;
-
-    let mut report = super::sustained::build_sustained_report(
-        result,
-        src,
-        dest,
-        stellar_recipient_addr,
-        sizing.total_expected,
-        sizing.num_keys,
-    );
-
-    let (verification, timings) = verify_handle.await??;
-    for (msg_id, timing) in timings {
-        if let Some(tx) = report
-            .transactions
-            .iter_mut()
-            .find(|t| t.signature == msg_id)
-        {
-            tx.amplifier_timing = Some(timing);
-        }
-    }
-    report.verification = Some(verification);
-    finish_report(args, &mut report, test_start)
+    verification
+        .finish_sustained(
+            args,
+            result,
+            stellar_recipient_addr,
+            sizing.total_expected,
+            sizing.num_keys,
+            test_start,
+        )
+        .await
 }
 
 /// Drive the burst-mode pipeline: fan out one `interchainTransfer` per derived
@@ -618,8 +579,6 @@ async fn run_burst_pipeline(
     stellar_recipient_addr: &str,
     sizing: &RunSizing,
 ) -> eyre::Result<()> {
-    let src = &args.source_chain;
-    let dest = &args.destination_chain;
     let num_txs = sizing
         .burst_count()
         .expect("burst pipeline requires burst sizing");
@@ -639,38 +598,22 @@ async fn run_burst_pipeline(
         &transfer.derived,
     )
     .await?;
-    let mut report = LoadTestReport::from_transactions(
-        ReportInput {
-            source_chain: src.to_string(),
-            destination_chain: dest.to_string(),
+    finish_burst(
+        args,
+        &StellarItsTarget {
+            rpc_url: stellar.rpc.clone(),
+            network_type: stellar.network_type.clone(),
+            gateway_contract: stellar.gateway_addr.clone(),
+            signer_pk: stellar.signer_pk,
+        },
+        burst,
+        ItsBurstReport {
             destination_address: stellar_recipient_addr.to_string(),
             num_txs: args.num_txs,
             num_keys: num_txs,
-            total_submitted: burst.total_submitted,
-            test_duration_secs: burst.test_duration_secs,
             compute_unit_summary: ComputeUnitSummary::Omit,
         },
-        burst.metrics,
-    );
-
-    let verification =
-        super::verify::verify_onchain_stellar_its(super::verify::ItsBatchVerification {
-            route: super::verify::VerificationRoute {
-                config: &args.config,
-                source_chain: &args.source_axelar_id,
-                destination_chain: &args.destination_axelar_id,
-                network: args.network,
-            },
-            destination: super::verify::StellarItsDestination {
-                rpc_url: &stellar.rpc,
-                network_type: &stellar.network_type,
-                gateway_contract: &stellar.gateway_addr,
-                signer_pk: stellar.signer_pk,
-            },
-            metrics: &mut report.transactions,
-        })
-        .await?;
-    report.verification = Some(verification);
-
-    finish_report(args, &mut report, test_start)
+        test_start,
+    )
+    .await
 }
