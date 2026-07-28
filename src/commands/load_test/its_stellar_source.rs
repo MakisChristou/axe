@@ -598,28 +598,13 @@ fn its_sustained_tasks(
     jobs: Vec<ItsStellarSubmitJob>,
     verify_tx: Option<tokio::sync::mpsc::UnboundedSender<super::verify::PendingTx>>,
 ) -> sustained::MakeTask {
-    let submitter = Arc::new(submitter);
-    let jobs = Arc::new(jobs);
-    Box::new(move |key_idx: usize, _nonce: Option<u64>| {
-        let submitter = Arc::clone(&submitter);
-        let job = jobs[key_idx].clone();
-        let verify_tx = verify_tx.clone();
-        Box::pin(async move {
-            let mut metrics = submitter.submit(job).await;
-            if metrics.is_success()
-                && let Some(verify_tx) = verify_tx
-            {
-                // Stellar ITS verification starts at the Voted stage.
-                match super::verify::tx_to_pending_its(&metrics, true) {
-                    Ok(pending) => {
-                        let _ = verify_tx.send(pending);
-                    }
-                    Err(error) => {
-                        metrics.mark_failed(format!("failed to build verification state: {error}"));
-                    }
-                }
-            }
-            metrics
-        })
-    })
+    sustained::submission_tasks(
+        submitter,
+        move |key_index, _| jobs[key_index].clone(),
+        verify_tx,
+        sustained::ItsPendingTxAdapter {
+            // Stellar ITS verification starts at the Voted stage.
+            has_voting_verifier: true,
+        },
+    )
 }

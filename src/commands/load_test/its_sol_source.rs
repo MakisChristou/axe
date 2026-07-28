@@ -154,27 +154,12 @@ pub(super) fn its_sustained_tasks(
     jobs: Vec<ItsSolanaSubmitJob>,
     verify_tx: Option<tokio::sync::mpsc::UnboundedSender<super::verify::PendingTx>>,
 ) -> super::sustained::MakeTask {
-    let submitter = Arc::new(submitter);
-    let jobs = Arc::new(jobs);
-    Box::new(move |key_idx: usize, _nonce: Option<u64>| {
-        let submitter = Arc::clone(&submitter);
-        let job = jobs[key_idx].clone();
-        let verify_tx = verify_tx.clone();
-        Box::pin(async move {
-            let mut metrics = submitter.submit(job).await;
-            if metrics.is_success()
-                && let Some(verify_tx) = verify_tx
-            {
-                match super::verify::tx_to_pending_its(&metrics, false) {
-                    Ok(pending) => {
-                        let _ = verify_tx.send(pending);
-                    }
-                    Err(error) => {
-                        metrics.mark_failed(format!("failed to build verification state: {error}"));
-                    }
-                }
-            }
-            metrics
-        })
-    })
+    super::sustained::submission_tasks(
+        submitter,
+        move |key_index, _| jobs[key_index].clone(),
+        verify_tx,
+        super::sustained::ItsPendingTxAdapter {
+            has_voting_verifier: false,
+        },
+    )
 }

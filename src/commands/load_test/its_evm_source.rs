@@ -23,7 +23,6 @@
 //!   * Wait-for-remote-deploy on the destination chain.
 //!   * Final on-chain verification (Solana / EVM / Stellar / etc.).
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy::{
@@ -644,35 +643,18 @@ pub(super) fn its_sustained_tasks(
     verify_tx: Option<tokio::sync::mpsc::UnboundedSender<super::verify::PendingTx>>,
     has_voting_verifier: bool,
 ) -> super::sustained::MakeTask {
-    let submitter = Arc::new(submitter);
-    let signers = Arc::new(signers);
-    Box::new(move |key_idx: usize, nonce: Option<u64>| {
-        let submitter = Arc::clone(&submitter);
-        let signers = Arc::clone(&signers);
-        let verify_tx = verify_tx.clone();
-        Box::pin(async move {
-            let mut result = submitter
-                .submit(ItsEvmSubmitJob {
-                    signer: signers[key_idx].clone(),
-                    explicit_nonce: nonce,
-                    retry_rate_limits: false,
-                })
-                .await;
-            if result.is_success()
-                && let Some(verify_tx) = verify_tx
-            {
-                match super::verify::tx_to_pending_its(&result, has_voting_verifier) {
-                    Ok(pending) => {
-                        let _ = verify_tx.send(pending);
-                    }
-                    Err(error) => {
-                        result.mark_failed(format!("failed to build verification state: {error}"));
-                    }
-                }
-            }
-            result
-        })
-    })
+    super::sustained::submission_tasks(
+        submitter,
+        move |key_index, nonce| ItsEvmSubmitJob {
+            signer: signers[key_index].clone(),
+            explicit_nonce: nonce,
+            retry_rate_limits: false,
+        },
+        verify_tx,
+        super::sustained::ItsPendingTxAdapter {
+            has_voting_verifier,
+        },
+    )
 }
 
 pub(super) async fn execute_interchain_transfer<P: Provider>(

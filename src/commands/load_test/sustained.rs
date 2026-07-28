@@ -8,6 +8,8 @@ use eyre::{Result, WrapErr};
 use tokio::task::JoinSet;
 
 use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+use super::submitter::TransactionSubmitter;
+use super::verify::PendingTx;
 use crate::ui;
 
 /// Result of the sustained send loop (before verification).
@@ -23,6 +25,74 @@ type TxFuture = Pin<Box<dyn Future<Output = TxMetrics> + Send>>;
 /// A factory that, given `(key_index, optional_nonce)`, returns a future
 /// that sends one transaction and produces its metrics.
 pub(super) type MakeTask = Box<dyn FnMut(usize, Option<u64>) -> TxFuture + Send>;
+
+/// Convert one successful source transaction into streaming verification
+/// state without coupling the shared submission driver to a chain family.
+pub(super) trait PendingTxAdapter: Send + Sync + 'static {
+    fn to_pending(&self, metrics: &TxMetrics) -> Result<PendingTx>;
+}
+
+pub(super) struct ItsPendingTxAdapter {
+    pub has_voting_verifier: bool,
+}
+
+impl PendingTxAdapter for ItsPendingTxAdapter {
+    fn to_pending(&self, metrics: &TxMetrics) -> Result<PendingTx> {
+        super::verify::tx_to_pending_its(metrics, self.has_voting_verifier)
+    }
+}
+
+pub(super) struct XrplPendingTxAdapter {
+    pub has_voting_verifier: bool,
+}
+
+impl PendingTxAdapter for XrplPendingTxAdapter {
+    fn to_pending(&self, metrics: &TxMetrics) -> Result<PendingTx> {
+        super::verify::tx_to_pending_xrpl(metrics, self.has_voting_verifier)
+    }
+}
+
+/// Adapt a chain-specific submitter and job selector to the sustained
+/// scheduler, forwarding successful submissions to streaming verification.
+pub(super) fn submission_tasks<S, F, V>(
+    submitter: S,
+    job_for: F,
+    verify_tx: Option<tokio::sync::mpsc::UnboundedSender<PendingTx>>,
+    verification: V,
+) -> MakeTask
+where
+    S: TransactionSubmitter,
+    F: Fn(usize, Option<u64>) -> S::Job + Send + Sync + 'static,
+    V: PendingTxAdapter,
+{
+    let submitter = Arc::new(submitter);
+    let job_for = Arc::new(job_for);
+    let verification = Arc::new(verification);
+
+    Box::new(move |key_index, nonce| {
+        let submitter = Arc::clone(&submitter);
+        let job = job_for(key_index, nonce);
+        let verify_tx = verify_tx.clone();
+        let verification = Arc::clone(&verification);
+
+        Box::pin(async move {
+            let mut metrics = submitter.submit(job).await;
+            if metrics.is_success()
+                && let Some(verify_tx) = verify_tx
+            {
+                match verification.to_pending(&metrics) {
+                    Ok(pending) => {
+                        let _ = verify_tx.send(pending);
+                    }
+                    Err(error) => {
+                        metrics.mark_failed(format!("failed to build verification state: {error}"));
+                    }
+                }
+            }
+            metrics
+        })
+    })
+}
 
 /// Run the sustained send loop: fire `tps` transactions per second for
 /// `duration_secs`, rotating through a key pool of size `tps * key_cycle`.
@@ -211,7 +281,121 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use super::{MakeTask, run_sustained_loop};
+    use super::{ItsPendingTxAdapter, MakeTask, run_sustained_loop, submission_tasks};
+    use crate::commands::load_test::metrics::TxMetrics;
+    use crate::commands::load_test::submitter::TransactionSubmitter;
+
+    #[derive(Clone, Copy)]
+    struct FakeJob {
+        key_index: usize,
+        nonce: Option<u64>,
+        succeeds: bool,
+    }
+
+    struct FakeSubmitter;
+
+    impl TransactionSubmitter for FakeSubmitter {
+        type Job = FakeJob;
+
+        async fn submit(&self, job: Self::Job) -> TxMetrics {
+            let nonce = job
+                .nonce
+                .map_or_else(|| "none".to_string(), |nonce| nonce.to_string());
+            TxMetrics {
+                signature: format!("{}:{nonce}", job.key_index),
+                submit_time_ms: 0,
+                confirm_time_ms: job.succeeds.then_some(0),
+                latency_ms: job.succeeds.then_some(0),
+                compute_units: None,
+                slot: None,
+                outcome: if job.succeeds {
+                    TxMetrics::succeeded_outcome()
+                } else {
+                    TxMetrics::failed_outcome("submission failed")
+                },
+                payload: Vec::new(),
+                payload_hash: String::new(),
+                source_address: String::new(),
+                gmp_destination_chain: String::new(),
+                gmp_destination_address: String::new(),
+                send_instant: None,
+                amplifier_timing: None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn submission_tasks_forward_success_and_job_context() {
+        let (verify_tx, mut verify_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut make_task = submission_tasks(
+            FakeSubmitter,
+            |key_index, nonce| FakeJob {
+                key_index,
+                nonce,
+                succeeds: true,
+            },
+            Some(verify_tx),
+            ItsPendingTxAdapter {
+                has_voting_verifier: false,
+            },
+        );
+
+        let metrics = make_task(2, Some(7)).await;
+
+        assert!(metrics.is_success());
+        assert_eq!(metrics.signature, "2:7");
+        assert!(verify_rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn submission_tasks_do_not_forward_failed_submissions() {
+        let (verify_tx, mut verify_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut make_task = submission_tasks(
+            FakeSubmitter,
+            |key_index, nonce| FakeJob {
+                key_index,
+                nonce,
+                succeeds: false,
+            },
+            Some(verify_tx),
+            ItsPendingTxAdapter {
+                has_voting_verifier: false,
+            },
+        );
+
+        let metrics = make_task(1, None).await;
+
+        assert!(!metrics.is_success());
+        assert_eq!(metrics.error(), Some("submission failed"));
+        assert!(verify_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn submission_tasks_mark_verification_conversion_failures() {
+        let (verify_tx, mut verify_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut make_task = submission_tasks(
+            FakeSubmitter,
+            |key_index, nonce| FakeJob {
+                key_index,
+                nonce,
+                succeeds: true,
+            },
+            Some(verify_tx),
+            ItsPendingTxAdapter {
+                has_voting_verifier: true,
+            },
+        );
+
+        let metrics = make_task(3, None).await;
+
+        assert!(!metrics.is_success());
+        assert!(
+            metrics
+                .error()
+                .is_some_and(|error| error.contains("failed to build verification state"))
+        );
+        assert!(verify_rx.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn task_panics_propagate_and_signal_send_completion() {

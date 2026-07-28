@@ -336,7 +336,7 @@ pub(super) async fn run_sustained(request: SustainedRequest) -> Result<sustained
         spinner,
         has_voting_verifier,
     } = request;
-    let submitter = Arc::new(XrplSubmitter {
+    let submitter = XrplSubmitter {
         client,
         destination_multisig,
         destination_chain,
@@ -344,38 +344,19 @@ pub(super) async fn run_sustained(request: SustainedRequest) -> Result<sustained
         gas_fee_drops,
         gmp_destination_chain: gmp_dest_chain,
         gmp_destination_address: gmp_dest_address,
-    });
-    let jobs = Arc::new(
-        wallets
-            .into_iter()
-            .map(|wallet| XrplSubmitJob { wallet })
-            .collect::<Vec<_>>(),
+    };
+    let jobs = wallets
+        .into_iter()
+        .map(|wallet| XrplSubmitJob { wallet })
+        .collect::<Vec<_>>();
+    let make_task = sustained::submission_tasks(
+        submitter,
+        move |key_index, _| jobs[key_index % jobs.len()].clone(),
+        verify_tx,
+        sustained::XrplPendingTxAdapter {
+            has_voting_verifier,
+        },
     );
-
-    let make_task: sustained::MakeTask = Box::new(move |key_idx: usize, _nonce: Option<u64>| {
-        let submitter = Arc::clone(&submitter);
-        let job = jobs[key_idx % jobs.len()].clone();
-        let vtx = verify_tx.clone();
-        let has_vv = has_voting_verifier;
-
-        Box::pin(async move {
-            let mut m = submitter.submit(job).await;
-
-            if m.is_success()
-                && let Some(ref tx_sender) = vtx
-            {
-                match super::verify::tx_to_pending_xrpl(&m, has_vv) {
-                    Ok(pending) => {
-                        let _ = tx_sender.send(pending);
-                    }
-                    Err(e) => {
-                        m.mark_failed(format!("failed to build verification state: {e}"));
-                    }
-                }
-            }
-            m
-        })
-    });
 
     sustained::run_sustained_loop(
         tps,
