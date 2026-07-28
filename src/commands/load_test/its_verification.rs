@@ -23,7 +23,8 @@ use super::submitter::BurstResult;
 use super::sustained::SustainedResult;
 use super::verify::{
     self, EvmItsDestination, ItsBatchVerification, PendingTx, SolanaItsDestination,
-    StellarItsDestination, StreamingVerification, VerificationRoute, XrplItsDestination,
+    StellarItsDestination, StreamingVerification, SuiItsDestination, VerificationRoute,
+    XrplItsDestination,
 };
 use super::{LoadTestArgs, finish_report};
 use crate::types::Network;
@@ -57,15 +58,19 @@ impl ItsVerificationRoute {
     }
 }
 
-/// A destination capable of verifying ITS transfers in batch or while sends
-/// are still in flight.
-pub(super) trait ItsVerificationTarget: Send + 'static {
+/// A destination capable of verifying a completed batch of ITS transfers.
+pub(super) trait ItsBatchTarget {
     fn verify_batch<'a>(
         &'a self,
         route: &'a ItsVerificationRoute,
         metrics: &'a mut [TxMetrics],
     ) -> impl Future<Output = Result<VerificationReport>> + Send + 'a;
+}
 
+/// A destination capable of verifying ITS transfers while sends remain in
+/// flight. Keeping this separate from [`ItsBatchTarget`] lets destinations
+/// such as Sui expose only the mode they actually implement.
+pub(super) trait ItsStreamingTarget: Send + 'static {
     fn verify_streaming<'a>(
         &'a self,
         route: &'a ItsVerificationRoute,
@@ -80,7 +85,7 @@ pub(super) struct EvmItsTarget {
     pub rpc_url: String,
 }
 
-impl ItsVerificationTarget for EvmItsTarget {
+impl ItsBatchTarget for EvmItsTarget {
     fn verify_batch<'a>(
         &'a self,
         route: &'a ItsVerificationRoute,
@@ -95,7 +100,9 @@ impl ItsVerificationTarget for EvmItsTarget {
             metrics,
         })
     }
+}
 
+impl ItsStreamingTarget for EvmItsTarget {
     fn verify_streaming<'a>(
         &'a self,
         route: &'a ItsVerificationRoute,
@@ -121,7 +128,7 @@ pub(super) struct SolanaItsTarget {
     pub rpc_url: String,
 }
 
-impl ItsVerificationTarget for SolanaItsTarget {
+impl ItsBatchTarget for SolanaItsTarget {
     fn verify_batch<'a>(
         &'a self,
         route: &'a ItsVerificationRoute,
@@ -135,7 +142,9 @@ impl ItsVerificationTarget for SolanaItsTarget {
             metrics,
         })
     }
+}
 
+impl ItsStreamingTarget for SolanaItsTarget {
     fn verify_streaming<'a>(
         &'a self,
         route: &'a ItsVerificationRoute,
@@ -163,7 +172,7 @@ pub(super) struct StellarItsTarget {
     pub signer_pk: [u8; 32],
 }
 
-impl ItsVerificationTarget for StellarItsTarget {
+impl ItsBatchTarget for StellarItsTarget {
     fn verify_batch<'a>(
         &'a self,
         route: &'a ItsVerificationRoute,
@@ -180,7 +189,9 @@ impl ItsVerificationTarget for StellarItsTarget {
             metrics,
         })
     }
+}
 
+impl ItsStreamingTarget for StellarItsTarget {
     fn verify_streaming<'a>(
         &'a self,
         route: &'a ItsVerificationRoute,
@@ -209,7 +220,7 @@ pub(super) struct XrplItsTarget {
     pub recipient: String,
 }
 
-impl ItsVerificationTarget for XrplItsTarget {
+impl ItsBatchTarget for XrplItsTarget {
     fn verify_batch<'a>(
         &'a self,
         route: &'a ItsVerificationRoute,
@@ -224,7 +235,9 @@ impl ItsVerificationTarget for XrplItsTarget {
             metrics,
         })
     }
+}
 
+impl ItsStreamingTarget for XrplItsTarget {
     fn verify_streaming<'a>(
         &'a self,
         route: &'a ItsVerificationRoute,
@@ -246,6 +259,26 @@ impl ItsVerificationTarget for XrplItsTarget {
     }
 }
 
+pub(super) struct SuiItsTarget {
+    pub rpc_url: String,
+}
+
+impl ItsBatchTarget for SuiItsTarget {
+    fn verify_batch<'a>(
+        &'a self,
+        route: &'a ItsVerificationRoute,
+        metrics: &'a mut [TxMetrics],
+    ) -> impl Future<Output = Result<VerificationReport>> + Send + 'a {
+        verify::verify_onchain_sui_its(ItsBatchVerification {
+            route: route.borrowed(),
+            destination: SuiItsDestination {
+                rpc_url: &self.rpc_url,
+            },
+            metrics,
+        })
+    }
+}
+
 type StreamingResult = Result<(VerificationReport, Vec<(String, AmplifierTiming)>)>;
 
 /// Owns the channels and task that connect a sustained sender to an ITS
@@ -260,7 +293,7 @@ pub(super) struct ItsVerificationSession {
 impl ItsVerificationSession {
     pub(super) fn start<T>(route: ItsVerificationRoute, target: T) -> Self
     where
-        T: ItsVerificationTarget,
+        T: ItsStreamingTarget,
     {
         let (verify_tx, verify_rx) = mpsc::unbounded_channel();
         let send_done = Arc::new(AtomicBool::new(false));
@@ -342,7 +375,7 @@ pub(super) async fn finish_batch<T>(
     test_start: Instant,
 ) -> Result<()>
 where
-    T: ItsVerificationTarget,
+    T: ItsBatchTarget,
 {
     let route = ItsVerificationRoute::from_args(args);
     let verification = target
@@ -367,7 +400,7 @@ pub(super) async fn finish_burst<T>(
     test_start: Instant,
 ) -> Result<()>
 where
-    T: ItsVerificationTarget,
+    T: ItsBatchTarget,
 {
     let mut report = LoadTestReport::from_transactions(
         ReportInput {

@@ -1173,23 +1173,17 @@ pub(crate) async fn finalize_sui_dest_run(
     source_type: verify::SourceChainType,
     test_start: Instant,
 ) -> Result<()> {
-    let verification = verify::verify_onchain_sui_gmp(verify::GmpBatchVerification {
-        route: verify::VerificationRoute {
-            config: &args.config,
-            source_chain: &args.source_axelar_id,
-            destination_chain: &args.destination_axelar_id,
-            network: args.network,
-        },
-        destination: verify::SuiGmpDestination {
+    super::gmp_verification::finish_batch(
+        args,
+        &super::gmp_verification::SuiGmpTarget {
             address: sui_channel,
             rpc_url: sui_rpc,
+            source_type,
         },
-        metrics: &mut report.transactions,
-        source_type,
-    })
-    .await?;
-    report.verification = Some(verification);
-    finish_report(args, report, test_start)
+        report,
+        test_start,
+    )
+    .await
 }
 
 /// ITS-to-Sui finalizer: like [`finalize_sui_dest_run`] but routes through the
@@ -1202,17 +1196,13 @@ pub(crate) async fn finalize_sui_dest_run_its(
     sui_rpc: &str,
     test_start: Instant,
 ) -> Result<()> {
-    let verification = verify::verify_onchain_sui_its(verify::ItsBatchVerification {
-        route: verify::VerificationRoute {
-            config: &args.config,
-            source_chain: &args.source_axelar_id,
-            destination_chain: &args.destination_axelar_id,
-            network: args.network,
+    super::its_verification::finish_batch(
+        args,
+        &super::its_verification::SuiItsTarget {
+            rpc_url: sui_rpc.to_string(),
         },
-        destination: verify::SuiItsDestination { rpc_url: sui_rpc },
-        metrics: &mut report.transactions,
-    })
-    .await?;
-    report.verification = Some(verification);
-    finish_report(args, report, test_start)
+        report,
+        test_start,
+    )
+    .await
 }

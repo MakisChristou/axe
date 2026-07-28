@@ -5,9 +5,10 @@
 
 use std::time::Instant;
 
-use alloy::primitives::{Address, FixedBytes};
+use alloy::primitives::Address;
 
 use super::THROUGHPUT_WINDOW;
+use crate::commands::load_test::identifiers::{MessageId, PayloadHash};
 use crate::commands::load_test::metrics::AmplifierTiming;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +50,7 @@ pub(super) enum VerificationState {
 /// prevents later stages from observing only a partial discovery result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SecondLeg {
-    pub(super) message_id: String,
+    pub(super) message_id: MessageId,
     pub(super) payload_hash: String,
     pub(super) source_address: String,
     pub(super) destination_address: String,
@@ -64,11 +65,11 @@ pub(super) struct SecondLeg {
 /// `verify/`-internal code reads them.
 pub(in crate::commands::load_test) struct PendingTx {
     pub(super) idx: usize,
-    pub(super) message_id: String,
+    pub(super) message_id: MessageId,
     pub(super) send_instant: Instant,
     pub(super) source_address: String,
     pub(super) contract_addr: Address,
-    pub(super) payload_hash: Option<FixedBytes<32>>,
+    pub(super) payload_hash: Option<PayloadHash>,
     pub(super) payload_hash_hex: String,
     /// Pre-computed command ID for Solana destination checks.
     pub(super) command_id: Option<[u8; 32]>,
@@ -335,7 +336,7 @@ mod tests {
     fn pending(phase: Phase) -> PendingTx {
         PendingTx {
             idx: 0,
-            message_id: "message-1".to_string(),
+            message_id: "message-1".into(),
             send_instant: Instant::now(),
             source_address: String::new(),
             contract_addr: Address::ZERO,

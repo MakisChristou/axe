@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -8,6 +7,7 @@ use alloy::providers::Provider;
 use eyre::{Result, WrapErr};
 use tokio::sync::mpsc;
 
+use super::identifiers::{MessageId, PayloadHash};
 use super::metrics::{AmplifierTiming, PeakThroughput, TxMetrics, VerificationReport};
 use crate::config::ChainsConfig;
 use crate::cosmos::read_axelar_rpc;
@@ -41,12 +41,24 @@ const THROUGHPUT_WINDOW: Duration = Duration::from_secs(10);
 const LEGACY_LOG_LOOKBACK_BLOCKS: u64 = 200;
 
 mod checks;
+mod config;
+mod input;
 mod its_deploy;
 mod legacy;
 mod pipeline;
 mod report;
 mod state;
 
+use self::config::{
+    GmpAxelarConfig, ItsAxelarConfig, load_gmp_axelar_config, load_its_axelar_config,
+    lookup_cosm_gateway_dest, lookup_xrpl_cosm_gateway_dest,
+};
+pub use self::input::{
+    EvmGmpDestination, EvmGmpStreamingDestination, EvmItsDestination, GmpBatchVerification,
+    ItsBatchVerification, SolanaGmpDestination, SolanaItsDestination, SourceChainType,
+    StellarGmpDestination, StellarItsDestination, StreamingVerification, SuiGmpDestination,
+    SuiItsDestination, VerificationRoute, XrplItsDestination,
+};
 use self::pipeline::{
     DestinationVerifier, EvmDestinationVerifier, ItsEvmDest, PollItsHubArgs, PollItsHubEvmArgs,
     PollPipelineArgs, SolanaDestinationVerifier, SolanaItsDestinationVerifier,
@@ -110,89 +122,6 @@ impl<'a> VerifyMode<'a> {
             } => (Some(rx), Some(send_done), Some(spinner)),
         }
     }
-}
-
-/// Axelar config loaded for GMP verification.
-struct GmpAxelarConfig {
-    lcd: String,
-    voting_verifier: Option<String>,
-    cosm_gateway: String,
-}
-
-fn load_gmp_axelar_config(
-    config: &Path,
-    source_chain: &str,
-    destination_chain: &str,
-) -> Result<GmpAxelarConfig> {
-    let cfg = ChainsConfig::load(config)?;
-    let (lcd, _, _, _) = cfg.axelar.cosmos_tx_params()?;
-    let voting_verifier = cfg
-        .axelar
-        .contract_address("VotingVerifier", source_chain)
-        .ok()
-        .map(String::from);
-    let cosm_gateway = cfg
-        .axelar
-        .contract_address("Gateway", destination_chain)?
-        .to_string();
-    Ok(GmpAxelarConfig {
-        lcd,
-        voting_verifier,
-        cosm_gateway,
-    })
-}
-
-/// Axelar config loaded for ITS-via-hub verification. Does not include the
-/// Tendermint `rpc` field — callers fetch `read_axelar_rpc` separately at
-/// the original call site so the ordering relative to tx construction is
-/// preserved verbatim. The `cfg` field is returned so the same config object
-/// can be reused for the destination `Gateway` lookup.
-struct ItsAxelarConfig {
-    cfg: ChainsConfig,
-    lcd: String,
-    voting_verifier: Option<String>,
-    axelarnet_gateway: String,
-}
-
-fn load_its_axelar_config(config: &Path, source_chain: &str) -> Result<ItsAxelarConfig> {
-    let cfg = ChainsConfig::load(config)?;
-    let (lcd, _, _, _) = cfg.axelar.cosmos_tx_params()?;
-    let voting_verifier = cfg
-        .axelar
-        .contract_address("VotingVerifier", source_chain)
-        .ok()
-        .map(String::from);
-    let axelarnet_gateway = cfg
-        .axelar
-        .global_contract_address("AxelarnetGateway")?
-        .to_string();
-    Ok(ItsAxelarConfig {
-        cfg,
-        lcd,
-        voting_verifier,
-        axelarnet_gateway,
-    })
-}
-
-/// Look up the destination cosmos `Gateway` for a chain.
-fn lookup_cosm_gateway_dest(cfg: &ChainsConfig, destination_chain: &str) -> Result<String> {
-    Ok(cfg
-        .axelar
-        .contract_address("Gateway", destination_chain)?
-        .to_string())
-}
-
-/// Look up the destination cosmos `Gateway` for an XRPL chain, falling back
-/// to `XrplGateway` for deployments that use that contract name.
-fn lookup_xrpl_cosm_gateway_dest(cfg: &ChainsConfig, destination_chain: &str) -> Result<String> {
-    Ok(cfg
-        .axelar
-        .contract_address("Gateway", destination_chain)
-        .or_else(|_| {
-            cfg.axelar
-                .contract_address("XrplGateway", destination_chain)
-        })?
-        .to_string())
 }
 
 /// Args bundle for [`run_gmp_pipeline`].
@@ -354,15 +283,12 @@ fn streaming_report_and_timings(
     let report = compute_verification_report(txs, &mut [], peaks);
     let timings: Vec<(String, AmplifierTiming)> = txs
         .iter()
-        .map(|tx| (tx.message_id.clone(), tx.timing.clone()))
+        .map(|tx| (tx.message_id.clone().into_string(), tx.timing.clone()))
         .collect();
     (report, timings)
 }
 
-fn parse_first_leg_payload_hash(
-    tx: &TxMetrics,
-    required: bool,
-) -> Result<Option<alloy::primitives::FixedBytes<32>>> {
+fn parse_first_leg_payload_hash(tx: &TxMetrics, required: bool) -> Result<Option<PayloadHash>> {
     if tx.payload_hash.is_empty() {
         if required {
             return Err(eyre::eyre!(
@@ -385,7 +311,7 @@ fn pending_tx_for_its_batch(tx: &TxMetrics, idx: usize, initial_phase: Phase) ->
     let payload_hash = parse_first_leg_payload_hash(tx, initial_phase == Phase::Voted)?;
     Ok(PendingTx {
         idx,
-        message_id: tx.signature.clone(),
+        message_id: tx.signature.clone().into(),
         send_instant: tx.send_instant.unwrap_or_else(Instant::now),
         source_address: tx.source_address.clone(),
         contract_addr: Address::ZERO,
@@ -409,8 +335,12 @@ fn pending_tx_for_its_batch(tx: &TxMetrics, idx: usize, initial_phase: Phase) ->
 /// inner-instruction index varies per tx (observed `-1.7` in production vs
 /// the static `-2.1` shape). Detect that by the `-` separator and pass
 /// through; otherwise fall back to the synthetic format for raw GMP paths.
-fn message_id_for_source(tx: &TxMetrics, source_type: SourceChainType, network: Network) -> String {
-    match source_type {
+fn message_id_for_source(
+    tx: &TxMetrics,
+    source_type: SourceChainType,
+    network: Network,
+) -> MessageId {
+    let message_id = match source_type {
         SourceChainType::Evm | SourceChainType::Stellar | SourceChainType::Sui => {
             tx.signature.clone()
         }
@@ -421,7 +351,8 @@ fn message_id_for_source(tx: &TxMetrics, source_type: SourceChainType, network: 
                 format!("{}-{}.1", tx.signature, solana_call_contract_index(network))
             }
         }
-    }
+    };
+    message_id.into()
 }
 
 /// Build a `PendingTx` for a GMP batch entry. The four GMP batch orchestrators
@@ -431,7 +362,7 @@ fn message_id_for_source(tx: &TxMetrics, source_type: SourceChainType, network: 
 struct PendingGmpBatchArgs<'a> {
     tx: &'a TxMetrics,
     idx: usize,
-    message_id: String,
+    message_id: MessageId,
     contract_addr: Address,
     command_id: Option<[u8; 32]>,
     gmp_destination_chain: String,
@@ -471,117 +402,6 @@ fn pending_tx_for_gmp_batch(args: PendingGmpBatchArgs<'_>) -> Result<PendingTx> 
 // ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
-
-/// Source chain type — determines how message IDs are constructed.
-#[derive(Clone, Copy)]
-pub enum SourceChainType {
-    /// Solana source: message ID = `{signature}-{group}.{index}`
-    Svm,
-    /// EVM source: message ID = `{tx_hash}-{event_index}` (already in tx.signature)
-    Evm,
-    /// Stellar source: message ID = `0x{lowercase_tx_hash}-{event_index}`
-    Stellar,
-    /// Sui source: message ID = `{base58_tx_digest}-{event_index}`
-    Sui,
-}
-
-/// Chain route shared by every verification adapter.
-#[derive(Clone, Copy)]
-pub struct VerificationRoute<'a> {
-    pub config: &'a Path,
-    pub source_chain: &'a str,
-    pub destination_chain: &'a str,
-    pub network: Network,
-}
-
-/// Batch verification input for a single-leg GMP route.
-pub struct GmpBatchVerification<'a, D> {
-    pub route: VerificationRoute<'a>,
-    pub destination: D,
-    pub metrics: &'a mut [TxMetrics],
-    pub source_type: SourceChainType,
-}
-
-/// Batch verification input for an ITS route through the Axelar hub.
-pub struct ItsBatchVerification<'a, D> {
-    pub route: VerificationRoute<'a>,
-    pub destination: D,
-    pub metrics: &'a mut [TxMetrics],
-}
-
-/// Streaming verification input shared by sustained GMP and ITS routes.
-pub struct StreamingVerification<'a, D> {
-    pub route: VerificationRoute<'a>,
-    pub destination: D,
-    pub rx: mpsc::UnboundedReceiver<PendingTx>,
-    pub send_done: Arc<AtomicBool>,
-    pub spinner: indicatif::ProgressBar,
-}
-
-/// Existing EVM client and gateway used by burst GMP verification.
-pub struct EvmGmpDestination<'a, P> {
-    pub address: &'a str,
-    pub gateway_addr: Address,
-    pub provider: &'a P,
-}
-
-/// EVM RPC endpoint and gateway used by streaming GMP verification.
-pub struct EvmGmpStreamingDestination<'a> {
-    pub address: &'a str,
-    pub gateway_addr: Address,
-    pub rpc_url: &'a str,
-}
-
-/// Stellar contracts and client settings used by GMP verification.
-pub struct StellarGmpDestination<'a> {
-    pub contract: &'a str,
-    pub rpc_url: &'a str,
-    pub network_type: &'a str,
-    pub gateway_contract: &'a str,
-    pub signer_pk: [u8; 32],
-}
-
-/// Sui package lookup inputs used by GMP verification.
-pub struct SuiGmpDestination<'a> {
-    pub address: &'a str,
-    pub rpc_url: &'a str,
-}
-
-/// Sui RPC endpoint used by ITS verification.
-pub struct SuiItsDestination<'a> {
-    pub rpc_url: &'a str,
-}
-
-/// Solana inputs used by GMP verification.
-pub struct SolanaGmpDestination<'a> {
-    pub address: &'a str,
-    pub rpc_url: &'a str,
-}
-
-/// Solana RPC endpoint used by ITS verification.
-pub struct SolanaItsDestination<'a> {
-    pub rpc_url: &'a str,
-}
-
-/// Stellar contracts and client settings used by ITS verification.
-pub struct StellarItsDestination<'a> {
-    pub rpc_url: &'a str,
-    pub network_type: &'a str,
-    pub gateway_contract: &'a str,
-    pub signer_pk: [u8; 32],
-}
-
-/// XRPL endpoint and recipient used by ITS verification.
-pub struct XrplItsDestination<'a> {
-    pub rpc_url: &'a str,
-    pub recipient: &'a str,
-}
-
-/// EVM endpoint and gateway used by ITS verification.
-pub struct EvmItsDestination<'a> {
-    pub gateway_addr: Address,
-    pub rpc_url: &'a str,
-}
 
 /// Verify transactions on-chain through 4 Amplifier pipeline checkpoints:
 ///
@@ -1136,7 +956,7 @@ pub(super) fn tx_to_pending_stellar(
     let payload_hash = parse_first_leg_payload_hash(tx, true)?;
     Ok(PendingTx {
         idx: 0,
-        message_id: tx.signature.clone(),
+        message_id: tx.signature.clone().into(),
         send_instant: tx.send_instant.unwrap_or_else(Instant::now),
         source_address: tx.source_address.clone(),
         contract_addr,
@@ -1163,7 +983,7 @@ pub(super) fn tx_to_pending_xrpl(tx: &TxMetrics, has_voting_verifier: bool) -> R
     let payload_hash = parse_first_leg_payload_hash(tx, has_voting_verifier)?;
     Ok(PendingTx {
         idx: 0,
-        message_id: tx.signature.clone(),
+        message_id: tx.signature.clone().into(),
         send_instant: tx.send_instant.unwrap_or_else(Instant::now),
         source_address: tx.source_address.clone(),
         contract_addr: Address::ZERO,
@@ -1189,7 +1009,7 @@ pub(super) fn tx_to_pending_its(tx: &TxMetrics, has_voting_verifier: bool) -> Re
     let payload_hash = parse_first_leg_payload_hash(tx, has_voting_verifier)?;
     Ok(PendingTx {
         idx: 0,
-        message_id: tx.signature.clone(),
+        message_id: tx.signature.clone().into(),
         send_instant: tx.send_instant.unwrap_or_else(Instant::now),
         source_address: tx.source_address.clone(),
         contract_addr: Address::ZERO,

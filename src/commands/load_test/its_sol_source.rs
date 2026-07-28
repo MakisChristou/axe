@@ -10,8 +10,10 @@ use std::time::Instant;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
 
+use super::identifiers::TokenId;
 use super::metrics::TxMetrics;
 use super::submitter::TransactionSubmitter;
+use super::units::Lamports;
 use crate::solana;
 
 #[derive(Clone)]
@@ -26,12 +28,12 @@ pub(super) enum MetricContext {
 pub(super) struct ItsSolanaSubmitter {
     pub rpc_url: String,
     pub network: crate::types::Network,
-    pub token_id: [u8; 32],
+    pub token_id: TokenId,
     pub mint: Pubkey,
     pub destination_chain: String,
     pub destination_address: Vec<u8>,
     pub amount: u64,
-    pub gas_value: u64,
+    pub gas_value: Lamports,
     pub metric_context: MetricContext,
 }
 
@@ -53,13 +55,13 @@ impl TransactionSubmitter for ItsSolanaSubmitter {
                 rpc_url: &submitter.rpc_url,
                 keypair: &job.keypair,
                 network: submitter.network,
-                token_id: &submitter.token_id,
+                token_id: submitter.token_id.as_bytes(),
                 source_account: &job.source_account,
                 mint: &submitter.mint,
                 destination_chain: &submitter.destination_chain,
                 destination_address: &submitter.destination_address,
                 amount: submitter.amount,
-                gas_value: submitter.gas_value,
+                gas_value: submitter.gas_value.get(),
             });
             result.map(|(signature, mut metrics)| {
                 metrics.signature = solana::extract_its_message_id(

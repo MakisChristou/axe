@@ -33,6 +33,15 @@ pub const BASE_FEE: u32 = 100_000;
 /// a comfortable default on testnet/devnet.
 pub const DEFAULT_GAS_STROOPS: u64 = 100_000_000; // 10 XLM
 
+pub fn parse_gas_stroops(value: Option<&str>) -> Result<u64> {
+    match value {
+        Some(value) => value
+            .parse()
+            .map_err(|error| eyre!("invalid --gas-value: {error}")),
+        None => Ok(DEFAULT_GAS_STROOPS),
+    }
+}
+
 /// Generate a default ABI-encoded payload compatible with EVM SenderReceiver.
 pub fn make_payload(custom: &Option<Vec<u8>>) -> Vec<u8> {
     match custom {

@@ -8,6 +8,7 @@ use std::time::Instant;
 use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
 use super::submitter::TransactionSubmitter;
 use super::sustained;
+use super::units::Drops;
 use crate::xrpl::{LAST_LEDGER_SEQUENCE_BUMP, XrplClient, XrplWallet, build_its_transfer_memos};
 use eyre::{Result, eyre};
 use indicatif::ProgressBar;
@@ -33,8 +34,8 @@ struct TransferSubmission<'a> {
     client: &'a XrplClient,
     wallet: &'a XrplWallet,
     destination_multisig: &'a AccountId,
-    total_drops: u64,
-    gas_fee_drops: u64,
+    total_drops: Drops,
+    gas_fee_drops: Drops,
     destination_chain: &'a str,
     destination_address_hex: &'a str,
     payload: Option<&'a [u8]>,
@@ -62,7 +63,7 @@ async fn submit_single(submission: TransferSubmission<'_>) -> TxMetrics {
 
     // Build + sign the tx locally (so we can compute the deterministic hash
     // before the submit call, matching the behaviour of the XRPL relayer).
-    let amount = match Amount::drops(total_drops) {
+    let amount = match Amount::drops(total_drops.get()) {
         Ok(a) => a,
         Err(e) => return fail_metrics(submit_start, &source_addr, &format!("amount: {e}")),
     };
@@ -70,7 +71,7 @@ async fn submit_single(submission: TransferSubmission<'_>) -> TxMetrics {
     tx.common.memos = build_its_transfer_memos(
         destination_chain,
         destination_address_hex,
-        gas_fee_drops,
+        gas_fee_drops.get(),
         payload,
     )
     .into_iter()
@@ -156,7 +157,7 @@ struct XrplSubmitter {
     destination_multisig: AccountId,
     destination_chain: String,
     destination_address_hex: String,
-    gas_fee_drops: u64,
+    gas_fee_drops: Drops,
     gmp_destination_chain: String,
     gmp_destination_address: String,
 }
@@ -174,7 +175,9 @@ impl TransactionSubmitter for XrplSubmitter {
             client: &self.client,
             wallet: &job.wallet,
             destination_multisig: &self.destination_multisig,
-            total_drops: self.gas_fee_drops.saturating_add(NET_TRANSFER_DROPS),
+            total_drops: self
+                .gas_fee_drops
+                .saturating_add(Drops::new(NET_TRANSFER_DROPS)),
             gas_fee_drops: self.gas_fee_drops,
             destination_chain: &self.destination_chain,
             destination_address_hex: &self.destination_address_hex,
@@ -251,7 +254,7 @@ pub async fn run_burst(request: BurstRequest<'_>) -> Result<LoadTestReport> {
             destination_multisig: *destination_multisig,
             destination_chain: destination_chain.to_string(),
             destination_address_hex: destination_address_hex.to_string(),
-            gas_fee_drops,
+            gas_fee_drops: Drops::new(gas_fee_drops),
             gmp_destination_chain: gmp_dest_chain.to_string(),
             gmp_destination_address: gmp_dest_address.to_string(),
         },
@@ -341,7 +344,7 @@ pub(super) async fn run_sustained(request: SustainedRequest) -> Result<sustained
         destination_multisig,
         destination_chain,
         destination_address_hex,
-        gas_fee_drops,
+        gas_fee_drops: Drops::new(gas_fee_drops),
         gmp_destination_chain: gmp_dest_chain,
         gmp_destination_address: gmp_dest_address,
     };

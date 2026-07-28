@@ -27,8 +27,9 @@ use std::time::Instant;
 
 use eyre::{Result, eyre};
 
-use super::gmp::{SUI_DEFAULT_GAS_BUDGET_MIST, SUI_DEFAULT_GAS_VALUE_MIST};
-use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+use super::gmp_sui_source::{DEFAULT_GAS_BUDGET, DEFAULT_GAS_VALUE};
+use super::its_sui_source::{ItsSuiSubmitter, run_its_sequential};
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput};
 use super::{
     LoadTestArgs, finish_report, load_sui_main_wallet, resolve_sui_axe_token, validate_solana_rpc,
 };
@@ -134,17 +135,17 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
         Some(v) => v
             .parse::<u64>()
             .map_err(|e| eyre!("invalid --gas-value: {e}"))?,
-        None => SUI_DEFAULT_GAS_VALUE_MIST,
+        None => DEFAULT_GAS_VALUE.get(),
     }
     .saturating_mul(2);
     ui::kv(
         "cross-chain gas",
         &format!("{gas_value_mist} mist (paid via Sui GasService)"),
     );
-    if bal < gas_value_mist + SUI_DEFAULT_GAS_BUDGET_MIST {
+    if bal < gas_value_mist + DEFAULT_GAS_BUDGET.get() {
         eyre::bail!(
             "Sui wallet has insufficient SUI: {bal} mist; need ≥ {} mist (gas budget + cross-chain gas).",
-            gas_value_mist + SUI_DEFAULT_GAS_BUDGET_MIST
+            gas_value_mist + DEFAULT_GAS_BUDGET.get()
         );
     }
 
@@ -158,102 +159,26 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
         .global_contract_address("InterchainTokenService")?
         .to_string();
 
-    // --- Sequential burst loop ---
+    // --- Sequential burst through the shared source capability ---
     let num_txs = args.num_txs.max(1) as usize;
     let test_start = Instant::now();
-    let spinner = ui::wait_spinner(&format!("sending (0/{num_txs} confirmed)..."));
-    let mut metrics: Vec<TxMetrics> = Vec::with_capacity(num_txs);
-
-    for i in 0..num_txs {
-        let send_start = Instant::now();
-        let result =
-            crate::sui::send_its_interchain_transfer(crate::sui::InterchainTransferRequest {
-                client: &sui_client,
-                wallet: &main_wallet,
-                contracts: &its_contracts,
-                coin_type_tag: &coin_type,
-                token_id,
-                destination_chain: &args.destination_axelar_id,
-                destination_address_bytes: &dest_address_bytes,
-                transfer_amount: AMOUNT_PER_TX,
-                gas_value_mist,
-                gas_budget_mist: SUI_DEFAULT_GAS_BUDGET_MIST,
-            })
-            .await;
-
-        match result {
-            Ok(r) if r.success => {
-                let latency_ms = send_start
-                    .elapsed()
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX);
-                let message_id = format!("{}-{}", r.digest, r.event_index);
-                metrics.push(TxMetrics {
-                    signature: message_id,
-                    submit_time_ms: latency_ms,
-                    confirm_time_ms: Some(latency_ms),
-                    latency_ms: Some(latency_ms),
-                    compute_units: None,
-                    slot: None,
-                    outcome: TxMetrics::succeeded_outcome(),
-                    payload: Vec::new(),
-                    payload_hash: r.payload_hash_hex.clone(),
-                    source_address: format!("0x{}", r.source_address_hex),
-                    gmp_destination_chain: "axelar".to_string(),
-                    gmp_destination_address: its_hub_addr.clone(),
-                    send_instant: Some(send_start),
-                    amplifier_timing: None,
-                });
-                spinner.set_message(format!("sending ({}/{num_txs} confirmed)...", i + 1));
-            }
-            Ok(r) => {
-                metrics.push(TxMetrics {
-                    signature: String::new(),
-                    submit_time_ms: 0,
-                    confirm_time_ms: None,
-                    latency_ms: None,
-                    compute_units: None,
-                    slot: None,
-                    outcome: TxMetrics::external_outcome(false, r.error, "Sui ITS tx failed"),
-                    payload: Vec::new(),
-                    payload_hash: String::new(),
-                    source_address: String::new(),
-                    gmp_destination_chain: String::new(),
-                    gmp_destination_address: String::new(),
-                    send_instant: None,
-                    amplifier_timing: None,
-                });
-            }
-            Err(e) => {
-                metrics.push(TxMetrics {
-                    signature: String::new(),
-                    submit_time_ms: 0,
-                    confirm_time_ms: None,
-                    latency_ms: None,
-                    compute_units: None,
-                    slot: None,
-                    outcome: TxMetrics::failed_outcome(e.to_string()),
-                    payload: Vec::new(),
-                    payload_hash: String::new(),
-                    source_address: String::new(),
-                    gmp_destination_chain: String::new(),
-                    gmp_destination_address: String::new(),
-                    send_instant: None,
-                    amplifier_timing: None,
-                });
-            }
-        }
-    }
-
-    spinner.finish_and_clear();
-    let total_submitted = metrics.len() as u64;
-    let total_confirmed = metrics.iter().filter(|m| m.is_success()).count() as u64;
-    ui::success(&format!(
-        "sent {total_confirmed}/{total_submitted} confirmed"
-    ));
-
-    let test_duration = test_start.elapsed().as_secs_f64();
+    let burst = run_its_sequential(
+        ItsSuiSubmitter {
+            client: sui_client,
+            wallet: main_wallet,
+            contracts: its_contracts,
+            coin_type,
+            token_id: token_id.into(),
+            destination_chain: args.destination_axelar_id.clone(),
+            destination_address_bytes: dest_address_bytes,
+            transfer_amount: AMOUNT_PER_TX,
+            gas_value: super::units::Mist::new(gas_value_mist),
+            gas_budget: DEFAULT_GAS_BUDGET,
+            its_hub_address: its_hub_addr,
+        },
+        num_txs,
+    )
+    .await?;
 
     let destination_address = sol_pubkey.to_string();
 
@@ -262,13 +187,13 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
             source_chain: src.to_string(),
             destination_chain: dest.to_string(),
             destination_address: destination_address.clone(),
-            num_txs: total_submitted,
+            num_txs: burst.total_submitted,
             num_keys: 1,
-            total_submitted,
-            test_duration_secs: test_duration,
+            total_submitted: burst.total_submitted,
+            test_duration_secs: burst.test_duration_secs,
             compute_unit_summary: ComputeUnitSummary::Omit,
         },
-        metrics,
+        burst.metrics,
     );
 
     let verification =

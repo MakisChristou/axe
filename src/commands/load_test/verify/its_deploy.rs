@@ -212,7 +212,7 @@ pub async fn wait_for_its_remote_deploy(
                     gw_contract.provider(),
                     *gw_contract.address(),
                     dst_addr,
-                    ph,
+                    ph.into_fixed_bytes(),
                     from_block,
                 )
                 .await?
@@ -248,7 +248,7 @@ pub async fn wait_for_its_remote_deploy(
                     sl_id,
                     "",
                     Address::ZERO,
-                    ph,
+                    ph.into_fixed_bytes(),
                 )
                 .await
                 {
@@ -280,7 +280,7 @@ pub async fn wait_for_its_remote_deploy(
                     sl_id,
                     "",
                     Address::ZERO,
-                    ph,
+                    ph.into_fixed_bytes(),
                 )
                 .await
                 {
@@ -487,7 +487,7 @@ async fn check_stellar_remote_deploy_approval(
             message_id: &info.message_id,
             source_address: &info.source_address,
             contract_address: &info.destination_address,
-            payload_hash: payload_hash.0,
+            payload_hash: payload_hash.into_fixed_bytes().into(),
         })
         .await?
         .ok_or_else(|| eyre::eyre!("Stellar gateway returned non-bool approval result"))?;

@@ -15,6 +15,7 @@ use super::tx::SubmittedTx;
 /// Mainnet and testnet share keys; we pick by URL hint.
 const TESTNET_FALLBACKS: &[&str] = &[
     "https://fullnode.testnet.sui.io:443",
+    "https://sui-testnet-endpoint.blockvision.org",
     "https://sui-testnet-rpc.publicnode.com",
 ];
 const MAINNET_FALLBACKS: &[&str] = &[

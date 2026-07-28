@@ -129,12 +129,12 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
     let submitter = its_sol_source::ItsSolanaSubmitter {
         rpc_url: sol_rpc,
         network: args.network,
-        token_id,
+        token_id: token_id.into(),
         mint,
         destination_chain: dest_chain_id,
         destination_address: sui_recipient_bytes,
         amount: AMOUNT_PER_TX,
-        gas_value,
+        gas_value: super::units::Lamports::new(gas_value),
         metric_context: its_sol_source::MetricContext::DestinationManaged,
     };
     let job = its_sol_source::ItsSolanaSubmitJob {

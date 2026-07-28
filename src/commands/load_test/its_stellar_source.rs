@@ -7,10 +7,12 @@ use std::time::Instant;
 use eyre::{Result, eyre};
 use rand::RngCore;
 
+use super::identifiers::TokenId;
 use super::metrics::TxMetrics;
 use super::run_sizing::RunSizing;
 use super::submitter::TransactionSubmitter;
 use super::sustained;
+use super::units::Stroops;
 use crate::stellar::{StellarClient, StellarWallet};
 use crate::ui;
 
@@ -103,7 +105,7 @@ pub(super) struct TokenSetupRequest<'a, V> {
     pub its_contract: &'a str,
     pub gateway_contract: &'a str,
     pub gas_token: &'a str,
-    pub gas_stroops: u64,
+    pub gas_stroops: Stroops,
     pub source_chain: &'a str,
     pub destination_chain: &'a str,
     pub destination_axelar_id: &'a str,
@@ -248,7 +250,7 @@ where
             salt,
             destination_chain: destination_axelar_id,
             gas_token,
-            gas_amount: gas_stroops,
+            gas_amount: gas_stroops.get(),
         })
         .await?;
     if !remote_invoked.success {
@@ -508,11 +510,11 @@ pub(super) struct ItsStellarSubmitter {
     pub client: StellarClient,
     pub its_contract: String,
     pub gateway_contract: String,
-    pub token_id: [u8; 32],
+    pub token_id: TokenId,
     pub destination_chain: String,
     pub destination_address_bytes: Vec<u8>,
     pub gas_token: String,
-    pub gas_stroops: u64,
+    pub gas_stroops: Stroops,
     pub amount_per_tx: u128,
     pub axelarnet_gw_addr: String,
 }
@@ -531,11 +533,11 @@ impl TransactionSubmitter for ItsStellarSubmitter {
             wallet: &job.wallet,
             its_contract: &self.its_contract,
             gateway_contract: &self.gateway_contract,
-            token_id: self.token_id,
+            token_id: self.token_id.into_bytes(),
             destination_chain: &self.destination_chain,
             destination_address_bytes: &self.destination_address_bytes,
             gas_token: &self.gas_token,
-            gas_amount_stroops: self.gas_stroops,
+            gas_amount_stroops: self.gas_stroops.get(),
             transfer_amount: self.amount_per_tx,
             gmp_dest_address: &self.axelarnet_gw_addr,
         })

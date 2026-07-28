@@ -2,7 +2,10 @@ mod evm_sender;
 mod gas_estimate;
 mod gas_mode;
 mod gmp;
+mod gmp_sui_source;
+mod gmp_verification;
 mod helpers;
+mod identifiers;
 mod its_evm_source;
 mod its_evm_to_evm;
 mod its_evm_to_sol;
@@ -18,6 +21,7 @@ mod its_stellar_source;
 mod its_stellar_to_evm;
 mod its_stellar_to_sol;
 mod its_stellar_to_sui;
+mod its_sui_source;
 mod its_sui_to_evm;
 mod its_sui_to_sol;
 mod its_verification;
@@ -26,12 +30,14 @@ mod keypairs;
 pub mod metrics;
 mod resolve;
 mod retry;
+mod route;
 mod run_sizing;
 mod sol_sender;
 mod stellar_sender;
 mod submitter;
 mod sustained;
 mod task_group;
+mod units;
 mod verify;
 mod xrpl_sender;
 
@@ -288,101 +294,91 @@ async fn dispatch(
     run_start: Instant,
     run_sizing: run_sizing::RunSizing,
 ) -> Result<()> {
-    match (args.protocol, args.test_type) {
-        (Protocol::Gmp, TestType::SolToEvm) => gmp::run_sol_to_evm(args, run_start).await,
-        (Protocol::Gmp, TestType::EvmToSol) => gmp::run_evm_to_sol(args, run_start).await,
-        (Protocol::Gmp, TestType::EvmToEvm) => gmp::run_evm_to_evm(args, run_start).await,
-        (Protocol::Gmp, TestType::SolToSol) => gmp::run_sol_to_sol(args, run_start).await,
-        (Protocol::Gmp, TestType::XrplToEvm | TestType::EvmToXrpl) => {
-            eyre::bail!(
-                "GMP {}->{} is not yet supported for XRPL. XRPL has no executable layer, \
-                 so GMP in either direction is not applicable; use --protocol its instead.",
-                args.source_chain,
-                args.destination_chain
-            )
-        }
-        (Protocol::Gmp, TestType::StellarToEvm) => gmp::run_stellar_to_evm(args, run_start).await,
-        (Protocol::Gmp, TestType::EvmToStellar) => gmp::run_evm_to_stellar(args, run_start).await,
-        (Protocol::Gmp, TestType::StellarToSol) => gmp::run_stellar_to_sol(args, run_start).await,
-        (Protocol::Gmp, TestType::SolToStellar) => gmp::run_sol_to_stellar(args, run_start).await,
-        (Protocol::Its, TestType::StellarToEvm) => {
-            its_stellar_to_evm::run(args, run_start, run_sizing).await
-        }
-        (Protocol::Its, TestType::EvmToStellar) => its_evm_to_stellar::run(args, run_start).await,
+    use route::SupportedRoute;
+
+    let route = SupportedRoute::resolve(
+        args.protocol,
+        args.test_type,
+        &args.source_chain,
+        &args.destination_chain,
+    )?;
+
+    match route {
+        SupportedRoute::Gmp(route) => dispatch_gmp(route, args, run_start).await,
+        SupportedRoute::Its(route) => dispatch_its(route, args, run_start, run_sizing).await,
+        SupportedRoute::ItsWithData(route) => dispatch_its_with_data(route, args, run_start).await,
+    }
+}
+
+async fn dispatch_gmp(
+    route: route::GmpRoute,
+    args: LoadTestArgs,
+    run_start: Instant,
+) -> Result<()> {
+    use route::GmpRoute;
+
+    match route {
+        GmpRoute::SolToEvm => gmp::run_sol_to_evm(args, run_start).await,
+        GmpRoute::EvmToSol => gmp::run_evm_to_sol(args, run_start).await,
+        GmpRoute::EvmToEvm => gmp::run_evm_to_evm(args, run_start).await,
+        GmpRoute::SolToSol => gmp::run_sol_to_sol(args, run_start).await,
+        GmpRoute::StellarToEvm => gmp::run_stellar_to_evm(args, run_start).await,
+        GmpRoute::EvmToStellar => gmp::run_evm_to_stellar(args, run_start).await,
+        GmpRoute::StellarToSol => gmp::run_stellar_to_sol(args, run_start).await,
+        GmpRoute::SolToStellar => gmp::run_sol_to_stellar(args, run_start).await,
+        GmpRoute::SuiToEvm => gmp::run_sui_to_evm(args, run_start).await,
+        GmpRoute::EvmToSui => gmp::run_evm_to_sui(args, run_start).await,
+        GmpRoute::SolToSui => gmp::run_sol_to_sui(args, run_start).await,
+        GmpRoute::StellarToSui => gmp::run_stellar_to_sui(args, run_start).await,
+        GmpRoute::SuiToSol => gmp::run_sui_to_sol(args, run_start).await,
+    }
+}
+
+async fn dispatch_its(
+    route: route::ItsRoute,
+    args: LoadTestArgs,
+    run_start: Instant,
+    run_sizing: run_sizing::RunSizing,
+) -> Result<()> {
+    use route::ItsRoute;
+
+    match route {
+        ItsRoute::StellarToEvm => its_stellar_to_evm::run(args, run_start, run_sizing).await,
+        ItsRoute::EvmToStellar => its_evm_to_stellar::run(args, run_start).await,
         // Stellar -> Solana ITS: code is in place, but the destination chain
         // must be in the Stellar ITS contract's trusted-chains list. On
         // testnet today "solana" is not registered, so the source-side
         // simulation reverts with Contract Error #7. The runner will surface
         // that clearly. We leave it dispatched so the run becomes possible
         // automatically once the trusted-chain config is updated upstream.
-        (Protocol::Its, TestType::StellarToSol) => {
-            its_stellar_to_sol::run(args, run_start, run_sizing).await
-        }
-        (Protocol::Its, TestType::SolToStellar) => {
-            eyre::bail!(
-                "ITS sol -> stellar is not implemented yet. Use --protocol gmp for this pair."
-            )
-        }
-        (Protocol::Its, TestType::EvmToSol) => its_evm_to_sol::run(args, run_start).await,
-        (Protocol::Its, TestType::SolToEvm) => its_sol_to_evm::run(args, run_start).await,
-        (Protocol::Its, TestType::XrplToEvm) => its_xrpl_to_evm::run(args, run_start).await,
-        (Protocol::Its, TestType::EvmToXrpl) => its_evm_to_xrpl::run(args, run_start).await,
-        (Protocol::Its, TestType::EvmToEvm) => its_evm_to_evm::run(args, run_start).await,
-        (Protocol::Its, TestType::SolToSol) => {
-            eyre::bail!(
-                "ITS {}->{} is not yet supported",
-                args.source_chain,
-                args.destination_chain
-            )
-        }
-        (Protocol::Gmp, TestType::SuiToEvm) => gmp::run_sui_to_evm(args, run_start).await,
-        (Protocol::ItsWithData, TestType::EvmToSol) => {
-            its_evm_to_sol_with_data::run(args, run_start).await
-        }
-        (Protocol::ItsWithData, _) => {
-            eyre::bail!("its-with-data only supports evm-to-sol currently")
-        }
+        ItsRoute::StellarToSol => its_stellar_to_sol::run(args, run_start, run_sizing).await,
+        ItsRoute::EvmToSol => its_evm_to_sol::run(args, run_start).await,
+        ItsRoute::SolToEvm => its_sol_to_evm::run(args, run_start).await,
+        ItsRoute::XrplToEvm => its_xrpl_to_evm::run(args, run_start).await,
+        ItsRoute::EvmToXrpl => its_evm_to_xrpl::run(args, run_start).await,
+        ItsRoute::EvmToEvm => its_evm_to_evm::run(args, run_start).await,
         // Sui as destination — Sui events-based verifier is now wired in
         // verify.rs. EVM -> Sui GMP runs end-to-end. ITS to Sui still
         // needs the receive-side coin type plumbing.
-        (Protocol::Gmp, TestType::EvmToSui) => gmp::run_evm_to_sui(args, run_start).await,
-        (Protocol::Its, TestType::EvmToSui) => its_evm_to_sui::run(args, run_start).await,
-        (Protocol::Gmp, TestType::SolToSui) => gmp::run_sol_to_sui(args, run_start).await,
-        (Protocol::Its, TestType::SolToSui) => its_sol_to_sui::run(args, run_start).await,
-        (Protocol::Gmp, TestType::StellarToSui) => gmp::run_stellar_to_sui(args, run_start).await,
-        (Protocol::Its, TestType::StellarToSui) => its_stellar_to_sui::run(args, run_start).await,
-        (_, TestType::XrplToSui) => {
-            eyre::bail!(
-                "xrpl -> sui ITS needs the Sui destination verifier plus a registered AXE/XRP \
-                 token on Sui ITS. Not yet implemented."
-            )
-        }
+        ItsRoute::EvmToSui => its_evm_to_sui::run(args, run_start).await,
+        ItsRoute::SolToSui => its_sol_to_sui::run(args, run_start).await,
+        ItsRoute::StellarToSui => its_stellar_to_sui::run(args, run_start).await,
         // Sui-source ITS. We don't auto-deploy a fresh AXE token on Sui
         // (Move package publish from Rust is impractical), so the user must
         // pre-register a token via axelar-contract-deployments/sui/its.js
         // and pass `--token-id`. `--coin-type` resolves automatically via
         // dev-inspect when omitted.
-        (Protocol::Its, TestType::SuiToEvm) => its_sui_to_evm::run(args, run_start).await,
-        (Protocol::Its, TestType::SuiToSol) => its_sui_to_sol::run(args, run_start).await,
-        (Protocol::Its, TestType::SuiToStellar) | (Protocol::Its, TestType::SuiToXrpl) => {
-            eyre::bail!(
-                "sui -> {} ITS not yet wired. Source-side PTB construction is identical to \
-                 sui -> evm / sui -> sol, only the destination verifier differs — follow the \
-                 its_sui_to_sol.rs pattern (verify_onchain_solana_its-style swap).",
-                args.destination_chain
-            )
-        }
-        // Sui-source GMP. SuiToSol is wired (sends via Example::gmp::send_call,
-        // verified on Solana with SourceChainType::Sui). SuiToStellar and
-        // SuiToXrpl still need implementations (Stellar verify path differs
-        // from Sol; XRPL has no GMP layer).
-        (Protocol::Gmp, TestType::SuiToSol) => gmp::run_sui_to_sol(args, run_start).await,
-        (Protocol::Gmp, TestType::SuiToStellar) | (Protocol::Gmp, TestType::SuiToXrpl) => {
-            eyre::bail!(
-                "sui -> {} GMP not implemented yet. Follow the run_sui_to_sol pattern in gmp.rs \
-                 (Sui-side PTB stays identical, only destination verification swaps in).",
-                args.destination_chain
-            )
-        }
+        ItsRoute::SuiToEvm => its_sui_to_evm::run(args, run_start).await,
+        ItsRoute::SuiToSol => its_sui_to_sol::run(args, run_start).await,
+    }
+}
+
+async fn dispatch_its_with_data(
+    route: route::ItsWithDataRoute,
+    args: LoadTestArgs,
+    run_start: Instant,
+) -> Result<()> {
+    match route {
+        route::ItsWithDataRoute::EvmToSol => its_evm_to_sol_with_data::run(args, run_start).await,
     }
 }

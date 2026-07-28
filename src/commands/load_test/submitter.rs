@@ -131,7 +131,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{TransactionSubmitter, run_burst};
+    use super::{TransactionSubmitter, run_burst, run_serial};
     use crate::commands::load_test::metrics::TxMetrics;
 
     struct FakeSubmitter;
@@ -173,6 +173,23 @@ mod tests {
                 .map(|metrics| metrics.signature.as_str())
                 .collect::<Vec<_>>(),
             ["1", "2", "3"]
+        );
+    }
+
+    #[tokio::test]
+    async fn serial_preserves_job_order() {
+        let result = run_serial(FakeSubmitter, vec![3, 1, 2], None)
+            .await
+            .expect("fake serial run should succeed");
+
+        assert_eq!(result.total_submitted, 3);
+        assert_eq!(
+            result
+                .metrics
+                .iter()
+                .map(|metrics| metrics.signature.as_str())
+                .collect::<Vec<_>>(),
+            ["3", "1", "2"]
         );
     }
 }

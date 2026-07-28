@@ -34,10 +34,12 @@ use alloy::{
 };
 use eyre::eyre;
 
+use super::identifiers::TokenId;
 use super::keypairs;
 use super::metrics::TxMetrics;
 use super::run_sizing::RunSizing;
 use super::submitter::TransactionSubmitter;
+use super::units::Wei;
 use super::{LoadTestArgs, check_evm_balance, save_its_cache};
 use crate::commands::test_its::{
     extract_contract_call_event, extract_token_deployed_event, generate_salt,
@@ -562,11 +564,11 @@ pub(super) async fn distribute_tokens<P: Provider>(
 pub(super) struct InterchainTransferRequest<'a, P> {
     pub provider: &'a P,
     pub its_proxy: Address,
-    pub token_id: FixedBytes<32>,
+    pub token_id: TokenId,
     pub destination_chain: &'a str,
     pub receiver: &'a Bytes,
     pub amount: U256,
-    pub gas_value: U256,
+    pub gas_value: Wei,
     pub gas_arg_scaling_factor: u32,
     pub explicit_nonce: Option<u64>,
 }
@@ -576,11 +578,11 @@ pub(super) struct InterchainTransferRequest<'a, P> {
 pub(super) struct ItsEvmSubmitter {
     pub rpc_url: reqwest::Url,
     pub its_proxy: Address,
-    pub token_id: FixedBytes<32>,
+    pub token_id: TokenId,
     pub destination_chain: String,
     pub receiver: Bytes,
     pub amount: U256,
-    pub gas_value: U256,
+    pub gas_value: Wei,
     pub gas_arg_scaling_factor: u32,
 }
 
@@ -673,7 +675,7 @@ pub(super) async fn execute_interchain_transfer<P: Provider>(
     } = request;
     let submit_start = Instant::now();
 
-    let hub_gas = gas_value * U256::from(2);
+    let hub_gas = gas_value.saturating_mul(2).as_u256();
     let gas_value_arg = if gas_arg_scaling_factor == 0 {
         hub_gas
     } else {
@@ -694,7 +696,7 @@ pub(super) async fn execute_interchain_transfer<P: Provider>(
     for attempt in 0..MAX_SUBMIT_ATTEMPTS {
         let base_call = its
             .interchainTransfer(
-                token_id,
+                token_id.into_fixed_bytes(),
                 dest_chain.to_string(),
                 receiver_bytes.clone(),
                 amount,

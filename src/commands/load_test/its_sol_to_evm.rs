@@ -331,12 +331,12 @@ async fn run_sustained_pipeline(
         its_sol_source::ItsSolanaSubmitter {
             rpc_url: args.source_rpc.clone(),
             network: args.network,
-            token_id: transfer.token_id,
+            token_id: transfer.token_id.into(),
             mint: transfer.mint,
             destination_chain: dest.to_string(),
             destination_address: transfer.dest_address_bytes.clone(),
             amount: transfer.amount_per_tx,
-            gas_value: hub_gas_value(transfer.gas_value),
+            gas_value: super::units::Lamports::new(hub_gas_value(transfer.gas_value)),
             metric_context: its_sol_source::MetricContext::HubRouted {
                 hub_address: evm.axelarnet_gw_addr.clone(),
             },
@@ -390,12 +390,12 @@ async fn run_burst_pipeline(
         its_sol_source::ItsSolanaSubmitter {
             rpc_url: args.source_rpc.clone(),
             network: args.network,
-            token_id: transfer.token_id,
+            token_id: transfer.token_id.into(),
             mint: transfer.mint,
             destination_chain: dest.to_string(),
             destination_address: transfer.dest_address_bytes.clone(),
             amount: transfer.amount_per_tx,
-            gas_value: transfer.gas_value,
+            gas_value: super::units::Lamports::new(transfer.gas_value),
             metric_context: its_sol_source::MetricContext::HubRouted {
                 hub_address: evm.axelarnet_gw_addr.clone(),
             },

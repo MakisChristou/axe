@@ -115,6 +115,15 @@ If you find yourself reaching for `<'a>` on a bundle struct, ask: is the alloc a
 - Pattern: `feature/{types.rs, helpers.rs, mod.rs}` where `mod.rs` is the orchestrator and the others hold reusable building blocks. Keep file scope narrow.
 - Imports always at the top of the module; never `use` inside a function body.
 
+### Extending load tests
+
+- Add or reject every protocol/chain pairing in `load_test/route.rs`. Route modules receive a validated route; do not recreate string-based compatibility checks downstream.
+- Put source-chain submission behind the narrow `TransactionSubmitter` capability. Choose `run_burst`, `run_serial`, or the existing sustained scheduler deliberately based on the chain's account model. Do not imply that every source supports every mode; Sui is intentionally sequential burst-only today.
+- Put destination observation behind the focused GMP or ITS verification target. Keep protocol routing and destination-specific verification explicit; do not create a single all-purpose chain trait.
+- Use the unit and identifier wrappers at internal boundaries (`Wei`, `Lamports`, `Stroops`, `Drops`, `Mist`, `TokenId`, `MessageId`, `PayloadHash`). Convert to SDK primitives only inside the chain adapter.
+- Route entry points should read as orchestration: prepare, start verification, submit, finish verification, report. Funding, deployment, signing, RPC decoding, retries, and polling belong one layer down.
+- Preserve established CLI, output, retry, timeout, concurrency, and key-pool behavior during refactors. Add pure contract tests for route validity, scheduling, normalization, and timing merge; live transactions require explicit approval.
+
 ### Deterministic over LLM
 
 - If a rule can be expressed as a lint or a hook, do that — don't rely on review or memory to catch it.
