@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use eyre::{Result, WrapErr};
 use tokio::task::JoinSet;
 
-use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentity, TxMetrics};
+use super::run_sizing::SustainedPlan;
 use super::submitter::TransactionSubmitter;
 use super::verify::PendingTx;
 use crate::ui;
@@ -106,23 +107,20 @@ where
 /// - `send_done` + verify channel: signalled when the send phase finishes.
 /// - `spinner`: progress bar for live display.
 pub(super) async fn run_sustained_loop(
-    tps: usize,
-    duration_secs: u64,
-    key_cycle: usize,
+    plan: SustainedPlan,
     mut nonces: Option<Vec<u64>>,
     mut make_task: MakeTask,
     send_done: Option<Arc<AtomicBool>>,
     spinner: indicatif::ProgressBar,
 ) -> Result<SustainedResult> {
-    if tps == 0 || duration_secs == 0 || key_cycle == 0 {
-        eyre::bail!("sustained schedule values must all be greater than zero");
-    }
-    let total_expected = u64::try_from(tps)
-        .wrap_err("sustained TPS exceeds the supported transaction count")?
-        .checked_mul(duration_secs)
-        .ok_or_else(|| eyre::eyre!("sustained transaction count overflow"))?;
-    tps.checked_mul(key_cycle)
-        .ok_or_else(|| eyre::eyre!("sustained key-pool size overflow"))?;
+    // `SustainedPlan` comes from `RunSizing`, which already rejected zeros and
+    // overflowing products, so the schedule needs no re-validation here.
+    let SustainedPlan {
+        tps,
+        duration_secs,
+        key_cycle,
+    } = plan;
+    let total_expected = plan.total_transactions();
 
     let src_confirmed = Arc::new(AtomicU64::new(0));
     let src_failed = Arc::new(AtomicU64::new(0));
@@ -255,16 +253,14 @@ pub(super) async fn run_sustained_loop(
 /// Build a `LoadTestReport` from the sustained loop result.
 pub(super) fn build_sustained_report(
     result: SustainedResult,
-    source_chain: &str,
-    destination_chain: &str,
+    run: RunIdentity,
     destination_address: &str,
     total_expected: u64,
     num_keys: usize,
 ) -> LoadTestReport {
     LoadTestReport::from_transactions(
         ReportInput {
-            source_chain: source_chain.to_string(),
-            destination_chain: destination_chain.to_string(),
+            run,
             destination_address: destination_address.to_string(),
             num_txs: total_expected,
             num_keys,
@@ -281,8 +277,10 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use super::{ItsPendingTxAdapter, MakeTask, run_sustained_loop, submission_tasks};
-    use crate::commands::load_test::metrics::TxMetrics;
+    use super::{
+        ItsPendingTxAdapter, MakeTask, SustainedPlan, run_sustained_loop, submission_tasks,
+    };
+    use crate::commands::load_test::metrics::{TxMetrics, TxOutcome};
     use crate::commands::load_test::submitter::TransactionSubmitter;
 
     #[derive(Clone, Copy)]
@@ -309,9 +307,9 @@ mod tests {
                 compute_units: None,
                 slot: None,
                 outcome: if job.succeeds {
-                    TxMetrics::succeeded_outcome()
+                    TxOutcome::Succeeded
                 } else {
-                    TxMetrics::failed_outcome("submission failed")
+                    TxOutcome::failed("submission failed")
                 },
                 payload: Vec::new(),
                 payload_hash: String::new(),
@@ -407,9 +405,11 @@ mod tests {
         });
 
         let error = run_sustained_loop(
-            1,
-            1,
-            1,
+            SustainedPlan {
+                tps: 1,
+                duration_secs: 1,
+                key_cycle: 1,
+            },
             None,
             make_task,
             Some(Arc::clone(&send_done)),

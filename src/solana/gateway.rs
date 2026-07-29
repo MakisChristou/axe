@@ -22,7 +22,7 @@ use solana_transaction_status::{
 };
 
 use super::rpc::{fetch_confirmed_tx, fetch_tx_details, rpc_client};
-use crate::commands::load_test::metrics::TxMetrics;
+use crate::commands::load_test::metrics::{TxMetrics, TxOutcome};
 use crate::types::Network;
 use crate::ui;
 
@@ -124,7 +124,7 @@ pub fn send_call_contract(
         latency_ms: Some(latency_ms),
         compute_units,
         slot,
-        outcome: TxMetrics::succeeded_outcome(),
+        outcome: TxOutcome::Succeeded,
         payload_hash: String::new(),
         source_address: String::new(),
         gmp_destination_chain: String::new(),

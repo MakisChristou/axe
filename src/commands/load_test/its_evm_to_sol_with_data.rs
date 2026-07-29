@@ -15,13 +15,14 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signer::Signer;
 
 use super::its_prerequisites::{self, GatewayRequirement};
-use super::its_verification::{
-    ItsBurstReport, ItsVerificationRoute, ItsVerificationSession, SolanaItsTarget, finish_burst,
-};
+use super::its_verification;
+use super::its_verification::{ItsBurstReport, SolanaItsTarget, finish_burst};
 use super::keypairs;
-use super::metrics::{ComputeUnitSummary, TxMetrics};
-use super::run_sizing::RunSizing;
+use super::metrics::{ComputeUnitSummary, TxMetrics, TxOutcome};
+use super::run_sizing::{RunSizing, SustainedPlan};
 use super::submitter::TransactionSubmitter;
+use super::verification_session::VerificationSession;
+use super::verify::VerificationRoute;
 use super::{
     LoadTestArgs, check_evm_balance, read_its_cache, save_its_cache, validate_evm_rpc,
     validate_solana_rpc,
@@ -490,7 +491,11 @@ async fn run_sustained_pipeline(
     transfer_ctx: &TransferContext,
 ) -> eyre::Result<()> {
     let dest = &args.destination_chain;
-    let (tps, duration_secs, key_cycle) = sizing.sustained().expect("sustained mode");
+    let SustainedPlan {
+        tps,
+        duration_secs,
+        key_cycle,
+    } = sizing.sustained().expect("sustained mode");
     let nonce_provider = ProviderBuilder::new().connect_http(evm_rpc_url.parse()?);
     let mut nonces: Vec<u64> = Vec::with_capacity(sizing.num_keys);
     for signer in derived {
@@ -506,8 +511,8 @@ async fn run_sustained_pipeline(
         .contract_address("VotingVerifier", &args.source_chain)
         .is_ok();
 
-    let mut verification = ItsVerificationSession::start(
-        ItsVerificationRoute::from_args(args),
+    let mut verification = VerificationSession::start(
+        VerificationRoute::from_args(args),
         SolanaItsTarget {
             rpc_url: args.destination_rpc.clone(),
         },
@@ -527,25 +532,27 @@ async fn run_sustained_pipeline(
     );
 
     let result = super::sustained::run_sustained_loop(
-        tps,
-        duration_secs,
-        key_cycle,
+        SustainedPlan {
+            tps,
+            duration_secs,
+            key_cycle,
+        },
         Some(nonces),
         make_task,
         Some(verification.send_done()),
         spinner,
     )
     .await?;
-    verification
-        .finish_sustained(
-            args,
-            result,
-            &format!("{}", transfer_ctx.its_proxy_addr),
-            sizing.total_expected,
-            sizing.num_keys,
-            test_start,
-        )
-        .await
+    its_verification::finish_sustained(
+        verification,
+        args,
+        result,
+        &format!("{}", transfer_ctx.its_proxy_addr),
+        sizing.total_expected,
+        sizing.num_keys,
+        test_start,
+    )
+    .await
 }
 
 /// Drive the burst-mode pipeline: fan out the EVM ITS-with-data transfers,
@@ -558,9 +565,7 @@ async fn run_burst_pipeline(
     transfer_ctx: &TransferContext,
 ) -> eyre::Result<()> {
     let dest = &args.destination_chain;
-    let num_txs = sizing
-        .burst_count()
-        .expect("burst pipeline requires burst sizing");
+    let num_txs = sizing.num_keys;
     let its_proxy_addr = transfer_ctx.its_proxy_addr;
 
     let test_start = Instant::now();
@@ -600,7 +605,7 @@ async fn run_burst_pipeline(
 
     finish_burst(
         args,
-        &SolanaItsTarget {
+        SolanaItsTarget {
             rpc_url: args.destination_rpc.clone(),
         },
         burst,
@@ -895,7 +900,7 @@ async fn execute_interchain_transfer_with_data<P: Provider>(
                                 latency_ms: Some(latency_ms),
                                 compute_units: Some(receipt.gas_used),
                                 slot: receipt.block_number,
-                                outcome: TxMetrics::succeeded_outcome(),
+                                outcome: TxOutcome::Succeeded,
                                 payload: Vec::new(),
                                 payload_hash,
                                 source_address,
@@ -935,7 +940,7 @@ fn make_failure_with_hash(
         latency_ms: None,
         compute_units: None,
         slot: None,
-        outcome: TxMetrics::failed_outcome(error.to_string()),
+        outcome: TxOutcome::failed(error.to_string()),
         payload: Vec::new(),
         payload_hash: String::new(),
         source_address: String::new(),

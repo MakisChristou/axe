@@ -9,7 +9,10 @@ const EVM_RECEIPT_TIMEOUT: Duration = Duration::from_secs(60);
 
 use super::LoadTestArgs;
 use super::keypairs;
-use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+use super::metrics::{
+    ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentity, TxMetrics, TxOutcome,
+};
+use super::run_sizing::SustainedPlan;
 use super::submitter::TransactionSubmitter;
 use crate::evm::{ContractCall, SenderReceiver};
 use crate::types::Network;
@@ -276,8 +279,7 @@ pub async fn run_load_test_with_metrics(
 
     let report = LoadTestReport::from_transactions(
         ReportInput {
-            source_chain: args.source_chain.clone(),
-            destination_chain: args.destination_chain.clone(),
+            run: RunIdentity::from_args(args),
             destination_address: dest_addr,
             num_txs: args.num_txs,
             num_keys: num_txs,
@@ -370,7 +372,7 @@ async fn execute_and_record_evm<P: Provider>(
                         latency_ms: Some(latency_ms),
                         compute_units: Some(receipt.gas_used),
                         slot: receipt.block_number,
-                        outcome: TxMetrics::succeeded_outcome(),
+                        outcome: TxOutcome::Succeeded,
                         payload: payload.to_vec(),
                         payload_hash,
                         source_address: format!("{sender_receiver_addr}"),
@@ -578,9 +580,11 @@ pub(super) async fn run_sustained_load_test_with_metrics(
         });
 
     let result = super::sustained::run_sustained_loop(
-        tps,
-        duration_secs,
-        key_cycle,
+        SustainedPlan {
+            tps,
+            duration_secs,
+            key_cycle,
+        },
         Some(nonces),
         make_task,
         send_done,
@@ -590,8 +594,7 @@ pub(super) async fn run_sustained_load_test_with_metrics(
 
     Ok(super::sustained::build_sustained_report(
         result,
-        &args.source_chain,
-        &args.destination_chain,
+        RunIdentity::from_args(args),
         destination_address,
         total_expected,
         pool_size,
@@ -615,7 +618,7 @@ fn make_failure_with_hash(
         latency_ms: None,
         compute_units: None,
         slot: None,
-        outcome: TxMetrics::failed_outcome(error.to_string()),
+        outcome: TxOutcome::failed(error.to_string()),
         payload: Vec::new(),
         payload_hash: String::new(),
         source_address: String::new(),

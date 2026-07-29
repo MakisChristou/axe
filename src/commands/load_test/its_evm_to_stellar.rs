@@ -10,12 +10,13 @@ use std::time::Instant;
 
 use super::its_evm_source::EvmTokenRunSizing as RunSizing;
 use super::its_prerequisites::{self, GatewayRequirement};
-use super::its_verification::{
-    ItsBurstReport, ItsVerificationRoute, ItsVerificationSession, StellarItsTarget, finish_burst,
-};
+use super::its_verification;
+use super::its_verification::{ItsBurstReport, StellarItsTarget, finish_burst};
 use super::keypairs;
 use super::metrics::ComputeUnitSummary;
-use super::run_sizing::RunSizing as ValidatedRunSizing;
+use super::run_sizing::{RunSizing as ValidatedRunSizing, SustainedPlan};
+use super::verification_session::VerificationSession;
+use super::verify::VerificationRoute;
 use super::{LoadTestArgs, check_evm_balance, read_its_cache, validate_evm_rpc};
 use crate::config::ChainsConfig;
 use crate::evm::{ERC20, InterchainTokenService};
@@ -491,7 +492,11 @@ async fn run_sustained_pipeline(
     stellar_recipient_addr: &str,
     sizing: &RunSizing,
 ) -> eyre::Result<()> {
-    let (tps, duration_secs, key_cycle) = sizing.sustained().expect("sustained mode");
+    let SustainedPlan {
+        tps,
+        duration_secs,
+        key_cycle,
+    } = sizing.sustained().expect("sustained mode");
 
     let nonce_provider = ProviderBuilder::new().connect_http(transfer.rpc_url.parse()?);
     let mut nonces: Vec<u64> = Vec::with_capacity(sizing.num_keys);
@@ -504,8 +509,8 @@ async fn run_sustained_pipeline(
         .axelar
         .contract_address("VotingVerifier", &args.source_axelar_id)
         .is_ok();
-    let mut verification = ItsVerificationSession::start(
-        ItsVerificationRoute::from_args(args),
+    let mut verification = VerificationSession::start(
+        VerificationRoute::from_args(args),
         StellarItsTarget {
             rpc_url: stellar.rpc.clone(),
             network_type: stellar.network_type.clone(),
@@ -548,25 +553,27 @@ async fn run_sustained_pipeline(
     );
 
     let result = super::sustained::run_sustained_loop(
-        tps,
-        duration_secs,
-        key_cycle,
+        SustainedPlan {
+            tps,
+            duration_secs,
+            key_cycle,
+        },
         Some(nonces),
         make_task,
         Some(verification.send_done()),
         spinner,
     )
     .await?;
-    verification
-        .finish_sustained(
-            args,
-            result,
-            stellar_recipient_addr,
-            sizing.total_expected,
-            sizing.num_keys,
-            test_start,
-        )
-        .await
+    its_verification::finish_sustained(
+        verification,
+        args,
+        result,
+        stellar_recipient_addr,
+        sizing.total_expected,
+        sizing.num_keys,
+        test_start,
+    )
+    .await
 }
 
 /// Drive the burst-mode pipeline: fan out one `interchainTransfer` per derived
@@ -579,9 +586,7 @@ async fn run_burst_pipeline(
     stellar_recipient_addr: &str,
     sizing: &RunSizing,
 ) -> eyre::Result<()> {
-    let num_txs = sizing
-        .burst_count()
-        .expect("burst pipeline requires burst sizing");
+    let num_txs = sizing.num_keys;
 
     let test_start = Instant::now();
     let burst = super::its_evm_source::run_its_burst(
@@ -600,7 +605,7 @@ async fn run_burst_pipeline(
     .await?;
     finish_burst(
         args,
-        &StellarItsTarget {
+        StellarItsTarget {
             rpc_url: stellar.rpc.clone(),
             network_type: stellar.network_type.clone(),
             gateway_contract: stellar.gateway_addr.clone(),

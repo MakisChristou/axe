@@ -38,6 +38,7 @@ mod submitter;
 mod sustained;
 mod task_group;
 mod units;
+mod verification_session;
 mod verify;
 mod xrpl_sender;
 

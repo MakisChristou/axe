@@ -3,7 +3,10 @@ use std::time::Instant;
 
 use super::LoadTestArgs;
 use super::keypairs;
-use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+use super::metrics::{
+    ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentity, TxMetrics, TxOutcome,
+};
+use super::run_sizing::SustainedPlan;
 use super::submitter::TransactionSubmitter;
 use super::sustained;
 use crate::solana;
@@ -179,8 +182,7 @@ pub async fn run_load_test_with_metrics(
     .await?;
     let report = LoadTestReport::from_transactions(
         ReportInput {
-            source_chain: args.source_chain.clone(),
-            destination_chain: args.destination_chain.clone(),
+            run: RunIdentity::from_args(args),
             destination_address: destination_address.to_string(),
             num_txs: args.num_txs,
             num_keys: key_count,
@@ -223,7 +225,7 @@ fn send_sol_tx(
                 latency_ms: None,
                 compute_units: None,
                 slot: None,
-                outcome: TxMetrics::failed_outcome(e.to_string()),
+                outcome: TxOutcome::failed(e.to_string()),
                 payload: Vec::new(),
                 payload_hash: String::new(),
                 source_address: String::new(),
@@ -351,7 +353,7 @@ pub(super) async fn run_sustained_load_test_with_metrics(
                 latency_ms: None,
                 compute_units: None,
                 slot: None,
-                outcome: TxMetrics::failed_outcome(format!("task panicked: {e}")),
+                outcome: TxOutcome::failed(format!("task panicked: {e}")),
                 payload: Vec::new(),
                 payload_hash: String::new(),
                 source_address: String::new(),
@@ -388,9 +390,11 @@ pub(super) async fn run_sustained_load_test_with_metrics(
     });
 
     let result = sustained::run_sustained_loop(
-        tps,
-        duration_secs,
-        key_cycle,
+        SustainedPlan {
+            tps,
+            duration_secs,
+            key_cycle,
+        },
         None,
         make_task,
         send_done.clone(),
@@ -400,8 +404,7 @@ pub(super) async fn run_sustained_load_test_with_metrics(
 
     Ok(sustained::build_sustained_report(
         result,
-        &args.source_chain,
-        &args.destination_chain,
+        RunIdentity::from_args(args),
         destination_address,
         total_expected,
         pool_size,

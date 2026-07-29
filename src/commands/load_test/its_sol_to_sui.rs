@@ -24,8 +24,8 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signer;
 
 use super::its_sol_source;
-use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
-use super::run_sizing::RunSizing;
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentity, TxMetrics};
+use super::run_sizing::{RunSizing, SustainedPlan};
 use super::{
     LoadTestArgs, finalize_sui_dest_run_its, load_sui_main_wallet, read_sui_axe_token_id,
     sui_its_dest_lookup, validate_solana_rpc,
@@ -52,9 +52,6 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
 
     // ----- Sizing -----
     let sizing = RunSizing::new(&args)?;
-    let sustained_params = sizing
-        .sustained()
-        .map(|(tps, duration_secs, _)| (tps as u64, duration_secs));
     let total_to_send = sizing.total_expected;
 
     // ----- Main keypair -----
@@ -142,14 +139,21 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
         source_account: source_ata,
     };
 
-    let send = if let Some((tps, duration_secs, key_cycle)) = sizing.sustained() {
+    let send = if let Some(SustainedPlan {
+        tps,
+        duration_secs,
+        key_cycle,
+    }) = sizing.sustained()
+    {
         let spinner = ui::wait_spinner(&format!(
             "[0/{duration_secs}s] starting sustained ITS send..."
         ));
         let result = super::sustained::run_sustained_loop(
-            tps,
-            duration_secs,
-            key_cycle,
+            SustainedPlan {
+                tps,
+                duration_secs,
+                key_cycle,
+            },
             None,
             its_sol_source::its_sustained_tasks(submitter, vec![job; sizing.num_keys], None),
             None,
@@ -162,9 +166,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
             test_duration_secs: result.test_duration_secs,
         }
     } else {
-        let num_txs = sizing
-            .burst_count()
-            .expect("burst path requires burst sizing");
+        let num_txs = sizing.num_keys;
         let result = its_sol_source::run_its_burst(submitter, vec![job; num_txs], 1).await?;
         SendResult {
             metrics: result.metrics,
@@ -175,8 +177,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
 
     let mut report = LoadTestReport::from_transactions(
         ReportInput {
-            source_chain: src.to_string(),
-            destination_chain: dest.to_string(),
+            run: RunIdentity::from_args(&args),
             destination_address: sui_wallet.address_hex(),
             num_txs: args.num_txs,
             num_keys: send.total_submitted as usize,
@@ -186,11 +187,6 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
         },
         send.metrics,
     );
-    if let Some((tps, duration_secs)) = sustained_params {
-        report.tps = Some(tps);
-        report.duration_secs = Some(duration_secs);
-    }
-
     finalize_sui_dest_run_its(&args, &mut report, &sui_rpc, test_start).await
 }
 

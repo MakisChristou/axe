@@ -24,11 +24,12 @@ use serde_json::json;
 use super::evm_sender;
 use super::gmp_verification;
 use super::helpers::list_gateway_chains;
-use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput};
-use super::run_sizing::RunSizing;
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentity};
+use super::run_sizing::{RunSizing, SustainedPlan};
 use super::sol_sender;
 use super::stellar_sender;
 use super::sustained;
+use super::verification_session;
 use super::verify;
 use super::{
     LoadTestArgs, check_evm_balance, deploy_or_reuse_sender_receiver, deploy_sender_receiver,
@@ -182,14 +183,14 @@ pub(super) async fn run_sol_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
     let sustained = !RunSizing::new(&args)?.is_burst();
 
     let mut report = if sustained {
-        let mut verification = gmp_verification::GmpVerificationSession::start(
-            gmp_verification::GmpVerificationRoute::from_args(&args),
+        let mut verification = verification_session::VerificationSession::start(
+            verify::VerificationRoute::from_args(&args),
             gmp_verification::EvmGmpStreamingTarget {
                 address: destination_address.clone(),
                 gateway_addr,
                 rpc_url: args.destination_rpc.clone(),
                 legacy: false,
-                message_matcher: gmp_verification::MessageMatcher::Solana,
+                message_matcher: verification_session::MessageMatcher::Solana,
             },
         );
 
@@ -199,7 +200,7 @@ pub(super) async fn run_sol_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
             &destination_address,
             Some(verification.sender()),
             Some(verification.send_done()),
-            verification.take_spinner_sender()?,
+            verification.spinner_sender()?,
         )
         .await?;
 
@@ -210,8 +211,8 @@ pub(super) async fn run_sol_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
             sol_sender::run_load_test_with_metrics(&args, &destination_address, true).await?;
         gmp_verification::attach_batch(
             &args,
-            &gmp_verification::EvmGmpTarget {
-                address: &destination_address,
+            gmp_verification::EvmGmpTarget {
+                address: destination_address.to_string(),
                 gateway_addr,
                 provider: &provider,
                 source_type: verify::SourceChainType::Svm,
@@ -223,7 +224,7 @@ pub(super) async fn run_sol_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
         report
     };
 
-    finish_report(&args, &mut report, test_start)
+    finish_report(&mut report, test_start)
 }
 
 pub(super) async fn run_evm_to_sol(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
@@ -310,8 +311,8 @@ pub(super) async fn run_evm_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
     let sustained = !RunSizing::new(&args)?.is_burst();
 
     let mut report = if sustained {
-        let mut verification = gmp_verification::GmpVerificationSession::start(
-            gmp_verification::GmpVerificationRoute::from_args(&args),
+        let mut verification = verification_session::VerificationSession::start(
+            verify::VerificationRoute::from_args(&args),
             gmp_verification::SolanaGmpStreamingTarget {
                 address: destination_address.to_string(),
                 rpc_url: args.destination_rpc.clone(),
@@ -327,7 +328,7 @@ pub(super) async fn run_evm_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
                 destination_address,
                 verify_tx: Some(verification.sender()),
                 send_done: Some(verification.send_done()),
-                verify_spinner_tx: verification.take_spinner_sender()?,
+                verify_spinner_tx: verification.spinner_sender()?,
                 evm_destination: false,
             })
             .await?;
@@ -347,9 +348,9 @@ pub(super) async fn run_evm_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
 
         gmp_verification::attach_batch(
             &args,
-            &gmp_verification::SolanaGmpTarget {
-                address: destination_address,
-                rpc_url: &args.destination_rpc,
+            gmp_verification::SolanaGmpTarget {
+                address: destination_address.to_string(),
+                rpc_url: args.destination_rpc.to_string(),
                 source_type: verify::SourceChainType::Evm,
             },
             &mut report,
@@ -358,7 +359,7 @@ pub(super) async fn run_evm_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
         report
     };
 
-    finish_report(&args, &mut report, test_start)
+    finish_report(&mut report, test_start)
 }
 
 pub(super) async fn run_evm_to_evm(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
@@ -508,14 +509,14 @@ pub(super) async fn run_evm_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
     let sustained = !RunSizing::new(&args)?.is_burst();
 
     let mut report = if sustained {
-        let mut verification = gmp_verification::GmpVerificationSession::start(
-            gmp_verification::GmpVerificationRoute::from_args(&args),
+        let mut verification = verification_session::VerificationSession::start(
+            verify::VerificationRoute::from_args(&args),
             gmp_verification::EvmGmpStreamingTarget {
                 address: destination_address.clone(),
                 gateway_addr: dest_gateway_addr,
                 rpc_url: dest_rpc_url.clone(),
                 legacy: legacy_route,
-                message_matcher: gmp_verification::MessageMatcher::Exact,
+                message_matcher: verification_session::MessageMatcher::Exact,
             },
         );
 
@@ -528,7 +529,7 @@ pub(super) async fn run_evm_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
                 destination_address: &destination_address,
                 verify_tx: Some(verification.sender()),
                 send_done: Some(verification.send_done()),
-                verify_spinner_tx: verification.take_spinner_sender()?,
+                verify_spinner_tx: verification.spinner_sender()?,
                 evm_destination: true,
             })
             .await?;
@@ -548,8 +549,8 @@ pub(super) async fn run_evm_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
 
         gmp_verification::attach_batch(
             &args,
-            &gmp_verification::EvmGmpTarget {
-                address: &destination_address,
+            gmp_verification::EvmGmpTarget {
+                address: destination_address.to_string(),
                 gateway_addr: dest_gateway_addr,
                 provider: &dest_read_provider,
                 source_type: verify::SourceChainType::Evm,
@@ -561,7 +562,7 @@ pub(super) async fn run_evm_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
         report
     };
 
-    finish_report(&args, &mut report, test_start)
+    finish_report(&mut report, test_start)
 }
 
 pub(super) async fn run_sol_to_sol(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
@@ -595,8 +596,8 @@ pub(super) async fn run_sol_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
     let sustained = !RunSizing::new(&args)?.is_burst();
 
     let mut report = if sustained {
-        let mut verification = gmp_verification::GmpVerificationSession::start(
-            gmp_verification::GmpVerificationRoute::from_args(&args),
+        let mut verification = verification_session::VerificationSession::start(
+            verify::VerificationRoute::from_args(&args),
             gmp_verification::SolanaGmpStreamingTarget {
                 address: destination_address.to_string(),
                 rpc_url: args.destination_rpc.clone(),
@@ -609,7 +610,7 @@ pub(super) async fn run_sol_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
             destination_address,
             Some(verification.sender()),
             Some(verification.send_done()),
-            verification.take_spinner_sender()?,
+            verification.spinner_sender()?,
         )
         .await?;
 
@@ -621,9 +622,9 @@ pub(super) async fn run_sol_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
 
         gmp_verification::attach_batch(
             &args,
-            &gmp_verification::SolanaGmpTarget {
-                address: destination_address,
-                rpc_url: &args.destination_rpc,
+            gmp_verification::SolanaGmpTarget {
+                address: destination_address.to_string(),
+                rpc_url: args.destination_rpc.to_string(),
                 source_type: verify::SourceChainType::Svm,
             },
             &mut report,
@@ -632,7 +633,7 @@ pub(super) async fn run_sol_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
         report
     };
 
-    finish_report(&args, &mut report, test_start)
+    finish_report(&mut report, test_start)
 }
 
 // ---------------------------------------------------------------------------
@@ -762,15 +763,20 @@ pub(super) async fn run_stellar_to_evm(args: LoadTestArgs, _run_start: Instant) 
     };
 
     let test_start = Instant::now();
-    let mut report = if let Some((tps, duration_secs, key_cycle)) = sustained_params {
-        let mut verification = gmp_verification::GmpVerificationSession::start(
-            gmp_verification::GmpVerificationRoute::from_args(&args),
+    let mut report = if let Some(SustainedPlan {
+        tps,
+        duration_secs,
+        key_cycle,
+    }) = sustained_params
+    {
+        let mut verification = verification_session::VerificationSession::start(
+            verify::VerificationRoute::from_args(&args),
             gmp_verification::EvmGmpStreamingTarget {
                 address: destination_address.clone(),
                 gateway_addr,
                 rpc_url: evm_rpc_url.clone(),
                 legacy: false,
-                message_matcher: gmp_verification::MessageMatcher::Exact,
+                message_matcher: verification_session::MessageMatcher::Exact,
             },
         );
 
@@ -778,7 +784,7 @@ pub(super) async fn run_stellar_to_evm(args: LoadTestArgs, _run_start: Instant) 
             "[0/{duration_secs}s] starting sustained Stellar GMP send..."
         ));
         verification
-            .take_spinner_sender()?
+            .spinner_sender()?
             .send(spinner.clone())
             .map_err(|_| eyre::eyre!("GMP verification task stopped before sending"))?;
 
@@ -812,8 +818,7 @@ pub(super) async fn run_stellar_to_evm(args: LoadTestArgs, _run_start: Instant) 
 
         let mut report = sustained::build_sustained_report(
             result,
-            src,
-            dest,
+            RunIdentity::from_args(&args),
             &destination_address,
             run_sizing.total_expected,
             num_keys,
@@ -830,7 +835,7 @@ pub(super) async fn run_stellar_to_evm(args: LoadTestArgs, _run_start: Instant) 
                 destination_chain: &args.destination_axelar_id,
                 destination_address: &destination_address,
                 payload_override,
-                source_chain: src,
+                run: RunIdentity::from_args(&args),
                 gas_token_contract: stellar_gas_token,
                 gas_amount_stroops: gas_stroops,
             },
@@ -838,8 +843,8 @@ pub(super) async fn run_stellar_to_evm(args: LoadTestArgs, _run_start: Instant) 
         .await?;
         gmp_verification::attach_batch(
             &args,
-            &gmp_verification::EvmGmpTarget {
-                address: &destination_address,
+            gmp_verification::EvmGmpTarget {
+                address: destination_address.to_string(),
                 gateway_addr,
                 provider: &provider,
                 source_type: verify::SourceChainType::Stellar,
@@ -851,7 +856,7 @@ pub(super) async fn run_stellar_to_evm(args: LoadTestArgs, _run_start: Instant) 
         report
     };
 
-    finish_report(&args, &mut report, test_start)
+    finish_report(&mut report, test_start)
 }
 
 // ===========================================================================
@@ -937,11 +942,11 @@ pub(super) async fn run_evm_to_stellar(args: LoadTestArgs, _run_start: Instant) 
     let signer_pk: [u8; 32] = alloy::primitives::keccak256(signer.address().as_slice()).into();
     gmp_verification::attach_batch(
         &args,
-        &gmp_verification::StellarGmpTarget {
-            contract: &stellar_example_addr,
-            rpc_url: stellar_rpc,
-            network_type: &stellar_network_type,
-            gateway_contract: &stellar_gateway_addr,
+        gmp_verification::StellarGmpTarget {
+            contract: stellar_example_addr.to_string(),
+            rpc_url: stellar_rpc.to_string(),
+            network_type: stellar_network_type.to_string(),
+            gateway_contract: stellar_gateway_addr.to_string(),
             signer_pk,
             source_type: verify::SourceChainType::Evm,
         },
@@ -949,7 +954,7 @@ pub(super) async fn run_evm_to_stellar(args: LoadTestArgs, _run_start: Instant) 
     )
     .await?;
 
-    finish_report(&args, &mut report, test_start)
+    finish_report(&mut report, test_start)
 }
 
 pub(super) async fn run_stellar_to_sol(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
@@ -1031,7 +1036,7 @@ pub(super) async fn run_stellar_to_sol(args: LoadTestArgs, _run_start: Instant) 
         destination_chain: &args.destination_axelar_id,
         destination_address: &destination_address,
         payload_override,
-        source_chain: src,
+        run: RunIdentity::from_args(&args),
         gas_token_contract: stellar_xlm,
         gas_amount_stroops: gas_stroops,
     })
@@ -1040,16 +1045,16 @@ pub(super) async fn run_stellar_to_sol(args: LoadTestArgs, _run_start: Instant) 
 
     gmp_verification::attach_batch(
         &args,
-        &gmp_verification::SolanaGmpTarget {
-            address: &destination_address,
-            rpc_url: &solana_rpc,
+        gmp_verification::SolanaGmpTarget {
+            address: destination_address.to_string(),
+            rpc_url: solana_rpc.to_string(),
             source_type: verify::SourceChainType::Stellar,
         },
         &mut report,
     )
     .await?;
 
-    finish_report(&args, &mut report, test_start)
+    finish_report(&mut report, test_start)
 }
 
 pub(super) async fn run_sol_to_stellar(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
@@ -1091,11 +1096,11 @@ pub(super) async fn run_sol_to_stellar(args: LoadTestArgs, _run_start: Instant) 
 
     gmp_verification::attach_batch(
         &args,
-        &gmp_verification::StellarGmpTarget {
-            contract: &stellar_example_addr,
-            rpc_url: stellar_rpc,
-            network_type: &stellar_network_type,
-            gateway_contract: &stellar_gateway_addr,
+        gmp_verification::StellarGmpTarget {
+            contract: stellar_example_addr.to_string(),
+            rpc_url: stellar_rpc.to_string(),
+            network_type: stellar_network_type.to_string(),
+            gateway_contract: stellar_gateway_addr.to_string(),
             signer_pk,
             source_type: verify::SourceChainType::Svm,
         },
@@ -1103,7 +1108,7 @@ pub(super) async fn run_sol_to_stellar(args: LoadTestArgs, _run_start: Instant) 
     )
     .await?;
 
-    finish_report(&args, &mut report, test_start)
+    finish_report(&mut report, test_start)
 }
 
 // ===========================================================================
@@ -1243,8 +1248,7 @@ pub(super) async fn run_sui_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
 
     let mut report = LoadTestReport::from_transactions(
         ReportInput {
-            source_chain: src.to_string(),
-            destination_chain: dest.to_string(),
+            run: RunIdentity::from_args(&args),
             destination_address: destination_address.clone(),
             num_txs: burst.total_submitted,
             num_keys: 1,
@@ -1257,8 +1261,8 @@ pub(super) async fn run_sui_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
 
     gmp_verification::attach_batch(
         &args,
-        &gmp_verification::EvmGmpTarget {
-            address: &destination_address,
+        gmp_verification::EvmGmpTarget {
+            address: destination_address.to_string(),
             gateway_addr,
             provider: &provider,
             source_type: verify::SourceChainType::Sui,
@@ -1268,7 +1272,7 @@ pub(super) async fn run_sui_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
     )
     .await?;
 
-    finish_report(&args, &mut report, test_start)
+    finish_report(&mut report, test_start)
 }
 
 // ===========================================================================
@@ -1376,8 +1380,7 @@ pub(super) async fn run_sui_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
 
     let mut report = LoadTestReport::from_transactions(
         ReportInput {
-            source_chain: src.to_string(),
-            destination_chain: dest.to_string(),
+            run: RunIdentity::from_args(&args),
             destination_address: destination_address.clone(),
             num_txs: burst.total_submitted,
             num_keys: 1,
@@ -1390,16 +1393,16 @@ pub(super) async fn run_sui_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
 
     gmp_verification::attach_batch(
         &args,
-        &gmp_verification::SolanaGmpTarget {
-            address: &destination_address,
-            rpc_url: &solana_rpc,
+        gmp_verification::SolanaGmpTarget {
+            address: destination_address.to_string(),
+            rpc_url: solana_rpc.to_string(),
             source_type: verify::SourceChainType::Sui,
         },
         &mut report,
     )
     .await?;
 
-    finish_report(&args, &mut report, test_start)
+    finish_report(&mut report, test_start)
 }
 
 // ===========================================================================
@@ -1586,7 +1589,7 @@ pub(super) async fn run_stellar_to_sui(args: LoadTestArgs, _run_start: Instant) 
         destination_chain: &args.destination_axelar_id,
         destination_address: &sui_channel,
         payload_override,
-        source_chain: src,
+        run: RunIdentity::from_args(&args),
         gas_token_contract: stellar_xlm,
         gas_amount_stroops: gas_stroops,
     })

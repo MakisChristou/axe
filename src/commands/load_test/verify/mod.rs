@@ -9,6 +9,10 @@ use tokio::sync::mpsc;
 
 use super::identifiers::{MessageId, PayloadHash};
 use super::metrics::{AmplifierTiming, PeakThroughput, TxMetrics, VerificationReport};
+
+/// Per-message amplifier timings a streaming verifier reports alongside its
+/// summary, keyed by protocol message id.
+pub type StreamingTimings = Vec<(super::identifiers::MessageId, AmplifierTiming)>;
 use crate::config::ChainsConfig;
 use crate::cosmos::read_axelar_rpc;
 use crate::evm::AxelarAmplifierGateway;
@@ -279,11 +283,11 @@ async fn run_its_hub_evm_pipeline<P: Provider>(
 fn streaming_report_and_timings(
     txs: &[PendingTx],
     peaks: PeakThroughput,
-) -> (VerificationReport, Vec<(String, AmplifierTiming)>) {
+) -> (VerificationReport, StreamingTimings) {
     let report = compute_verification_report(txs, &mut [], peaks);
-    let timings: Vec<(String, AmplifierTiming)> = txs
+    let timings: StreamingTimings = txs
         .iter()
-        .map(|tx| (tx.message_id.clone().into_string(), tx.timing.clone()))
+        .map(|tx| (tx.message_id.clone(), tx.timing.clone()))
         .collect();
     (report, timings)
 }
@@ -410,14 +414,15 @@ fn pending_tx_for_gmp_batch(args: PendingGmpBatchArgs<'_>) -> Result<PendingTx> 
 /// 3. **Approved** — EVM gateway isMessageApproved
 /// 4. **Executed** — EVM approval consumed
 pub async fn verify_onchain<P: Provider>(
-    request: GmpBatchVerification<'_, EvmGmpDestination<'_, P>>,
+    metrics: &mut [TxMetrics],
+    request: GmpBatchVerification<EvmGmpDestination<&P>>,
 ) -> Result<VerificationReport> {
     let GmpBatchVerification {
         route:
             VerificationRoute {
-                config,
-                source_chain,
-                destination_chain,
+                ref config,
+                ref source_chain,
+                ref destination_chain,
                 network,
             },
         destination:
@@ -426,7 +431,6 @@ pub async fn verify_onchain<P: Provider>(
                 gateway_addr,
                 provider,
             },
-        metrics,
         source_type,
     } = request;
     let confirmed = confirmed_indices(metrics);
@@ -445,21 +449,23 @@ pub async fn verify_onchain<P: Provider>(
         .contract_address("VotingVerifier", destination_chain)
         .is_err()
     {
-        return verify_onchain_evm_legacy(GmpBatchVerification {
-            route: VerificationRoute {
-                config,
-                source_chain,
-                destination_chain,
-                network,
-            },
-            destination: EvmGmpDestination {
-                address: destination_address,
-                gateway_addr,
-                provider,
-            },
+        return verify_onchain_evm_legacy(
             metrics,
-            source_type,
-        })
+            GmpBatchVerification {
+                route: VerificationRoute {
+                    config: config.clone(),
+                    source_chain: source_chain.clone(),
+                    destination_chain: destination_chain.clone(),
+                    network,
+                },
+                destination: EvmGmpDestination {
+                    address: destination_address.clone(),
+                    gateway_addr,
+                    provider,
+                },
+                source_type,
+            },
+        )
         .await;
     }
 
@@ -552,14 +558,15 @@ pub(in crate::commands::load_test) fn classify_route(
 ///   gateway (`EvmLegacy`: read the on-chain `ContractCallApproved` commandId,
 ///   then `isCommandExecuted`) or the Amplifier gateway (`isMessageApproved`).
 pub async fn verify_onchain_evm_legacy<P: Provider>(
-    request: GmpBatchVerification<'_, EvmGmpDestination<'_, P>>,
+    metrics: &mut [TxMetrics],
+    request: GmpBatchVerification<EvmGmpDestination<&P>>,
 ) -> Result<VerificationReport> {
     let GmpBatchVerification {
         route:
             VerificationRoute {
-                config,
-                source_chain,
-                destination_chain,
+                ref config,
+                ref source_chain,
+                ref destination_chain,
                 network,
             },
         destination:
@@ -568,7 +575,6 @@ pub async fn verify_onchain_evm_legacy<P: Provider>(
                 gateway_addr,
                 provider,
             },
-        metrics,
         source_type,
     } = request;
     let confirmed = confirmed_indices(metrics);
@@ -672,14 +678,14 @@ pub async fn verify_onchain_evm_legacy<P: Provider>(
 /// Streaming version of `verify_onchain` for EVM destinations — runs
 /// concurrently with the send phase, receiving confirmed txs via the channel.
 pub async fn verify_onchain_evm_streaming(
-    request: StreamingVerification<'_, EvmGmpStreamingDestination<'_>>,
-) -> Result<(VerificationReport, Vec<(String, AmplifierTiming)>)> {
+    request: StreamingVerification<EvmGmpStreamingDestination>,
+) -> Result<(VerificationReport, StreamingTimings)> {
     let StreamingVerification {
         route:
             VerificationRoute {
-                config,
-                source_chain,
-                destination_chain,
+                ref config,
+                ref source_chain,
+                ref destination_chain,
                 network,
             },
         destination:
@@ -739,14 +745,14 @@ pub async fn verify_onchain_evm_streaming(
 /// channel. `from_block` is captured here, before the first tx arrives, so the
 /// `ContractCallApproved` scan has a sound lower bound.
 pub async fn verify_onchain_evm_legacy_streaming(
-    request: StreamingVerification<'_, EvmGmpStreamingDestination<'_>>,
-) -> Result<(VerificationReport, Vec<(String, AmplifierTiming)>)> {
+    request: StreamingVerification<EvmGmpStreamingDestination>,
+) -> Result<(VerificationReport, StreamingTimings)> {
     let StreamingVerification {
         route:
             VerificationRoute {
-                config,
-                source_chain,
-                destination_chain,
+                ref config,
+                ref source_chain,
+                ref destination_chain,
                 network,
             },
         destination:
@@ -826,14 +832,15 @@ pub async fn verify_onchain_evm_legacy_streaming(
 /// `is_message_approved` / `is_message_executed` Soroban view calls
 /// instead of an EVM gateway or Solana PDA.
 pub async fn verify_onchain_stellar_gmp(
-    request: GmpBatchVerification<'_, StellarGmpDestination<'_>>,
+    metrics: &mut [TxMetrics],
+    request: GmpBatchVerification<StellarGmpDestination>,
 ) -> Result<VerificationReport> {
     let GmpBatchVerification {
         route:
             VerificationRoute {
-                config,
-                source_chain,
-                destination_chain,
+                ref config,
+                ref source_chain,
+                ref destination_chain,
                 network,
             },
         destination:
@@ -844,7 +851,6 @@ pub async fn verify_onchain_stellar_gmp(
                 gateway_contract: stellar_gateway,
                 signer_pk,
             },
-        metrics,
         source_type,
     } = request;
     let confirmed = confirmed_indices(metrics);
@@ -881,7 +887,7 @@ pub async fn verify_onchain_stellar_gmp(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let stellar_client = crate::stellar::StellarClient::new(stellar_rpc, stellar_network_type)?;
+    let stellar_client = crate::stellar::StellarClient::new(&stellar_rpc, &stellar_network_type)?;
     let checker = StellarDestinationVerifier {
         client: stellar_client,
         gateway_contract: stellar_gateway.to_string(),
@@ -1036,14 +1042,15 @@ pub(super) fn tx_to_pending_its(tx: &TxMetrics, has_voting_verifier: bool) -> Re
 /// Uses Sui events polling (`MessageApproved` / `MessageExecuted` on the
 /// AxelarGateway events module) for the destination-side phases.
 pub async fn verify_onchain_sui_gmp(
-    request: GmpBatchVerification<'_, SuiGmpDestination<'_>>,
+    metrics: &mut [TxMetrics],
+    request: GmpBatchVerification<SuiGmpDestination>,
 ) -> Result<VerificationReport> {
     let GmpBatchVerification {
         route:
             VerificationRoute {
-                config,
-                source_chain,
-                destination_chain,
+                ref config,
+                ref source_chain,
+                ref destination_chain,
                 network,
             },
         destination:
@@ -1051,7 +1058,6 @@ pub async fn verify_onchain_sui_gmp(
                 address: destination_address,
                 rpc_url: sui_rpc,
             },
-        metrics,
         source_type,
     } = request;
     let confirmed = confirmed_indices(metrics);
@@ -1067,7 +1073,7 @@ pub async fn verify_onchain_sui_gmp(
         cosm_gateway,
     } = load_gmp_axelar_config(config, source_chain, destination_chain)?;
     let gateway_pkg = crate::sui::read_sui_gateway_pkg(config, destination_chain)?;
-    let sui_client = crate::sui::SuiClient::new(sui_rpc);
+    let sui_client = crate::sui::SuiClient::new(&sui_rpc);
 
     let initial_phase = if voting_verifier.is_some() {
         Phase::Voted
@@ -1129,14 +1135,14 @@ pub async fn verify_onchain_sui_gmp(
 /// Runs verification concurrently with the send phase. Receives confirmed
 /// transactions via the channel and starts polling them immediately.
 pub async fn verify_onchain_solana_streaming(
-    request: StreamingVerification<'_, SolanaGmpDestination<'_>>,
-) -> Result<(VerificationReport, Vec<(String, AmplifierTiming)>)> {
+    request: StreamingVerification<SolanaGmpDestination>,
+) -> Result<(VerificationReport, StreamingTimings)> {
     let StreamingVerification {
         route:
             VerificationRoute {
-                config,
-                source_chain,
-                destination_chain,
+                ref config,
+                ref source_chain,
+                ref destination_chain,
                 network,
             },
         destination:
@@ -1197,14 +1203,15 @@ pub async fn verify_onchain_solana_streaming(
 /// 3. **Approved** — Solana IncomingMessage PDA exists
 /// 4. **Executed** — Solana IncomingMessage PDA status = executed
 pub async fn verify_onchain_solana(
-    request: GmpBatchVerification<'_, SolanaGmpDestination<'_>>,
+    metrics: &mut [TxMetrics],
+    request: GmpBatchVerification<SolanaGmpDestination>,
 ) -> Result<VerificationReport> {
     let GmpBatchVerification {
         route:
             VerificationRoute {
-                config,
-                source_chain,
-                destination_chain,
+                ref config,
+                ref source_chain,
+                ref destination_chain,
                 network,
             },
         destination:
@@ -1212,7 +1219,6 @@ pub async fn verify_onchain_solana(
                 address: destination_address,
                 rpc_url: solana_rpc,
             },
-        metrics,
         source_type,
     } = request;
     let confirmed = confirmed_indices(metrics);
@@ -1304,20 +1310,20 @@ pub async fn verify_onchain_solana(
 /// 5. **Approved** — Solana IncomingMessage PDA exists
 /// 6. **Executed** — Solana IncomingMessage PDA status = executed
 pub async fn verify_onchain_solana_its(
-    request: ItsBatchVerification<'_, SolanaItsDestination<'_>>,
+    metrics: &mut [TxMetrics],
+    request: ItsBatchVerification<SolanaItsDestination>,
 ) -> Result<VerificationReport> {
     let ItsBatchVerification {
         route:
             VerificationRoute {
-                config,
-                source_chain,
-                destination_chain,
+                ref config,
+                ref source_chain,
+                ref destination_chain,
                 network,
             },
         destination: SolanaItsDestination {
             rpc_url: solana_rpc,
         },
-        metrics,
     } = request;
     let confirmed = confirmed_indices(metrics);
     if confirmed.is_empty() {
@@ -1377,18 +1383,18 @@ pub async fn verify_onchain_solana_its(
 /// This is the ITS counterpart to [`verify_onchain_sui_gmp`], which handles
 /// only single-leg raw GMP to Sui and so can't see the hub→Sui second leg.
 pub async fn verify_onchain_sui_its(
-    request: ItsBatchVerification<'_, SuiItsDestination<'_>>,
+    metrics: &mut [TxMetrics],
+    request: ItsBatchVerification<SuiItsDestination>,
 ) -> Result<VerificationReport> {
     let ItsBatchVerification {
         route:
             VerificationRoute {
-                config,
-                source_chain,
-                destination_chain,
+                ref config,
+                ref source_chain,
+                ref destination_chain,
                 network,
             },
         destination: SuiItsDestination { rpc_url: sui_rpc },
-        metrics,
     } = request;
     let confirmed = confirmed_indices(metrics);
     if confirmed.is_empty() {
@@ -1429,7 +1435,7 @@ pub async fn verify_onchain_sui_its(
             rpc,
             cosm_gateway_dest,
             network,
-            dest: SuiItsDestinationVerifier::new(sui_rpc, gateway_pkg),
+            dest: SuiItsDestinationVerifier::new(&sui_rpc, gateway_pkg),
         },
     )
     .await?;
@@ -1440,14 +1446,14 @@ pub async fn verify_onchain_sui_its(
 /// Streaming version of `verify_onchain_solana_its` — runs concurrently with
 /// the send phase, receiving confirmed txs via the channel.
 pub async fn verify_onchain_solana_its_streaming(
-    request: StreamingVerification<'_, SolanaItsDestination<'_>>,
-) -> Result<(VerificationReport, Vec<(String, AmplifierTiming)>)> {
+    request: StreamingVerification<SolanaItsDestination>,
+) -> Result<(VerificationReport, StreamingTimings)> {
     let StreamingVerification {
         route:
             VerificationRoute {
-                config,
-                source_chain,
-                destination_chain,
+                ref config,
+                ref source_chain,
+                ref destination_chain,
                 network,
             },
         destination: SolanaItsDestination {
@@ -1498,14 +1504,15 @@ pub async fn verify_onchain_solana_its_streaming(
 /// execution. The `signer_pk` is just the source account for simulate
 /// envelopes — read-only, no real authorization needed.
 pub async fn verify_onchain_stellar_its(
-    request: ItsBatchVerification<'_, StellarItsDestination<'_>>,
+    metrics: &mut [TxMetrics],
+    request: ItsBatchVerification<StellarItsDestination>,
 ) -> Result<VerificationReport> {
     let ItsBatchVerification {
         route:
             VerificationRoute {
-                config,
-                source_chain,
-                destination_chain,
+                ref config,
+                ref source_chain,
+                ref destination_chain,
                 network,
             },
         destination:
@@ -1515,7 +1522,6 @@ pub async fn verify_onchain_stellar_its(
                 gateway_contract: stellar_gateway_contract,
                 signer_pk,
             },
-        metrics,
     } = request;
     let confirmed = confirmed_indices(metrics);
     if confirmed.is_empty() {
@@ -1556,8 +1562,8 @@ pub async fn verify_onchain_stellar_its(
             cosm_gateway_dest,
             network,
             dest: StellarItsDestinationVerifier::new(
-                stellar_rpc,
-                stellar_network_type,
+                &stellar_rpc,
+                &stellar_network_type,
                 stellar_gateway_contract.to_string(),
                 signer_pk,
             )?,
@@ -1570,14 +1576,14 @@ pub async fn verify_onchain_stellar_its(
 
 /// Streaming variant of `verify_onchain_stellar_its`.
 pub async fn verify_onchain_stellar_its_streaming(
-    request: StreamingVerification<'_, StellarItsDestination<'_>>,
-) -> Result<(VerificationReport, Vec<(String, AmplifierTiming)>)> {
+    request: StreamingVerification<StellarItsDestination>,
+) -> Result<(VerificationReport, StreamingTimings)> {
     let StreamingVerification {
         route:
             VerificationRoute {
-                config,
-                source_chain,
-                destination_chain,
+                ref config,
+                ref source_chain,
+                ref destination_chain,
                 network,
             },
         destination:
@@ -1619,8 +1625,8 @@ pub async fn verify_onchain_stellar_its_streaming(
             cosm_gateway_dest,
             network,
             dest: StellarItsDestinationVerifier::new(
-                stellar_rpc,
-                stellar_network_type,
+                &stellar_rpc,
+                &stellar_network_type,
                 stellar_gateway_contract.to_string(),
                 signer_pk,
             )?,
@@ -1635,14 +1641,15 @@ pub async fn verify_onchain_stellar_its_streaming(
 /// account's `account_tx` for an inbound `Payment` whose `message_id` memo
 /// matches the second-leg message id (the XRPL relayer attaches that memo).
 pub async fn verify_onchain_xrpl_its(
-    request: ItsBatchVerification<'_, XrplItsDestination<'_>>,
+    metrics: &mut [TxMetrics],
+    request: ItsBatchVerification<XrplItsDestination>,
 ) -> Result<VerificationReport> {
     let ItsBatchVerification {
         route:
             VerificationRoute {
-                config,
-                source_chain,
-                destination_chain,
+                ref config,
+                ref source_chain,
+                ref destination_chain,
                 network,
             },
         destination:
@@ -1650,7 +1657,6 @@ pub async fn verify_onchain_xrpl_its(
                 rpc_url: xrpl_rpc,
                 recipient: xrpl_recipient,
             },
-        metrics,
     } = request;
     let confirmed = confirmed_indices(metrics);
     if confirmed.is_empty() {
@@ -1693,7 +1699,7 @@ pub async fn verify_onchain_xrpl_its(
             rpc,
             cosm_gateway_dest,
             network,
-            dest: XrplItsDestinationVerifier::new(xrpl_rpc, xrpl_recipient.to_string()),
+            dest: XrplItsDestinationVerifier::new(&xrpl_rpc, xrpl_recipient),
         },
     )
     .await?;
@@ -1703,14 +1709,14 @@ pub async fn verify_onchain_xrpl_its(
 
 /// Streaming variant of `verify_onchain_xrpl_its`.
 pub async fn verify_onchain_xrpl_its_streaming(
-    request: StreamingVerification<'_, XrplItsDestination<'_>>,
-) -> Result<(VerificationReport, Vec<(String, AmplifierTiming)>)> {
+    request: StreamingVerification<XrplItsDestination>,
+) -> Result<(VerificationReport, StreamingTimings)> {
     let StreamingVerification {
         route:
             VerificationRoute {
-                config,
-                source_chain,
-                destination_chain,
+                ref config,
+                ref source_chain,
+                ref destination_chain,
                 network,
             },
         destination:
@@ -1749,7 +1755,7 @@ pub async fn verify_onchain_xrpl_its_streaming(
             rpc,
             cosm_gateway_dest,
             network,
-            dest: XrplItsDestinationVerifier::new(xrpl_rpc, xrpl_recipient.to_string()),
+            dest: XrplItsDestinationVerifier::new(&xrpl_rpc, xrpl_recipient),
         },
     )
     .await?;
@@ -1770,14 +1776,15 @@ pub async fn verify_onchain_xrpl_its_streaming(
 /// 5. **Approved** — EVM gateway isMessageApproved (second-leg)
 /// 6. **Executed** — EVM approval consumed
 pub async fn verify_onchain_evm_its(
-    request: ItsBatchVerification<'_, EvmItsDestination<'_>>,
+    metrics: &mut [TxMetrics],
+    request: ItsBatchVerification<EvmItsDestination>,
 ) -> Result<VerificationReport> {
     let ItsBatchVerification {
         route:
             VerificationRoute {
-                config,
-                source_chain,
-                destination_chain,
+                ref config,
+                ref source_chain,
+                ref destination_chain,
                 network,
             },
         destination:
@@ -1785,7 +1792,6 @@ pub async fn verify_onchain_evm_its(
                 gateway_addr: evm_gateway_addr,
                 rpc_url: evm_rpc_url,
             },
-        metrics,
     } = request;
     let confirmed = confirmed_indices(metrics);
     if confirmed.is_empty() {
@@ -1869,14 +1875,14 @@ async fn its_evm_dest<P: Provider>(
 /// Streaming version of `verify_onchain_evm_its` — runs concurrently with
 /// the send phase, receiving confirmed txs via the channel.
 pub async fn verify_onchain_evm_its_streaming(
-    request: StreamingVerification<'_, EvmItsDestination<'_>>,
-) -> Result<(VerificationReport, Vec<(String, AmplifierTiming)>)> {
+    request: StreamingVerification<EvmItsDestination>,
+) -> Result<(VerificationReport, StreamingTimings)> {
     let StreamingVerification {
         route:
             VerificationRoute {
-                config,
-                source_chain,
-                destination_chain,
+                ref config,
+                ref source_chain,
+                ref destination_chain,
                 network,
             },
         destination:

@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use super::metrics::TxMetrics;
+use super::metrics::{TxMetrics, TxOutcome};
 use super::submitter::TransactionSubmitter;
 use super::units::Mist;
 use crate::sui::{SuiClient, SuiContractsConfig, SuiWallet};
@@ -83,7 +83,7 @@ impl TransactionSubmitter for GmpSuiSubmitter {
                     latency_ms: Some(latency_ms),
                     compute_units: None,
                     slot: None,
-                    outcome: TxMetrics::succeeded_outcome(),
+                    outcome: TxOutcome::Succeeded,
                     payload: job.payload,
                     payload_hash: result.payload_hash_hex,
                     source_address: format!("0x{}", result.source_address_hex),
@@ -95,9 +95,9 @@ impl TransactionSubmitter for GmpSuiSubmitter {
             }
             Ok(result) => failed_metrics(
                 job.payload,
-                TxMetrics::external_outcome(false, result.error, "Sui tx failed"),
+                TxOutcome::from_external(false, result.error, "Sui tx failed"),
             ),
-            Err(error) => failed_metrics(job.payload, TxMetrics::failed_outcome(error.to_string())),
+            Err(error) => failed_metrics(job.payload, TxOutcome::failed(error.to_string())),
         }
     }
 }

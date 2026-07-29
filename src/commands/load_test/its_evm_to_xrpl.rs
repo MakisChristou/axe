@@ -14,12 +14,13 @@
 use std::time::Instant;
 
 use super::its_prerequisites::{self, GatewayRequirement};
-use super::its_verification::{
-    ItsBurstReport, ItsVerificationRoute, ItsVerificationSession, XrplItsTarget, finish_burst,
-};
+use super::its_verification;
+use super::its_verification::{ItsBurstReport, XrplItsTarget, finish_burst};
 use super::keypairs;
 use super::metrics::ComputeUnitSummary;
-use super::run_sizing::RunSizing;
+use super::run_sizing::{RunSizing, SustainedPlan};
+use super::verification_session::VerificationSession;
+use super::verify::VerificationRoute;
 use super::{LoadTestArgs, check_evm_balance, validate_evm_rpc};
 use crate::config::ChainsConfig;
 use crate::cosmos::lcd_cosmwasm_smart_query;
@@ -434,7 +435,11 @@ async fn run_sustained_pipeline(
     its_ctx: &ItsCallCtx,
     sizing: &RunSizing,
 ) -> eyre::Result<()> {
-    let (tps, duration_secs, key_cycle) = sizing.sustained().expect("sustained mode");
+    let SustainedPlan {
+        tps,
+        duration_secs,
+        key_cycle,
+    } = sizing.sustained().expect("sustained mode");
 
     let nonce_provider = ProviderBuilder::new().connect_http(evm_rpc_url.parse()?);
     let mut nonces: Vec<u64> = Vec::with_capacity(sizing.num_keys);
@@ -447,8 +452,8 @@ async fn run_sustained_pipeline(
         .axelar
         .contract_address("VotingVerifier", &args.source_axelar_id)
         .is_ok();
-    let mut verification = ItsVerificationSession::start(
-        ItsVerificationRoute::from_args(args),
+    let mut verification = VerificationSession::start(
+        VerificationRoute::from_args(args),
         XrplItsTarget {
             rpc_url: xrpl.xrpl_rpc.clone(),
             recipient: xrpl.recipient_addr.clone(),
@@ -478,25 +483,27 @@ async fn run_sustained_pipeline(
     );
 
     let result = super::sustained::run_sustained_loop(
-        tps,
-        duration_secs,
-        key_cycle,
+        SustainedPlan {
+            tps,
+            duration_secs,
+            key_cycle,
+        },
         Some(nonces),
         make_task,
         Some(verification.send_done()),
         spinner,
     )
     .await?;
-    verification
-        .finish_sustained(
-            args,
-            result,
-            &xrpl.recipient_addr,
-            sizing.total_expected,
-            sizing.num_keys,
-            test_start,
-        )
-        .await
+    its_verification::finish_sustained(
+        verification,
+        args,
+        result,
+        &xrpl.recipient_addr,
+        sizing.total_expected,
+        sizing.num_keys,
+        test_start,
+    )
+    .await
 }
 
 /// Drive the burst-mode pipeline: fan out parallel `interchainTransfer`
@@ -529,7 +536,7 @@ async fn run_burst_pipeline(
     .await?;
     finish_burst(
         args,
-        &XrplItsTarget {
+        XrplItsTarget {
             rpc_url: xrpl.xrpl_rpc.clone(),
             recipient: xrpl.recipient_addr.clone(),
         },

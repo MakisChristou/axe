@@ -28,7 +28,7 @@ use super::report::compute_peak_throughput;
 use super::state::{Phase, RealTimeStats, SecondLeg, phase_counts};
 use super::{INACTIVITY_TIMEOUT, POLL_INTERVAL};
 use crate::commands::load_test::identifiers::PayloadHash;
-use crate::commands::load_test::metrics::PeakThroughput;
+use crate::commands::load_test::metrics::{AmplifierTiming, PeakThroughput};
 use crate::cosmos::{
     CosmwasmQueryError, CosmwasmQueryPending, discover_second_leg, lcd_cosmwasm_smart_query_typed,
 };
@@ -77,9 +77,7 @@ fn required_second_leg(tx: &PendingTx) -> Result<&SecondLeg> {
 }
 
 fn required_second_leg_payload_hash(tx: &PendingTx) -> Result<FixedBytes<32>> {
-    parse_payload_hash(&required_second_leg(tx)?.payload_hash)
-        .map(PayloadHash::into_fixed_bytes)
-        .wrap_err_with(|| format!("tx {} has invalid second-leg payload_hash", tx.message_id))
+    Ok(required_second_leg(tx)?.payload_hash.into_fixed_bytes())
 }
 
 enum ContractQueryObservation {
@@ -110,6 +108,26 @@ async fn observe_contract_query(
     }
 }
 
+/// Stamp the elapsed time into one Cosmos-side timing slot and advance every
+/// tx whose check came back positive. Returns whether anything moved.
+fn apply_cosmos_results(
+    txs: &mut [PendingTx],
+    results: Vec<(usize, bool)>,
+    timing_slot: impl Fn(&mut AmplifierTiming) -> &mut Option<f64>,
+    next_phase: Phase,
+) -> bool {
+    let mut progressed = false;
+    for (index, observed) in results {
+        if !observed {
+            continue;
+        }
+        let tx = &mut txs[index];
+        *timing_slot(&mut tx.timing) = Some(tx.send_instant.elapsed().as_secs_f64());
+        progressed |= tx.transition_to(next_phase);
+    }
+    progressed
+}
+
 fn apply_destination_observations(
     txs: &mut [PendingTx],
     observations: Vec<DestinationObservation>,
@@ -117,13 +135,17 @@ fn apply_destination_observations(
     let mut progressed = false;
     for DestinationObservation { index, status } in observations {
         let tx = &mut txs[index];
+        // A verifier that reports twice for the same tx in one cycle must not
+        // re-apply timings on top of a settled state.
+        if !tx.is_active() {
+            continue;
+        }
         match status {
             DestinationStatus::Pending => {}
             DestinationStatus::Approved { command_id } if tx.is_phase(Phase::Approved) => {
                 tx.command_id = command_id.or(tx.command_id);
                 tx.timing.approved_secs = Some(tx.send_instant.elapsed().as_secs_f64());
-                tx.transition_to(Phase::Executed);
-                progressed = true;
+                progressed |= tx.transition_to(Phase::Executed);
             }
             DestinationStatus::Executed { command_id } => {
                 tx.command_id = command_id.or(tx.command_id);
@@ -133,8 +155,7 @@ fn apply_destination_observations(
                 }
                 tx.timing.executed_secs = Some(elapsed);
                 tx.timing.executed_ok = Some(true);
-                tx.succeed(false);
-                progressed = true;
+                progressed |= tx.succeed(false);
             }
             DestinationStatus::Approved { .. } => {}
         }
@@ -324,9 +345,9 @@ fn mark_timed_out_tx(
         tx.succeed(true);
         return;
     }
-    let phase = tx
-        .phase()
-        .expect("timeout finalization only receives active transactions");
+    let Some(phase) = tx.phase() else {
+        return;
+    };
     let label = match phase {
         Phase::Voted => "VotingVerifier",
         Phase::Routed => "cosmos routing",
@@ -413,7 +434,7 @@ pub(super) async fn poll_pipeline<V: DestinationVerifier>(
 
     // For EVM destinations, derive the contract_addr from destination_address
     // so streaming PendingTx entries (which may have Address::ZERO) get the right value.
-    let default_contract_addr = if verifier.default_contract_address().is_some() {
+    let default_contract_addr = if verifier.needs_contract_address() {
         Some(destination_address.parse()?)
     } else {
         None
@@ -550,38 +571,38 @@ pub(super) async fn poll_pipeline<V: DestinationVerifier>(
         let routed_results = routed_results?;
         let hub_results = hub_results?;
 
-        // Apply Cosmos results
-        for (i, ok) in voted_results {
-            if ok {
-                txs[i].timing.voted_secs = Some(txs[i].send_instant.elapsed().as_secs_f64());
-                // No destination Cosmos Gateway (legacy/consensus destination)
-                // means there is no `routed` phase to observe — skip straight to
-                // the destination approval check so timings stay honest.
-                txs[i].transition_to(if cosm_gateway.is_some() {
-                    Phase::Routed
-                } else {
-                    Phase::Approved
-                });
-                scheduler.mark_progress();
-            }
-        }
-        for (i, ok) in routed_results {
-            if ok {
-                txs[i].timing.routed_secs = Some(txs[i].send_instant.elapsed().as_secs_f64());
-                txs[i].transition_to(if axelarnet_gateway.is_some() {
-                    Phase::HubApproved
-                } else {
-                    Phase::Approved
-                });
-                scheduler.mark_progress();
-            }
-        }
-        for (i, ok) in hub_results {
-            if ok {
-                txs[i].timing.hub_approved_secs = Some(txs[i].send_instant.elapsed().as_secs_f64());
-                txs[i].transition_to(Phase::Approved);
-                scheduler.mark_progress();
-            }
+        // Apply Cosmos results.
+        //
+        // No destination Cosmos Gateway (legacy/consensus destination) means
+        // there is no `routed` phase to observe — such a tx skips straight to
+        // the destination approval check so timings stay honest. The same
+        // applies to `hub_approved` when there is no AxelarnetGateway.
+        let cosmos_progress = apply_cosmos_results(
+            txs,
+            voted_results,
+            |timing| &mut timing.voted_secs,
+            if cosm_gateway.is_some() {
+                Phase::Routed
+            } else {
+                Phase::Approved
+            },
+        ) | apply_cosmos_results(
+            txs,
+            routed_results,
+            |timing| &mut timing.routed_secs,
+            if axelarnet_gateway.is_some() {
+                Phase::HubApproved
+            } else {
+                Phase::Approved
+            },
+        ) | apply_cosmos_results(
+            txs,
+            hub_results,
+            |timing| &mut timing.hub_approved_secs,
+            Phase::Approved,
+        );
+        if cosmos_progress {
+            scheduler.mark_progress();
         }
 
         // Chain-specific destination observations, followed by one shared
@@ -1059,8 +1080,7 @@ impl ItsHubVerifier<'_> {
             if approved {
                 txs[index].timing.voted_secs =
                     Some(txs[index].send_instant.elapsed().as_secs_f64());
-                txs[index].transition_to(Phase::HubApproved);
-                progressed = true;
+                progressed |= txs[index].transition_to(Phase::HubApproved);
             }
         }
         for (index, approved) in hub_results? {
@@ -1070,16 +1090,14 @@ impl ItsHubVerifier<'_> {
                     txs[index].timing.voted_secs = Some(elapsed);
                 }
                 txs[index].timing.hub_approved_secs = Some(elapsed);
-                txs[index].transition_to(Phase::DiscoverSecondLeg);
-                progressed = true;
+                progressed |= txs[index].transition_to(Phase::DiscoverSecondLeg);
             }
         }
         for (index, routed) in routed_results? {
             if routed {
                 txs[index].timing.routed_secs =
                     Some(txs[index].send_instant.elapsed().as_secs_f64());
-                txs[index].transition_to(Phase::Approved);
-                progressed = true;
+                progressed |= txs[index].transition_to(Phase::Approved);
             }
         }
 
@@ -1105,15 +1123,19 @@ impl ItsHubVerifier<'_> {
             if let Some(info) = info {
                 txs[index].second_leg = Some(SecondLeg {
                     message_id: info.message_id.into(),
-                    payload_hash: info.payload_hash,
+                    payload_hash: parse_payload_hash(&info.payload_hash).wrap_err_with(|| {
+                        format!(
+                            "tx {} has an invalid second-leg payload_hash",
+                            txs[index].message_id
+                        )
+                    })?,
                     source_address: info.source_address,
                     destination_address: info.destination_address,
                 });
-                txs[index].transition_to(match self.second_leg_target {
+                progressed |= txs[index].transition_to(match self.second_leg_target {
                     SecondLegTarget::Routed => Phase::Routed,
                     SecondLegTarget::DestinationApproval => Phase::Approved,
                 });
-                progressed = true;
             }
         }
 

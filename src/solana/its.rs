@@ -22,7 +22,7 @@ use super::encoding::{
     spl_associated_token_account_program_id,
 };
 use super::rpc::{fetch_tx_details, rpc_client};
-use crate::commands::load_test::metrics::TxMetrics;
+use crate::commands::load_test::metrics::{TxMetrics, TxOutcome};
 use crate::types::Network;
 
 /// Deploy an interchain token on Solana.
@@ -378,7 +378,7 @@ pub fn send_its_interchain_transfer(
         latency_ms: Some(latency_ms),
         compute_units,
         slot,
-        outcome: TxMetrics::succeeded_outcome(),
+        outcome: TxOutcome::Succeeded,
         // CosmWasm VotingVerifier rejects `0x`-prefixed hex (sees it as
         // invalid hex). Match the Sui/EVM convention (no prefix) so the
         // amplifier `messages_status` query parses.

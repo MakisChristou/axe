@@ -188,22 +188,13 @@ pub(crate) fn scrub_urls(input: &str) -> String {
     out
 }
 
-pub(crate) fn finish_report(
-    args: &LoadTestArgs,
-    report: &mut LoadTestReport,
-    run_start: Instant,
-) -> Result<()> {
-    report.protocol = format!("{}", args.protocol);
-    report.tps = args.tps;
-    report.duration_secs = args.duration_secs;
+pub(crate) fn finish_report(report: &mut LoadTestReport, run_start: Instant) -> Result<()> {
     // Scrub any URLs that upstream-crate errors may have folded into
     // per-tx error strings. Belt-and-suspenders alongside the error-template
     // refactor: private RPC URLs (from repo secrets) must not appear in the
     // JSON artifact, regardless of where the underlying error came from.
     for tx in &mut report.transactions {
-        if let Some(err) = tx.error_mut() {
-            *err = scrub_urls(err);
-        }
+        tx.map_error(scrub_urls);
     }
     print_final_report(report);
 
@@ -1175,9 +1166,9 @@ pub(crate) async fn finalize_sui_dest_run(
 ) -> Result<()> {
     super::gmp_verification::finish_batch(
         args,
-        &super::gmp_verification::SuiGmpTarget {
-            address: sui_channel,
-            rpc_url: sui_rpc,
+        super::gmp_verification::SuiGmpTarget {
+            address: sui_channel.to_string(),
+            rpc_url: sui_rpc.to_string(),
             source_type,
         },
         report,
@@ -1198,7 +1189,7 @@ pub(crate) async fn finalize_sui_dest_run_its(
 ) -> Result<()> {
     super::its_verification::finish_batch(
         args,
-        &super::its_verification::SuiItsTarget {
+        super::its_verification::SuiItsTarget {
             rpc_url: sui_rpc.to_string(),
         },
         report,

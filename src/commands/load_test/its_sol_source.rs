@@ -11,7 +11,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
 
 use super::identifiers::TokenId;
-use super::metrics::TxMetrics;
+use super::metrics::{TxMetrics, TxOutcome};
 use super::submitter::TransactionSubmitter;
 use super::units::Lamports;
 use crate::solana;
@@ -117,7 +117,7 @@ impl ItsSolanaSubmitter {
             latency_ms: None,
             compute_units: None,
             slot: None,
-            outcome: TxMetrics::failed_outcome(error),
+            outcome: TxOutcome::failed(error),
             payload: Vec::new(),
             payload_hash: String::new(),
             source_address,

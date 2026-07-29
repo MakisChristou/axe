@@ -7,14 +7,25 @@ use super::LoadTestArgs;
 /// A validated load-test run mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RunMode {
-    Burst {
-        num_txs: u64,
-    },
-    Sustained {
-        tps: usize,
-        duration_secs: u64,
-        key_cycle: usize,
-    },
+    Burst { num_txs: u64 },
+    Sustained(SustainedPlan),
+}
+
+/// A validated sustained-mode schedule. Named fields keep call sites from
+/// destructuring a positional tuple whose three numbers all look alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SustainedPlan {
+    pub tps: usize,
+    pub duration_secs: u64,
+    pub key_cycle: usize,
+}
+
+impl SustainedPlan {
+    /// Total transactions the schedule will fire. Overflow-free: `RunSizing`
+    /// rejects any `tps * duration_secs` that does not fit in a `u64`.
+    pub fn total_transactions(self) -> u64 {
+        (self.tps as u64).saturating_mul(self.duration_secs)
+    }
 }
 
 /// Validated run mode plus the derived wallet and transaction counts.
@@ -66,11 +77,11 @@ impl RunSizing {
                 })?;
 
                 Ok(Self {
-                    mode: RunMode::Sustained {
+                    mode: RunMode::Sustained(SustainedPlan {
                         tps,
                         duration_secs,
                         key_cycle,
-                    },
+                    }),
                     num_keys,
                     total_expected,
                 })
@@ -85,32 +96,21 @@ impl RunSizing {
         matches!(self.mode, RunMode::Burst { .. })
     }
 
-    pub fn burst_count(self) -> Option<usize> {
-        match self.mode {
-            RunMode::Burst { .. } => Some(self.num_keys),
-            RunMode::Sustained { .. } => None,
-        }
-    }
-
-    pub fn sustained(self) -> Option<(usize, u64, usize)> {
+    pub fn sustained(self) -> Option<SustainedPlan> {
         match self.mode {
             RunMode::Burst { .. } => None,
-            RunMode::Sustained {
-                tps,
-                duration_secs,
-                key_cycle,
-            } => Some((tps, duration_secs, key_cycle)),
+            RunMode::Sustained(plan) => Some(plan),
         }
     }
 
     pub fn transactions_per_key(self) -> u64 {
         match self.mode {
             RunMode::Burst { .. } => 1,
-            RunMode::Sustained {
+            RunMode::Sustained(SustainedPlan {
                 duration_secs,
                 key_cycle,
                 ..
-            } => duration_secs.div_ceil(key_cycle as u64),
+            }) => duration_secs.div_ceil(key_cycle as u64),
         }
     }
 }
@@ -121,7 +121,7 @@ fn nonzero(value: u64, flag: &str) -> Result<NonZeroU64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunMode, RunSizing};
+    use super::{RunMode, RunSizing, SustainedPlan};
 
     #[test]
     fn sizes_burst_run() {
@@ -138,11 +138,11 @@ mod tests {
 
         assert_eq!(
             sizing.mode,
-            RunMode::Sustained {
+            RunMode::Sustained(SustainedPlan {
                 tps: 4,
                 duration_secs: 10,
                 key_cycle: 3,
-            }
+            })
         );
         assert_eq!(sizing.num_keys, 12);
         assert_eq!(sizing.total_expected, 40);

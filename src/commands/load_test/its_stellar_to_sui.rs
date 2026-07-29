@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use eyre::{Result, eyre};
 
 use super::its_stellar_source::{ItsStellarSubmitJob, ItsStellarSubmitter};
-use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput};
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentity};
 use super::run_sizing::RunSizing;
 use super::{
     LoadTestArgs, finalize_sui_dest_run_its, load_stellar_main_wallet, load_sui_main_wallet,
@@ -56,7 +56,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
     let sizing = RunSizing::new(&args)?;
     let sustained_params = sizing
         .sustained()
-        .map(|(tps, duration_secs, _)| (tps as u64, duration_secs));
+        .map(|plan| (plan.tps as u64, plan.duration_secs));
 
     // ----- Stellar source setup -----
     let stellar_rpc = &args.source_rpc;
@@ -154,8 +154,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
     .await?;
     let mut report = LoadTestReport::from_transactions(
         ReportInput {
-            source_chain: src.to_string(),
-            destination_chain: dest.to_string(),
+            run: RunIdentity::from_args(&args),
             destination_address: sui_wallet.address_hex(),
             num_txs: args.num_txs,
             num_keys: total_to_send as usize,
@@ -165,10 +164,5 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
         },
         send.metrics,
     );
-    if let Some((tps, duration_secs)) = sustained_params {
-        report.tps = Some(tps);
-        report.duration_secs = Some(duration_secs);
-    }
-
     finalize_sui_dest_run_its(&args, &mut report, &sui_rpc, test_start).await
 }

@@ -19,11 +19,12 @@ use super::its_stellar_source::{
     amount_per_key, derive_and_fund_wallets, distribute_token_balances, parse_gas_stroops,
     setup_token, transfer_amount,
 };
-use super::its_verification::{
-    ItsBurstReport, ItsVerificationRoute, ItsVerificationSession, SolanaItsTarget, finish_burst,
-};
+use super::its_verification;
+use super::its_verification::{ItsBurstReport, SolanaItsTarget, finish_burst};
 use super::metrics::ComputeUnitSummary;
-use super::run_sizing::RunSizing;
+use super::run_sizing::{RunSizing, SustainedPlan};
+use super::verification_session::VerificationSession;
+use super::verify::VerificationRoute;
 use super::{LoadTestArgs, validate_solana_rpc};
 use crate::config::ChainsConfig;
 use crate::stellar::{StellarClient, StellarWallet};
@@ -288,9 +289,13 @@ async fn run_sustained_pipeline(
     transfer: &ItsTransferSpec,
     sizing: &RunSizing,
 ) -> Result<()> {
-    let (tps_n, duration_secs, key_cycle) = sizing.sustained().expect("sustained mode");
-    let mut verification = ItsVerificationSession::start(
-        ItsVerificationRoute::from_args(args),
+    let SustainedPlan {
+        tps: tps_n,
+        duration_secs,
+        key_cycle,
+    } = sizing.sustained().expect("sustained mode");
+    let mut verification = VerificationSession::start(
+        VerificationRoute::from_args(args),
         SolanaItsTarget {
             rpc_url: args.destination_rpc.clone(),
         },
@@ -324,16 +329,16 @@ async fn run_sustained_pipeline(
         spinner,
     })
     .await?;
-    verification
-        .finish_sustained(
-            args,
-            result,
-            &solana.recipient.to_string(),
-            sizing.total_expected,
-            sizing.num_keys,
-            test_start,
-        )
-        .await
+    its_verification::finish_sustained(
+        verification,
+        args,
+        result,
+        &solana.recipient.to_string(),
+        sizing.total_expected,
+        sizing.num_keys,
+        test_start,
+    )
+    .await
 }
 
 /// Drive the burst-mode pipeline: fan out the Stellar transfers, build the
@@ -373,7 +378,7 @@ async fn run_burst_pipeline(
     let num_txs = burst.total_submitted;
     finish_burst(
         args,
-        &SolanaItsTarget {
+        SolanaItsTarget {
             rpc_url: args.destination_rpc.clone(),
         },
         burst,

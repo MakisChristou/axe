@@ -36,7 +36,7 @@ use eyre::eyre;
 
 use super::identifiers::TokenId;
 use super::keypairs;
-use super::metrics::TxMetrics;
+use super::metrics::{TxMetrics, TxOutcome};
 use super::run_sizing::RunSizing;
 use super::submitter::TransactionSubmitter;
 use super::units::Wei;
@@ -804,7 +804,7 @@ fn receipt_to_metrics(
             latency_ms: Some(latency_ms),
             compute_units: Some(receipt.gas_used),
             slot: receipt.block_number,
-            outcome: TxMetrics::succeeded_outcome(),
+            outcome: TxOutcome::Succeeded,
             payload: Vec::new(),
             payload_hash: alloy::hex::encode(payload_hash_bytes.as_slice()),
             source_address: format!("{its_proxy}"),
@@ -901,7 +901,7 @@ fn make_failure_with_hash(
         latency_ms: None,
         compute_units: None,
         slot: None,
-        outcome: TxMetrics::failed_outcome(error.to_string()),
+        outcome: TxOutcome::failed(error.to_string()),
         payload: Vec::new(),
         payload_hash: String::new(),
         source_address: String::new(),

@@ -7,7 +7,7 @@
 use std::time::Instant;
 
 use super::identifiers::TokenId;
-use super::metrics::TxMetrics;
+use super::metrics::{TxMetrics, TxOutcome};
 use super::submitter::TransactionSubmitter;
 use super::units::Mist;
 use crate::sui::{SuiClient, SuiItsContractsConfig, SuiWallet};
@@ -61,7 +61,7 @@ impl TransactionSubmitter for ItsSuiSubmitter {
                     latency_ms: Some(latency_ms),
                     compute_units: None,
                     slot: None,
-                    outcome: TxMetrics::succeeded_outcome(),
+                    outcome: TxOutcome::Succeeded,
                     payload: Vec::new(),
                     payload_hash: result.payload_hash_hex,
                     source_address: format!("0x{}", result.source_address_hex),
@@ -71,12 +71,12 @@ impl TransactionSubmitter for ItsSuiSubmitter {
                     amplifier_timing: None,
                 }
             }
-            Ok(result) => failed_metrics(TxMetrics::external_outcome(
+            Ok(result) => failed_metrics(TxOutcome::from_external(
                 false,
                 result.error,
                 "Sui ITS tx failed",
             )),
-            Err(error) => failed_metrics(TxMetrics::failed_outcome(error.to_string())),
+            Err(error) => failed_metrics(TxOutcome::failed(error.to_string())),
         }
     }
 }

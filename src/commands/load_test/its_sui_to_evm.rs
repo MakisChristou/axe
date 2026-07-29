@@ -27,10 +27,8 @@ use eyre::{Result, eyre};
 
 use super::gmp_sui_source::{DEFAULT_GAS_BUDGET, DEFAULT_GAS_VALUE};
 use super::its_sui_source::{ItsSuiSubmitter, run_its_sequential};
-use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput};
-use super::{
-    LoadTestArgs, finish_report, load_sui_main_wallet, resolve_sui_axe_token, validate_evm_rpc,
-};
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentity};
+use super::{LoadTestArgs, load_sui_main_wallet, resolve_sui_axe_token, validate_evm_rpc};
 use crate::config::ChainsConfig;
 use crate::ui;
 
@@ -192,8 +190,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
 
     let mut report = LoadTestReport::from_transactions(
         ReportInput {
-            source_chain: src.to_string(),
-            destination_chain: dest.to_string(),
+            run: RunIdentity::from_args(&args),
             destination_address: destination_address.clone(),
             num_txs: burst.total_submitted,
             num_keys: 1,
@@ -204,21 +201,14 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
         burst.metrics,
     );
 
-    let verification = super::verify::verify_onchain_evm_its(super::verify::ItsBatchVerification {
-        route: super::verify::VerificationRoute {
-            config: &args.config,
-            source_chain: &args.source_axelar_id,
-            destination_chain: &args.destination_axelar_id,
-            network: args.network,
-        },
-        destination: super::verify::EvmItsDestination {
+    super::its_verification::finish_batch(
+        &args,
+        super::its_verification::EvmItsTarget {
             gateway_addr: evm_gateway_addr,
-            rpc_url: &evm_rpc_url,
+            rpc_url: evm_rpc_url,
         },
-        metrics: &mut report.transactions,
-    })
-    .await?;
-    report.verification = Some(verification);
-
-    finish_report(&args, &mut report, test_start)
+        &mut report,
+        test_start,
+    )
+    .await
 }

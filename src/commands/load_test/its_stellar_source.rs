@@ -8,8 +8,8 @@ use eyre::{Result, eyre};
 use rand::RngCore;
 
 use super::identifiers::TokenId;
-use super::metrics::TxMetrics;
-use super::run_sizing::RunSizing;
+use super::metrics::{TxMetrics, TxOutcome};
+use super::run_sizing::{RunSizing, SustainedPlan};
 use super::submitter::TransactionSubmitter;
 use super::sustained;
 use super::units::Stroops;
@@ -54,7 +54,7 @@ pub(super) fn amount_per_key(sizing: &RunSizing, key_cycle: u64, decimals: u32) 
     if sizing.is_burst() {
         scale_to_decimals(WHOLE_TOKENS_PER_KEY, decimals) / 100
     } else {
-        let (_, duration_secs, _) = sizing.sustained().expect("sustained mode");
+        let duration_secs = sizing.sustained().expect("sustained mode").duration_secs;
         let txs_per_key = duration_secs.div_ceil(key_cycle) as u128;
         transfer_amount(decimals)
             .saturating_mul(txs_per_key)
@@ -468,7 +468,7 @@ pub(super) async fn submit_transfer(request: TransferRequest<'_>) -> TxMetrics {
                 latency_ms: Some(submit_time_ms),
                 compute_units: None,
                 slot: None,
-                outcome: TxMetrics::external_outcome(
+                outcome: TxOutcome::from_external(
                     invoked.success,
                     None,
                     "interchain_transfer reverted",
@@ -491,7 +491,7 @@ pub(super) async fn submit_transfer(request: TransferRequest<'_>) -> TxMetrics {
                 latency_ms: None,
                 compute_units: None,
                 slot: None,
-                outcome: TxMetrics::failed_outcome(error.to_string()),
+                outcome: TxOutcome::failed(error.to_string()),
                 payload: Vec::new(),
                 payload_hash: String::new(),
                 source_address: source_addr,
@@ -584,9 +584,11 @@ pub(super) async fn run_sustained(
     let make_task = its_sustained_tasks(args.submitter, jobs, args.verify_tx);
 
     sustained::run_sustained_loop(
-        args.tps,
-        args.duration_secs,
-        args.key_cycle,
+        SustainedPlan {
+            tps: args.tps,
+            duration_secs: args.duration_secs,
+            key_cycle: args.key_cycle,
+        },
         None,
         make_task,
         args.send_done,

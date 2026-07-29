@@ -23,8 +23,8 @@ use std::time::Instant;
 
 use super::its_prerequisites::{self, GatewayRequirement};
 use super::keypairs;
-use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput};
-use super::run_sizing::RunSizing;
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentity};
+use super::run_sizing::{RunSizing, SustainedPlan};
 use super::{
     LoadTestArgs, check_evm_balance, finalize_sui_dest_run_its, load_sui_main_wallet,
     read_sui_axe_token_id, sui_its_dest_lookup, validate_evm_rpc,
@@ -234,11 +234,7 @@ async fn run_burst_pipeline(
     sizing: &RunSizing,
     amount_per_tx: U256,
 ) -> eyre::Result<()> {
-    let src = &args.source_chain;
-    let dest = &args.destination_chain;
-    let num_txs = sizing
-        .burst_count()
-        .expect("burst pipeline requires burst sizing");
+    let num_txs = sizing.num_keys;
     let test_start = Instant::now();
     let gas_value = U256::from(evm.gas_value_wei);
     let gas_arg_scaling_factor =
@@ -259,8 +255,7 @@ async fn run_burst_pipeline(
     .await?;
     let mut report = LoadTestReport::from_transactions(
         ReportInput {
-            source_chain: src.to_string(),
-            destination_chain: dest.to_string(),
+            run: RunIdentity::from_args(args),
             destination_address: sui.recipient_display.clone(),
             num_txs: args.num_txs,
             num_keys: num_txs,
@@ -282,9 +277,11 @@ async fn run_sustained_pipeline(
     sizing: &RunSizing,
     amount_per_tx: U256,
 ) -> eyre::Result<()> {
-    let src = &args.source_chain;
-    let dest = &args.destination_chain;
-    let (tps_usize, duration_secs, key_cycle) = sizing.sustained().expect("sustained mode");
+    let SustainedPlan {
+        tps: tps_usize,
+        duration_secs,
+        key_cycle,
+    } = sizing.sustained().expect("sustained mode");
 
     // Pre-fetch each derived signer's nonce so the rate-limited loop can
     // bump them locally per dispatch (avoids RPC round-trips on each tx).
@@ -319,9 +316,11 @@ async fn run_sustained_pipeline(
     );
 
     let result = super::sustained::run_sustained_loop(
-        tps_usize,
-        duration_secs,
-        key_cycle,
+        SustainedPlan {
+            tps: tps_usize,
+            duration_secs,
+            key_cycle,
+        },
         Some(nonces),
         make_task,
         None,
@@ -331,14 +330,11 @@ async fn run_sustained_pipeline(
 
     let mut report = super::sustained::build_sustained_report(
         result,
-        src,
-        dest,
+        RunIdentity::from_args(args),
         &sui.recipient_display,
         sizing.total_expected,
         sizing.num_keys,
     );
-    report.tps = Some(tps_usize as u64);
-    report.duration_secs = Some(duration_secs);
 
     finalize_sui_dest_run_its(args, &mut report, &sui.rpc, test_start).await
 }

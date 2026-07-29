@@ -16,6 +16,10 @@ pub(crate) enum TxOutcome {
 }
 
 impl TxOutcome {
+    pub(crate) fn failed(error: impl Into<String>) -> Self {
+        Self::Failed(error.into())
+    }
+
     pub(crate) fn from_external(
         success: bool,
         error: Option<String>,
@@ -112,22 +116,6 @@ pub struct TxMetrics {
 }
 
 impl TxMetrics {
-    pub(crate) const fn succeeded_outcome() -> TxOutcome {
-        TxOutcome::Succeeded
-    }
-
-    pub(crate) fn failed_outcome(error: impl Into<String>) -> TxOutcome {
-        TxOutcome::Failed(error.into())
-    }
-
-    pub(crate) fn external_outcome(
-        success: bool,
-        error: Option<String>,
-        fallback: impl Into<String>,
-    ) -> TxOutcome {
-        TxOutcome::from_external(success, error, fallback)
-    }
-
     pub(crate) fn is_success(&self) -> bool {
         self.outcome.is_success()
     }
@@ -140,10 +128,11 @@ impl TxMetrics {
         self.outcome = TxOutcome::Failed(error.into());
     }
 
-    pub(crate) fn error_mut(&mut self) -> Option<&mut String> {
-        match &mut self.outcome {
-            TxOutcome::Succeeded => None,
-            TxOutcome::Failed(error) => Some(error),
+    /// Rewrite the failure reason in place, keeping the success/failure state
+    /// intact. Used to scrub private RPC URLs out of upstream error strings.
+    pub(crate) fn map_error(&mut self, rewrite: impl FnOnce(&str) -> String) {
+        if let TxOutcome::Failed(error) = &mut self.outcome {
+            *error = rewrite(error);
         }
     }
 }
@@ -218,14 +207,46 @@ pub(super) enum ComputeUnitSummary {
 /// disagree about how those values are calculated.
 #[derive(Debug)]
 pub(super) struct ReportInput {
-    pub source_chain: String,
-    pub destination_chain: String,
+    pub run: RunIdentity,
     pub destination_address: String,
     pub num_txs: u64,
     pub num_keys: usize,
     pub total_submitted: u64,
     pub test_duration_secs: f64,
     pub compute_unit_summary: ComputeUnitSummary,
+}
+
+/// What run this report describes. Every route derives these from the CLI
+/// arguments, so they are filled in at construction rather than patched onto
+/// the finished report afterwards.
+#[derive(Debug, Clone)]
+pub(super) struct RunIdentity {
+    pub source_chain: String,
+    pub destination_chain: String,
+    pub protocol: String,
+    /// The `--tps` / `--duration-secs` pair, absent for burst runs. They are
+    /// only ever meaningful together, so they travel as one value.
+    pub schedule: Option<SustainedSchedule>,
+}
+
+impl RunIdentity {
+    pub(super) fn from_args(args: &super::LoadTestArgs) -> Self {
+        Self {
+            source_chain: args.source_chain.clone(),
+            destination_chain: args.destination_chain.clone(),
+            protocol: args.protocol.to_string(),
+            schedule: args
+                .tps
+                .zip(args.duration_secs)
+                .map(|(tps, duration_secs)| SustainedSchedule { tps, duration_secs }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SustainedSchedule {
+    pub tps: u64,
+    pub duration_secs: u64,
 }
 
 impl LoadTestReport {
@@ -266,12 +287,12 @@ impl LoadTestReport {
         };
 
         Self {
-            source_chain: input.source_chain,
-            destination_chain: input.destination_chain,
+            source_chain: input.run.source_chain,
+            destination_chain: input.run.destination_chain,
             destination_address: input.destination_address,
-            protocol: String::new(),
-            tps: None,
-            duration_secs: None,
+            protocol: input.run.protocol,
+            tps: input.run.schedule.map(|schedule| schedule.tps),
+            duration_secs: input.run.schedule.map(|schedule| schedule.duration_secs),
             num_txs: input.num_txs,
             num_keys: input.num_keys,
             total_submitted: input.total_submitted,
@@ -356,7 +377,9 @@ pub struct FailureCategory {
 
 #[cfg(test)]
 mod tests {
-    use super::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics, TxOutcome};
+    use super::{
+        ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentity, TxMetrics, TxOutcome,
+    };
 
     fn metric(success: bool, latency_ms: Option<u64>, compute_units: Option<u64>) -> TxMetrics {
         TxMetrics {
@@ -383,8 +406,12 @@ mod tests {
 
     fn input(compute_unit_summary: ComputeUnitSummary) -> ReportInput {
         ReportInput {
-            source_chain: "source".to_string(),
-            destination_chain: "destination".to_string(),
+            run: RunIdentity {
+                source_chain: "source".to_string(),
+                destination_chain: "destination".to_string(),
+                protocol: "gmp".to_string(),
+                schedule: None,
+            },
             destination_address: "address".to_string(),
             num_txs: 4,
             num_keys: 2,

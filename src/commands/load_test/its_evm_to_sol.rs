@@ -5,11 +5,12 @@ use super::its_evm_source::{
     derive_and_fund_keys, distribute_tokens, init_evm_source, resolve_its_contracts,
 };
 use super::its_prerequisites::{self, GatewayRequirement};
-use super::its_verification::{
-    ItsBurstReport, ItsVerificationRoute, ItsVerificationSession, SolanaItsTarget, finish_burst,
-};
+use super::its_verification;
+use super::its_verification::{ItsBurstReport, SolanaItsTarget, finish_burst};
 use super::metrics::ComputeUnitSummary;
-use super::run_sizing::RunSizing as ValidatedRunSizing;
+use super::run_sizing::{RunSizing as ValidatedRunSizing, SustainedPlan};
+use super::verification_session::VerificationSession;
+use super::verify::VerificationRoute;
 use super::{LoadTestArgs, read_its_cache, validate_evm_rpc, validate_solana_rpc};
 use crate::config::ChainsConfig;
 use crate::evm::{ERC20, InterchainTokenService};
@@ -312,7 +313,11 @@ async fn run_sustained_pipeline(
     targets: &TransferTargets,
 ) -> eyre::Result<()> {
     let dest = &args.destination_chain;
-    let (tps, duration_secs, key_cycle) = sizing.sustained().expect("sustained mode");
+    let SustainedPlan {
+        tps,
+        duration_secs,
+        key_cycle,
+    } = sizing.sustained().expect("sustained mode");
 
     // Pre-fetch nonces.
     let nonce_provider = ProviderBuilder::new().connect_http(evm_rpc_url.parse()?);
@@ -328,8 +333,8 @@ async fn run_sustained_pipeline(
         .axelar
         .contract_address("VotingVerifier", &args.source_chain)
         .is_ok();
-    let mut verification = ItsVerificationSession::start(
-        ItsVerificationRoute::from_args(args),
+    let mut verification = VerificationSession::start(
+        VerificationRoute::from_args(args),
         SolanaItsTarget {
             rpc_url: args.destination_rpc.clone(),
         },
@@ -358,25 +363,27 @@ async fn run_sustained_pipeline(
     );
 
     let result = super::sustained::run_sustained_loop(
-        tps,
-        duration_secs,
-        key_cycle,
+        SustainedPlan {
+            tps,
+            duration_secs,
+            key_cycle,
+        },
         Some(nonces),
         make_task,
         Some(verification.send_done()),
         spinner,
     )
     .await?;
-    verification
-        .finish_sustained(
-            args,
-            result,
-            &format!("{}", targets.its_proxy_addr),
-            sizing.total_expected,
-            sizing.num_keys,
-            test_start,
-        )
-        .await
+    its_verification::finish_sustained(
+        verification,
+        args,
+        result,
+        &format!("{}", targets.its_proxy_addr),
+        sizing.total_expected,
+        sizing.num_keys,
+        test_start,
+    )
+    .await
 }
 
 /// Drive the burst-mode pipeline: fan out parallel ITS interchain transfers
@@ -390,9 +397,7 @@ async fn run_burst_pipeline(
     targets: &TransferTargets,
 ) -> eyre::Result<()> {
     let dest = &args.destination_chain;
-    let num_txs = sizing
-        .burst_count()
-        .expect("burst pipeline requires burst sizing");
+    let num_txs = sizing.num_keys;
 
     let test_start = Instant::now();
     let burst = its_evm_source::run_its_burst(
@@ -430,7 +435,7 @@ async fn run_burst_pipeline(
 
     finish_burst(
         args,
-        &SolanaItsTarget {
+        SolanaItsTarget {
             rpc_url: args.destination_rpc.clone(),
         },
         burst,

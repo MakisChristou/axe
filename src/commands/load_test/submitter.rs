@@ -132,7 +132,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{TransactionSubmitter, run_burst, run_serial};
-    use crate::commands::load_test::metrics::TxMetrics;
+    use crate::commands::load_test::metrics::{TxMetrics, TxOutcome};
 
     struct FakeSubmitter;
 
@@ -147,7 +147,7 @@ mod tests {
                 latency_ms: Some(0),
                 compute_units: None,
                 slot: None,
-                outcome: TxMetrics::succeeded_outcome(),
+                outcome: TxOutcome::Succeeded,
                 payload: Vec::new(),
                 payload_hash: String::new(),
                 source_address: String::new(),

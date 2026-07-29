@@ -4,7 +4,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use alloy::primitives::Address;
 use alloy::providers::Provider;
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
@@ -42,10 +41,12 @@ pub(in crate::commands::load_test::verify) trait DestinationVerifier {
     fn approval_label(&self) -> &str;
     fn execution_label(&self) -> &str;
 
-    /// Some streaming senders cannot populate the destination contract address
-    /// until the verifier is constructed.
-    fn default_contract_address(&self) -> Option<Address> {
-        None
+    /// Whether this destination needs `PendingTx::contract_addr` backfilled
+    /// from the route.  Streaming senders cannot populate it themselves, so
+    /// the pipeline parses the address from its typed arguments and fills in
+    /// any `Address::ZERO` it receives.
+    fn needs_contract_address(&self) -> bool {
+        false
     }
 
     fn check<'a>(
@@ -101,10 +102,8 @@ impl<P: Provider> DestinationVerifier for EvmDestinationVerifier<'_, P> {
         }
     }
 
-    fn default_contract_address(&self) -> Option<Address> {
-        // The address itself is route data, so the pipeline parses it from its
-        // typed arguments. `Some` is only a marker that this adapter needs it.
-        Some(Address::ZERO)
+    fn needs_contract_address(&self) -> bool {
+        true
     }
 
     fn check<'a>(
@@ -121,9 +120,11 @@ impl<P: Provider> DestinationVerifier for EvmDestinationVerifier<'_, P> {
                 } => {
                     let mut futures = Vec::with_capacity(indices.len());
                     for &index in indices {
-                        let phase = txs[index]
-                            .phase()
-                            .expect("destination checks only receive active txs");
+                        // The pipeline only schedules active txs; a settled one
+                        // has nothing left to observe.
+                        let Some(phase) = txs[index].phase() else {
+                            continue;
+                        };
                         let message_id = txs[index].message_id.clone();
                         let source_address = txs[index].source_address.clone();
                         let contract_address = txs[index].contract_addr;

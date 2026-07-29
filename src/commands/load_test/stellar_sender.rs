@@ -5,7 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, TxMetrics};
+use super::metrics::{
+    ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentity, TxMetrics, TxOutcome,
+};
+use super::run_sizing::SustainedPlan;
 use super::submitter::TransactionSubmitter;
 use super::sustained;
 use crate::stellar::{
@@ -138,7 +141,7 @@ async fn submit_single(request: SubmitRequest<'_>) -> TxMetrics {
                 latency_ms: Some(submit_time_ms),
                 compute_units: None,
                 slot: None,
-                outcome: TxMetrics::external_outcome(invoked.success, None, "tx failed on-chain"),
+                outcome: TxOutcome::from_external(invoked.success, None, "tx failed on-chain"),
                 payload: payload.to_vec(),
                 payload_hash,
                 source_address: source_addr,
@@ -212,7 +215,7 @@ fn fail_metrics(submit_start: Instant, source: &str, err: &str) -> TxMetrics {
         latency_ms: None,
         compute_units: None,
         slot: None,
-        outcome: TxMetrics::failed_outcome(err.to_string()),
+        outcome: TxOutcome::failed(err.to_string()),
         payload: Vec::new(),
         payload_hash: String::new(),
         source_address: source.to_string(),
@@ -235,7 +238,7 @@ pub(super) struct BurstRequest<'a> {
     pub destination_chain: &'a str,
     pub destination_address: &'a str,
     pub payload_override: Option<Vec<u8>>,
-    pub source_chain: &'a str,
+    pub run: RunIdentity,
     pub gas_token_contract: String,
     pub gas_amount_stroops: u64,
 }
@@ -249,7 +252,7 @@ pub async fn run_burst(request: BurstRequest<'_>) -> Result<LoadTestReport> {
         destination_chain,
         destination_address,
         payload_override,
-        source_chain,
+        run,
         gas_token_contract,
         gas_amount_stroops,
     } = request;
@@ -278,8 +281,7 @@ pub async fn run_burst(request: BurstRequest<'_>) -> Result<LoadTestReport> {
     .await?;
     Ok(build_burst_report(
         burst.metrics,
-        source_chain,
-        destination_chain,
+        run,
         destination_address,
         burst.total_submitted,
         burst.test_duration_secs,
@@ -289,8 +291,7 @@ pub async fn run_burst(request: BurstRequest<'_>) -> Result<LoadTestReport> {
 
 fn build_burst_report(
     metrics: Vec<TxMetrics>,
-    source_chain: &str,
-    destination_chain: &str,
+    run: RunIdentity,
     destination_address: &str,
     total_submitted: u64,
     test_duration: f64,
@@ -298,8 +299,7 @@ fn build_burst_report(
 ) -> LoadTestReport {
     LoadTestReport::from_transactions(
         ReportInput {
-            source_chain: source_chain.to_string(),
-            destination_chain: destination_chain.to_string(),
+            run,
             destination_address: destination_address.to_string(),
             num_txs: total_submitted,
             num_keys: key_count,
@@ -403,9 +403,11 @@ pub(super) async fn run_sustained(request: SustainedRequest) -> Result<sustained
     });
 
     sustained::run_sustained_loop(
-        tps,
-        duration_secs,
-        key_cycle,
+        SustainedPlan {
+            tps,
+            duration_secs,
+            key_cycle,
+        },
         None,
         make_task,
         send_done,

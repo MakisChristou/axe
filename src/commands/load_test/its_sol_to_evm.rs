@@ -16,12 +16,13 @@ use solana_sdk::transaction::Transaction;
 use super::LoadTestArgs;
 use super::its_prerequisites::{self, GatewayRequirement};
 use super::its_sol_source;
-use super::its_verification::{
-    EvmItsTarget, ItsBurstReport, ItsVerificationRoute, ItsVerificationSession, finish_burst,
-};
+use super::its_verification;
+use super::its_verification::{EvmItsTarget, ItsBurstReport, finish_burst};
 use super::keypairs;
 use super::metrics::ComputeUnitSummary;
-use super::run_sizing::RunSizing;
+use super::run_sizing::{RunSizing, SustainedPlan};
+use super::verification_session::VerificationSession;
+use super::verify::VerificationRoute;
 use super::{read_its_cache, save_its_cache, validate_evm_rpc, validate_solana_rpc};
 use crate::config::ChainsConfig;
 use crate::solana;
@@ -303,10 +304,14 @@ async fn run_sustained_pipeline(
 ) -> eyre::Result<()> {
     let dest = &args.destination_chain;
     let evm_rpc_url = args.destination_rpc.clone();
-    let (tps_n, duration_secs, key_cycle) = sizing.sustained().expect("sustained mode");
+    let SustainedPlan {
+        tps: tps_n,
+        duration_secs,
+        key_cycle,
+    } = sizing.sustained().expect("sustained mode");
 
-    let mut verification = ItsVerificationSession::start(
-        ItsVerificationRoute::from_args(args),
+    let mut verification = VerificationSession::start(
+        VerificationRoute::from_args(args),
         EvmItsTarget {
             gateway_addr: evm.evm_gateway_addr,
             rpc_url: evm_rpc_url,
@@ -346,25 +351,27 @@ async fn run_sustained_pipeline(
     );
 
     let result = super::sustained::run_sustained_loop(
-        tps_n,
-        duration_secs,
-        key_cycle,
+        SustainedPlan {
+            tps: tps_n,
+            duration_secs,
+            key_cycle,
+        },
         None,
         make_task,
         Some(verification.send_done()),
         spinner,
     )
     .await?;
-    verification
-        .finish_sustained(
-            args,
-            result,
-            &format!("{}", evm.its_proxy_addr),
-            sizing.total_expected,
-            sizing.num_keys,
-            test_start,
-        )
-        .await
+    its_verification::finish_sustained(
+        verification,
+        args,
+        result,
+        &format!("{}", evm.its_proxy_addr),
+        sizing.total_expected,
+        sizing.num_keys,
+        test_start,
+    )
+    .await
 }
 
 /// Drive the burst-mode pipeline: fan out the Solana ITS transfers, batch-
@@ -424,7 +431,7 @@ async fn run_burst_pipeline(
 
     finish_burst(
         args,
-        &EvmItsTarget {
+        EvmItsTarget {
             gateway_addr: evm.evm_gateway_addr,
             rpc_url: evm_rpc_url.to_string(),
         },

@@ -10,6 +10,7 @@ use alloy::primitives::Address;
 use super::THROUGHPUT_WINDOW;
 use crate::commands::load_test::identifiers::{MessageId, PayloadHash};
 use crate::commands::load_test::metrics::AmplifierTiming;
+use crate::ui;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Phase {
@@ -51,7 +52,7 @@ pub(super) enum VerificationState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SecondLeg {
     pub(super) message_id: MessageId,
-    pub(super) payload_hash: String,
+    pub(super) payload_hash: PayloadHash,
     pub(super) source_address: String,
     pub(super) destination_address: String,
 }
@@ -101,36 +102,58 @@ impl PendingTx {
         matches!(self.state, VerificationState::Active(_))
     }
 
-    pub(super) fn transition_to(&mut self, phase: Phase) {
-        let current = self
-            .phase()
-            .expect("cannot transition a successful transaction");
-        assert!(
-            self.is_active(),
-            "cannot transition a failed transaction from {current:?} to {phase:?}"
-        );
-        assert!(
-            current.can_transition_to(phase),
-            "invalid verification transition from {current:?} to {phase:?}"
-        );
+    /// Advance to `phase`, ignoring the request if it is not a legal step from
+    /// the current state.
+    ///
+    /// Returns whether the transition was applied. Rejections are reported but
+    /// never panic: verification runs inside a spawned task, so an unforeseen
+    /// state sequence must not abort a load test that has already spent real
+    /// funds. A tx left behind by a rejected transition keeps polling and is
+    /// resolved by the inactivity-timeout GMP-API recheck.
+    pub(super) fn transition_to(&mut self, phase: Phase) -> bool {
+        let VerificationState::Active(current) = self.state else {
+            self.reject_transition(&format!("transition to {phase:?}"));
+            return false;
+        };
+        if !current.can_transition_to(phase) {
+            self.reject_transition(&format!("transition from {current:?} to {phase:?}"));
+            return false;
+        }
         self.state = VerificationState::Active(phase);
+        true
     }
 
-    pub(super) fn succeed(&mut self, recovered_via_api: bool) {
-        assert!(
-            self.is_active(),
-            "only an active transaction can be marked successful"
-        );
+    /// Mark the tx successful. Ignored if it already reached a terminal state.
+    pub(super) fn succeed(&mut self, recovered_via_api: bool) -> bool {
+        if !self.is_active() {
+            self.reject_transition("mark successful");
+            return false;
+        }
         self.state = VerificationState::Succeeded { recovered_via_api };
+        true
     }
 
-    pub(super) fn fail(&mut self, reason: String) {
-        assert!(
-            self.is_active(),
-            "only an active transaction can be marked failed"
-        );
-        let phase = self.phase().expect("active transaction must have a phase");
+    /// Mark the tx failed. Ignored if it already reached a terminal state, so
+    /// the first recorded reason wins.
+    pub(super) fn fail(&mut self, reason: String) -> bool {
+        let VerificationState::Active(phase) = self.state else {
+            self.reject_transition("mark failed");
+            return false;
+        };
         self.state = VerificationState::Failed { phase, reason };
+        true
+    }
+
+    fn reject_transition(&self, attempted: &str) {
+        ui::warn(&format!(
+            "verification: ignoring {attempted} for {} — already {}",
+            self.message_id,
+            match &self.state {
+                VerificationState::Active(phase) => format!("in phase {phase:?}"),
+                VerificationState::Succeeded { .. } => "successful".to_string(),
+                VerificationState::Failed { reason, .. } => format!("failed ({reason})"),
+            }
+        ));
     }
 
     pub(super) fn is_failed(&self) -> bool {
@@ -366,14 +389,27 @@ mod tests {
             (Phase::Approved, Phase::Executed),
         ] {
             let mut tx = pending(from);
-            tx.transition_to(to);
+            assert!(tx.transition_to(to));
             assert!(tx.is_phase(to));
         }
     }
 
     #[test]
-    #[should_panic(expected = "invalid verification transition")]
-    fn rejects_out_of_order_transition() {
-        pending(Phase::Voted).transition_to(Phase::Executed);
+    fn rejects_out_of_order_transition_without_panicking() {
+        let mut tx = pending(Phase::Voted);
+
+        assert!(!tx.transition_to(Phase::Executed));
+        assert!(tx.is_phase(Phase::Voted));
+    }
+
+    #[test]
+    fn keeps_the_first_terminal_verdict() {
+        let mut tx = pending(Phase::Approved);
+        assert!(tx.fail("approval: timed out".to_string()));
+
+        assert!(!tx.succeed(true));
+        assert!(!tx.transition_to(Phase::Executed));
+        assert!(!tx.fail("something else".to_string()));
+        assert_eq!(tx.failure_reason(), Some("approval: timed out"));
     }
 }

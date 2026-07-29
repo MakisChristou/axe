@@ -12,10 +12,12 @@ use eyre::{Result, eyre};
 use xrpl_types::AccountId;
 
 use super::its_prerequisites::{self, GatewayRequirement};
-use super::its_verification::{
-    EvmItsTarget, ItsVerificationRoute, ItsVerificationSession, finish_batch,
-};
-use super::run_sizing::RunSizing;
+use super::its_verification;
+use super::its_verification::{EvmItsTarget, finish_batch};
+use super::metrics::RunIdentity;
+use super::run_sizing::{RunSizing, SustainedPlan};
+use super::verification_session::VerificationSession;
+use super::verify::VerificationRoute;
 use super::{LoadTestArgs, validate_evm_rpc, xrpl_sender};
 use crate::config::ChainsConfig;
 use crate::ui;
@@ -214,9 +216,13 @@ async fn run_sustained_pipeline(
     sizing: &RunSizing,
 ) -> Result<()> {
     let dest = &args.destination_chain;
-    let (tps_n, duration_secs, key_cycle) = sizing.sustained().expect("sustained mode");
-    let mut verification = ItsVerificationSession::start(
-        ItsVerificationRoute::from_args(args),
+    let SustainedPlan {
+        tps: tps_n,
+        duration_secs,
+        key_cycle,
+    } = sizing.sustained().expect("sustained mode");
+    let mut verification = VerificationSession::start(
+        VerificationRoute::from_args(args),
         EvmItsTarget {
             gateway_addr: evm.evm_gateway_addr,
             rpc_url: args.destination_rpc.clone(),
@@ -254,16 +260,16 @@ async fn run_sustained_pipeline(
         has_voting_verifier,
     })
     .await?;
-    verification
-        .finish_sustained(
-            args,
-            result,
-            &format!("{}", evm.its_proxy_addr),
-            tps_n as u64 * duration_secs,
-            sizing.num_keys,
-            test_start,
-        )
-        .await
+    its_verification::finish_sustained(
+        verification,
+        args,
+        result,
+        &format!("{}", evm.its_proxy_addr),
+        tps_n as u64 * duration_secs,
+        sizing.num_keys,
+        test_start,
+    )
+    .await
 }
 
 /// Drive the burst-mode pipeline: fan out the XRPL transfers, batch-verify on
@@ -276,7 +282,6 @@ async fn run_burst_pipeline(
     evm: &EvmTargets,
     gas_fee_drops: u64,
 ) -> Result<()> {
-    let src = &args.source_chain;
     let dest = &args.destination_chain;
 
     let test_start = Instant::now();
@@ -289,8 +294,7 @@ async fn run_burst_pipeline(
         gas_fee_drops,
         gmp_dest_chain: "axelar",
         gmp_dest_address: &evm.axelarnet_gw_addr,
-        source_chain: src,
-        destination_chain_label: dest,
+        run: RunIdentity::from_args(args),
     })
     .await?;
     report.destination_address = format!("{}", evm.its_proxy_addr);
@@ -300,7 +304,7 @@ async fn run_burst_pipeline(
 
     finish_batch(
         args,
-        &EvmItsTarget {
+        EvmItsTarget {
             gateway_addr: evm.evm_gateway_addr,
             rpc_url: args.destination_rpc.clone(),
         },
