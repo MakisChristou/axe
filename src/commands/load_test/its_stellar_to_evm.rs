@@ -21,7 +21,7 @@ use super::its_stellar_source::{
 use super::its_verification;
 use super::its_verification::{EvmItsTarget, ItsBurstReport, finish_burst};
 use super::metrics::ComputeUnitSummary;
-use super::run_sizing::{RunSizing, SustainedPlan};
+use super::run_sizing::{RunMode, RunSizing, SustainedPlan};
 use super::verification_session::VerificationSession;
 use super::verify::VerificationRoute;
 use super::{LoadTestArgs, validate_evm_rpc};
@@ -49,23 +49,25 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
 
     let remote_verifier = EvmRemoteDeployment {
         gateway: evm.evm_gateway_addr,
-        rpc_url: &evm_rpc_url,
+        rpc_url: evm_rpc_url.clone(),
     };
-    let token = setup_token(TokenSetupRequest {
-        client: &stellar.client,
-        main_wallet: &stellar.main_wallet,
-        its_contract: &stellar.its_addr,
-        gateway_contract: &stellar.gateway_addr,
-        gas_token: &stellar.xlm_addr,
-        gas_stroops: super::units::Stroops::new(gas_stroops),
-        source_chain: src,
-        destination_chain: dest,
-        destination_axelar_id: &args.destination_axelar_id,
-        token_id_override: args.token_id.as_deref(),
-        config: &args.config,
-        required_transfers: sizing.num_keys,
-        remote_verifier: &remote_verifier,
-    })
+    let token = setup_token(
+        &stellar.client,
+        &stellar.main_wallet,
+        &remote_verifier,
+        TokenSetupRequest {
+            its_contract: stellar.its_addr.clone(),
+            gateway_contract: stellar.gateway_addr.clone(),
+            gas_token: stellar.xlm_addr.clone(),
+            gas_stroops: super::units::Stroops::new(gas_stroops),
+            source_chain: src.clone(),
+            destination_chain: dest.clone(),
+            destination_axelar_id: args.destination_axelar_id.clone(),
+            token_id_override: args.token_id.clone(),
+            config: args.config.clone(),
+            required_transfers: sizing.num_keys,
+        },
+    )
     .await?;
     ui::kv("token ID", &hex::encode(token.token_id));
     ui::address("token contract (Stellar)", &token.token_address);
@@ -75,7 +77,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
     // Burst: 1 tx/key. Sustained: each derived key serves `key_cycle` txs in
     // its rotation slot before rotating out, so fund it for that many gas
     // payments.
-    let txs_per_key = if sizing.is_burst() { 1 } else { args.key_cycle };
+    let txs_per_key = sizing.transactions_per_key();
     let wallets = derive_and_fund_wallets(
         &stellar.client,
         &stellar.main_wallet,
@@ -86,7 +88,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
     )
     .await?;
 
-    let amount_per_key = amount_per_key(&sizing, args.key_cycle, token.decimals);
+    let amount_per_key = amount_per_key(&sizing, token.decimals);
     distribute_token_balances(
         &stellar.client,
         &stellar.main_wallet,
@@ -96,19 +98,19 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
     )
     .await?;
 
+    let mode = sizing.mode();
     let pipeline = PipelineContext {
-        args: &args,
-        stellar: &stellar,
-        evm: &evm,
-        sizing: &sizing,
+        args,
+        stellar,
+        evm,
+        sizing,
         token_id: token.token_id,
         gas_stroops,
         amount_per_tx,
     };
-    if !sizing.is_burst() {
-        run_sustained_pipeline(&pipeline, wallets).await
-    } else {
-        run_burst_pipeline(&pipeline, wallets).await
+    match mode {
+        RunMode::Sustained(plan) => run_sustained_pipeline(pipeline, plan, wallets).await,
+        RunMode::Burst { .. } => run_burst_pipeline(pipeline, wallets).await,
     }
 }
 
@@ -131,12 +133,12 @@ struct EvmTargets {
     axelarnet_gw_addr: String,
 }
 
-struct EvmRemoteDeployment<'a> {
+struct EvmRemoteDeployment {
     gateway: alloy::primitives::Address,
-    rpc_url: &'a str,
+    rpc_url: String,
 }
 
-impl RemoteDeploymentVerifier for EvmRemoteDeployment<'_> {
+impl RemoteDeploymentVerifier for EvmRemoteDeployment {
     async fn wait_for_remote_deploy(
         &self,
         config: &std::path::Path,
@@ -150,7 +152,7 @@ impl RemoteDeploymentVerifier for EvmRemoteDeployment<'_> {
             destination_axelar_id,
             message_id,
             self.gateway,
-            self.rpc_url,
+            &self.rpc_url,
         )
         .await
     }
@@ -252,19 +254,19 @@ fn resolve_evm_targets(cfg: &ChainsConfig, dest: &str) -> Result<EvmTargets> {
 /// Drive the sustained-mode pipeline: spawn the streaming verifier, run the
 /// Stellar ITS sustained loop, stitch amplifier timings back into the report,
 /// and hand off to `finish_report`.
-#[derive(Clone, Copy)]
-struct PipelineContext<'a> {
-    args: &'a LoadTestArgs,
-    stellar: &'a StellarSetup,
-    evm: &'a EvmTargets,
-    sizing: &'a RunSizing,
+struct PipelineContext {
+    args: LoadTestArgs,
+    stellar: StellarSetup,
+    evm: EvmTargets,
+    sizing: RunSizing,
     token_id: [u8; 32],
     gas_stroops: u64,
     amount_per_tx: u128,
 }
 
 async fn run_sustained_pipeline(
-    pipeline: &PipelineContext<'_>,
+    pipeline: PipelineContext,
+    plan: SustainedPlan,
     wallets: Vec<StellarWallet>,
 ) -> Result<()> {
     let PipelineContext {
@@ -275,14 +277,10 @@ async fn run_sustained_pipeline(
         token_id,
         gas_stroops,
         amount_per_tx,
-    } = *pipeline;
-    let SustainedPlan {
-        tps: tps_n,
-        duration_secs,
-        key_cycle,
-    } = sizing.sustained().expect("sustained mode");
+    } = pipeline;
+    let duration_secs = plan.duration_secs;
     let mut verification = VerificationSession::start(
-        VerificationRoute::from_args(args),
+        VerificationRoute::from_args(&args),
         EvmItsTarget {
             gateway_addr: evm.evm_gateway_addr,
             rpc_url: args.destination_rpc.clone(),
@@ -309,9 +307,7 @@ async fn run_sustained_pipeline(
             axelarnet_gw_addr: evm.axelarnet_gw_addr.clone(),
         },
         wallets,
-        tps: tps_n,
-        duration_secs,
-        key_cycle,
+        plan,
         verify_tx: Some(verification.sender()),
         send_done: Some(verification.send_done()),
         spinner,
@@ -319,7 +315,7 @@ async fn run_sustained_pipeline(
     .await?;
     its_verification::finish_sustained(
         verification,
-        args,
+        &args,
         result,
         &format!("{}", evm.evm_its_addr),
         sizing.total_expected,
@@ -331,10 +327,7 @@ async fn run_sustained_pipeline(
 
 /// Drive the burst-mode pipeline: fan out `num_keys` parallel ITS transfers,
 /// batch-verify on the EVM destination, and hand off to `finish_report`.
-async fn run_burst_pipeline(
-    pipeline: &PipelineContext<'_>,
-    wallets: Vec<StellarWallet>,
-) -> Result<()> {
+async fn run_burst_pipeline(pipeline: PipelineContext, wallets: Vec<StellarWallet>) -> Result<()> {
     let PipelineContext {
         args,
         stellar,
@@ -343,7 +336,7 @@ async fn run_burst_pipeline(
         token_id,
         gas_stroops,
         amount_per_tx,
-    } = *pipeline;
+    } = pipeline;
     let num_keys = sizing.num_keys;
 
     let test_start = Instant::now();
@@ -366,7 +359,7 @@ async fn run_burst_pipeline(
     .await?;
     let num_txs = burst.total_submitted;
     finish_burst(
-        args,
+        &args,
         EvmItsTarget {
             gateway_addr: evm.evm_gateway_addr,
             rpc_url: args.destination_rpc.clone(),

@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 
 use super::state::PendingTx;
 use crate::commands::load_test::LoadTestArgs;
+use crate::commands::load_test::chain_names::AxelarChainId;
 use crate::types::Network;
 
 /// Source chain type — determines how message IDs are constructed.
@@ -34,8 +35,8 @@ pub enum SourceChainType {
 #[derive(Clone)]
 pub struct VerificationRoute {
     pub config: PathBuf,
-    pub source_chain: String,
-    pub destination_chain: String,
+    pub source_chain: AxelarChainId,
+    pub destination_chain: AxelarChainId,
     pub network: Network,
 }
 
@@ -45,8 +46,8 @@ impl VerificationRoute {
     pub fn from_args(args: &LoadTestArgs) -> Self {
         Self {
             config: args.config.clone(),
-            source_chain: args.source_axelar_id.clone(),
-            destination_chain: args.destination_axelar_id.clone(),
+            source_chain: args.source_axelar_id.clone().into(),
+            destination_chain: args.destination_axelar_id.clone().into(),
             network: args.network,
         }
     }

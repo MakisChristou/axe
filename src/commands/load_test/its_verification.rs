@@ -164,7 +164,7 @@ pub(super) async fn finish_burst<T: ItsBatchTarget>(
 ) -> Result<()> {
     let mut report = LoadTestReport::from_transactions(
         ReportInput {
-            run: RunIdentity::from_args(args),
+            run: RunIdentity::burst(args),
             destination_address: spec.destination_address,
             num_txs: spec.num_txs,
             num_keys: spec.num_keys,
@@ -187,9 +187,10 @@ pub(super) async fn finish_sustained(
     num_keys: usize,
     test_start: Instant,
 ) -> Result<()> {
+    let plan = result.plan;
     let mut report = super::sustained::build_sustained_report(
         result,
-        RunIdentity::from_args(args),
+        RunIdentity::sustained(args, plan),
         destination_address,
         total_expected,
         num_keys,

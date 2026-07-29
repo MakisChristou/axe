@@ -9,9 +9,7 @@ const EVM_RECEIPT_TIMEOUT: Duration = Duration::from_secs(60);
 
 use super::LoadTestArgs;
 use super::keypairs;
-use super::metrics::{
-    ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentity, TxMetrics, TxOutcome,
-};
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentity, TxMetrics};
 use super::run_sizing::SustainedPlan;
 use super::submitter::TransactionSubmitter;
 use crate::evm::{ContractCall, SenderReceiver};
@@ -166,13 +164,14 @@ impl TransactionSubmitter for EvmSubmitter {
 /// `SenderReceiver._execute`. When false, payloads use the Solana gateway format.
 pub async fn run_load_test_with_metrics(
     args: &LoadTestArgs,
+    num_txs: u64,
     sender_receiver_addr: Address,
     main_key: &[u8; 32],
     evm_rpc_url: &str,
     destination_address: &str,
     evm_destination: bool,
 ) -> eyre::Result<LoadTestReport> {
-    let num_txs = args.num_txs.max(1) as usize;
+    let num_txs = usize::try_from(num_txs)?;
 
     // Derive the memo program's counter PDA
     let memo_program_id = memo_program_id(args.network);
@@ -279,9 +278,9 @@ pub async fn run_load_test_with_metrics(
 
     let report = LoadTestReport::from_transactions(
         ReportInput {
-            run: RunIdentity::from_args(args),
+            run: RunIdentity::burst(args),
             destination_address: dest_addr,
-            num_txs: args.num_txs,
+            num_txs: num_txs as u64,
             num_keys: num_txs,
             total_submitted: burst.total_submitted,
             test_duration_secs: burst.test_duration_secs,
@@ -366,20 +365,15 @@ async fn execute_and_record_evm<P: Provider>(
                     let message_id = format!("{tx_hash:#x}-{event_index}");
 
                     TxMetrics {
-                        signature: message_id,
-                        submit_time_ms: 0,
                         confirm_time_ms: Some(latency_ms),
                         latency_ms: Some(latency_ms),
                         compute_units: Some(receipt.gas_used),
                         slot: receipt.block_number,
-                        outcome: TxOutcome::Succeeded,
                         payload: payload.to_vec(),
                         payload_hash,
                         source_address: format!("{sender_receiver_addr}"),
-                        gmp_destination_chain: String::new(),
-                        gmp_destination_address: String::new(),
                         send_instant: Some(submit_start),
-                        amplifier_timing: None,
+                        ..TxMetrics::succeeded(message_id, 0)
                     }
                 }
                 Ok(Err(e)) => make_failure_with_hash(submit_start, &e.to_string(), Some(tx_hash)),
@@ -394,12 +388,13 @@ async fn execute_and_record_evm<P: Provider>(
 ///
 /// Uses a rotating pool of `tps * key_cycle` derived wallets, cycling keys
 /// every `key_cycle` seconds. Sends `tps` txs per second for `duration_secs`.
-pub(super) struct SustainedLoadRequest<'a> {
-    pub args: &'a LoadTestArgs,
+pub(super) struct SustainedLoadRequest {
+    pub args: LoadTestArgs,
+    pub plan: SustainedPlan,
     pub sender_receiver: Address,
-    pub main_key: &'a [u8; 32],
-    pub evm_rpc_url: &'a str,
-    pub destination_address: &'a str,
+    pub main_key: [u8; 32],
+    pub evm_rpc_url: String,
+    pub destination_address: String,
     pub verify_tx: Option<tokio::sync::mpsc::UnboundedSender<super::verify::PendingTx>>,
     pub send_done: Option<Arc<AtomicBool>>,
     pub verify_spinner_tx: tokio::sync::oneshot::Sender<indicatif::ProgressBar>,
@@ -407,10 +402,16 @@ pub(super) struct SustainedLoadRequest<'a> {
 }
 
 pub(super) async fn run_sustained_load_test_with_metrics(
-    request: SustainedLoadRequest<'_>,
+    request: SustainedLoadRequest,
 ) -> eyre::Result<LoadTestReport> {
     let SustainedLoadRequest {
         args,
+        plan:
+            plan @ SustainedPlan {
+                tps,
+                duration_secs,
+                key_cycle,
+            },
         sender_receiver: sender_receiver_addr,
         main_key,
         evm_rpc_url,
@@ -420,17 +421,8 @@ pub(super) async fn run_sustained_load_test_with_metrics(
         verify_spinner_tx,
         evm_destination,
     } = request;
-    // `run_sustained` is only called from sustained-mode dispatch, where
-    // both `tps` and `duration_secs` have already been validated as `Some`.
-    let tps = args
-        .tps
-        .expect("run_sustained called outside sustained mode") as usize;
-    let duration_secs = args
-        .duration_secs
-        .expect("run_sustained called outside sustained mode");
-    let key_cycle = args.key_cycle as usize;
     let pool_size = tps * key_cycle;
-    let total_expected = tps as u64 * duration_secs;
+    let total_expected = plan.total_transactions();
 
     let memo_program_id = memo_program_id(args.network);
     let (counter_pda, _) = Pubkey::find_program_address(&[b"counter"], &memo_program_id);
@@ -441,18 +433,18 @@ pub(super) async fn run_sustained_load_test_with_metrics(
     };
     let gas_value_wei: u128 = match &args.gas_value {
         Some(v) => v.parse().map_err(|e| eyre!("invalid --gas-value: {e}"))?,
-        None => default_gas_value_wei(args).await,
+        None => default_gas_value_wei(&args).await,
     };
 
     // Derive pool
-    let derived = keypairs::derive_evm_signers(main_key, pool_size)?;
+    let derived = keypairs::derive_evm_signers(&main_key, pool_size)?;
     ui::info(&format!(
         "derived {} EVM signing keys (pool: {} tx/s × {}s cycle)",
         pool_size, tps, key_cycle
     ));
 
     // Fund pool keys.
-    let main_signer = PrivateKeySigner::from_bytes(&(*main_key).into())
+    let main_signer = PrivateKeySigner::from_bytes(&main_key.into())
         .map_err(|e| eyre!("invalid main EVM key: {e}"))?;
     let funding_provider = ProviderBuilder::new()
         .wallet(main_signer.clone())
@@ -594,8 +586,8 @@ pub(super) async fn run_sustained_load_test_with_metrics(
 
     Ok(super::sustained::build_sustained_report(
         result,
-        RunIdentity::from_args(args),
-        destination_address,
+        RunIdentity::sustained(&args, plan),
+        &destination_address,
         total_expected,
         pool_size,
     ))
@@ -611,20 +603,9 @@ fn make_failure_with_hash(
     tx_hash: Option<alloy::primitives::TxHash>,
 ) -> TxMetrics {
     let elapsed_ms = submit_start.elapsed().as_millis() as u64;
-    TxMetrics {
-        signature: tx_hash.map_or_else(String::new, |h| format!("{h:#x}")),
-        submit_time_ms: elapsed_ms,
-        confirm_time_ms: None,
-        latency_ms: None,
-        compute_units: None,
-        slot: None,
-        outcome: TxOutcome::failed(error.to_string()),
-        payload: Vec::new(),
-        payload_hash: String::new(),
-        source_address: String::new(),
-        gmp_destination_chain: String::new(),
-        gmp_destination_address: String::new(),
-        send_instant: None,
-        amplifier_timing: None,
-    }
+    TxMetrics::failed(
+        tx_hash.map_or_else(String::new, |h| format!("{h:#x}")),
+        elapsed_ms,
+        error,
+    )
 }

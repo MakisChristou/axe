@@ -11,7 +11,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
 
 use super::identifiers::TokenId;
-use super::metrics::{TxMetrics, TxOutcome};
+use super::metrics::TxMetrics;
 use super::submitter::TransactionSubmitter;
 use super::units::Lamports;
 use crate::solana;
@@ -111,20 +111,8 @@ impl ItsSolanaSubmitter {
             MetricContext::DestinationManaged => source_address,
         };
         TxMetrics {
-            signature: String::new(),
-            submit_time_ms: 0,
-            confirm_time_ms: None,
-            latency_ms: None,
-            compute_units: None,
-            slot: None,
-            outcome: TxOutcome::failed(error),
-            payload: Vec::new(),
-            payload_hash: String::new(),
             source_address,
-            gmp_destination_chain: String::new(),
-            gmp_destination_address: String::new(),
-            send_instant: None,
-            amplifier_timing: None,
+            ..TxMetrics::failed("", 0, error)
         }
     }
 }

@@ -50,12 +50,11 @@ pub(super) fn transfer_amount(decimals: u32) -> u128 {
     scale_to_decimals(WHOLE_TOKENS_PER_TX, decimals) / 100
 }
 
-pub(super) fn amount_per_key(sizing: &RunSizing, key_cycle: u64, decimals: u32) -> u128 {
+pub(super) fn amount_per_key(sizing: &RunSizing, decimals: u32) -> u128 {
     if sizing.is_burst() {
         scale_to_decimals(WHOLE_TOKENS_PER_KEY, decimals) / 100
     } else {
-        let duration_secs = sizing.sustained().expect("sustained mode").duration_secs;
-        let txs_per_key = duration_secs.div_ceil(key_cycle) as u128;
+        let txs_per_key = sizing.transactions_per_key() as u128;
         transfer_amount(decimals)
             .saturating_mul(txs_per_key)
             .saturating_mul(2)
@@ -99,20 +98,17 @@ pub(super) trait RemoteDeploymentVerifier {
     fn after_remote_deploy(&self, _source_chain: &str, _token_id: [u8; 32]) {}
 }
 
-pub(super) struct TokenSetupRequest<'a, V> {
-    pub client: &'a StellarClient,
-    pub main_wallet: &'a StellarWallet,
-    pub its_contract: &'a str,
-    pub gateway_contract: &'a str,
-    pub gas_token: &'a str,
+pub(super) struct TokenSetupRequest {
+    pub its_contract: String,
+    pub gateway_contract: String,
+    pub gas_token: String,
     pub gas_stroops: Stroops,
-    pub source_chain: &'a str,
-    pub destination_chain: &'a str,
-    pub destination_axelar_id: &'a str,
-    pub token_id_override: Option<&'a str>,
-    pub config: &'a std::path::Path,
+    pub source_chain: String,
+    pub destination_chain: String,
+    pub destination_axelar_id: String,
+    pub token_id_override: Option<String>,
+    pub config: std::path::PathBuf,
     pub required_transfers: usize,
-    pub remote_verifier: &'a V,
 }
 
 pub(super) struct TokenSetup {
@@ -121,13 +117,16 @@ pub(super) struct TokenSetup {
     pub decimals: u32,
 }
 
-pub(super) async fn setup_token<V>(request: TokenSetupRequest<'_, V>) -> Result<TokenSetup>
+pub(super) async fn setup_token<V>(
+    client: &StellarClient,
+    main_wallet: &StellarWallet,
+    remote_verifier: &V,
+    request: TokenSetupRequest,
+) -> Result<TokenSetup>
 where
     V: RemoteDeploymentVerifier + Sync,
 {
     let TokenSetupRequest {
-        client,
-        main_wallet,
         its_contract,
         gateway_contract,
         gas_token,
@@ -138,8 +137,15 @@ where
         token_id_override,
         config,
         required_transfers,
-        remote_verifier,
     } = request;
+    let its_contract = its_contract.as_str();
+    let gateway_contract = gateway_contract.as_str();
+    let gas_token = gas_token.as_str();
+    let source_chain = source_chain.as_str();
+    let destination_chain = destination_chain.as_str();
+    let destination_axelar_id = destination_axelar_id.as_str();
+    let token_id_override = token_id_override.as_deref();
+    let config = config.as_path();
 
     if let Some(token_id_hex) = token_id_override {
         let token_id = match parse_token_id(token_id_hex) {
@@ -422,21 +428,21 @@ pub(super) async fn distribute_token_balances(
     Ok(())
 }
 
-pub(super) struct TransferRequest<'a> {
-    pub client: &'a StellarClient,
-    pub wallet: &'a StellarWallet,
-    pub its_contract: &'a str,
-    pub gateway_contract: &'a str,
+pub(super) struct TransferRequest {
+    pub client: StellarClient,
+    pub wallet: Arc<StellarWallet>,
+    pub its_contract: String,
+    pub gateway_contract: String,
     pub token_id: [u8; 32],
-    pub destination_chain: &'a str,
-    pub destination_address_bytes: &'a [u8],
-    pub gas_token: &'a str,
+    pub destination_chain: String,
+    pub destination_address_bytes: Vec<u8>,
+    pub gas_token: String,
     pub gas_amount_stroops: u64,
     pub transfer_amount: u128,
-    pub gmp_dest_address: &'a str,
+    pub gmp_dest_address: String,
 }
 
-pub(super) async fn submit_transfer(request: TransferRequest<'_>) -> TxMetrics {
+pub(super) async fn submit_transfer(request: TransferRequest) -> TxMetrics {
     let submit_start = Instant::now();
     // ITS emits the `ContractCall` event from the AxelarGateway contract,
     // so VotingVerifier records the ITS contract as the source address.
@@ -444,15 +450,15 @@ pub(super) async fn submit_transfer(request: TransferRequest<'_>) -> TxMetrics {
     match request
         .client
         .its_interchain_transfer(crate::stellar::InterchainTransferRequest {
-            wallet: request.wallet,
-            its_contract: request.its_contract,
-            gateway_contract: request.gateway_contract,
+            wallet: &request.wallet,
+            its_contract: &request.its_contract,
+            gateway_contract: &request.gateway_contract,
             token_id: request.token_id,
-            destination_chain: request.destination_chain,
-            destination_address_bytes: request.destination_address_bytes,
+            destination_chain: &request.destination_chain,
+            destination_address_bytes: &request.destination_address_bytes,
             amount: request.transfer_amount,
             data: None,
-            gas_token: request.gas_token,
+            gas_token: &request.gas_token,
             gas_amount: request.gas_amount_stroops,
         })
         .await
@@ -462,43 +468,24 @@ pub(super) async fn submit_transfer(request: TransferRequest<'_>) -> TxMetrics {
             let event_index = invoked.event_index.unwrap_or(0);
             let message_id = format!("0x{}-{event_index}", invoked.tx_hash_hex.to_lowercase());
             TxMetrics {
-                signature: message_id,
-                submit_time_ms,
                 confirm_time_ms: Some(submit_time_ms),
                 latency_ms: Some(submit_time_ms),
-                compute_units: None,
-                slot: None,
-                outcome: TxOutcome::from_external(
-                    invoked.success,
-                    None,
-                    "interchain_transfer reverted",
-                ),
-                payload: Vec::new(),
-                payload_hash: String::new(),
                 source_address: source_addr,
                 gmp_destination_chain: "axelar".to_string(),
                 gmp_destination_address: request.gmp_dest_address.to_string(),
                 send_instant: Some(submit_start),
-                amplifier_timing: None,
+                ..TxMetrics::from_outcome(
+                    message_id,
+                    submit_time_ms,
+                    TxOutcome::from_external(invoked.success, None, "interchain_transfer reverted"),
+                )
             }
         }
         Err(error) => {
             let elapsed_ms = submit_start.elapsed().as_millis() as u64;
             TxMetrics {
-                signature: String::new(),
-                submit_time_ms: elapsed_ms,
-                confirm_time_ms: None,
-                latency_ms: None,
-                compute_units: None,
-                slot: None,
-                outcome: TxOutcome::failed(error.to_string()),
-                payload: Vec::new(),
-                payload_hash: String::new(),
                 source_address: source_addr,
-                gmp_destination_chain: String::new(),
-                gmp_destination_address: String::new(),
-                send_instant: None,
-                amplifier_timing: None,
+                ..TxMetrics::failed("", elapsed_ms, error.to_string())
             }
         }
     }
@@ -529,17 +516,17 @@ impl TransactionSubmitter for ItsStellarSubmitter {
 
     async fn submit(&self, job: Self::Job) -> TxMetrics {
         submit_transfer(TransferRequest {
-            client: &self.client,
-            wallet: &job.wallet,
-            its_contract: &self.its_contract,
-            gateway_contract: &self.gateway_contract,
+            client: self.client.clone(),
+            wallet: job.wallet,
+            its_contract: self.its_contract.clone(),
+            gateway_contract: self.gateway_contract.clone(),
             token_id: self.token_id.into_bytes(),
-            destination_chain: &self.destination_chain,
-            destination_address_bytes: &self.destination_address_bytes,
-            gas_token: &self.gas_token,
+            destination_chain: self.destination_chain.clone(),
+            destination_address_bytes: self.destination_address_bytes.clone(),
+            gas_token: self.gas_token.clone(),
             gas_amount_stroops: self.gas_stroops.get(),
             transfer_amount: self.amount_per_tx,
-            gmp_dest_address: &self.axelarnet_gw_addr,
+            gmp_dest_address: self.axelarnet_gw_addr.clone(),
         })
         .await
     }
@@ -563,9 +550,7 @@ pub(super) async fn run_its_burst(
 pub(super) struct SustainedTransferArgs {
     pub submitter: ItsStellarSubmitter,
     pub wallets: Vec<StellarWallet>,
-    pub tps: usize,
-    pub duration_secs: u64,
-    pub key_cycle: usize,
+    pub plan: SustainedPlan,
     pub verify_tx: Option<tokio::sync::mpsc::UnboundedSender<super::verify::PendingTx>>,
     pub send_done: Option<Arc<AtomicBool>>,
     pub spinner: indicatif::ProgressBar,
@@ -583,18 +568,7 @@ pub(super) async fn run_sustained(
         .collect();
     let make_task = its_sustained_tasks(args.submitter, jobs, args.verify_tx);
 
-    sustained::run_sustained_loop(
-        SustainedPlan {
-            tps: args.tps,
-            duration_secs: args.duration_secs,
-            key_cycle: args.key_cycle,
-        },
-        None,
-        make_task,
-        args.send_done,
-        args.spinner,
-    )
-    .await
+    sustained::run_sustained_loop(args.plan, None, make_task, args.send_done, args.spinner).await
 }
 
 fn its_sustained_tasks(

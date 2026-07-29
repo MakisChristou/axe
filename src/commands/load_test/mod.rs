@@ -1,3 +1,4 @@
+mod chain_names;
 mod evm_sender;
 mod gas_estimate;
 mod gas_mode;
@@ -173,6 +174,7 @@ impl std::fmt::Display for Protocol {
 }
 
 /// CLI arguments for the load test command.
+#[derive(Clone)]
 pub struct LoadTestArgs {
     pub config: PathBuf,
     /// The Axelar network this run targets (resolved in `main.rs` from
@@ -305,9 +307,11 @@ async fn dispatch(
     )?;
 
     match route {
-        SupportedRoute::Gmp(route) => dispatch_gmp(route, args, run_start).await,
+        SupportedRoute::Gmp(route) => dispatch_gmp(route, args, run_start, run_sizing).await,
         SupportedRoute::Its(route) => dispatch_its(route, args, run_start, run_sizing).await,
-        SupportedRoute::ItsWithData(route) => dispatch_its_with_data(route, args, run_start).await,
+        SupportedRoute::ItsWithData(route) => {
+            dispatch_its_with_data(route, args, run_start, run_sizing).await
+        }
     }
 }
 
@@ -315,23 +319,24 @@ async fn dispatch_gmp(
     route: route::GmpRoute,
     args: LoadTestArgs,
     run_start: Instant,
+    run_sizing: run_sizing::RunSizing,
 ) -> Result<()> {
     use route::GmpRoute;
 
     match route {
-        GmpRoute::SolToEvm => gmp::run_sol_to_evm(args, run_start).await,
-        GmpRoute::EvmToSol => gmp::run_evm_to_sol(args, run_start).await,
-        GmpRoute::EvmToEvm => gmp::run_evm_to_evm(args, run_start).await,
-        GmpRoute::SolToSol => gmp::run_sol_to_sol(args, run_start).await,
-        GmpRoute::StellarToEvm => gmp::run_stellar_to_evm(args, run_start).await,
-        GmpRoute::EvmToStellar => gmp::run_evm_to_stellar(args, run_start).await,
-        GmpRoute::StellarToSol => gmp::run_stellar_to_sol(args, run_start).await,
-        GmpRoute::SolToStellar => gmp::run_sol_to_stellar(args, run_start).await,
-        GmpRoute::SuiToEvm => gmp::run_sui_to_evm(args, run_start).await,
-        GmpRoute::EvmToSui => gmp::run_evm_to_sui(args, run_start).await,
-        GmpRoute::SolToSui => gmp::run_sol_to_sui(args, run_start).await,
-        GmpRoute::StellarToSui => gmp::run_stellar_to_sui(args, run_start).await,
-        GmpRoute::SuiToSol => gmp::run_sui_to_sol(args, run_start).await,
+        GmpRoute::SolToEvm => gmp::run_sol_to_evm(args, run_start, run_sizing).await,
+        GmpRoute::EvmToSol => gmp::run_evm_to_sol(args, run_start, run_sizing).await,
+        GmpRoute::EvmToEvm => gmp::run_evm_to_evm(args, run_start, run_sizing).await,
+        GmpRoute::SolToSol => gmp::run_sol_to_sol(args, run_start, run_sizing).await,
+        GmpRoute::StellarToEvm => gmp::run_stellar_to_evm(args, run_start, run_sizing).await,
+        GmpRoute::EvmToStellar => gmp::run_evm_to_stellar(args, run_start, run_sizing).await,
+        GmpRoute::StellarToSol => gmp::run_stellar_to_sol(args, run_start, run_sizing).await,
+        GmpRoute::SolToStellar => gmp::run_sol_to_stellar(args, run_start, run_sizing).await,
+        GmpRoute::SuiToEvm => gmp::run_sui_to_evm(args, run_start, run_sizing).await,
+        GmpRoute::EvmToSui => gmp::run_evm_to_sui(args, run_start, run_sizing).await,
+        GmpRoute::SolToSui => gmp::run_sol_to_sui(args, run_start, run_sizing).await,
+        GmpRoute::StellarToSui => gmp::run_stellar_to_sui(args, run_start, run_sizing).await,
+        GmpRoute::SuiToSol => gmp::run_sui_to_sol(args, run_start, run_sizing).await,
     }
 }
 
@@ -345,7 +350,7 @@ async fn dispatch_its(
 
     match route {
         ItsRoute::StellarToEvm => its_stellar_to_evm::run(args, run_start, run_sizing).await,
-        ItsRoute::EvmToStellar => its_evm_to_stellar::run(args, run_start).await,
+        ItsRoute::EvmToStellar => its_evm_to_stellar::run(args, run_start, run_sizing).await,
         // Stellar -> Solana ITS: code is in place, but the destination chain
         // must be in the Stellar ITS contract's trusted-chains list. On
         // testnet today "solana" is not registered, so the source-side
@@ -353,24 +358,24 @@ async fn dispatch_its(
         // that clearly. We leave it dispatched so the run becomes possible
         // automatically once the trusted-chain config is updated upstream.
         ItsRoute::StellarToSol => its_stellar_to_sol::run(args, run_start, run_sizing).await,
-        ItsRoute::EvmToSol => its_evm_to_sol::run(args, run_start).await,
-        ItsRoute::SolToEvm => its_sol_to_evm::run(args, run_start).await,
-        ItsRoute::XrplToEvm => its_xrpl_to_evm::run(args, run_start).await,
-        ItsRoute::EvmToXrpl => its_evm_to_xrpl::run(args, run_start).await,
-        ItsRoute::EvmToEvm => its_evm_to_evm::run(args, run_start).await,
+        ItsRoute::EvmToSol => its_evm_to_sol::run(args, run_start, run_sizing).await,
+        ItsRoute::SolToEvm => its_sol_to_evm::run(args, run_start, run_sizing).await,
+        ItsRoute::XrplToEvm => its_xrpl_to_evm::run(args, run_start, run_sizing).await,
+        ItsRoute::EvmToXrpl => its_evm_to_xrpl::run(args, run_start, run_sizing).await,
+        ItsRoute::EvmToEvm => its_evm_to_evm::run(args, run_start, run_sizing).await,
         // Sui as destination — Sui events-based verifier is now wired in
         // verify.rs. EVM -> Sui GMP runs end-to-end. ITS to Sui still
         // needs the receive-side coin type plumbing.
-        ItsRoute::EvmToSui => its_evm_to_sui::run(args, run_start).await,
-        ItsRoute::SolToSui => its_sol_to_sui::run(args, run_start).await,
-        ItsRoute::StellarToSui => its_stellar_to_sui::run(args, run_start).await,
+        ItsRoute::EvmToSui => its_evm_to_sui::run(args, run_start, run_sizing).await,
+        ItsRoute::SolToSui => its_sol_to_sui::run(args, run_start, run_sizing).await,
+        ItsRoute::StellarToSui => its_stellar_to_sui::run(args, run_start, run_sizing).await,
         // Sui-source ITS. We don't auto-deploy a fresh AXE token on Sui
         // (Move package publish from Rust is impractical), so the user must
         // pre-register a token via axelar-contract-deployments/sui/its.js
         // and pass `--token-id`. `--coin-type` resolves automatically via
         // dev-inspect when omitted.
-        ItsRoute::SuiToEvm => its_sui_to_evm::run(args, run_start).await,
-        ItsRoute::SuiToSol => its_sui_to_sol::run(args, run_start).await,
+        ItsRoute::SuiToEvm => its_sui_to_evm::run(args, run_start, run_sizing).await,
+        ItsRoute::SuiToSol => its_sui_to_sol::run(args, run_start, run_sizing).await,
     }
 }
 
@@ -378,8 +383,11 @@ async fn dispatch_its_with_data(
     route: route::ItsWithDataRoute,
     args: LoadTestArgs,
     run_start: Instant,
+    run_sizing: run_sizing::RunSizing,
 ) -> Result<()> {
     match route {
-        route::ItsWithDataRoute::EvmToSol => its_evm_to_sol_with_data::run(args, run_start).await,
+        route::ItsWithDataRoute::EvmToSol => {
+            its_evm_to_sol_with_data::run(args, run_start, run_sizing).await
+        }
     }
 }

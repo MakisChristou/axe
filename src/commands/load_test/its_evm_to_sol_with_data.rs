@@ -18,8 +18,8 @@ use super::its_prerequisites::{self, GatewayRequirement};
 use super::its_verification;
 use super::its_verification::{ItsBurstReport, SolanaItsTarget, finish_burst};
 use super::keypairs;
-use super::metrics::{ComputeUnitSummary, TxMetrics, TxOutcome};
-use super::run_sizing::{RunSizing, SustainedPlan};
+use super::metrics::{ComputeUnitSummary, TxMetrics};
+use super::run_sizing::{RunMode, RunSizing, SustainedPlan};
 use super::submitter::TransactionSubmitter;
 use super::verification_session::VerificationSession;
 use super::verify::VerificationRoute;
@@ -94,7 +94,7 @@ fn build_its_memo_metadata(
     metadata
 }
 
-pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
+pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> eyre::Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
@@ -127,7 +127,6 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
 
     let (gas_value_wei, gas_value) = super::its_evm_source::standard_gas_value(&args).await?;
 
-    let sizing = RunSizing::new(&args)?;
     let amount_per_tx = U256::from(1_000_000_000_000_000_000u128); // 1 token
     let amount_per_key = amount_per_tx * U256::from(100);
 
@@ -177,10 +176,22 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
         token_mint_ata,
     };
 
-    if !sizing.is_burst() {
-        run_sustained_pipeline(&args, &cfg, &evm_rpc_url, &derived, &sizing, &transfer_ctx).await
-    } else {
-        run_burst_pipeline(&args, &evm_rpc_url, &derived, &sizing, &transfer_ctx).await
+    match sizing.mode() {
+        RunMode::Sustained(plan) => {
+            run_sustained_pipeline(
+                &args,
+                &cfg,
+                &evm_rpc_url,
+                &derived,
+                &sizing,
+                plan,
+                &transfer_ctx,
+            )
+            .await
+        }
+        RunMode::Burst { .. } => {
+            run_burst_pipeline(&args, &evm_rpc_url, &derived, &sizing, &transfer_ctx).await
+        }
     }
 }
 
@@ -488,6 +499,7 @@ async fn run_sustained_pipeline(
     evm_rpc_url: &str,
     derived: &[PrivateKeySigner],
     sizing: &RunSizing,
+    plan: SustainedPlan,
     transfer_ctx: &TransferContext,
 ) -> eyre::Result<()> {
     let dest = &args.destination_chain;
@@ -495,7 +507,7 @@ async fn run_sustained_pipeline(
         tps,
         duration_secs,
         key_cycle,
-    } = sizing.sustained().expect("sustained mode");
+    } = plan;
     let nonce_provider = ProviderBuilder::new().connect_http(evm_rpc_url.parse()?);
     let mut nonces: Vec<u64> = Vec::with_capacity(sizing.num_keys);
     for signer in derived {
@@ -611,7 +623,7 @@ async fn run_burst_pipeline(
         burst,
         ItsBurstReport {
             destination_address: format!("{its_proxy_addr}"),
-            num_txs: args.num_txs,
+            num_txs: sizing.total_expected,
             num_keys: num_txs,
             compute_unit_summary: ComputeUnitSummary::Omit,
         },
@@ -758,19 +770,21 @@ impl TransactionSubmitter for ItsEvmWithDataSubmitter {
             .wallet(job.signer)
             .connect_http(self.rpc_url.clone());
         let submit = || {
-            execute_interchain_transfer_with_data(InterchainTransferWithDataRequest {
-                provider: &provider,
-                its_proxy: self.its_proxy,
-                token_id: self.token_id,
-                destination_chain: &self.destination_chain,
-                receiver: &self.receiver,
-                amount: self.amount,
-                gas_value: self.gas_value,
-                counter_pda: &self.counter_pda,
-                extra_accounts: self.extra_accounts,
-                token_mint_ata: self.token_mint_ata.as_ref(),
-                explicit_nonce: job.explicit_nonce,
-            })
+            execute_interchain_transfer_with_data(
+                &provider,
+                InterchainTransferWithDataRequest {
+                    its_proxy: self.its_proxy,
+                    token_id: self.token_id,
+                    destination_chain: self.destination_chain.clone(),
+                    receiver: self.receiver.clone(),
+                    amount: self.amount,
+                    gas_value: self.gas_value,
+                    counter_pda: self.counter_pda,
+                    extra_accounts: self.extra_accounts,
+                    token_mint_ata: self.token_mint_ata,
+                    explicit_nonce: job.explicit_nonce,
+                },
+            )
         };
         if job.retry_rate_limits {
             super::retry::rate_limited(submit).await
@@ -816,25 +830,24 @@ fn its_with_data_sustained_tasks(
 }
 
 /// Send a single interchainTransfer with metadata that triggers the memo program.
-struct InterchainTransferWithDataRequest<'a, P> {
-    provider: &'a P,
+struct InterchainTransferWithDataRequest {
     its_proxy: Address,
     token_id: FixedBytes<32>,
-    destination_chain: &'a str,
-    receiver: &'a Bytes,
+    destination_chain: String,
+    receiver: Bytes,
     amount: U256,
     gas_value: U256,
-    counter_pda: &'a Pubkey,
+    counter_pda: Pubkey,
     extra_accounts: u32,
-    token_mint_ata: Option<&'a Pubkey>,
+    token_mint_ata: Option<Pubkey>,
     explicit_nonce: Option<u64>,
 }
 
 async fn execute_interchain_transfer_with_data<P: Provider>(
-    request: InterchainTransferWithDataRequest<'_, P>,
+    provider: &P,
+    request: InterchainTransferWithDataRequest,
 ) -> TxMetrics {
     let InterchainTransferWithDataRequest {
-        provider,
         its_proxy,
         token_id,
         destination_chain: dest_chain,
@@ -850,9 +863,9 @@ async fn execute_interchain_transfer_with_data<P: Provider>(
 
     // Build unique metadata per tx (random memo string)
     let metadata = Bytes::from(build_its_memo_metadata(
-        counter_pda,
+        &counter_pda,
         extra_accounts,
-        token_mint_ata,
+        token_mint_ata.as_ref(),
     ));
 
     // ITS routes via the hub, so two commands are created (source→hub and
@@ -894,20 +907,16 @@ async fn execute_interchain_transfer_with_data<P: Provider>(
                             let payload_hash = alloy::hex::encode(payload_hash_bytes.as_slice());
 
                             TxMetrics {
-                                signature: message_id,
-                                submit_time_ms: 0,
                                 confirm_time_ms: Some(latency_ms),
                                 latency_ms: Some(latency_ms),
                                 compute_units: Some(receipt.gas_used),
                                 slot: receipt.block_number,
-                                outcome: TxOutcome::Succeeded,
-                                payload: Vec::new(),
                                 payload_hash,
                                 source_address,
                                 gmp_destination_chain: dest_chain,
                                 gmp_destination_address: dest_address,
                                 send_instant: Some(submit_start),
-                                amplifier_timing: None,
+                                ..TxMetrics::succeeded(message_id, 0)
                             }
                         }
                         Err(e) => {
@@ -933,20 +942,9 @@ fn make_failure_with_hash(
     tx_hash: Option<alloy::primitives::TxHash>,
 ) -> TxMetrics {
     let elapsed_ms = submit_start.elapsed().as_millis() as u64;
-    TxMetrics {
-        signature: tx_hash.map_or_else(String::new, |h| format!("{h:#x}")),
-        submit_time_ms: elapsed_ms,
-        confirm_time_ms: None,
-        latency_ms: None,
-        compute_units: None,
-        slot: None,
-        outcome: TxOutcome::failed(error.to_string()),
-        payload: Vec::new(),
-        payload_hash: String::new(),
-        source_address: String::new(),
-        gmp_destination_chain: String::new(),
-        gmp_destination_address: String::new(),
-        send_instant: None,
-        amplifier_timing: None,
-    }
+    TxMetrics::failed(
+        tx_hash.map_or_else(String::new, |h| format!("{h:#x}")),
+        elapsed_ms,
+        error,
+    )
 }

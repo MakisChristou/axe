@@ -36,7 +36,7 @@ use crate::ui;
 const AMOUNT_PER_TX: u64 = 1;
 const TOKEN_PROGRAM_2022: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
-pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
+pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> eyre::Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
@@ -51,7 +51,6 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
     );
 
     // ----- Sizing -----
-    let sizing = RunSizing::new(&args)?;
     let total_to_send = sizing.total_expected;
 
     // ----- Main keypair -----
@@ -177,9 +176,9 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
 
     let mut report = LoadTestReport::from_transactions(
         ReportInput {
-            run: RunIdentity::from_args(&args),
+            run: RunIdentity::from_sizing(&args, sizing),
             destination_address: sui_wallet.address_hex(),
-            num_txs: args.num_txs,
+            num_txs: sizing.total_expected,
             num_keys: send.total_submitted as usize,
             total_submitted: send.total_submitted,
             test_duration_secs: send.test_duration_secs,

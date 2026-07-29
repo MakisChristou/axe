@@ -4,6 +4,9 @@ use serde::de::Error as _;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use super::chain_names::DisplayChainName;
+use super::run_sizing::{RunMode, RunSizing, SustainedPlan};
+
 /// A transaction either succeeded or failed with a reason.
 ///
 /// The custom serde representation deliberately preserves the public report
@@ -116,6 +119,41 @@ pub struct TxMetrics {
 }
 
 impl TxMetrics {
+    pub(crate) fn from_outcome(
+        signature: impl Into<String>,
+        submit_time_ms: u64,
+        outcome: TxOutcome,
+    ) -> Self {
+        Self {
+            signature: signature.into(),
+            submit_time_ms,
+            confirm_time_ms: None,
+            latency_ms: None,
+            compute_units: None,
+            slot: None,
+            outcome,
+            payload_hash: String::new(),
+            source_address: String::new(),
+            payload: Vec::new(),
+            send_instant: None,
+            gmp_destination_chain: String::new(),
+            gmp_destination_address: String::new(),
+            amplifier_timing: None,
+        }
+    }
+
+    pub(crate) fn succeeded(signature: impl Into<String>, submit_time_ms: u64) -> Self {
+        Self::from_outcome(signature, submit_time_ms, TxOutcome::Succeeded)
+    }
+
+    pub(crate) fn failed(
+        signature: impl Into<String>,
+        submit_time_ms: u64,
+        error: impl Into<String>,
+    ) -> Self {
+        Self::from_outcome(signature, submit_time_ms, TxOutcome::Failed(error.into()))
+    }
+
     pub(crate) fn is_success(&self) -> bool {
         self.outcome.is_success()
     }
@@ -221,8 +259,8 @@ pub(super) struct ReportInput {
 /// the finished report afterwards.
 #[derive(Debug, Clone)]
 pub(super) struct RunIdentity {
-    pub source_chain: String,
-    pub destination_chain: String,
+    pub source_chain: DisplayChainName,
+    pub destination_chain: DisplayChainName,
     pub protocol: String,
     /// The `--tps` / `--duration-secs` pair, absent for burst runs. They are
     /// only ever meaningful together, so they travel as one value.
@@ -230,15 +268,30 @@ pub(super) struct RunIdentity {
 }
 
 impl RunIdentity {
-    pub(super) fn from_args(args: &super::LoadTestArgs) -> Self {
+    pub(super) fn burst(args: &super::LoadTestArgs) -> Self {
+        Self::from_args(args, None)
+    }
+
+    pub(super) fn sustained(args: &super::LoadTestArgs, plan: SustainedPlan) -> Self {
+        Self::from_args(args, Some(plan))
+    }
+
+    pub(super) fn from_sizing(args: &super::LoadTestArgs, sizing: RunSizing) -> Self {
+        match sizing.mode() {
+            RunMode::Burst { .. } => Self::burst(args),
+            RunMode::Sustained(plan) => Self::sustained(args, plan),
+        }
+    }
+
+    fn from_args(args: &super::LoadTestArgs, plan: Option<SustainedPlan>) -> Self {
         Self {
-            source_chain: args.source_chain.clone(),
-            destination_chain: args.destination_chain.clone(),
+            source_chain: args.source_chain.clone().into(),
+            destination_chain: args.destination_chain.clone().into(),
             protocol: args.protocol.to_string(),
-            schedule: args
-                .tps
-                .zip(args.duration_secs)
-                .map(|(tps, duration_secs)| SustainedSchedule { tps, duration_secs }),
+            schedule: plan.map(|plan| SustainedSchedule {
+                tps: plan.tps as u64,
+                duration_secs: plan.duration_secs,
+            }),
         }
     }
 }
@@ -287,8 +340,8 @@ impl LoadTestReport {
         };
 
         Self {
-            source_chain: input.run.source_chain,
-            destination_chain: input.run.destination_chain,
+            source_chain: input.run.source_chain.into_string(),
+            destination_chain: input.run.destination_chain.into_string(),
             destination_address: input.destination_address,
             protocol: input.run.protocol,
             tps: input.run.schedule.map(|schedule| schedule.tps),
@@ -382,33 +435,23 @@ mod tests {
     };
 
     fn metric(success: bool, latency_ms: Option<u64>, compute_units: Option<u64>) -> TxMetrics {
+        let outcome = if success {
+            TxOutcome::Succeeded
+        } else {
+            TxOutcome::Failed("test failure".to_string())
+        };
         TxMetrics {
-            signature: String::new(),
-            submit_time_ms: 0,
-            confirm_time_ms: None,
             latency_ms,
             compute_units,
-            slot: None,
-            outcome: if success {
-                TxOutcome::Succeeded
-            } else {
-                TxOutcome::Failed("test failure".to_string())
-            },
-            payload_hash: String::new(),
-            source_address: String::new(),
-            payload: Vec::new(),
-            send_instant: None,
-            gmp_destination_chain: String::new(),
-            gmp_destination_address: String::new(),
-            amplifier_timing: None,
+            ..TxMetrics::from_outcome("", 0, outcome)
         }
     }
 
     fn input(compute_unit_summary: ComputeUnitSummary) -> ReportInput {
         ReportInput {
             run: RunIdentity {
-                source_chain: "source".to_string(),
-                destination_chain: "destination".to_string(),
+                source_chain: "source".into(),
+                destination_chain: "destination".into(),
                 protocol: "gmp".to_string(),
                 schedule: None,
             },
@@ -499,5 +542,69 @@ mod tests {
         let mut invalid = serde_json::to_value(metric(true, None, None)).unwrap();
         invalid["success"] = serde_json::Value::Bool(false);
         assert!(serde_json::from_value::<TxMetrics>(invalid).is_err());
+    }
+
+    #[test]
+    fn report_json_contract_is_stable() {
+        let report = LoadTestReport::from_transactions(
+            input(ComputeUnitSummary::Omit),
+            vec![metric(true, Some(10), None)],
+        );
+
+        assert_eq!(
+            serde_json::to_value(report).unwrap(),
+            serde_json::json!({
+                "source_chain": "source",
+                "destination_chain": "destination",
+                "destination_address": "address",
+                "protocol": "gmp",
+                "num_txs": 4,
+                "num_keys": 2,
+                "total_submitted": 4,
+                "total_confirmed": 1,
+                "total_failed": 0,
+                "test_duration_secs": 2.0,
+                "tps_submitted": 2.0,
+                "tps_confirmed": 0.5,
+                "landing_rate": 0.25,
+                "avg_latency_ms": 10.0,
+                "min_latency_ms": 10,
+                "max_latency_ms": 10,
+                "avg_compute_units": null,
+                "min_compute_units": null,
+                "max_compute_units": null,
+                "verification": null,
+                "transactions": [{
+                    "signature": "",
+                    "submit_time_ms": 0,
+                    "confirm_time_ms": null,
+                    "latency_ms": 10,
+                    "compute_units": null,
+                    "slot": null,
+                    "success": true,
+                    "error": null,
+                    "payload_hash": "",
+                    "source_address": "",
+                    "gmp_destination_chain": "",
+                    "gmp_destination_address": "",
+                    "amplifier_timing": null
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn constructors_initialize_consistent_outcomes_and_defaults() {
+        let succeeded = TxMetrics::succeeded("ok", 12);
+        assert!(succeeded.is_success());
+        assert_eq!(succeeded.error(), None);
+        assert_eq!(succeeded.signature, "ok");
+        assert_eq!(succeeded.submit_time_ms, 12);
+
+        let failed = TxMetrics::failed("bad", 34, "reverted");
+        assert!(!failed.is_success());
+        assert_eq!(failed.error(), Some("reverted"));
+        assert_eq!(failed.confirm_time_ms, None);
+        assert!(failed.payload.is_empty());
     }
 }

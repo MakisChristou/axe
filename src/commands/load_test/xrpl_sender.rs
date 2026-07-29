@@ -5,9 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-use super::metrics::{
-    ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentity, TxMetrics, TxOutcome,
-};
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentity, TxMetrics};
 use super::run_sizing::SustainedPlan;
 use super::submitter::TransactionSubmitter;
 use super::sustained;
@@ -33,21 +31,21 @@ pub const DEFAULT_GAS_FEE_DROPS: u64 = 100_000; // 0.1 XRP
 
 /// Build, sign and submit a single `interchain_transfer` Payment.
 /// Returns (tx_hash_uppercase, metrics).
-struct TransferSubmission<'a> {
-    client: &'a XrplClient,
-    wallet: &'a XrplWallet,
-    destination_multisig: &'a AccountId,
+struct TransferSubmission {
+    client: XrplClient,
+    wallet: XrplWallet,
+    destination_multisig: AccountId,
     total_drops: Drops,
     gas_fee_drops: Drops,
-    destination_chain: &'a str,
-    destination_address_hex: &'a str,
-    payload: Option<&'a [u8]>,
-    payload_hash_hex: &'a str,
-    gmp_dest_chain: &'a str,
-    gmp_dest_address: &'a str,
+    destination_chain: String,
+    destination_address_hex: String,
+    payload: Option<Vec<u8>>,
+    payload_hash_hex: String,
+    gmp_dest_chain: String,
+    gmp_dest_address: String,
 }
 
-async fn submit_single(submission: TransferSubmission<'_>) -> TxMetrics {
+async fn submit_single(submission: TransferSubmission) -> TxMetrics {
     let TransferSubmission {
         client,
         wallet,
@@ -70,12 +68,12 @@ async fn submit_single(submission: TransferSubmission<'_>) -> TxMetrics {
         Ok(a) => a,
         Err(e) => return fail_metrics(submit_start, &source_addr, &format!("amount: {e}")),
     };
-    let mut tx = PaymentTransaction::new(wallet.account_id, amount, *destination_multisig);
+    let mut tx = PaymentTransaction::new(wallet.account_id, amount, destination_multisig);
     tx.common.memos = build_its_transfer_memos(
-        destination_chain,
-        destination_address_hex,
+        &destination_chain,
+        &destination_address_hex,
         gas_fee_drops.get(),
-        payload,
+        payload.as_deref(),
     )
     .into_iter()
     .map(|m| xrpl_types::Memo {
@@ -137,20 +135,15 @@ async fn submit_single(submission: TransferSubmission<'_>) -> TxMetrics {
     let message_id = format!("0x{}", tx_hash.to_lowercase());
 
     TxMetrics {
-        signature: message_id,
-        submit_time_ms,
         confirm_time_ms: Some(submit_time_ms),
         latency_ms: Some(submit_time_ms),
-        compute_units: None,
-        slot: None,
-        outcome: TxOutcome::Succeeded,
         payload: payload.map(|p| p.to_vec()).unwrap_or_default(),
         payload_hash: payload_hash_hex.to_string(),
         source_address: source_addr,
         gmp_destination_chain: gmp_dest_chain.to_string(),
         gmp_destination_address: gmp_dest_address.to_string(),
         send_instant: Some(submit_start),
-        amplifier_timing: None,
+        ..TxMetrics::succeeded(message_id, submit_time_ms)
     }
 }
 
@@ -175,19 +168,19 @@ impl TransactionSubmitter for XrplSubmitter {
 
     async fn submit(&self, job: Self::Job) -> TxMetrics {
         submit_single(TransferSubmission {
-            client: &self.client,
-            wallet: &job.wallet,
-            destination_multisig: &self.destination_multisig,
+            client: self.client.clone(),
+            wallet: job.wallet,
+            destination_multisig: self.destination_multisig,
             total_drops: self
                 .gas_fee_drops
                 .saturating_add(Drops::new(NET_TRANSFER_DROPS)),
             gas_fee_drops: self.gas_fee_drops,
-            destination_chain: &self.destination_chain,
-            destination_address_hex: &self.destination_address_hex,
+            destination_chain: self.destination_chain.clone(),
+            destination_address_hex: self.destination_address_hex.clone(),
             payload: None,
-            payload_hash_hex: "",
-            gmp_dest_chain: &self.gmp_destination_chain,
-            gmp_dest_address: &self.gmp_destination_address,
+            payload_hash_hex: String::new(),
+            gmp_dest_chain: self.gmp_destination_chain.clone(),
+            gmp_dest_address: self.gmp_destination_address.clone(),
         })
         .await
     }
@@ -196,20 +189,8 @@ impl TransactionSubmitter for XrplSubmitter {
 fn fail_metrics(submit_start: Instant, source: &str, err: &str) -> TxMetrics {
     let elapsed_ms = submit_start.elapsed().as_millis() as u64;
     TxMetrics {
-        signature: String::new(),
-        submit_time_ms: elapsed_ms,
-        confirm_time_ms: None,
-        latency_ms: None,
-        compute_units: None,
-        slot: None,
-        outcome: TxOutcome::failed(err.to_string()),
-        payload: Vec::new(),
-        payload_hash: String::new(),
         source_address: source.to_string(),
-        gmp_destination_chain: String::new(),
-        gmp_destination_address: String::new(),
-        send_instant: None,
-        amplifier_timing: None,
+        ..TxMetrics::failed("", elapsed_ms, err)
     }
 }
 
@@ -219,19 +200,19 @@ fn fail_metrics(submit_start: Instant, source: &str, err: &str) -> TxMetrics {
 
 /// Run a burst-mode XRPL ITS load test: fires one Payment per derived
 /// ephemeral wallet, in parallel.
-pub(super) struct BurstRequest<'a> {
-    pub client: &'a XrplClient,
-    pub wallets: &'a [XrplWallet],
-    pub destination_multisig: &'a AccountId,
-    pub destination_chain: &'a str,
-    pub destination_address_hex: &'a str,
+pub(super) struct BurstRequest {
+    pub client: XrplClient,
+    pub wallets: Vec<XrplWallet>,
+    pub destination_multisig: AccountId,
+    pub destination_chain: String,
+    pub destination_address_hex: String,
     pub gas_fee_drops: u64,
-    pub gmp_dest_chain: &'a str,
-    pub gmp_dest_address: &'a str,
+    pub gmp_dest_chain: String,
+    pub gmp_dest_address: String,
     pub run: RunIdentity,
 }
 
-pub async fn run_burst(request: BurstRequest<'_>) -> Result<LoadTestReport> {
+pub async fn run_burst(request: BurstRequest) -> Result<LoadTestReport> {
     let BurstRequest {
         client,
         wallets,
@@ -251,13 +232,13 @@ pub async fn run_burst(request: BurstRequest<'_>) -> Result<LoadTestReport> {
         .collect();
     let burst = super::submitter::run_burst(
         XrplSubmitter {
-            client: client.clone(),
-            destination_multisig: *destination_multisig,
-            destination_chain: destination_chain.to_string(),
-            destination_address_hex: destination_address_hex.to_string(),
+            client,
+            destination_multisig,
+            destination_chain,
+            destination_address_hex: destination_address_hex.clone(),
             gas_fee_drops: Drops::new(gas_fee_drops),
-            gmp_destination_chain: gmp_dest_chain.to_string(),
-            gmp_destination_address: gmp_dest_address.to_string(),
+            gmp_destination_chain: gmp_dest_chain,
+            gmp_destination_address: gmp_dest_address,
         },
         jobs,
         key_count,
@@ -266,7 +247,7 @@ pub async fn run_burst(request: BurstRequest<'_>) -> Result<LoadTestReport> {
     Ok(build_burst_report(
         burst.metrics,
         run,
-        destination_address_hex,
+        &destination_address_hex,
         burst.total_submitted,
         burst.test_duration_secs,
         key_count,

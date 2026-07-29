@@ -22,7 +22,7 @@ use super::its_stellar_source::{
 use super::its_verification;
 use super::its_verification::{ItsBurstReport, SolanaItsTarget, finish_burst};
 use super::metrics::ComputeUnitSummary;
-use super::run_sizing::{RunSizing, SustainedPlan};
+use super::run_sizing::{RunMode, RunSizing, SustainedPlan};
 use super::verification_session::VerificationSession;
 use super::verify::VerificationRoute;
 use super::{LoadTestArgs, validate_solana_rpc};
@@ -74,10 +74,14 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
         amount_per_tx,
     };
 
-    if !sizing.is_burst() {
-        run_sustained_pipeline(&args, &stellar, &solana, wallets, &transfer, &sizing).await
-    } else {
-        run_burst_pipeline(&args, &stellar, &solana, wallets, &transfer, &sizing).await
+    match sizing.mode() {
+        RunMode::Sustained(plan) => {
+            run_sustained_pipeline(&args, &stellar, &solana, wallets, &transfer, &sizing, plan)
+                .await
+        }
+        RunMode::Burst { .. } => {
+            run_burst_pipeline(&args, &stellar, &solana, wallets, &transfer, &sizing).await
+        }
     }
 }
 
@@ -99,12 +103,12 @@ struct SolanaTarget {
     address_bytes: Vec<u8>,
 }
 
-struct SolanaRemoteDeployment<'a> {
-    rpc_url: &'a str,
+struct SolanaRemoteDeployment {
+    rpc_url: String,
     network: crate::types::Network,
 }
 
-impl RemoteDeploymentVerifier for SolanaRemoteDeployment<'_> {
+impl RemoteDeploymentVerifier for SolanaRemoteDeployment {
     async fn wait_for_remote_deploy(
         &self,
         config: &std::path::Path,
@@ -117,7 +121,7 @@ impl RemoteDeploymentVerifier for SolanaRemoteDeployment<'_> {
             source_axelar_id,
             destination_axelar_id,
             message_id,
-            self.rpc_url,
+            &self.rpc_url,
             self.network,
         )
         .await
@@ -230,29 +234,31 @@ async fn prepare_token_and_wallets(
     let dest = &args.destination_chain;
 
     let remote_verifier = SolanaRemoteDeployment {
-        rpc_url: solana_rpc_url,
+        rpc_url: solana_rpc_url.to_string(),
         network: args.network,
     };
-    let token = setup_token(TokenSetupRequest {
-        client: &stellar.client,
+    let token = setup_token(
+        &stellar.client,
         main_wallet,
-        its_contract: &stellar.its_addr,
-        gateway_contract: &stellar.gateway_addr,
-        gas_token: &stellar.xlm_addr,
-        gas_stroops: super::units::Stroops::new(gas_stroops),
-        source_chain: src,
-        destination_chain: dest,
-        destination_axelar_id: &args.destination_axelar_id,
-        token_id_override: args.token_id.as_deref(),
-        config: &args.config,
-        required_transfers: sizing.num_keys,
-        remote_verifier: &remote_verifier,
-    })
+        &remote_verifier,
+        TokenSetupRequest {
+            its_contract: stellar.its_addr.clone(),
+            gateway_contract: stellar.gateway_addr.clone(),
+            gas_token: stellar.xlm_addr.clone(),
+            gas_stroops: super::units::Stroops::new(gas_stroops),
+            source_chain: src.clone(),
+            destination_chain: dest.clone(),
+            destination_axelar_id: args.destination_axelar_id.clone(),
+            token_id_override: args.token_id.clone(),
+            config: args.config.clone(),
+            required_transfers: sizing.num_keys,
+        },
+    )
     .await?;
     ui::kv("token ID", &hex::encode(token.token_id));
     ui::address("token contract (Stellar)", &token.token_address);
 
-    let txs_per_key = if sizing.is_burst() { 1 } else { args.key_cycle };
+    let txs_per_key = sizing.transactions_per_key();
     let wallets = derive_and_fund_wallets(
         &stellar.client,
         main_wallet,
@@ -263,7 +269,7 @@ async fn prepare_token_and_wallets(
     )
     .await?;
 
-    let amount_per_key = amount_per_key(sizing, args.key_cycle, token.decimals);
+    let amount_per_key = amount_per_key(sizing, token.decimals);
     distribute_token_balances(
         &stellar.client,
         main_wallet,
@@ -288,12 +294,9 @@ async fn run_sustained_pipeline(
     wallets: Vec<StellarWallet>,
     transfer: &ItsTransferSpec,
     sizing: &RunSizing,
+    plan: SustainedPlan,
 ) -> Result<()> {
-    let SustainedPlan {
-        tps: tps_n,
-        duration_secs,
-        key_cycle,
-    } = sizing.sustained().expect("sustained mode");
+    let duration_secs = plan.duration_secs;
     let mut verification = VerificationSession::start(
         VerificationRoute::from_args(args),
         SolanaItsTarget {
@@ -321,9 +324,7 @@ async fn run_sustained_pipeline(
             axelarnet_gw_addr: transfer.axelarnet_gw_addr.clone(),
         },
         wallets,
-        tps: tps_n,
-        duration_secs,
-        key_cycle,
+        plan,
         verify_tx: Some(verification.sender()),
         send_done: Some(verification.send_done()),
         spinner,

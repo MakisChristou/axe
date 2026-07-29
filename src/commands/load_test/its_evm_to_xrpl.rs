@@ -18,7 +18,7 @@ use super::its_verification;
 use super::its_verification::{ItsBurstReport, XrplItsTarget, finish_burst};
 use super::keypairs;
 use super::metrics::ComputeUnitSummary;
-use super::run_sizing::{RunSizing, SustainedPlan};
+use super::run_sizing::{RunMode, RunSizing, SustainedPlan};
 use super::verification_session::VerificationSession;
 use super::verify::VerificationRoute;
 use super::{LoadTestArgs, check_evm_balance, validate_evm_rpc};
@@ -53,7 +53,7 @@ fn default_xrpl_recipient(network: crate::types::Network) -> &'static str {
 /// 0.001 axlXRP = 1e15 wei → 1000 drops on XRPL.
 const AMOUNT_PER_TX_WEI: u128 = 1_000_000_000_000_000;
 
-pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
+pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> eyre::Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
@@ -83,8 +83,6 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
     let xrpl = setup_xrpl_recipient(&args.config, dest, args.network).await?;
 
     let (gas_value_wei, gas_value) = super::its_evm_source::standard_gas_value(&args).await?;
-
-    let sizing = RunSizing::new(&args)?;
 
     let derived =
         derive_and_fund_evm_signers(&evm_src, &evm_rpc_url, gas_value_wei, &sizing).await?;
@@ -117,10 +115,23 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
         amount_per_tx: U256::from(AMOUNT_PER_TX_WEI),
     };
 
-    if !sizing.is_burst() {
-        run_sustained_pipeline(&args, &cfg, &evm_rpc_url, &xrpl, derived, &its_ctx, &sizing).await
-    } else {
-        run_burst_pipeline(&args, &evm_rpc_url, &xrpl, &derived, &its_ctx, &sizing).await
+    match sizing.mode() {
+        RunMode::Sustained(plan) => {
+            run_sustained_pipeline(SustainedPipeline {
+                args,
+                cfg,
+                evm_rpc_url,
+                xrpl,
+                derived,
+                its_ctx,
+                sizing,
+                plan,
+            })
+            .await
+        }
+        RunMode::Burst { .. } => {
+            run_burst_pipeline(&args, &evm_rpc_url, &xrpl, &derived, &its_ctx, &sizing).await
+        }
     }
 }
 
@@ -426,20 +437,33 @@ async fn distribute_and_approve_tokens(
 /// Drive the sustained-mode pipeline: spawn the streaming verifier, run the
 /// EVM sustained loop, stitch amplifier timings back into the report, and
 /// hand off to `finish_report`.
-async fn run_sustained_pipeline(
-    args: &LoadTestArgs,
-    cfg: &ChainsConfig,
-    evm_rpc_url: &str,
-    xrpl: &XrplDest,
+struct SustainedPipeline {
+    args: LoadTestArgs,
+    cfg: ChainsConfig,
+    evm_rpc_url: String,
+    xrpl: XrplDest,
     derived: Vec<PrivateKeySigner>,
-    its_ctx: &ItsCallCtx,
-    sizing: &RunSizing,
-) -> eyre::Result<()> {
+    its_ctx: ItsCallCtx,
+    sizing: RunSizing,
+    plan: SustainedPlan,
+}
+
+async fn run_sustained_pipeline(pipeline: SustainedPipeline) -> eyre::Result<()> {
+    let SustainedPipeline {
+        args,
+        cfg,
+        evm_rpc_url,
+        xrpl,
+        derived,
+        its_ctx,
+        sizing,
+        plan,
+    } = pipeline;
     let SustainedPlan {
         tps,
         duration_secs,
         key_cycle,
-    } = sizing.sustained().expect("sustained mode");
+    } = plan;
 
     let nonce_provider = ProviderBuilder::new().connect_http(evm_rpc_url.parse()?);
     let mut nonces: Vec<u64> = Vec::with_capacity(sizing.num_keys);
@@ -453,7 +477,7 @@ async fn run_sustained_pipeline(
         .contract_address("VotingVerifier", &args.source_axelar_id)
         .is_ok();
     let mut verification = VerificationSession::start(
-        VerificationRoute::from_args(args),
+        VerificationRoute::from_args(&args),
         XrplItsTarget {
             rpc_url: xrpl.xrpl_rpc.clone(),
             recipient: xrpl.recipient_addr.clone(),
@@ -496,7 +520,7 @@ async fn run_sustained_pipeline(
     .await?;
     its_verification::finish_sustained(
         verification,
-        args,
+        &args,
         result,
         &xrpl.recipient_addr,
         sizing.total_expected,
@@ -543,7 +567,7 @@ async fn run_burst_pipeline(
         burst,
         ItsBurstReport {
             destination_address: xrpl.recipient_addr.clone(),
-            num_txs: args.num_txs,
+            num_txs: sizing.total_expected,
             num_keys,
             compute_unit_summary: ComputeUnitSummary::Omit,
         },

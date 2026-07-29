@@ -3,9 +3,7 @@ use std::time::Instant;
 
 use super::LoadTestArgs;
 use super::keypairs;
-use super::metrics::{
-    ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentity, TxMetrics, TxOutcome,
-};
+use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentity, TxMetrics};
 use super::run_sizing::SustainedPlan;
 use super::submitter::TransactionSubmitter;
 use super::sustained;
@@ -122,10 +120,11 @@ fn prepare_keypairs(
 /// `SenderReceiver._execute`. When false, payloads use the Solana executable format.
 pub async fn run_load_test_with_metrics(
     args: &LoadTestArgs,
+    num_txs: u64,
     destination_address: &str,
     evm_destination: bool,
 ) -> eyre::Result<LoadTestReport> {
-    let num_txs = args.num_txs.max(1) as usize;
+    let num_txs = usize::try_from(num_txs)?;
 
     let main_keypair = solana::load_keypair(args.keypair.as_deref())?;
 
@@ -182,9 +181,9 @@ pub async fn run_load_test_with_metrics(
     .await?;
     let report = LoadTestReport::from_transactions(
         ReportInput {
-            run: RunIdentity::from_args(args),
+            run: RunIdentity::burst(args),
             destination_address: destination_address.to_string(),
-            num_txs: args.num_txs,
+            num_txs: num_txs as u64,
             num_keys: key_count,
             total_submitted: burst.total_submitted,
             test_duration_secs: burst.test_duration_secs,
@@ -218,22 +217,7 @@ fn send_sol_tx(
         }
         Err(e) => {
             let elapsed_ms = submit_start.elapsed().as_millis() as u64;
-            TxMetrics {
-                signature: String::new(),
-                submit_time_ms: elapsed_ms,
-                confirm_time_ms: None,
-                latency_ms: None,
-                compute_units: None,
-                slot: None,
-                outcome: TxOutcome::failed(e.to_string()),
-                payload: Vec::new(),
-                payload_hash: String::new(),
-                source_address: String::new(),
-                gmp_destination_chain: String::new(),
-                gmp_destination_address: String::new(),
-                send_instant: None,
-                amplifier_timing: None,
-            }
+            TxMetrics::failed("", elapsed_ms, e.to_string())
         }
     }
 }
@@ -241,23 +225,20 @@ fn send_sol_tx(
 /// Run Solana sustained load test at a controlled TPS rate.
 pub(super) async fn run_sustained_load_test_with_metrics(
     args: &LoadTestArgs,
+    plan: SustainedPlan,
     evm_destination: bool,
     destination_address: &str,
     verify_tx: Option<tokio::sync::mpsc::UnboundedSender<super::verify::PendingTx>>,
     send_done: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     spinner_tx: tokio::sync::oneshot::Sender<indicatif::ProgressBar>,
 ) -> eyre::Result<LoadTestReport> {
-    // `run_sustained` is only called from sustained-mode dispatch, where
-    // both `tps` and `duration_secs` have already been validated as `Some`.
-    let tps = args
-        .tps
-        .expect("run_sustained called outside sustained mode") as usize;
-    let duration_secs = args
-        .duration_secs
-        .expect("run_sustained called outside sustained mode");
-    let key_cycle = args.key_cycle as usize;
+    let SustainedPlan {
+        tps,
+        duration_secs,
+        key_cycle,
+    } = plan;
     let pool_size = tps * key_cycle;
-    let total_expected = tps as u64 * duration_secs;
+    let total_expected = plan.total_transactions();
 
     let main_keypair = solana::load_keypair(args.keypair.as_deref())?;
     let rpc_client = RpcClient::new_with_commitment(
@@ -346,22 +327,7 @@ pub(super) async fn run_sustained_load_test_with_metrics(
                 send_sol_tx(&rpc, kp.as_ref(), network, &dc, &da, &tx_payload)
             })
             .await
-            .unwrap_or_else(|e| TxMetrics {
-                signature: String::new(),
-                submit_time_ms: 0,
-                confirm_time_ms: None,
-                latency_ms: None,
-                compute_units: None,
-                slot: None,
-                outcome: TxOutcome::failed(format!("task panicked: {e}")),
-                payload: Vec::new(),
-                payload_hash: String::new(),
-                source_address: String::new(),
-                gmp_destination_chain: String::new(),
-                gmp_destination_address: String::new(),
-                send_instant: None,
-                amplifier_timing: None,
-            });
+            .unwrap_or_else(|e| TxMetrics::failed("", 0, format!("task panicked: {e}")));
             // Stream successful txs to the concurrent verification pipeline.
             if result.is_success()
                 && let Some(ref tx_sender) = vtx
@@ -404,7 +370,7 @@ pub(super) async fn run_sustained_load_test_with_metrics(
 
     Ok(sustained::build_sustained_report(
         result,
-        RunIdentity::from_args(args),
+        RunIdentity::sustained(args, plan),
         destination_address,
         total_expected,
         pool_size,

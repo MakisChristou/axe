@@ -18,6 +18,7 @@ pub(super) struct SustainedResult {
     pub metrics: Vec<TxMetrics>,
     pub test_duration_secs: f64,
     pub total_submitted: u64,
+    pub plan: SustainedPlan,
 }
 
 /// A boxed future that produces a single `TxMetrics`.
@@ -26,6 +27,10 @@ type TxFuture = Pin<Box<dyn Future<Output = TxMetrics> + Send>>;
 /// A factory that, given `(key_index, optional_nonce)`, returns a future
 /// that sends one transaction and produces its metrics.
 pub(super) type MakeTask = Box<dyn FnMut(usize, Option<u64>) -> TxFuture + Send>;
+
+fn scheduled_key_index(tick: u64, offset: usize, plan: SustainedPlan) -> usize {
+    (tick as usize % plan.key_cycle) * plan.tps + offset
+}
 
 /// Convert one successful source transaction into streaming verification
 /// state without coupling the shared submission driver to a chain family.
@@ -118,7 +123,7 @@ pub(super) async fn run_sustained_loop(
     let SustainedPlan {
         tps,
         duration_secs,
-        key_cycle,
+        key_cycle: _,
     } = plan;
     let total_expected = plan.total_transactions();
 
@@ -139,9 +144,8 @@ pub(super) async fn run_sustained_loop(
             break;
         }
 
-        let batch_start = (tick as usize % key_cycle) * tps;
         for i in 0..tps {
-            let key_idx = batch_start + i;
+            let key_idx = scheduled_key_index(tick, i, plan);
 
             let nonce = nonces.as_mut().map(|n| {
                 let val = n[key_idx];
@@ -247,6 +251,7 @@ pub(super) async fn run_sustained_loop(
         metrics,
         test_duration_secs: test_duration,
         total_submitted,
+        plan,
     })
 }
 
@@ -278,7 +283,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{
-        ItsPendingTxAdapter, MakeTask, SustainedPlan, run_sustained_loop, submission_tasks,
+        ItsPendingTxAdapter, MakeTask, SustainedPlan, run_sustained_loop, scheduled_key_index,
+        submission_tasks,
     };
     use crate::commands::load_test::metrics::{TxMetrics, TxOutcome};
     use crate::commands::load_test::submitter::TransactionSubmitter;
@@ -421,5 +427,30 @@ mod tests {
 
         assert!(send_done.load(Ordering::Relaxed));
         assert!(error.to_string().contains("sustained send task failed"));
+    }
+
+    #[test]
+    fn scheduler_rotates_complete_tps_batches_across_the_key_pool() {
+        let plan = SustainedPlan {
+            tps: 2,
+            duration_secs: 5,
+            key_cycle: 3,
+        };
+        let scheduled = (0..plan.duration_secs)
+            .map(|tick| {
+                (0..plan.tps)
+                    .map(|offset| scheduled_key_index(tick, offset, plan))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            scheduled,
+            vec![vec![0, 1], vec![2, 3], vec![4, 5], vec![0, 1], vec![2, 3]]
+        );
+        assert_eq!(
+            scheduled.iter().map(Vec::len).sum::<usize>() as u64,
+            plan.total_transactions()
+        );
     }
 }

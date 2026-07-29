@@ -28,13 +28,15 @@ use eyre::{Result, eyre};
 use super::gmp_sui_source::{DEFAULT_GAS_BUDGET, DEFAULT_GAS_VALUE};
 use super::its_sui_source::{ItsSuiSubmitter, run_its_sequential};
 use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentity};
+use super::run_sizing::RunSizing;
 use super::{LoadTestArgs, load_sui_main_wallet, resolve_sui_axe_token, validate_evm_rpc};
 use crate::config::ChainsConfig;
 use crate::ui;
 
 const AMOUNT_PER_TX: u64 = 1; // ITS amounts are in token sub-units; 1 is fine for a load test.
 
-pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
+pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> Result<()> {
+    let num_txs = usize::try_from(sizing.require_burst("ITS sui-to-evm")?)?;
     let src = &args.source_chain;
     let dest = &args.destination_chain;
     let cfg = ChainsConfig::load(&args.config)?;
@@ -168,7 +170,6 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
         .to_string();
 
     // --- Sequential burst through the shared source capability ---
-    let num_txs = args.num_txs.max(1) as usize;
     let test_start = Instant::now();
     let burst = run_its_sequential(
         ItsSuiSubmitter {
@@ -190,7 +191,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
 
     let mut report = LoadTestReport::from_transactions(
         ReportInput {
-            run: RunIdentity::from_args(&args),
+            run: RunIdentity::burst(&args),
             destination_address: destination_address.clone(),
             num_txs: burst.total_submitted,
             num_keys: 1,

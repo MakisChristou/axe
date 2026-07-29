@@ -363,8 +363,7 @@ fn message_id_for_source(
 /// vary by destination chain — `contract_addr` (parsed for EVM, zero
 /// elsewhere), `command_id` (`Some` for Solana, `None` elsewhere), and the
 /// `gmp_destination_*` fields — so the caller passes those explicitly.
-struct PendingGmpBatchArgs<'a> {
-    tx: &'a TxMetrics,
+struct PendingGmpBatchArgs {
     idx: usize,
     message_id: MessageId,
     contract_addr: Address,
@@ -374,9 +373,8 @@ struct PendingGmpBatchArgs<'a> {
     initial_phase: Phase,
 }
 
-fn pending_tx_for_gmp_batch(args: PendingGmpBatchArgs<'_>) -> Result<PendingTx> {
+fn pending_tx_for_gmp_batch(tx: &TxMetrics, args: PendingGmpBatchArgs) -> Result<PendingTx> {
     let PendingGmpBatchArgs {
-        tx,
         idx,
         message_id,
         contract_addr,
@@ -488,16 +486,18 @@ pub async fn verify_onchain<P: Provider>(
         .iter()
         .map(|&idx| {
             let tx = &metrics[idx];
-            pending_tx_for_gmp_batch(PendingGmpBatchArgs {
+            pending_tx_for_gmp_batch(
                 tx,
-                idx,
-                message_id: message_id_for_source(tx, source_type, network),
-                contract_addr,
-                command_id: None, // EVM destination, not needed
-                gmp_destination_chain: String::new(),
-                gmp_destination_address: String::new(),
-                initial_phase,
-            })
+                PendingGmpBatchArgs {
+                    idx,
+                    message_id: message_id_for_source(tx, source_type, network),
+                    contract_addr,
+                    command_id: None, // EVM destination, not needed
+                    gmp_destination_chain: String::new(),
+                    gmp_destination_address: String::new(),
+                    initial_phase,
+                },
+            )
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -622,16 +622,18 @@ pub async fn verify_onchain_evm_legacy<P: Provider>(
         .iter()
         .map(|&idx| {
             let tx = &metrics[idx];
-            pending_tx_for_gmp_batch(PendingGmpBatchArgs {
+            pending_tx_for_gmp_batch(
                 tx,
-                idx,
-                message_id: message_id_for_source(tx, source_type, network),
-                contract_addr,
-                command_id: None,
-                gmp_destination_chain: String::new(),
-                gmp_destination_address: String::new(),
-                initial_phase,
-            })
+                PendingGmpBatchArgs {
+                    idx,
+                    message_id: message_id_for_source(tx, source_type, network),
+                    contract_addr,
+                    command_id: None,
+                    gmp_destination_chain: String::new(),
+                    gmp_destination_address: String::new(),
+                    initial_phase,
+                },
+            )
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -874,16 +876,18 @@ pub async fn verify_onchain_stellar_gmp(
         .iter()
         .map(|&idx| {
             let tx = &metrics[idx];
-            pending_tx_for_gmp_batch(PendingGmpBatchArgs {
+            pending_tx_for_gmp_batch(
                 tx,
-                idx,
-                message_id: message_id_for_source(tx, source_type, network),
-                contract_addr: Address::ZERO,
-                command_id: None,
-                gmp_destination_chain: tx.gmp_destination_chain.clone(),
-                gmp_destination_address: destination_contract.to_string(),
-                initial_phase,
-            })
+                PendingGmpBatchArgs {
+                    idx,
+                    message_id: message_id_for_source(tx, source_type, network),
+                    contract_addr: Address::ZERO,
+                    command_id: None,
+                    gmp_destination_chain: tx.gmp_destination_chain.clone(),
+                    gmp_destination_address: destination_contract.to_string(),
+                    initial_phase,
+                },
+            )
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -1093,16 +1097,18 @@ pub async fn verify_onchain_sui_gmp(
             // `messages_status` query never match (status "unknown") and the
             // verify phase timed out at "voted". Plumb the per-tx hub
             // destination through; for raw Sui-dest GMP it equals the channel.
-            pending_tx_for_gmp_batch(PendingGmpBatchArgs {
+            pending_tx_for_gmp_batch(
                 tx,
-                idx,
-                message_id: message_id_for_source(tx, source_type, network),
-                contract_addr: Address::ZERO,
-                command_id: None,
-                gmp_destination_chain: tx.gmp_destination_chain.clone(),
-                gmp_destination_address: tx.gmp_destination_address.clone(),
-                initial_phase,
-            })
+                PendingGmpBatchArgs {
+                    idx,
+                    message_id: message_id_for_source(tx, source_type, network),
+                    contract_addr: Address::ZERO,
+                    command_id: None,
+                    gmp_destination_chain: tx.gmp_destination_chain.clone(),
+                    gmp_destination_address: tx.gmp_destination_address.clone(),
+                    initial_phase,
+                },
+            )
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -1253,16 +1259,18 @@ pub async fn verify_onchain_solana(
             // phase timed out at "voted". The TxMetrics already captured
             // these from the source-side CallContract event, so plumb them
             // through.
-            pending_tx_for_gmp_batch(PendingGmpBatchArgs {
+            pending_tx_for_gmp_batch(
                 tx,
-                idx,
-                message_id,
-                contract_addr: Address::ZERO,
-                command_id: Some(keccak256(&cmd_input).into()),
-                gmp_destination_chain: tx.gmp_destination_chain.clone(),
-                gmp_destination_address: tx.gmp_destination_address.clone(),
-                initial_phase,
-            })
+                PendingGmpBatchArgs {
+                    idx,
+                    message_id,
+                    contract_addr: Address::ZERO,
+                    command_id: Some(keccak256(&cmd_input).into()),
+                    gmp_destination_chain: tx.gmp_destination_chain.clone(),
+                    gmp_destination_address: tx.gmp_destination_address.clone(),
+                    initial_phase,
+                },
+            )
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -1935,4 +1943,42 @@ pub async fn verify_onchain_evm_its_streaming(
     .await?;
 
     Ok(streaming_report_and_timings(&txs, peaks))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SourceChainType, message_id_for_source};
+    use crate::commands::load_test::metrics::TxMetrics;
+    use crate::types::Network;
+
+    #[test]
+    fn message_id_normalization_matches_each_source_family_contract() {
+        let network = Network::DevnetAmplifier;
+        let evm = TxMetrics::succeeded("0xabc-4", 0);
+        assert_eq!(
+            message_id_for_source(&evm, SourceChainType::Evm, network).as_ref(),
+            "0xabc-4"
+        );
+
+        let preformatted_solana = TxMetrics::succeeded("signature-1.7", 0);
+        assert_eq!(
+            message_id_for_source(&preformatted_solana, SourceChainType::Svm, network).as_ref(),
+            "signature-1.7"
+        );
+
+        let raw_solana = TxMetrics::succeeded("signature", 0);
+        assert_eq!(
+            message_id_for_source(&raw_solana, SourceChainType::Svm, network).as_ref(),
+            format!(
+                "signature-{}.1",
+                crate::solana::solana_call_contract_index(network)
+            )
+        );
+
+        let stellar = TxMetrics::succeeded("0xstellar-2", 0);
+        assert_eq!(
+            message_id_for_source(&stellar, SourceChainType::Stellar, network).as_ref(),
+            "0xstellar-2"
+        );
+    }
 }

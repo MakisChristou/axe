@@ -25,7 +25,7 @@ use super::its_prerequisites::{self, GatewayRequirement};
 use super::its_verification;
 use super::its_verification::{EvmItsTarget, ItsBurstReport, finish_burst};
 use super::metrics::ComputeUnitSummary;
-use super::run_sizing::{RunSizing as ValidatedRunSizing, SustainedPlan};
+use super::run_sizing::{RunMode, RunSizing as ValidatedRunSizing, SustainedPlan};
 use super::verification_session::VerificationSession;
 use super::verify::VerificationRoute;
 use super::{LoadTestArgs, read_its_cache, validate_evm_rpc};
@@ -39,7 +39,11 @@ use alloy::{
 };
 use eyre::eyre;
 
-pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
+pub async fn run(
+    args: LoadTestArgs,
+    _run_start: Instant,
+    validated_sizing: ValidatedRunSizing,
+) -> eyre::Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
@@ -67,7 +71,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
 
     let gas_value_wei = its_evm_source::standard_gas_value_wei(&args).await?;
     let gas_value = U256::from(gas_value_wei);
-    let mut sizing = RunSizing::standard(ValidatedRunSizing::new(&args)?);
+    let mut sizing = RunSizing::standard(validated_sizing);
 
     let token = resolve_or_deploy_token(
         &args,
@@ -146,20 +150,20 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
         receiver_bytes,
     };
 
+    let mode = sizing.mode();
     let pipeline = PipelineContext {
-        args: &args,
-        cfg: &cfg,
-        source_rpc_url: &source_rpc_url,
-        destination_rpc_url: &dest_rpc_url,
+        args,
+        cfg,
+        source_rpc_url,
+        destination_rpc_url: dest_rpc_url,
         destination_gateway: dest_gateway_addr,
-        derived: &derived,
-        sizing: &sizing,
-        targets: &targets,
+        derived,
+        sizing,
+        targets,
     };
-    if !sizing.is_burst() {
-        run_sustained_pipeline(&pipeline).await
-    } else {
-        run_burst_pipeline(&pipeline).await
+    match mode {
+        RunMode::Sustained(plan) => run_sustained_pipeline(pipeline, plan).await,
+        RunMode::Burst { .. } => run_burst_pipeline(pipeline).await,
     }
 }
 
@@ -361,19 +365,21 @@ fn hub_gas_extra_per_key(sizing: &RunSizing, gas_value_wei: u128) -> u128 {
     }
 }
 
-#[derive(Clone, Copy)]
-struct PipelineContext<'a> {
-    args: &'a LoadTestArgs,
-    cfg: &'a ChainsConfig,
-    source_rpc_url: &'a str,
-    destination_rpc_url: &'a str,
+struct PipelineContext {
+    args: LoadTestArgs,
+    cfg: ChainsConfig,
+    source_rpc_url: String,
+    destination_rpc_url: String,
     destination_gateway: Address,
-    derived: &'a [PrivateKeySigner],
-    sizing: &'a RunSizing,
-    targets: &'a TransferTargets,
+    derived: Vec<PrivateKeySigner>,
+    sizing: RunSizing,
+    targets: TransferTargets,
 }
 
-async fn run_sustained_pipeline(pipeline: &PipelineContext<'_>) -> eyre::Result<()> {
+async fn run_sustained_pipeline(
+    pipeline: PipelineContext,
+    plan: SustainedPlan,
+) -> eyre::Result<()> {
     let PipelineContext {
         args,
         cfg,
@@ -383,16 +389,16 @@ async fn run_sustained_pipeline(pipeline: &PipelineContext<'_>) -> eyre::Result<
         derived,
         sizing,
         targets,
-    } = *pipeline;
+    } = pipeline;
     let SustainedPlan {
         tps,
         duration_secs,
         key_cycle,
-    } = sizing.sustained().expect("sustained mode");
+    } = plan;
 
     let nonce_provider = ProviderBuilder::new().connect_http(source_rpc_url.parse()?);
     let mut nonces: Vec<u64> = Vec::with_capacity(sizing.num_keys);
-    for signer in derived {
+    for signer in &derived {
         let n = nonce_provider
             .get_transaction_count(signer.address())
             .await?;
@@ -404,7 +410,7 @@ async fn run_sustained_pipeline(pipeline: &PipelineContext<'_>) -> eyre::Result<
         .contract_address("VotingVerifier", &args.source_chain)
         .is_ok();
     let mut verification = VerificationSession::start(
-        VerificationRoute::from_args(args),
+        VerificationRoute::from_args(&args),
         EvmItsTarget {
             gateway_addr: dest_gateway_addr,
             rpc_url: dest_rpc_url.to_string(),
@@ -428,7 +434,7 @@ async fn run_sustained_pipeline(pipeline: &PipelineContext<'_>) -> eyre::Result<
             gas_value: super::units::Wei::from_u256(targets.gas_value),
             gas_arg_scaling_factor: targets.gas_arg_scaling_factor,
         },
-        derived.to_vec(),
+        derived,
         Some(verification.sender()),
         has_voting_verifier,
     );
@@ -447,7 +453,7 @@ async fn run_sustained_pipeline(pipeline: &PipelineContext<'_>) -> eyre::Result<
     .await?;
     its_verification::finish_sustained(
         verification,
-        args,
+        &args,
         result,
         &format!("{}", targets.its_proxy_addr),
         sizing.total_expected,
@@ -457,7 +463,7 @@ async fn run_sustained_pipeline(pipeline: &PipelineContext<'_>) -> eyre::Result<
     .await
 }
 
-async fn run_burst_pipeline(pipeline: &PipelineContext<'_>) -> eyre::Result<()> {
+async fn run_burst_pipeline(pipeline: PipelineContext) -> eyre::Result<()> {
     let PipelineContext {
         args,
         source_rpc_url,
@@ -467,7 +473,7 @@ async fn run_burst_pipeline(pipeline: &PipelineContext<'_>) -> eyre::Result<()> 
         sizing,
         targets,
         ..
-    } = *pipeline;
+    } = pipeline;
     let num_txs = sizing.num_keys;
 
     let test_start = Instant::now();
@@ -482,7 +488,7 @@ async fn run_burst_pipeline(pipeline: &PipelineContext<'_>) -> eyre::Result<()> 
             gas_value: super::units::Wei::from_u256(targets.gas_value),
             gas_arg_scaling_factor: targets.gas_arg_scaling_factor,
         },
-        derived,
+        &derived,
     )
     .await?;
     let total_failed = burst.metrics.iter().filter(|m| !m.is_success()).count() as u64;
@@ -505,7 +511,7 @@ async fn run_burst_pipeline(pipeline: &PipelineContext<'_>) -> eyre::Result<()> 
     }
 
     finish_burst(
-        args,
+        &args,
         EvmItsTarget {
             gateway_addr: dest_gateway_addr,
             rpc_url: dest_rpc_url.to_string(),
@@ -513,7 +519,7 @@ async fn run_burst_pipeline(pipeline: &PipelineContext<'_>) -> eyre::Result<()> 
         burst,
         ItsBurstReport {
             destination_address: format!("{}", targets.its_proxy_addr),
-            num_txs: args.num_txs,
+            num_txs: sizing.total_expected,
             num_keys: num_txs,
             compute_unit_summary: ComputeUnitSummary::Omit,
         },

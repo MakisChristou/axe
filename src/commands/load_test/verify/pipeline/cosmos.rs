@@ -1,6 +1,8 @@
 //! Cosmos single-message and batch observations used by the polling pipeline.
 
 use eyre::Result;
+use serde::Deserialize;
+use serde::de::IgnoredAny;
 use serde_json::json;
 
 use super::{ContractQueryObservation, observe_contract_query};
@@ -9,6 +11,13 @@ use crate::cosmos::{CosmwasmQueryPending, lcd_cosmwasm_smart_query};
 /// Max messages per Cosmos LCD batch query. The query is base64-encoded in
 /// the URL, so each message adds ~500 chars. Ten stays below common URL limits.
 const COSMOS_BATCH_SIZE: usize = 10;
+
+type PresenceList = Vec<Option<IgnoredAny>>;
+
+#[derive(Deserialize)]
+struct VotingStatus {
+    status: String,
+}
 
 pub(in crate::commands::load_test::verify) async fn check_cosmos_routed(
     lcd: &str,
@@ -34,16 +43,8 @@ pub(in crate::commands::load_test::verify) async fn check_cosmos_routed(
         ContractQueryObservation::Ready(response) => response,
         ContractQueryObservation::Pending => return Ok(false),
     };
-    let data = response
-        .get("data")
-        .or_else(|| response.as_array().map(|_| &response));
-    Ok(match data {
-        Some(array) if array.is_array() => {
-            let items = array.as_array().expect("checked as array");
-            !items.is_empty() && !items.iter().all(serde_json::Value::is_null)
-        }
-        _ => false,
-    })
+    let items: PresenceList = response;
+    Ok(items.into_iter().any(|item| item.is_some()))
 }
 
 pub(in crate::commands::load_test::verify) async fn check_hub_approved(
@@ -72,8 +73,8 @@ pub(in crate::commands::load_test::verify) async fn check_hub_approved(
         ContractQueryObservation::Ready(response) => response,
         ContractQueryObservation::Pending => return Ok(false),
     };
-    let response = serde_json::to_string(&response)?;
-    Ok(!response.contains("null") && response.contains(message_id))
+    let items: PresenceList = response;
+    Ok(items.into_iter().any(|item| item.is_some()))
 }
 
 pub(super) async fn batch_check_voting_verifier_owned(
@@ -104,9 +105,8 @@ pub(super) async fn batch_check_voting_verifier_owned(
                 .collect::<Vec<_>>();
             let query = json!({ "messages_status": messages });
             let response = lcd_cosmwasm_smart_query(lcd, voting_verifier, &query).await?;
-            let items = response.as_array().ok_or_else(|| {
-                eyre::eyre!("VotingVerifier messages_status returned non-array: {response}")
-            })?;
+            let items: Vec<Option<VotingStatus>> = serde_json::from_value(response)
+                .map_err(|error| eyre::eyre!("invalid VotingVerifier response: {error}"))?;
             if items.len() != chunk.len() {
                 return Err(eyre::eyre!(
                     "VotingVerifier messages_status returned {} items for {} messages",
@@ -115,22 +115,17 @@ pub(super) async fn batch_check_voting_verifier_owned(
                 ));
             }
 
-            items
+            Ok(items
                 .iter()
                 .zip(chunk)
                 .map(|(item, (index, ..))| {
-                    if item.is_null() {
-                        return Ok((*index, false));
-                    }
-                    let status = item
-                        .get("status")
-                        .and_then(|status| status.as_str())
-                        .ok_or_else(|| {
-                            eyre::eyre!("VotingVerifier status item missing string status: {item}")
-                        })?;
-                    Ok((*index, status.to_lowercase().contains("succeeded")))
+                    (
+                        *index,
+                        item.as_ref()
+                            .is_some_and(|item| item.status.to_lowercase().contains("succeeded")),
+                    )
                 })
-                .collect::<Result<Vec<_>>>()
+                .collect::<Vec<_>>())
         })
         .collect::<Vec<_>>();
     Ok(futures::future::try_join_all(futures)
@@ -174,9 +169,7 @@ pub(super) async fn batch_check_cosmos_routed_owned(
                     );
                 }
             };
-            let items = response.as_array().ok_or_else(|| {
-                eyre::eyre!("Gateway outgoing_messages returned non-array: {response}")
-            })?;
+            let items: PresenceList = response;
             if items.len() != chunk.len() {
                 return Err(eyre::eyre!(
                     "Gateway outgoing_messages returned {} items for {} messages",
@@ -187,7 +180,7 @@ pub(super) async fn batch_check_cosmos_routed_owned(
             Ok(items
                 .iter()
                 .zip(chunk)
-                .map(|(item, (index, _))| (*index, !item.is_null()))
+                .map(|(item, (index, _))| (*index, item.is_some()))
                 .collect())
         })
         .collect();
@@ -232,9 +225,7 @@ pub(super) async fn batch_check_hub_approved_owned(
                     );
                 }
             };
-            let items = response.as_array().ok_or_else(|| {
-                eyre::eyre!("AxelarnetGateway executable_messages returned non-array: {response}")
-            })?;
+            let items: PresenceList = response;
             if items.len() != chunk.len() {
                 return Err(eyre::eyre!(
                     "AxelarnetGateway executable_messages returned {} items for {} messages",
@@ -245,7 +236,7 @@ pub(super) async fn batch_check_hub_approved_owned(
             Ok(items
                 .iter()
                 .zip(chunk)
-                .map(|(item, (index, _))| (*index, !item.is_null()))
+                .map(|(item, (index, _))| (*index, item.is_some()))
                 .collect())
         })
         .collect();

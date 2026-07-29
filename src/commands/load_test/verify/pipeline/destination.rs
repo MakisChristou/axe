@@ -229,7 +229,7 @@ impl<P: Provider> DestinationVerifier for EvmDestinationVerifier<'_, P> {
                                 }
                             }
                             Some(Phase::Executed) => {
-                                let command_id = tx.command_id.ok_or_else(|| {
+                                let command_id = tx.command_id().ok_or_else(|| {
                                     eyre::eyre!(
                                         "legacy tx {} in Executed phase without a commandId",
                                         tx.message_id
@@ -280,7 +280,7 @@ impl DestinationVerifier for SolanaDestinationVerifier {
             let data = indices
                 .iter()
                 .map(|&index| {
-                    let command_id = txs[index].command_id.ok_or_else(|| {
+                    let command_id = txs[index].command_id().ok_or_else(|| {
                         eyre::eyre!(
                             "tx {} missing Solana command_id for destination check",
                             txs[index].message_id

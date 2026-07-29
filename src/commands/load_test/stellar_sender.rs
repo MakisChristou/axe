@@ -63,19 +63,19 @@ pub fn make_payload(custom: &Option<Vec<u8>>) -> Vec<u8> {
 /// high-level wrapper that internally pays gas via `AxelarGasService` and
 /// emits the `ContractCall` event from `AxelarGateway`. Mirrors the reference
 /// `axelar-contract-deployments/stellar/gmp.js` script.
-struct SubmitRequest<'a> {
-    client: &'a StellarClient,
-    wallet: &'a StellarWallet,
-    example_contract: &'a str,
-    gateway_contract: &'a str,
-    destination_chain: &'a str,
-    destination_address: &'a str,
-    payload: &'a [u8],
-    gas_token_contract: &'a str,
+struct SubmitRequest {
+    client: StellarClient,
+    wallet: StellarWallet,
+    example_contract: String,
+    gateway_contract: String,
+    destination_chain: String,
+    destination_address: String,
+    payload: Vec<u8>,
+    gas_token_contract: String,
     gas_amount_stroops: u64,
 }
 
-async fn submit_single(request: SubmitRequest<'_>) -> TxMetrics {
+async fn submit_single(request: SubmitRequest) -> TxMetrics {
     let SubmitRequest {
         client,
         wallet,
@@ -95,29 +95,29 @@ async fn submit_single(request: SubmitRequest<'_>) -> TxMetrics {
     // Amplifier stored on-chain to make the voted-stage query succeed.
     let source_addr = example_contract.to_string();
     let _caller_addr = wallet.address();
-    let payload_hash = hex::encode(keccak256(payload));
+    let payload_hash = hex::encode(keccak256(&payload));
 
     let args = match build_send_args(
-        wallet,
-        destination_chain,
-        destination_address,
-        payload,
-        gas_token_contract,
+        &wallet,
+        &destination_chain,
+        &destination_address,
+        &payload,
+        &gas_token_contract,
         gas_amount_stroops,
     ) {
         Ok(a) => a,
         Err(e) => return fail_metrics(submit_start, &source_addr, &format!("args: {e}")),
     };
 
-    let gateway_filter = match crate::stellar::parse_contract_id(gateway_contract) {
+    let gateway_filter = match crate::stellar::parse_contract_id(&gateway_contract) {
         Ok(h) => Some(h),
         Err(e) => return fail_metrics(submit_start, &source_addr, &format!("gateway id: {e}")),
     };
 
     match client
         .invoke_contract(
-            wallet,
-            example_contract,
+            &wallet,
+            &example_contract,
             "send",
             args,
             BASE_FEE,
@@ -135,20 +135,19 @@ async fn submit_single(request: SubmitRequest<'_>) -> TxMetrics {
             let event_index = invoked.event_index.unwrap_or(0);
             let message_id = format!("0x{}-{event_index}", invoked.tx_hash_hex.to_lowercase());
             TxMetrics {
-                signature: message_id,
-                submit_time_ms,
                 confirm_time_ms: Some(submit_time_ms),
                 latency_ms: Some(submit_time_ms),
-                compute_units: None,
-                slot: None,
-                outcome: TxOutcome::from_external(invoked.success, None, "tx failed on-chain"),
-                payload: payload.to_vec(),
+                payload,
                 payload_hash,
                 source_address: source_addr,
-                gmp_destination_chain: destination_chain.to_string(),
-                gmp_destination_address: destination_address.to_string(),
+                gmp_destination_chain: destination_chain,
+                gmp_destination_address: destination_address,
                 send_instant: Some(submit_start),
-                amplifier_timing: None,
+                ..TxMetrics::from_outcome(
+                    message_id,
+                    submit_time_ms,
+                    TxOutcome::from_external(invoked.success, None, "tx failed on-chain"),
+                )
             }
         }
         Err(e) => fail_metrics(submit_start, &source_addr, &e.to_string()),
@@ -175,14 +174,14 @@ impl TransactionSubmitter for StellarSubmitter {
 
     async fn submit(&self, job: Self::Job) -> TxMetrics {
         submit_single(SubmitRequest {
-            client: &self.client,
-            wallet: &job.wallet,
-            example_contract: &self.example_contract,
-            gateway_contract: &self.gateway_contract,
-            destination_chain: &self.destination_chain,
-            destination_address: &self.destination_address,
-            payload: &job.payload,
-            gas_token_contract: &self.gas_token_contract,
+            client: self.client.clone(),
+            wallet: job.wallet,
+            example_contract: self.example_contract.clone(),
+            gateway_contract: self.gateway_contract.clone(),
+            destination_chain: self.destination_chain.clone(),
+            destination_address: self.destination_address.clone(),
+            payload: job.payload,
+            gas_token_contract: self.gas_token_contract.clone(),
             gas_amount_stroops: self.gas_amount_stroops,
         })
         .await
@@ -209,20 +208,8 @@ fn build_send_args(
 fn fail_metrics(submit_start: Instant, source: &str, err: &str) -> TxMetrics {
     let elapsed_ms = submit_start.elapsed().as_millis() as u64;
     TxMetrics {
-        signature: String::new(),
-        submit_time_ms: elapsed_ms,
-        confirm_time_ms: None,
-        latency_ms: None,
-        compute_units: None,
-        slot: None,
-        outcome: TxOutcome::failed(err.to_string()),
-        payload: Vec::new(),
-        payload_hash: String::new(),
         source_address: source.to_string(),
-        gmp_destination_chain: String::new(),
-        gmp_destination_address: String::new(),
-        send_instant: None,
-        amplifier_timing: None,
+        ..TxMetrics::failed("", elapsed_ms, err)
     }
 }
 
@@ -230,20 +217,20 @@ fn fail_metrics(submit_start: Instant, source: &str, err: &str) -> TxMetrics {
 // Burst mode
 // ---------------------------------------------------------------------------
 
-pub(super) struct BurstRequest<'a> {
-    pub client: &'a StellarClient,
-    pub wallets: &'a [StellarWallet],
+pub(super) struct BurstRequest {
+    pub client: StellarClient,
+    pub wallets: Vec<StellarWallet>,
     pub example_contract: String,
     pub gateway_contract: String,
-    pub destination_chain: &'a str,
-    pub destination_address: &'a str,
+    pub destination_chain: String,
+    pub destination_address: String,
     pub payload_override: Option<Vec<u8>>,
     pub run: RunIdentity,
     pub gas_token_contract: String,
     pub gas_amount_stroops: u64,
 }
 
-pub async fn run_burst(request: BurstRequest<'_>) -> Result<LoadTestReport> {
+pub async fn run_burst(request: BurstRequest) -> Result<LoadTestReport> {
     let BurstRequest {
         client,
         wallets,
@@ -267,11 +254,11 @@ pub async fn run_burst(request: BurstRequest<'_>) -> Result<LoadTestReport> {
         .collect();
     let burst = super::submitter::run_burst(
         StellarSubmitter {
-            client: client.clone(),
+            client,
             example_contract,
             gateway_contract,
-            destination_chain: destination_chain.to_string(),
-            destination_address: destination_address.to_string(),
+            destination_chain,
+            destination_address: destination_address.clone(),
             gas_token_contract,
             gas_amount_stroops,
         },
@@ -282,7 +269,7 @@ pub async fn run_burst(request: BurstRequest<'_>) -> Result<LoadTestReport> {
     Ok(build_burst_report(
         burst.metrics,
         run,
-        destination_address,
+        &destination_address,
         burst.total_submitted,
         burst.test_duration_secs,
         key_count,
@@ -375,14 +362,14 @@ pub(super) async fn run_sustained(request: SustainedRequest) -> Result<sustained
         Box::pin(async move {
             let wallet = &ws[key_idx % ws.len()];
             let mut m = submit_single(SubmitRequest {
-                client: &c,
-                wallet,
-                example_contract: &ex,
-                gateway_contract: &gw,
-                destination_chain: &dc,
-                destination_address: &da,
-                payload: &payload,
-                gas_token_contract: &gas_token,
+                client: c.as_ref().clone(),
+                wallet: wallet.clone(),
+                example_contract: ex,
+                gateway_contract: gw,
+                destination_chain: dc,
+                destination_address: da,
+                payload,
+                gas_token_contract: gas_token,
                 gas_amount_stroops: gas,
             })
             .await;

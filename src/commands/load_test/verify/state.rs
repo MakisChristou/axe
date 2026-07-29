@@ -123,6 +123,61 @@ impl PendingTx {
         true
     }
 
+    /// Install the fully parsed second leg and advance in one operation.
+    ///
+    /// A failed transition leaves both the phase and discovery data unchanged,
+    /// so callers cannot expose a half-applied hub discovery.
+    pub(super) fn discover_second_leg(&mut self, second_leg: SecondLeg, phase: Phase) -> bool {
+        let VerificationState::Active(current) = self.state else {
+            self.reject_transition("install second leg");
+            return false;
+        };
+        if current != Phase::DiscoverSecondLeg || !current.can_transition_to(phase) {
+            self.reject_transition(&format!(
+                "install second leg and transition from {current:?} to {phase:?}"
+            ));
+            return false;
+        }
+        self.second_leg = Some(second_leg);
+        self.state = VerificationState::Active(phase);
+        true
+    }
+
+    pub(super) fn second_leg(&self) -> Option<&SecondLeg> {
+        self.second_leg.as_ref()
+    }
+
+    pub(super) fn command_id(&self) -> Option<[u8; 32]> {
+        self.command_id
+    }
+
+    /// Record destination approval and atomically advance to execution polling.
+    pub(super) fn approve_destination(&mut self, command_id: Option<[u8; 32]>) -> bool {
+        if !self.is_phase(Phase::Approved) {
+            self.reject_transition("record destination approval");
+            return false;
+        }
+        self.command_id = command_id.or(self.command_id);
+        self.state = VerificationState::Active(Phase::Executed);
+        true
+    }
+
+    /// Record destination execution and settle the transaction.
+    pub(super) fn execute_destination(&mut self, command_id: Option<[u8; 32]>) -> bool {
+        if !matches!(
+            self.state,
+            VerificationState::Active(Phase::Approved | Phase::Executed)
+        ) {
+            self.reject_transition("record destination execution");
+            return false;
+        }
+        self.command_id = command_id.or(self.command_id);
+        self.state = VerificationState::Succeeded {
+            recovered_via_api: false,
+        };
+        true
+    }
+
     /// Mark the tx successful. Ignored if it already reached a terminal state.
     pub(super) fn succeed(&mut self, recovered_via_api: bool) -> bool {
         if !self.is_active() {
@@ -351,9 +406,10 @@ pub(super) fn phase_counts(txs: &[PendingTx]) -> (usize, usize, usize, usize, us
 mod tests {
     use std::time::Instant;
 
-    use alloy::primitives::Address;
+    use alloy::primitives::{Address, FixedBytes};
 
-    use super::{PendingTx, Phase, VerificationState};
+    use super::{PendingTx, Phase, SecondLeg, VerificationState};
+    use crate::commands::load_test::identifiers::PayloadHash;
     use crate::commands::load_test::metrics::AmplifierTiming;
 
     fn pending(phase: Phase) -> PendingTx {
@@ -411,5 +467,39 @@ mod tests {
         assert!(!tx.transition_to(Phase::Executed));
         assert!(!tx.fail("something else".to_string()));
         assert_eq!(tx.failure_reason(), Some("approval: timed out"));
+    }
+
+    #[test]
+    fn second_leg_discovery_is_atomic_and_phase_checked() {
+        let second_leg = SecondLeg {
+            message_id: "second-leg".into(),
+            payload_hash: PayloadHash::from(FixedBytes::from([3; 32])),
+            source_address: "hub".to_string(),
+            destination_address: "destination".to_string(),
+        };
+        let mut wrong_phase = pending(Phase::HubApproved);
+
+        assert!(!wrong_phase.discover_second_leg(second_leg.clone(), Phase::Routed));
+        assert!(wrong_phase.second_leg().is_none());
+        assert!(wrong_phase.is_phase(Phase::HubApproved));
+
+        let mut discovering = pending(Phase::DiscoverSecondLeg);
+        assert!(discovering.discover_second_leg(second_leg.clone(), Phase::Routed));
+        assert_eq!(discovering.second_leg(), Some(&second_leg));
+        assert!(discovering.is_phase(Phase::Routed));
+    }
+
+    #[test]
+    fn destination_observations_preserve_command_id_across_state_changes() {
+        let command_id = [9; 32];
+        let mut tx = pending(Phase::Approved);
+
+        assert!(tx.approve_destination(Some(command_id)));
+        assert_eq!(tx.command_id(), Some(command_id));
+        assert!(tx.is_phase(Phase::Executed));
+
+        assert!(tx.execute_destination(None));
+        assert_eq!(tx.command_id(), Some(command_id));
+        assert!(!tx.is_active());
     }
 }

@@ -36,7 +36,7 @@ use eyre::eyre;
 
 use super::identifiers::TokenId;
 use super::keypairs;
-use super::metrics::{TxMetrics, TxOutcome};
+use super::metrics::TxMetrics;
 use super::run_sizing::RunSizing;
 use super::submitter::TransactionSubmitter;
 use super::units::Wei;
@@ -561,12 +561,11 @@ pub(super) async fn distribute_tokens<P: Provider>(
 /// "CONTRACT_REVERT_EXECUTED, data: 0x" at submit time). Other EVM chains
 /// in the matrix omit `gasScalingFactor` so callers pass 0 and behavior is
 /// unchanged.
-pub(super) struct InterchainTransferRequest<'a, P> {
-    pub provider: &'a P,
+pub(super) struct InterchainTransferRequest {
     pub its_proxy: Address,
     pub token_id: TokenId,
-    pub destination_chain: &'a str,
-    pub receiver: &'a Bytes,
+    pub destination_chain: String,
+    pub receiver: Bytes,
     pub amount: U256,
     pub gas_value: Wei,
     pub gas_arg_scaling_factor: u32,
@@ -601,17 +600,19 @@ impl TransactionSubmitter for ItsEvmSubmitter {
             .wallet(job.signer)
             .connect_http(self.rpc_url.clone());
         let submit = || {
-            execute_interchain_transfer(InterchainTransferRequest {
-                provider: &provider,
-                its_proxy: self.its_proxy,
-                token_id: self.token_id,
-                destination_chain: &self.destination_chain,
-                receiver: &self.receiver,
-                amount: self.amount,
-                gas_value: self.gas_value,
-                gas_arg_scaling_factor: self.gas_arg_scaling_factor,
-                explicit_nonce: job.explicit_nonce,
-            })
+            execute_interchain_transfer(
+                &provider,
+                InterchainTransferRequest {
+                    its_proxy: self.its_proxy,
+                    token_id: self.token_id,
+                    destination_chain: self.destination_chain.clone(),
+                    receiver: self.receiver.clone(),
+                    amount: self.amount,
+                    gas_value: self.gas_value,
+                    gas_arg_scaling_factor: self.gas_arg_scaling_factor,
+                    explicit_nonce: job.explicit_nonce,
+                },
+            )
         };
         if job.retry_rate_limits {
             super::retry::rate_limited(submit).await
@@ -660,10 +661,10 @@ pub(super) fn its_sustained_tasks(
 }
 
 pub(super) async fn execute_interchain_transfer<P: Provider>(
-    request: InterchainTransferRequest<'_, P>,
+    provider: &P,
+    request: InterchainTransferRequest,
 ) -> TxMetrics {
     let InterchainTransferRequest {
-        provider,
         its_proxy,
         token_id,
         destination_chain: dest_chain,
@@ -697,7 +698,7 @@ pub(super) async fn execute_interchain_transfer<P: Provider>(
         let base_call = its
             .interchainTransfer(
                 token_id.into_fixed_bytes(),
-                dest_chain.to_string(),
+                dest_chain.clone(),
                 receiver_bytes.clone(),
                 amount,
                 Bytes::new(),
@@ -798,20 +799,16 @@ fn receipt_to_metrics(
     }
     match extract_contract_call_event(receipt) {
         Ok((event_index, _payload, payload_hash_bytes, dest_chain, dest_address)) => TxMetrics {
-            signature: format!("{tx_hash:#x}-{event_index}"),
-            submit_time_ms: 0,
             confirm_time_ms: Some(latency_ms),
             latency_ms: Some(latency_ms),
             compute_units: Some(receipt.gas_used),
             slot: receipt.block_number,
-            outcome: TxOutcome::Succeeded,
-            payload: Vec::new(),
             payload_hash: alloy::hex::encode(payload_hash_bytes.as_slice()),
             source_address: format!("{its_proxy}"),
             gmp_destination_chain: dest_chain,
             gmp_destination_address: dest_address,
             send_instant: Some(submit_start),
-            amplifier_timing: None,
+            ..TxMetrics::succeeded(format!("{tx_hash:#x}-{event_index}"), 0)
         },
         Err(e) => make_failure_with_hash(
             submit_start,
@@ -847,15 +844,29 @@ pub(super) fn read_gas_arg_scaling_factor(
     config_path: &std::path::Path,
     source_chain_id: &str,
 ) -> u32 {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ChainSettings {
+        #[serde(default)]
+        gas_scaling_factor: Option<u32>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Config {
+        #[serde(default)]
+        chains: std::collections::HashMap<String, ChainSettings>,
+    }
+
     let Ok(content) = std::fs::read_to_string(config_path) else {
         return 0;
     };
-    let Ok(root) = serde_json::from_str::<serde_json::Value>(&content) else {
+    let Ok(config) = serde_json::from_str::<Config>(&content) else {
         return 0;
     };
-    root.pointer(&format!("/chains/{source_chain_id}/gasScalingFactor"))
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|v| u32::try_from(v).ok())
+    config
+        .chains
+        .get(source_chain_id)
+        .and_then(|chain| chain.gas_scaling_factor)
         .unwrap_or(0)
 }
 
@@ -894,20 +905,9 @@ fn make_failure_with_hash(
     tx_hash: Option<TxHash>,
 ) -> TxMetrics {
     let elapsed_ms = submit_start.elapsed().as_millis() as u64;
-    TxMetrics {
-        signature: tx_hash.map_or_else(String::new, |h| format!("{h:#x}")),
-        submit_time_ms: elapsed_ms,
-        confirm_time_ms: None,
-        latency_ms: None,
-        compute_units: None,
-        slot: None,
-        outcome: TxOutcome::failed(error.to_string()),
-        payload: Vec::new(),
-        payload_hash: String::new(),
-        source_address: String::new(),
-        gmp_destination_chain: String::new(),
-        gmp_destination_address: String::new(),
-        send_instant: None,
-        amplifier_timing: None,
-    }
+    TxMetrics::failed(
+        tx_hash.map_or_else(String::new, |h| format!("{h:#x}")),
+        elapsed_ms,
+        error,
+    )
 }

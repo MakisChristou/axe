@@ -24,7 +24,7 @@ use std::time::Instant;
 use super::its_prerequisites::{self, GatewayRequirement};
 use super::keypairs;
 use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentity};
-use super::run_sizing::{RunSizing, SustainedPlan};
+use super::run_sizing::{RunMode, RunSizing, SustainedPlan};
 use super::{
     LoadTestArgs, check_evm_balance, finalize_sui_dest_run_its, load_sui_main_wallet,
     read_sui_axe_token_id, sui_its_dest_lookup, validate_evm_rpc,
@@ -58,7 +58,7 @@ struct SuiContext {
     rpc: String,
 }
 
-pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
+pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> eyre::Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
@@ -77,15 +77,17 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
 
     let evm = resolve_evm_context(&args, &cfg, evm_rpc_url.clone()).await?;
     let sui = resolve_sui_context(&args)?;
-    let sizing = RunSizing::new(&args)?;
 
     let derived = derive_and_fund_signers(&evm, &sizing).await?;
     let amount_per_tx = U256::from(1u64);
 
-    if sizing.is_burst() {
-        run_burst_pipeline(&args, &evm, &sui, &derived, &sizing, amount_per_tx).await
-    } else {
-        run_sustained_pipeline(&args, &evm, &sui, derived, &sizing, amount_per_tx).await
+    match sizing.mode() {
+        RunMode::Burst { .. } => {
+            run_burst_pipeline(&args, &evm, &sui, &derived, &sizing, amount_per_tx).await
+        }
+        RunMode::Sustained(plan) => {
+            run_sustained_pipeline(&args, &evm, &sui, derived, &sizing, plan, amount_per_tx).await
+        }
     }
 }
 
@@ -255,9 +257,9 @@ async fn run_burst_pipeline(
     .await?;
     let mut report = LoadTestReport::from_transactions(
         ReportInput {
-            run: RunIdentity::from_args(args),
+            run: RunIdentity::burst(args),
             destination_address: sui.recipient_display.clone(),
-            num_txs: args.num_txs,
+            num_txs: sizing.total_expected,
             num_keys: num_txs,
             total_submitted: burst.total_submitted,
             test_duration_secs: burst.test_duration_secs,
@@ -275,13 +277,14 @@ async fn run_sustained_pipeline(
     sui: &SuiContext,
     derived: Vec<PrivateKeySigner>,
     sizing: &RunSizing,
+    plan: SustainedPlan,
     amount_per_tx: U256,
 ) -> eyre::Result<()> {
     let SustainedPlan {
         tps: tps_usize,
         duration_secs,
         key_cycle,
-    } = sizing.sustained().expect("sustained mode");
+    } = plan;
 
     // Pre-fetch each derived signer's nonce so the rate-limited loop can
     // bump them locally per dispatch (avoids RPC round-trips on each tx).
@@ -330,7 +333,7 @@ async fn run_sustained_pipeline(
 
     let mut report = super::sustained::build_sustained_report(
         result,
-        RunIdentity::from_args(args),
+        RunIdentity::sustained(args, plan),
         &sui.recipient_display,
         sizing.total_expected,
         sizing.num_keys,

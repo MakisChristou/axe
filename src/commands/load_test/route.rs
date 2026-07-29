@@ -186,4 +186,72 @@ mod tests {
             assert!(error.to_string().contains(expected));
         }
     }
+
+    #[test]
+    fn route_contract_covers_the_full_protocol_pair_matrix() {
+        let protocols = [Protocol::Gmp, Protocol::Its, Protocol::ItsWithData];
+        let test_types = [
+            TestType::SolToEvm,
+            TestType::EvmToSol,
+            TestType::EvmToEvm,
+            TestType::SolToSol,
+            TestType::XrplToEvm,
+            TestType::EvmToXrpl,
+            TestType::StellarToEvm,
+            TestType::EvmToStellar,
+            TestType::StellarToSol,
+            TestType::SolToStellar,
+            TestType::SuiToEvm,
+            TestType::EvmToSui,
+            TestType::SuiToSol,
+            TestType::SolToSui,
+            TestType::SuiToStellar,
+            TestType::StellarToSui,
+            TestType::SuiToXrpl,
+            TestType::XrplToSui,
+        ];
+        let expected_supported = [
+            (Protocol::Gmp, TestType::SolToEvm),
+            (Protocol::Gmp, TestType::EvmToSol),
+            (Protocol::Gmp, TestType::EvmToEvm),
+            (Protocol::Gmp, TestType::SolToSol),
+            (Protocol::Gmp, TestType::StellarToEvm),
+            (Protocol::Gmp, TestType::EvmToStellar),
+            (Protocol::Gmp, TestType::StellarToSol),
+            (Protocol::Gmp, TestType::SolToStellar),
+            (Protocol::Gmp, TestType::SuiToEvm),
+            (Protocol::Gmp, TestType::EvmToSui),
+            (Protocol::Gmp, TestType::SuiToSol),
+            (Protocol::Gmp, TestType::SolToSui),
+            (Protocol::Gmp, TestType::StellarToSui),
+            (Protocol::Its, TestType::SolToEvm),
+            (Protocol::Its, TestType::EvmToSol),
+            (Protocol::Its, TestType::EvmToEvm),
+            (Protocol::Its, TestType::XrplToEvm),
+            (Protocol::Its, TestType::EvmToXrpl),
+            (Protocol::Its, TestType::StellarToEvm),
+            (Protocol::Its, TestType::EvmToStellar),
+            (Protocol::Its, TestType::StellarToSol),
+            (Protocol::Its, TestType::SuiToEvm),
+            (Protocol::Its, TestType::EvmToSui),
+            (Protocol::Its, TestType::SuiToSol),
+            (Protocol::Its, TestType::SolToSui),
+            (Protocol::Its, TestType::StellarToSui),
+            (Protocol::ItsWithData, TestType::EvmToSol),
+        ];
+
+        let mut actual_supported = Vec::new();
+        let mut checked = 0;
+        for protocol in protocols {
+            for test_type in test_types {
+                checked += 1;
+                if SupportedRoute::resolve(protocol, test_type, "source", "destination").is_ok() {
+                    actual_supported.push((protocol, test_type));
+                }
+            }
+        }
+
+        assert_eq!(checked, 54);
+        assert_eq!(actual_supported, expected_supported);
+    }
 }

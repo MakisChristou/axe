@@ -96,6 +96,25 @@ impl RunSizing {
         matches!(self.mode, RunMode::Burst { .. })
     }
 
+    pub fn mode(self) -> RunMode {
+        self.mode
+    }
+
+    pub fn burst_transactions(self) -> Option<u64> {
+        match self.mode {
+            RunMode::Burst { num_txs } => Some(num_txs),
+            RunMode::Sustained(_) => None,
+        }
+    }
+
+    pub fn require_burst(self, route: &str) -> Result<u64> {
+        self.burst_transactions().ok_or_else(|| {
+            eyre!(
+                "{route} supports burst mode only; omit --tps and --duration-secs and use --num-txs"
+            )
+        })
+    }
+
     pub fn sustained(self) -> Option<SustainedPlan> {
         match self.mode {
             RunMode::Burst { .. } => None,
@@ -188,5 +207,25 @@ mod tests {
         let error = RunSizing::from_values(1, Some(u64::MAX), Some(2), 1).unwrap_err();
 
         assert!(error.to_string().contains("supported transaction count"));
+    }
+
+    #[test]
+    fn derives_per_key_rounds_with_ceiling_division() {
+        let sizing = RunSizing::from_values(1, Some(3), Some(10), 4).unwrap();
+
+        assert_eq!(sizing.transactions_per_key(), 3);
+        assert_eq!(sizing.burst_transactions(), None);
+    }
+
+    #[test]
+    fn burst_only_routes_reject_sustained_sizing() {
+        let sizing = RunSizing::from_values(1, Some(2), Some(3), 1).unwrap();
+
+        let error = sizing.require_burst("example route").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("example route supports burst mode only")
+        );
     }
 }

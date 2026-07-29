@@ -41,7 +41,11 @@ use super::{
 use crate::config::ChainsConfig;
 use crate::ui;
 
-pub(super) async fn run_sol_to_evm(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
+pub(super) async fn run_sol_to_evm(
+    args: LoadTestArgs,
+    _run_start: Instant,
+    sizing: RunSizing,
+) -> Result<()> {
     let dest = &args.destination_chain;
     let src = &args.source_chain;
 
@@ -180,9 +184,7 @@ pub(super) async fn run_sol_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
     let destination_address = format!("{sender_receiver_addr}");
 
     let test_start = Instant::now();
-    let sustained = !RunSizing::new(&args)?.is_burst();
-
-    let mut report = if sustained {
+    let mut report = if let Some(plan) = sizing.sustained() {
         let mut verification = verification_session::VerificationSession::start(
             verify::VerificationRoute::from_args(&args),
             gmp_verification::EvmGmpStreamingTarget {
@@ -196,6 +198,7 @@ pub(super) async fn run_sol_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
 
         let mut report = sol_sender::run_sustained_load_test_with_metrics(
             &args,
+            plan,
             true,
             &destination_address,
             Some(verification.sender()),
@@ -207,8 +210,13 @@ pub(super) async fn run_sol_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
         verification.finish(&mut report, args.network).await?;
         report
     } else {
-        let mut report =
-            sol_sender::run_load_test_with_metrics(&args, &destination_address, true).await?;
+        let mut report = sol_sender::run_load_test_with_metrics(
+            &args,
+            sizing.require_burst("GMP sol-to-evm")?,
+            &destination_address,
+            true,
+        )
+        .await?;
         gmp_verification::attach_batch(
             &args,
             gmp_verification::EvmGmpTarget {
@@ -227,7 +235,11 @@ pub(super) async fn run_sol_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
     finish_report(&mut report, test_start)
 }
 
-pub(super) async fn run_evm_to_sol(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
+pub(super) async fn run_evm_to_sol(
+    args: LoadTestArgs,
+    _run_start: Instant,
+    sizing: RunSizing,
+) -> Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
@@ -308,9 +320,7 @@ pub(super) async fn run_evm_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
     ui::kv("destination program", destination_address);
 
     let test_start = Instant::now();
-    let sustained = !RunSizing::new(&args)?.is_burst();
-
-    let mut report = if sustained {
+    let mut report = if let Some(plan) = sizing.sustained() {
         let mut verification = verification_session::VerificationSession::start(
             verify::VerificationRoute::from_args(&args),
             gmp_verification::SolanaGmpStreamingTarget {
@@ -321,11 +331,12 @@ pub(super) async fn run_evm_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
 
         let mut report =
             evm_sender::run_sustained_load_test_with_metrics(evm_sender::SustainedLoadRequest {
-                args: &args,
+                args: args.clone(),
+                plan,
                 sender_receiver: sender_receiver_addr,
-                main_key: &main_key,
-                evm_rpc_url: &evm_rpc_url,
-                destination_address,
+                main_key,
+                evm_rpc_url: evm_rpc_url.clone(),
+                destination_address: destination_address.to_string(),
                 verify_tx: Some(verification.sender()),
                 send_done: Some(verification.send_done()),
                 verify_spinner_tx: verification.spinner_sender()?,
@@ -338,6 +349,7 @@ pub(super) async fn run_evm_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
     } else {
         let mut report = evm_sender::run_load_test_with_metrics(
             &args,
+            sizing.require_burst("GMP evm-to-sol")?,
             sender_receiver_addr,
             &main_key,
             &evm_rpc_url,
@@ -362,7 +374,11 @@ pub(super) async fn run_evm_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
     finish_report(&mut report, test_start)
 }
 
-pub(super) async fn run_evm_to_evm(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
+pub(super) async fn run_evm_to_evm(
+    args: LoadTestArgs,
+    _run_start: Instant,
+    sizing: RunSizing,
+) -> Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
@@ -506,9 +522,7 @@ pub(super) async fn run_evm_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
     let destination_address = format!("{dest_sender_receiver}");
 
     let test_start = Instant::now();
-    let sustained = !RunSizing::new(&args)?.is_burst();
-
-    let mut report = if sustained {
+    let mut report = if let Some(plan) = sizing.sustained() {
         let mut verification = verification_session::VerificationSession::start(
             verify::VerificationRoute::from_args(&args),
             gmp_verification::EvmGmpStreamingTarget {
@@ -522,11 +536,12 @@ pub(super) async fn run_evm_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
 
         let mut report =
             evm_sender::run_sustained_load_test_with_metrics(evm_sender::SustainedLoadRequest {
-                args: &args,
+                args: args.clone(),
+                plan,
                 sender_receiver: sender_receiver_addr,
-                main_key: &main_key,
-                evm_rpc_url: &source_rpc_url,
-                destination_address: &destination_address,
+                main_key,
+                evm_rpc_url: source_rpc_url.clone(),
+                destination_address: destination_address.clone(),
                 verify_tx: Some(verification.sender()),
                 send_done: Some(verification.send_done()),
                 verify_spinner_tx: verification.spinner_sender()?,
@@ -539,6 +554,7 @@ pub(super) async fn run_evm_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
     } else {
         let mut report = evm_sender::run_load_test_with_metrics(
             &args,
+            sizing.require_burst("GMP evm-to-evm")?,
             sender_receiver_addr,
             &main_key,
             &source_rpc_url,
@@ -565,7 +581,11 @@ pub(super) async fn run_evm_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
     finish_report(&mut report, test_start)
 }
 
-pub(super) async fn run_sol_to_sol(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
+pub(super) async fn run_sol_to_sol(
+    args: LoadTestArgs,
+    _run_start: Instant,
+    sizing: RunSizing,
+) -> Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
@@ -593,9 +613,7 @@ pub(super) async fn run_sol_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
     ui::kv("destination program", destination_address);
 
     let test_start = Instant::now();
-    let sustained = !RunSizing::new(&args)?.is_burst();
-
-    let mut report = if sustained {
+    let mut report = if let Some(plan) = sizing.sustained() {
         let mut verification = verification_session::VerificationSession::start(
             verify::VerificationRoute::from_args(&args),
             gmp_verification::SolanaGmpStreamingTarget {
@@ -606,6 +624,7 @@ pub(super) async fn run_sol_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
 
         let mut report = sol_sender::run_sustained_load_test_with_metrics(
             &args,
+            plan,
             false,
             destination_address,
             Some(verification.sender()),
@@ -617,8 +636,13 @@ pub(super) async fn run_sol_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
         verification.finish(&mut report, args.network).await?;
         report
     } else {
-        let mut report =
-            sol_sender::run_load_test_with_metrics(&args, destination_address, false).await?;
+        let mut report = sol_sender::run_load_test_with_metrics(
+            &args,
+            sizing.require_burst("GMP sol-to-sol")?,
+            destination_address,
+            false,
+        )
+        .await?;
 
         gmp_verification::attach_batch(
             &args,
@@ -640,7 +664,11 @@ pub(super) async fn run_sol_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
 // Stellar -> EVM (GMP)
 // ---------------------------------------------------------------------------
 
-pub(super) async fn run_stellar_to_evm(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
+pub(super) async fn run_stellar_to_evm(
+    args: LoadTestArgs,
+    _run_start: Instant,
+    run_sizing: RunSizing,
+) -> Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
     let cfg = ChainsConfig::load(&args.config)?;
@@ -737,7 +765,6 @@ pub(super) async fn run_stellar_to_evm(args: LoadTestArgs, _run_start: Instant) 
     let destination_address = format!("{sender_receiver_addr}");
 
     // --- Burst vs sustained ---
-    let run_sizing = RunSizing::new(&args)?;
     let sustained_params = run_sizing.sustained();
     let num_keys = run_sizing.num_keys;
     ui::info(&format!("deriving {num_keys} Stellar keys..."));
@@ -818,7 +845,7 @@ pub(super) async fn run_stellar_to_evm(args: LoadTestArgs, _run_start: Instant) 
 
         let mut report = sustained::build_sustained_report(
             result,
-            RunIdentity::from_args(&args),
+            RunIdentity::from_sizing(&args, run_sizing),
             &destination_address,
             run_sizing.total_expected,
             num_keys,
@@ -828,14 +855,14 @@ pub(super) async fn run_stellar_to_evm(args: LoadTestArgs, _run_start: Instant) 
     } else {
         let mut report = crate::commands::load_test::stellar_sender::run_burst(
             crate::commands::load_test::stellar_sender::BurstRequest {
-                client: &stellar_client,
-                wallets: &wallets,
+                client: stellar_client.clone(),
+                wallets: wallets.clone(),
                 example_contract: stellar_example,
                 gateway_contract: stellar_gateway,
-                destination_chain: &args.destination_axelar_id,
-                destination_address: &destination_address,
+                destination_chain: args.destination_axelar_id.clone(),
+                destination_address: destination_address.clone(),
                 payload_override,
-                run: RunIdentity::from_args(&args),
+                run: RunIdentity::from_sizing(&args, run_sizing),
                 gas_token_contract: stellar_gas_token,
                 gas_amount_stroops: gas_stroops,
             },
@@ -868,7 +895,12 @@ pub(super) async fn run_stellar_to_evm(args: LoadTestArgs, _run_start: Instant) 
 // in parallel with a semaphore, then run the appropriate destination
 // verifier.
 
-pub(super) async fn run_evm_to_stellar(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
+pub(super) async fn run_evm_to_stellar(
+    args: LoadTestArgs,
+    _run_start: Instant,
+    sizing: RunSizing,
+) -> Result<()> {
+    sizing.require_burst("GMP evm-to-stellar")?;
     let src = &args.source_chain;
     let dest = &args.destination_chain;
     let cfg = ChainsConfig::load(&args.config)?;
@@ -931,6 +963,7 @@ pub(super) async fn run_evm_to_stellar(args: LoadTestArgs, _run_start: Instant) 
     let test_start = Instant::now();
     let mut report = evm_sender::run_load_test_with_metrics(
         &args,
+        sizing.require_burst("GMP evm-to-stellar")?,
         sender_receiver_addr,
         &main_key,
         &evm_rpc_url,
@@ -957,7 +990,12 @@ pub(super) async fn run_evm_to_stellar(args: LoadTestArgs, _run_start: Instant) 
     finish_report(&mut report, test_start)
 }
 
-pub(super) async fn run_stellar_to_sol(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
+pub(super) async fn run_stellar_to_sol(
+    args: LoadTestArgs,
+    _run_start: Instant,
+    sizing: RunSizing,
+) -> Result<()> {
+    let num_txs = sizing.require_burst("GMP stellar-to-sol")?;
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
@@ -1012,7 +1050,7 @@ pub(super) async fn run_stellar_to_sol(args: LoadTestArgs, _run_start: Instant) 
         &counter_pda,
     ));
 
-    let num_keys = args.num_txs.max(1) as usize;
+    let num_keys = usize::try_from(num_txs)?;
     let gas_stroops = stellar_sender::parse_gas_stroops(args.gas_value.as_deref())?;
     ui::info(&format!("deriving {num_keys} Stellar keys..."));
     let main_seed = main_wallet.signing_key.to_bytes();
@@ -1029,14 +1067,14 @@ pub(super) async fn run_stellar_to_sol(args: LoadTestArgs, _run_start: Instant) 
 
     let test_start = Instant::now();
     let mut report = stellar_sender::run_burst(stellar_sender::BurstRequest {
-        client: &stellar_client,
-        wallets: &wallets,
+        client: stellar_client.clone(),
+        wallets: wallets.clone(),
         example_contract: stellar_example.clone(),
         gateway_contract: stellar_gateway,
-        destination_chain: &args.destination_axelar_id,
-        destination_address: &destination_address,
+        destination_chain: args.destination_axelar_id.clone(),
+        destination_address: destination_address.clone(),
         payload_override,
-        run: RunIdentity::from_args(&args),
+        run: RunIdentity::from_sizing(&args, sizing),
         gas_token_contract: stellar_xlm,
         gas_amount_stroops: gas_stroops,
     })
@@ -1057,7 +1095,12 @@ pub(super) async fn run_stellar_to_sol(args: LoadTestArgs, _run_start: Instant) 
     finish_report(&mut report, test_start)
 }
 
-pub(super) async fn run_sol_to_stellar(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
+pub(super) async fn run_sol_to_stellar(
+    args: LoadTestArgs,
+    _run_start: Instant,
+    sizing: RunSizing,
+) -> Result<()> {
+    sizing.require_burst("GMP sol-to-stellar")?;
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
@@ -1077,6 +1120,7 @@ pub(super) async fn run_sol_to_stellar(args: LoadTestArgs, _run_start: Instant) 
     let test_start = Instant::now();
     let mut report = sol_sender::run_load_test_with_metrics(
         &args,
+        sizing.require_burst("GMP sol-to-stellar")?,
         &stellar_example_addr,
         true, // evm_destination=true means use EVM-style payload encoding;
               // Stellar AxelarExample.execute also takes raw bytes so this
@@ -1116,7 +1160,12 @@ pub(super) async fn run_sol_to_stellar(args: LoadTestArgs, _run_start: Instant) 
 // ===========================================================================
 
 /// Sui source -> any EVM destination, GMP only (sequential burst).
-pub(super) async fn run_sui_to_evm(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
+pub(super) async fn run_sui_to_evm(
+    args: LoadTestArgs,
+    _run_start: Instant,
+    sizing: RunSizing,
+) -> Result<()> {
+    let num_txs = sizing.require_burst("GMP sui-to-evm")?;
     let src = &args.source_chain;
     let dest = &args.destination_chain;
     let cfg = ChainsConfig::load(&args.config)?;
@@ -1222,7 +1271,7 @@ pub(super) async fn run_sui_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
             }
         };
 
-    let num_txs = args.num_txs.max(1) as usize;
+    let num_txs = usize::try_from(num_txs)?;
 
     let test_start = Instant::now();
     // Sui's `Example::gmp::send_call` takes the destination address as a
@@ -1248,7 +1297,7 @@ pub(super) async fn run_sui_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
 
     let mut report = LoadTestReport::from_transactions(
         ReportInput {
-            run: RunIdentity::from_args(&args),
+            run: RunIdentity::from_sizing(&args, sizing),
             destination_address: destination_address.clone(),
             num_txs: burst.total_submitted,
             num_keys: 1,
@@ -1285,7 +1334,12 @@ pub(super) async fn run_sui_to_evm(args: LoadTestArgs, _run_start: Instant) -> R
 /// but targets the Solana memo program and uses `verify_onchain_solana` for
 /// the destination-side polling. Payload format matches what `run_evm_to_sol`
 /// sends — the memo program accepts the same ABI-string framing.
-pub(super) async fn run_sui_to_sol(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
+pub(super) async fn run_sui_to_sol(
+    args: LoadTestArgs,
+    _run_start: Instant,
+    sizing: RunSizing,
+) -> Result<()> {
+    let num_txs = sizing.require_burst("GMP sui-to-sol")?;
     let src = &args.source_chain;
     let dest = &args.destination_chain;
     let cfg = ChainsConfig::load(&args.config)?;
@@ -1357,7 +1411,7 @@ pub(super) async fn run_sui_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
     // picks a random "hello from axe load test ..." string.
     let inner_payload = super::gmp_sui_source::parse_payload(args.payload.as_deref())?;
 
-    let num_txs = args.num_txs.max(1) as usize;
+    let num_txs = usize::try_from(num_txs)?;
 
     let test_start = Instant::now();
     let burst = super::gmp_sui_source::run_sequential(
@@ -1380,7 +1434,7 @@ pub(super) async fn run_sui_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
 
     let mut report = LoadTestReport::from_transactions(
         ReportInput {
-            run: RunIdentity::from_args(&args),
+            run: RunIdentity::from_sizing(&args, sizing),
             destination_address: destination_address.clone(),
             num_txs: burst.total_submitted,
             num_keys: 1,
@@ -1409,7 +1463,12 @@ pub(super) async fn run_sui_to_sol(args: LoadTestArgs, _run_start: Instant) -> R
 // EVM -> Sui GMP
 // ===========================================================================
 
-pub(super) async fn run_evm_to_sui(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
+pub(super) async fn run_evm_to_sui(
+    args: LoadTestArgs,
+    _run_start: Instant,
+    sizing: RunSizing,
+) -> Result<()> {
+    sizing.require_burst("GMP evm-to-sui")?;
     let src = &args.source_chain;
     let dest = &args.destination_chain;
     let cfg = ChainsConfig::load(&args.config)?;
@@ -1469,6 +1528,7 @@ pub(super) async fn run_evm_to_sui(args: LoadTestArgs, _run_start: Instant) -> R
     let test_start = Instant::now();
     let mut report = evm_sender::run_load_test_with_metrics(
         &args,
+        sizing.require_burst("GMP evm-to-sui")?,
         sender_receiver_addr,
         &main_key,
         &evm_rpc_url,
@@ -1492,7 +1552,12 @@ pub(super) async fn run_evm_to_sui(args: LoadTestArgs, _run_start: Instant) -> R
 // Solana -> Sui GMP
 // ===========================================================================
 
-pub(super) async fn run_sol_to_sui(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
+pub(super) async fn run_sol_to_sui(
+    args: LoadTestArgs,
+    _run_start: Instant,
+    sizing: RunSizing,
+) -> Result<()> {
+    sizing.require_burst("GMP sol-to-sui")?;
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
@@ -1508,10 +1573,16 @@ pub(super) async fn run_sol_to_sui(args: LoadTestArgs, _run_start: Instant) -> R
 
     let test_start = Instant::now();
     // sol_sender's `run_load_test_with_metrics` handles signer load,
-    // ephemeral key derivation, sustained vs burst from args.tps. Pass
+    // ephemeral key derivation and the validated run sizing. Pass
     // evm_destination=true so the payload is ABI-string-encoded — Sui's
     // memo example accepts that the same way EVM SenderReceiver does.
-    let mut report = sol_sender::run_load_test_with_metrics(&args, &sui_channel, true).await?;
+    let mut report = sol_sender::run_load_test_with_metrics(
+        &args,
+        sizing.require_burst("GMP sol-to-sui")?,
+        &sui_channel,
+        true,
+    )
+    .await?;
     report.destination_address = sui_channel.clone();
 
     finalize_sui_dest_run(
@@ -1529,7 +1600,12 @@ pub(super) async fn run_sol_to_sui(args: LoadTestArgs, _run_start: Instant) -> R
 // Stellar -> Sui GMP
 // ===========================================================================
 
-pub(super) async fn run_stellar_to_sui(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
+pub(super) async fn run_stellar_to_sui(
+    args: LoadTestArgs,
+    _run_start: Instant,
+    sizing: RunSizing,
+) -> Result<()> {
+    let num_txs = sizing.require_burst("GMP stellar-to-sui")?;
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
@@ -1566,7 +1642,7 @@ pub(super) async fn run_stellar_to_sui(args: LoadTestArgs, _run_start: Instant) 
         None => None,
     };
 
-    let num_keys = args.num_txs.max(1) as usize;
+    let num_keys = usize::try_from(num_txs)?;
     let gas_stroops = stellar_sender::parse_gas_stroops(args.gas_value.as_deref())?;
     let main_seed = main_wallet.signing_key.to_bytes();
     let wallets = stellar_sender::derive_wallets(&main_seed, num_keys)?;
@@ -1582,14 +1658,14 @@ pub(super) async fn run_stellar_to_sui(args: LoadTestArgs, _run_start: Instant) 
 
     let test_start = Instant::now();
     let mut report = stellar_sender::run_burst(stellar_sender::BurstRequest {
-        client: &stellar_client,
-        wallets: &wallets,
+        client: stellar_client.clone(),
+        wallets: wallets.clone(),
         example_contract: stellar_example.clone(),
         gateway_contract: stellar_gateway,
-        destination_chain: &args.destination_axelar_id,
-        destination_address: &sui_channel,
+        destination_chain: args.destination_axelar_id.clone(),
+        destination_address: sui_channel.clone(),
         payload_override,
-        run: RunIdentity::from_args(&args),
+        run: RunIdentity::from_sizing(&args, sizing),
         gas_token_contract: stellar_xlm,
         gas_amount_stroops: gas_stroops,
     })

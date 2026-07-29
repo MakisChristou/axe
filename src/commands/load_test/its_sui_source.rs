@@ -55,20 +55,17 @@ impl TransactionSubmitter for ItsSuiSubmitter {
                     .try_into()
                     .unwrap_or(u64::MAX);
                 TxMetrics {
-                    signature: format!("{}-{}", result.digest, result.event_index),
-                    submit_time_ms: latency_ms,
                     confirm_time_ms: Some(latency_ms),
                     latency_ms: Some(latency_ms),
-                    compute_units: None,
-                    slot: None,
-                    outcome: TxOutcome::Succeeded,
-                    payload: Vec::new(),
                     payload_hash: result.payload_hash_hex,
                     source_address: format!("0x{}", result.source_address_hex),
                     gmp_destination_chain: "axelar".to_string(),
                     gmp_destination_address: self.its_hub_address.clone(),
                     send_instant: Some(send_start),
-                    amplifier_timing: None,
+                    ..TxMetrics::succeeded(
+                        format!("{}-{}", result.digest, result.event_index),
+                        latency_ms,
+                    )
                 }
             }
             Ok(result) => failed_metrics(TxOutcome::from_external(
@@ -82,22 +79,7 @@ impl TransactionSubmitter for ItsSuiSubmitter {
 }
 
 fn failed_metrics(outcome: super::metrics::TxOutcome) -> TxMetrics {
-    TxMetrics {
-        signature: String::new(),
-        submit_time_ms: 0,
-        confirm_time_ms: None,
-        latency_ms: None,
-        compute_units: None,
-        slot: None,
-        outcome,
-        payload: Vec::new(),
-        payload_hash: String::new(),
-        source_address: String::new(),
-        gmp_destination_chain: String::new(),
-        gmp_destination_address: String::new(),
-        send_instant: None,
-        amplifier_timing: None,
-    }
+    TxMetrics::from_outcome("", 0, outcome)
 }
 
 pub(super) async fn run_its_sequential(

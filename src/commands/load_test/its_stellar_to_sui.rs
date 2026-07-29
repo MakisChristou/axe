@@ -42,7 +42,7 @@ const AMOUNT_PER_TX: u64 = 10_000_000;
 /// Solana destination variants.
 const DEFAULT_GAS_STROOPS: u64 = 100_000_000;
 
-pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
+pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
@@ -53,7 +53,6 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
         "ITS (interchainTransfer via hub, Sui destination)",
     );
 
-    let sizing = RunSizing::new(&args)?;
     let sustained_params = sizing
         .sustained()
         .map(|plan| (plan.tps as u64, plan.duration_secs));
@@ -154,9 +153,9 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
     .await?;
     let mut report = LoadTestReport::from_transactions(
         ReportInput {
-            run: RunIdentity::from_args(&args),
+            run: RunIdentity::from_sizing(&args, sizing),
             destination_address: sui_wallet.address_hex(),
-            num_txs: args.num_txs,
+            num_txs: sizing.total_expected,
             num_keys: total_to_send as usize,
             total_submitted: send.total_submitted,
             test_duration_secs: send.test_duration_secs,

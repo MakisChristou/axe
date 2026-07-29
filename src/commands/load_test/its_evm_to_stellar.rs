@@ -14,7 +14,7 @@ use super::its_verification;
 use super::its_verification::{ItsBurstReport, StellarItsTarget, finish_burst};
 use super::keypairs;
 use super::metrics::ComputeUnitSummary;
-use super::run_sizing::{RunSizing as ValidatedRunSizing, SustainedPlan};
+use super::run_sizing::{RunMode, RunSizing as ValidatedRunSizing, SustainedPlan};
 use super::verification_session::VerificationSession;
 use super::verify::VerificationRoute;
 use super::{LoadTestArgs, check_evm_balance, read_its_cache, validate_evm_rpc};
@@ -28,7 +28,11 @@ use alloy::{
 };
 use eyre::eyre;
 
-pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
+pub async fn run(
+    args: LoadTestArgs,
+    _run_start: Instant,
+    validated_sizing: ValidatedRunSizing,
+) -> eyre::Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
@@ -47,7 +51,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
     let stellar = resolve_stellar_targets(&args, evm_src.deployer_address)?;
     let gas_value_wei = super::its_evm_source::standard_gas_value_wei(&args).await?;
     let gas_value = U256::from(gas_value_wei);
-    let mut sizing = RunSizing::standard(ValidatedRunSizing::new(&args)?);
+    let mut sizing = RunSizing::standard(validated_sizing);
 
     let token =
         resolve_or_deploy_token(&args, &evm_src, &evm_targets, &stellar, gas_value, &sizing)
@@ -106,18 +110,22 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
         gas_arg_scaling_factor,
     };
 
-    if !sizing.is_burst() {
-        run_sustained_pipeline(
-            &args,
-            &cfg,
-            transfer,
-            &stellar,
-            &stellar_recipient_addr,
-            &sizing,
-        )
-        .await
-    } else {
-        run_burst_pipeline(&args, transfer, &stellar, &stellar_recipient_addr, &sizing).await
+    match sizing.mode() {
+        RunMode::Sustained(plan) => {
+            run_sustained_pipeline(
+                &args,
+                &cfg,
+                transfer,
+                &stellar,
+                &stellar_recipient_addr,
+                &sizing,
+                plan,
+            )
+            .await
+        }
+        RunMode::Burst { .. } => {
+            run_burst_pipeline(&args, transfer, &stellar, &stellar_recipient_addr, &sizing).await
+        }
     }
 }
 
@@ -491,12 +499,13 @@ async fn run_sustained_pipeline(
     stellar: &StellarTargets,
     stellar_recipient_addr: &str,
     sizing: &RunSizing,
+    plan: SustainedPlan,
 ) -> eyre::Result<()> {
     let SustainedPlan {
         tps,
         duration_secs,
         key_cycle,
-    } = sizing.sustained().expect("sustained mode");
+    } = plan;
 
     let nonce_provider = ProviderBuilder::new().connect_http(transfer.rpc_url.parse()?);
     let mut nonces: Vec<u64> = Vec::with_capacity(sizing.num_keys);
@@ -614,7 +623,7 @@ async fn run_burst_pipeline(
         burst,
         ItsBurstReport {
             destination_address: stellar_recipient_addr.to_string(),
-            num_txs: args.num_txs,
+            num_txs: sizing.total_expected,
             num_keys: num_txs,
             compute_unit_summary: ComputeUnitSummary::Omit,
         },

@@ -16,6 +16,7 @@ use alloy::primitives::{Address, FixedBytes, keccak256};
 use alloy::providers::Provider;
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
+use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 
 use super::PendingTx;
@@ -71,8 +72,7 @@ fn required_payload_hash(tx: &PendingTx) -> Result<FixedBytes<32>> {
 }
 
 fn required_second_leg(tx: &PendingTx) -> Result<&SecondLeg> {
-    tx.second_leg
-        .as_ref()
+    tx.second_leg()
         .ok_or_else(|| eyre::eyre!("tx {} has no discovered second leg", tx.message_id))
 }
 
@@ -80,8 +80,8 @@ fn required_second_leg_payload_hash(tx: &PendingTx) -> Result<FixedBytes<32>> {
     Ok(required_second_leg(tx)?.payload_hash.into_fixed_bytes())
 }
 
-enum ContractQueryObservation {
-    Ready(serde_json::Value),
+enum ContractQueryObservation<T> {
+    Ready(T),
     Pending,
 }
 
@@ -93,14 +93,16 @@ fn is_pending_contract_error(error: &CosmwasmQueryError, pending: CosmwasmQueryP
 /// response and failures in transport or response decoding. Some LCDs return
 /// a 500 for a valid query while the message is still being routed; only the
 /// typed HTTP response body is eligible for that pending classification.
-async fn observe_contract_query(
+async fn observe_contract_query<T: DeserializeOwned>(
     lcd: &str,
     contract: &str,
     query: &serde_json::Value,
     pending: CosmwasmQueryPending,
-) -> Result<ContractQueryObservation> {
+) -> Result<ContractQueryObservation<T>> {
     match lcd_cosmwasm_smart_query_typed(lcd, contract, query).await {
-        Ok(response) => Ok(ContractQueryObservation::Ready(response)),
+        Ok(response) => serde_json::from_value(response)
+            .map(ContractQueryObservation::Ready)
+            .wrap_err("CosmWasm verification response had an unexpected shape"),
         Err(error) if is_pending_contract_error(&error, pending) => {
             Ok(ContractQueryObservation::Pending)
         }
@@ -143,19 +145,17 @@ fn apply_destination_observations(
         match status {
             DestinationStatus::Pending => {}
             DestinationStatus::Approved { command_id } if tx.is_phase(Phase::Approved) => {
-                tx.command_id = command_id.or(tx.command_id);
                 tx.timing.approved_secs = Some(tx.send_instant.elapsed().as_secs_f64());
-                progressed |= tx.transition_to(Phase::Executed);
+                progressed |= tx.approve_destination(command_id);
             }
             DestinationStatus::Executed { command_id } => {
-                tx.command_id = command_id.or(tx.command_id);
                 let elapsed = tx.send_instant.elapsed().as_secs_f64();
                 if tx.timing.approved_secs.is_none() {
                     tx.timing.approved_secs = Some(elapsed);
                 }
                 tx.timing.executed_secs = Some(elapsed);
                 tx.timing.executed_ok = Some(true);
-                progressed |= tx.succeed(false);
+                progressed |= tx.execute_destination(command_id);
             }
             DestinationStatus::Approved { .. } => {}
         }
@@ -1121,7 +1121,7 @@ impl ItsHubVerifier<'_> {
         for result in discovery_results {
             let (index, info) = result?;
             if let Some(info) = info {
-                txs[index].second_leg = Some(SecondLeg {
+                let second_leg = SecondLeg {
                     message_id: info.message_id.into(),
                     payload_hash: parse_payload_hash(&info.payload_hash).wrap_err_with(|| {
                         format!(
@@ -1131,11 +1131,14 @@ impl ItsHubVerifier<'_> {
                     })?,
                     source_address: info.source_address,
                     destination_address: info.destination_address,
-                });
-                progressed |= txs[index].transition_to(match self.second_leg_target {
-                    SecondLegTarget::Routed => Phase::Routed,
-                    SecondLegTarget::DestinationApproval => Phase::Approved,
-                });
+                };
+                progressed |= txs[index].discover_second_leg(
+                    second_leg,
+                    match self.second_leg_target {
+                        SecondLegTarget::Routed => Phase::Routed,
+                        SecondLegTarget::DestinationApproval => Phase::Approved,
+                    },
+                );
             }
         }
 
@@ -1403,7 +1406,7 @@ impl<P: Provider> DestinationVerifier for EvmItsDestinationVerifier<'_, P> {
                                 }
                             }
                             Some(Phase::Executed) => {
-                                let command_id = tx.command_id.ok_or_else(|| {
+                                let command_id = tx.command_id().ok_or_else(|| {
                                     eyre::eyre!(
                                         "legacy ITS tx {} in Executed phase without a commandId",
                                         tx.message_id
@@ -1687,7 +1690,7 @@ mod tests {
             }],
         ));
         assert_eq!(txs[0].phase(), Some(Phase::Executed));
-        assert_eq!(txs[0].command_id, Some(command_id));
+        assert_eq!(txs[0].command_id(), Some(command_id));
         assert!(txs[0].timing.approved_secs.is_some());
         assert!(txs[0].timing.executed_secs.is_none());
     }

@@ -15,7 +15,7 @@ use super::its_prerequisites::{self, GatewayRequirement};
 use super::its_verification;
 use super::its_verification::{EvmItsTarget, finish_batch};
 use super::metrics::RunIdentity;
-use super::run_sizing::{RunSizing, SustainedPlan};
+use super::run_sizing::{RunMode, RunSizing, SustainedPlan};
 use super::verification_session::VerificationSession;
 use super::verify::VerificationRoute;
 use super::{LoadTestArgs, validate_evm_rpc, xrpl_sender};
@@ -25,7 +25,7 @@ use crate::xrpl::{
     XrplClient, XrplWallet, account_id_to_hex, faucet_url_for_network, parse_address,
 };
 
-pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
+pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
@@ -48,7 +48,6 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
     let evm_targets = resolve_evm_targets(&cfg, dest)?;
 
     let gas_fee_drops = parse_gas_fee_drops(args.gas_value.as_deref())?;
-    let sizing = RunSizing::new(&args)?;
     let wallets = fund_ephemeral_wallets(
         &xrpl_client,
         &main_wallet,
@@ -60,27 +59,31 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> Result<()> {
     .await?;
     let multisig = parse_address(&xrpl_multisig_addr)?;
 
-    if !sizing.is_burst() {
-        run_sustained_pipeline(
-            &args,
-            &xrpl_client,
-            wallets,
-            multisig,
-            &evm_targets,
-            gas_fee_drops,
-            &sizing,
-        )
-        .await
-    } else {
-        run_burst_pipeline(
-            &args,
-            &xrpl_client,
-            &wallets,
-            &multisig,
-            &evm_targets,
-            gas_fee_drops,
-        )
-        .await
+    match sizing.mode() {
+        RunMode::Sustained(plan) => {
+            run_sustained_pipeline(SustainedPipeline {
+                args,
+                xrpl_client,
+                wallets,
+                multisig,
+                evm: evm_targets,
+                gas_fee_drops,
+                sizing,
+                plan,
+            })
+            .await
+        }
+        RunMode::Burst { .. } => {
+            run_burst_pipeline(
+                &args,
+                &xrpl_client,
+                &wallets,
+                &multisig,
+                &evm_targets,
+                gas_fee_drops,
+            )
+            .await
+        }
     }
 }
 
@@ -206,23 +209,36 @@ async fn fund_ephemeral_wallets(
 /// Drive the sustained-mode pipeline: spawn the streaming verifier, run the
 /// XRPL sustained sender, stitch amplifier timings back into the report, and
 /// hand off to `finish_report`.
-async fn run_sustained_pipeline(
-    args: &LoadTestArgs,
-    xrpl_client: &XrplClient,
+struct SustainedPipeline {
+    args: LoadTestArgs,
+    xrpl_client: XrplClient,
     wallets: Vec<XrplWallet>,
     multisig: AccountId,
-    evm: &EvmTargets,
+    evm: EvmTargets,
     gas_fee_drops: u64,
-    sizing: &RunSizing,
-) -> Result<()> {
+    sizing: RunSizing,
+    plan: SustainedPlan,
+}
+
+async fn run_sustained_pipeline(pipeline: SustainedPipeline) -> Result<()> {
+    let SustainedPipeline {
+        args,
+        xrpl_client,
+        wallets,
+        multisig,
+        evm,
+        gas_fee_drops,
+        sizing,
+        plan,
+    } = pipeline;
     let dest = &args.destination_chain;
     let SustainedPlan {
         tps: tps_n,
         duration_secs,
         key_cycle,
-    } = sizing.sustained().expect("sustained mode");
+    } = plan;
     let mut verification = VerificationSession::start(
-        VerificationRoute::from_args(args),
+        VerificationRoute::from_args(&args),
         EvmItsTarget {
             gateway_addr: evm.evm_gateway_addr,
             rpc_url: args.destination_rpc.clone(),
@@ -243,7 +259,7 @@ async fn run_sustained_pipeline(
     let has_voting_verifier = false;
 
     let result = xrpl_sender::run_sustained(xrpl_sender::SustainedRequest {
-        client: xrpl_client.clone(),
+        client: xrpl_client,
         wallets,
         destination_multisig: multisig,
         destination_chain: dest.clone(),
@@ -262,7 +278,7 @@ async fn run_sustained_pipeline(
     .await?;
     its_verification::finish_sustained(
         verification,
-        args,
+        &args,
         result,
         &format!("{}", evm.its_proxy_addr),
         tps_n as u64 * duration_secs,
@@ -286,15 +302,15 @@ async fn run_burst_pipeline(
 
     let test_start = Instant::now();
     let mut report = xrpl_sender::run_burst(xrpl_sender::BurstRequest {
-        client: xrpl_client,
-        wallets,
-        destination_multisig: multisig,
-        destination_chain: dest,
-        destination_address_hex: &evm.dest_address_hex,
+        client: xrpl_client.clone(),
+        wallets: wallets.to_vec(),
+        destination_multisig: *multisig,
+        destination_chain: dest.clone(),
+        destination_address_hex: evm.dest_address_hex.clone(),
         gas_fee_drops,
-        gmp_dest_chain: "axelar",
-        gmp_dest_address: &evm.axelarnet_gw_addr,
-        run: RunIdentity::from_args(args),
+        gmp_dest_chain: "axelar".to_string(),
+        gmp_dest_address: evm.axelarnet_gw_addr.clone(),
+        run: RunIdentity::burst(args),
     })
     .await?;
     report.destination_address = format!("{}", evm.its_proxy_addr);

@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -20,7 +19,7 @@ use super::its_verification;
 use super::its_verification::{EvmItsTarget, ItsBurstReport, finish_burst};
 use super::keypairs;
 use super::metrics::ComputeUnitSummary;
-use super::run_sizing::{RunSizing, SustainedPlan};
+use super::run_sizing::{RunMode, RunSizing, SustainedPlan};
 use super::verification_session::VerificationSession;
 use super::verify::VerificationRoute;
 use super::{read_its_cache, save_its_cache, validate_evm_rpc, validate_solana_rpc};
@@ -75,7 +74,7 @@ fn hub_gas_value(per_command: u64) -> u64 {
 /// 10× ≈ 0.001 SOL covers the deploy with margin.
 const DEPLOY_GAS_MULTIPLIER: u64 = 10;
 
-pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
+pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> eyre::Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
@@ -102,22 +101,22 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
     let (evm, dest_address_bytes) =
         resolve_evm_targets_and_receiver(&cfg, dest, args.private_key.as_deref())?;
 
-    let sizing = RunSizing::new(&args)?;
-
-    let (token_id, _salt, mint) = setup_its_token(TokenSetupRequest {
-        solana_rpc: &args.source_rpc,
-        keypair: &main_keypair,
-        network: args.network,
-        source_chain: src,
-        destination_chain: dest,
-        num_txs: sizing.num_keys,
-        gas_value,
-        token_id_override: args.token_id.as_deref(),
-        config: &args.config,
-        evm_gateway: evm.evm_gateway_addr,
-        evm_rpc_url: &evm_rpc_url,
-        rpc_client: &rpc_client,
-    })
+    let (token_id, _salt, mint) = setup_its_token(
+        &main_keypair,
+        &rpc_client,
+        TokenSetupRequest {
+            solana_rpc: args.source_rpc.clone(),
+            network: args.network,
+            source_chain: src.clone(),
+            destination_chain: dest.clone(),
+            num_txs: sizing.num_keys,
+            gas_value,
+            token_id_override: args.token_id.clone(),
+            config: args.config.clone(),
+            evm_gateway: evm.evm_gateway_addr,
+            evm_rpc_url: evm_rpc_url.clone(),
+        },
+    )
     .await?;
 
     ui::kv("token ID", &hex::encode(token_id));
@@ -152,10 +151,13 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
         amount_per_tx,
     };
 
-    if !sizing.is_burst() {
-        run_sustained_pipeline(&args, &evm, &sizing, keypairs, &transfer).await
-    } else {
-        run_burst_pipeline(&args, &evm, &keypairs, &transfer, &evm_rpc_url).await
+    match sizing.mode() {
+        RunMode::Sustained(plan) => {
+            run_sustained_pipeline(&args, &evm, &sizing, plan, keypairs, &transfer).await
+        }
+        RunMode::Burst { .. } => {
+            run_burst_pipeline(&args, &evm, &keypairs, &transfer, &evm_rpc_url, sizing).await
+        }
     }
 }
 
@@ -299,6 +301,7 @@ async fn run_sustained_pipeline(
     args: &LoadTestArgs,
     evm: &EvmTargets,
     sizing: &RunSizing,
+    plan: SustainedPlan,
     keypairs: Vec<Arc<Keypair>>,
     transfer: &ItsTransferSpec,
 ) -> eyre::Result<()> {
@@ -308,7 +311,7 @@ async fn run_sustained_pipeline(
         tps: tps_n,
         duration_secs,
         key_cycle,
-    } = sizing.sustained().expect("sustained mode");
+    } = plan;
 
     let mut verification = VerificationSession::start(
         VerificationRoute::from_args(args),
@@ -382,6 +385,7 @@ async fn run_burst_pipeline(
     keypairs: &[Arc<Keypair>],
     transfer: &ItsTransferSpec,
     evm_rpc_url: &str,
+    sizing: RunSizing,
 ) -> eyre::Result<()> {
     let dest = &args.destination_chain;
     let key_count = keypairs.len();
@@ -438,7 +442,7 @@ async fn run_burst_pipeline(
         burst,
         ItsBurstReport {
             destination_address: format!("{}", evm.its_proxy_addr),
-            num_txs: args.num_txs,
+            num_txs: sizing.total_expected,
             num_keys: key_count,
             compute_unit_summary: ComputeUnitSummary::Include,
         },
@@ -477,27 +481,26 @@ fn deployer_spl_balance(
 /// Deploy or reuse ITS token. Returns (token_id, salt, mint).
 /// When deploying fresh, waits for the remote deploy to propagate through the
 /// ITS hub and execute on the EVM destination before returning.
-struct TokenSetupRequest<'a> {
-    solana_rpc: &'a str,
-    keypair: &'a Keypair,
+struct TokenSetupRequest {
+    solana_rpc: String,
     network: crate::types::Network,
-    source_chain: &'a str,
-    destination_chain: &'a str,
+    source_chain: String,
+    destination_chain: String,
     num_txs: usize,
     gas_value: u64,
-    token_id_override: Option<&'a str>,
-    config: &'a Path,
+    token_id_override: Option<String>,
+    config: std::path::PathBuf,
     evm_gateway: Address,
-    evm_rpc_url: &'a str,
-    rpc_client: &'a solana_client::rpc_client::RpcClient,
+    evm_rpc_url: String,
 }
 
 async fn setup_its_token(
-    request: TokenSetupRequest<'_>,
+    keypair: &Keypair,
+    rpc_client: &solana_client::rpc_client::RpcClient,
+    request: TokenSetupRequest,
 ) -> eyre::Result<([u8; 32], [u8; 32], solana_sdk::pubkey::Pubkey)> {
     let TokenSetupRequest {
         solana_rpc,
-        keypair,
         network,
         source_chain: src,
         destination_chain: dest,
@@ -507,8 +510,13 @@ async fn setup_its_token(
         config,
         evm_gateway: evm_gateway_addr,
         evm_rpc_url,
-        rpc_client,
     } = request;
+    let solana_rpc = solana_rpc.as_str();
+    let src = src.as_str();
+    let dest = dest.as_str();
+    let token_id_override = token_id_override.as_deref();
+    let config = config.as_path();
+    let evm_rpc_url = evm_rpc_url.as_str();
     if let Some(tid_hex) = token_id_override {
         let tid_bytes = hex::decode(tid_hex.strip_prefix("0x").unwrap_or(tid_hex))
             .map_err(|e| eyre!("invalid --token-id: {e}"))?;

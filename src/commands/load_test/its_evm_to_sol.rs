@@ -8,7 +8,7 @@ use super::its_prerequisites::{self, GatewayRequirement};
 use super::its_verification;
 use super::its_verification::{ItsBurstReport, SolanaItsTarget, finish_burst};
 use super::metrics::ComputeUnitSummary;
-use super::run_sizing::{RunSizing as ValidatedRunSizing, SustainedPlan};
+use super::run_sizing::{RunMode, RunSizing as ValidatedRunSizing, SustainedPlan};
 use super::verification_session::VerificationSession;
 use super::verify::VerificationRoute;
 use super::{LoadTestArgs, read_its_cache, validate_evm_rpc, validate_solana_rpc};
@@ -23,7 +23,11 @@ use alloy::{
 use eyre::eyre;
 use solana_sdk::signer::Signer;
 
-pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
+pub async fn run(
+    args: LoadTestArgs,
+    _run_start: Instant,
+    validated_sizing: ValidatedRunSizing,
+) -> eyre::Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
@@ -42,7 +46,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
     let its = resolve_its_contracts(&cfg, src)?;
     let gas_value_wei = its_evm_source::standard_gas_value_wei(&args).await?;
     let gas_value = U256::from(gas_value_wei);
-    let mut sizing = RunSizing::standard(ValidatedRunSizing::new(&args)?);
+    let mut sizing = RunSizing::standard(validated_sizing);
 
     let token =
         resolve_or_deploy_token(&args, &evm_source, &its, &evm_rpc_url, &sizing, gas_value).await?;
@@ -108,10 +112,14 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
         receiver_bytes,
     };
 
-    if !sizing.is_burst() {
-        run_sustained_pipeline(&args, &cfg, &evm_rpc_url, &derived, &sizing, &targets).await
-    } else {
-        run_burst_pipeline(&args, &evm_rpc_url, &derived, &sizing, &targets).await
+    match sizing.mode() {
+        RunMode::Sustained(plan) => {
+            run_sustained_pipeline(&args, &cfg, &evm_rpc_url, &derived, &sizing, plan, &targets)
+                .await
+        }
+        RunMode::Burst { .. } => {
+            run_burst_pipeline(&args, &evm_rpc_url, &derived, &sizing, &targets).await
+        }
     }
 }
 
@@ -310,6 +318,7 @@ async fn run_sustained_pipeline(
     evm_rpc_url: &str,
     derived: &[PrivateKeySigner],
     sizing: &RunSizing,
+    plan: SustainedPlan,
     targets: &TransferTargets,
 ) -> eyre::Result<()> {
     let dest = &args.destination_chain;
@@ -317,7 +326,7 @@ async fn run_sustained_pipeline(
         tps,
         duration_secs,
         key_cycle,
-    } = sizing.sustained().expect("sustained mode");
+    } = plan;
 
     // Pre-fetch nonces.
     let nonce_provider = ProviderBuilder::new().connect_http(evm_rpc_url.parse()?);
@@ -441,7 +450,7 @@ async fn run_burst_pipeline(
         burst,
         ItsBurstReport {
             destination_address: format!("{}", targets.its_proxy_addr),
-            num_txs: args.num_txs,
+            num_txs: sizing.total_expected,
             num_keys: num_txs,
             compute_unit_summary: ComputeUnitSummary::Omit,
         },
