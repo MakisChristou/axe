@@ -21,6 +21,8 @@ pub struct SubmittedTx {
     pub digest: String,
     pub success: bool,
     pub error: Option<String>,
+    /// Move events are module-defined JSON-RPC payloads. Callers deserialize
+    /// the event type they expect at the protocol boundary.
     pub events: Vec<Value>,
 }
 

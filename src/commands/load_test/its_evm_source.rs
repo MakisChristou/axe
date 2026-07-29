@@ -175,7 +175,7 @@ async fn quote_route_gas(args: &LoadTestArgs) -> Option<u128> {
     let cfg = ChainsConfig::load(&args.config).ok()?;
     let symbol = cfg
         .chains
-        .get(&args.source_chain)?
+        .get(args.source_chain.as_ref())?
         .token_symbol
         .as_deref()?;
     super::gas_estimate::estimate_route_gas(
@@ -912,29 +912,14 @@ pub(super) fn read_gas_arg_scaling_factor(
     config_path: &std::path::Path,
     source_chain_id: &str,
 ) -> u32 {
-    #[derive(serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct ChainSettings {
-        #[serde(default)]
-        gas_scaling_factor: Option<u32>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct Config {
-        #[serde(default)]
-        chains: std::collections::HashMap<String, ChainSettings>,
-    }
-
-    let Ok(content) = std::fs::read_to_string(config_path) else {
-        return 0;
-    };
-    let Ok(config) = serde_json::from_str::<Config>(&content) else {
-        return 0;
-    };
-    config
-        .chains
-        .get(source_chain_id)
-        .and_then(|chain| chain.gas_scaling_factor)
+    ChainsConfig::load(config_path)
+        .ok()
+        .and_then(|config| {
+            config
+                .chains
+                .get(source_chain_id)
+                .and_then(|chain| chain.gas_scaling_factor)
+        })
         .unwrap_or(0)
 }
 

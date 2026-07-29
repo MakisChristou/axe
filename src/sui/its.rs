@@ -31,6 +31,7 @@ use super::config::parse_sui_addr;
 use super::rpc::{SuiClient, object_ref_from_json, owner_addr_hex};
 use super::tx::{PtbBuilder, sign_and_submit};
 use super::wallet::SuiWallet;
+use crate::config::ChainsConfig;
 
 /// Sui's well-known shared `Clock` object id (`0x6`).
 pub const SUI_CLOCK_ADDR_HEX: &str =
@@ -64,29 +65,66 @@ pub fn read_sui_its_config(
     config: &std::path::Path,
     chain_id: &str,
 ) -> Result<SuiItsContractsConfig> {
-    let content =
-        std::fs::read_to_string(config).map_err(|e| eyre!("failed to read config: {e}"))?;
-    let root: Value = serde_json::from_str(&content)?;
-    let chain = root
-        .pointer(&format!("/chains/{chain_id}"))
-        .ok_or_else(|| eyre!("chain '{chain_id}' not found in config"))?;
-
-    let read = |ptr: &str| -> Result<&str> {
-        chain
-            .pointer(ptr)
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| eyre!("missing {ptr} for sui chain '{chain_id}'"))
-    };
+    let config = ChainsConfig::load(config)?;
+    let chain = config.chain(chain_id)?;
+    let example = chain.contract("Example", chain_id)?;
+    let example_objects = example
+        .objects
+        .as_ref()
+        .ok_or_else(|| eyre!("missing Example.objects for sui chain '{chain_id}'"))?;
+    let its = chain.contract("InterchainTokenService", chain_id)?;
+    let its_objects = its.objects.as_ref().ok_or_else(|| {
+        eyre!("missing InterchainTokenService.objects for sui chain '{chain_id}'")
+    })?;
 
     Ok(SuiItsContractsConfig {
-        example_pkg: parse_sui_addr(read("/contracts/Example/address")?)?,
-        its_pkg: parse_sui_addr(read("/contracts/InterchainTokenService/address")?)?,
-        its_singleton: parse_sui_addr(read("/contracts/Example/objects/ItsSingleton")?)?,
-        its_object: parse_sui_addr(read(
-            "/contracts/InterchainTokenService/objects/InterchainTokenService",
-        )?)?,
-        gateway_object: parse_sui_addr(read("/contracts/AxelarGateway/objects/Gateway")?)?,
-        gas_service_object: parse_sui_addr(read("/contracts/GasService/objects/GasService")?)?,
+        example_pkg: parse_sui_addr(
+            example
+                .address
+                .as_deref()
+                .ok_or_else(|| eyre!("missing Example.address for sui chain '{chain_id}'"))?,
+        )?,
+        its_pkg: parse_sui_addr(its.address.as_deref().ok_or_else(|| {
+            eyre!("missing InterchainTokenService.address for sui chain '{chain_id}'")
+        })?)?,
+        its_singleton: parse_sui_addr(
+            example_objects
+                .its_singleton
+                .as_deref()
+                .ok_or_else(|| {
+                    eyre!("missing Example.objects.ItsSingleton for sui chain '{chain_id}'")
+                })?,
+        )?,
+        its_object: parse_sui_addr(
+            its_objects
+                .interchain_token_service
+                .as_deref()
+                .ok_or_else(|| {
+                    eyre!(
+                        "missing InterchainTokenService.objects.InterchainTokenService for sui chain '{chain_id}'"
+                    )
+                })?,
+        )?,
+        gateway_object: parse_sui_addr(
+            chain
+                .contract("AxelarGateway", chain_id)?
+                .objects
+                .as_ref()
+                .and_then(|objects| objects.gateway.as_deref())
+                .ok_or_else(|| {
+                    eyre!("missing AxelarGateway.objects.Gateway for sui chain '{chain_id}'")
+                })?,
+        )?,
+        gas_service_object: parse_sui_addr(
+            chain
+                .contract("GasService", chain_id)?
+                .objects
+                .as_ref()
+                .and_then(|objects| objects.gas_service.as_deref())
+                .ok_or_else(|| {
+                    eyre!("missing GasService.objects.GasService for sui chain '{chain_id}'")
+                })?,
+        )?,
     })
 }
 

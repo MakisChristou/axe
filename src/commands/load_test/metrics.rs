@@ -118,6 +118,12 @@ impl<'de> Deserialize<'de> for TxOutcome {
 }
 
 /// Per-transaction metrics collected during load testing.
+///
+/// Identifier and address fields intentionally remain strings here because
+/// this struct is the stable JSON report boundary. Orchestration converts
+/// them to `MessageId`, `PayloadHash`, or chain-SDK address types before
+/// making semantic decisions; wrapping these serialized fields themselves
+/// would add conversion churn without strengthening internal state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxMetrics {
     pub signature: String,
@@ -322,8 +328,8 @@ impl RunIdentity {
 
     fn from_args(args: &super::LoadTestArgs, plan: Option<SustainedPlan>) -> Self {
         Self {
-            source_chain: args.source_chain.clone().into(),
-            destination_chain: args.destination_chain.clone().into(),
+            source_chain: args.source_chain.to_string().into(),
+            destination_chain: args.destination_chain.to_string().into(),
             protocol: args.protocol.to_string(),
             schedule: plan.map(|plan| SustainedSchedule {
                 tps: plan.tps as u64,

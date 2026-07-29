@@ -44,7 +44,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
     let dest = &args.destination_chain;
     let cfg = ChainsConfig::load(&args.config)?;
 
-    let evm_rpc_url = args.destination_rpc.clone();
+    let evm_rpc_url = args.destination_rpc.to_string();
     validate_evm_rpc(&evm_rpc_url).await?;
 
     // A legacy (consensus) destination has no Cosmos Gateway and is verified on
@@ -79,7 +79,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
     // --- EVM ITS proxy + gateway (for verification + dest_address) ---
     let dest_cfg = cfg
         .chains
-        .get(dest)
+        .get(dest.as_ref())
         .ok_or_else(|| eyre!("destination chain '{dest}' not found in config"))?;
     let evm_its_addr: alloy::primitives::Address = dest_cfg
         .contract_address("InterchainTokenService", dest)?
@@ -116,7 +116,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
             contracts: its_contracts,
             coin_type,
             token_id,
-            destination_chain: args.destination_axelar_id.clone(),
+            destination_chain: args.destination_axelar_id.to_string(),
             destination_address_bytes: dest_address_bytes,
             transfer_amount: AMOUNT_PER_TX,
             gas_value,

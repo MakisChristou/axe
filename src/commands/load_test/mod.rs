@@ -81,6 +81,7 @@ use eyre::Result;
 
 use crate::config::ChainsConfig;
 use crate::ui;
+use chain_names::{AxelarChainId, ConfigChainId, RpcUrl};
 
 /// Load test type (extensible for future directions).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -175,21 +176,21 @@ impl std::fmt::Display for Protocol {
 
 /// CLI arguments for the load test command.
 #[derive(Clone)]
-pub struct LoadTestArgs {
+pub(crate) struct LoadTestArgs {
     pub config: PathBuf,
     /// The Axelar network this run targets (resolved in `main.rs` from
     /// `--network` / the config filename).
     pub network: crate::types::Network,
     pub test_type: TestType,
     pub protocol: Protocol,
-    pub destination_chain: String,
-    pub source_chain: String,
+    pub destination_chain: ConfigChainId,
+    pub source_chain: ConfigChainId,
     /// The `axelarId` for the source chain (used for Cosmos-side verification).
-    pub source_axelar_id: String,
+    pub source_axelar_id: AxelarChainId,
     /// The `axelarId` for the destination chain (used for Cosmos-side verification).
-    pub destination_axelar_id: String,
-    pub source_rpc: String,
-    pub destination_rpc: String,
+    pub destination_axelar_id: AxelarChainId,
+    pub source_rpc: RpcUrl,
+    pub destination_rpc: RpcUrl,
     pub private_key: Option<String>,
     pub num_txs: u64,
     pub keypair: Option<String>,

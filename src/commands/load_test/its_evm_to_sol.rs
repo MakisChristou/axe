@@ -10,8 +10,6 @@ use super::its_verification;
 use super::its_verification::{ItsBurstReport, SolanaItsTarget, finish_burst};
 use super::metrics::ComputeUnitSummary;
 use super::run_sizing::{RunMode, RunSizing as ValidatedRunSizing, SustainedPlan};
-use super::verification_session::VerificationSession;
-use super::verify::VerificationRoute;
 use super::{LoadTestArgs, validate_evm_rpc, validate_solana_rpc};
 use crate::config::ChainsConfig;
 use crate::evm::InterchainTokenService;
@@ -32,7 +30,7 @@ pub async fn run(
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
-    let evm_rpc_url = args.source_rpc.clone();
+    let evm_rpc_url = args.source_rpc.to_string();
     validate_evm_rpc(&evm_rpc_url).await?;
     validate_solana_rpc(&args.destination_rpc).await?;
 
@@ -318,55 +316,46 @@ async fn run_sustained_pipeline(
         .axelar
         .contract_address("VotingVerifier", &args.source_chain)
         .is_ok();
-    let mut verification = VerificationSession::start(
-        VerificationRoute::from_args(args),
-        SolanaItsTarget {
-            rpc_url: args.destination_rpc.clone(),
-        },
-    );
-
-    let spinner = ui::wait_spinner(&format!(
-        "[0/{duration_secs}s] starting sustained ITS send..."
-    ));
-    verification.attach_spinner(spinner.clone())?;
-
-    let test_start = Instant::now();
-    let make_task = its_evm_source::its_sustained_tasks(
-        its_evm_source::ItsEvmSubmitter {
-            rpc_url: evm_rpc_url.parse()?,
-            its_proxy: targets.its_proxy_addr,
-            token_id: targets.token_id.into(),
-            destination_chain: dest.to_string(),
-            receiver: targets.receiver_bytes.clone(),
-            amount: sizing.amount_per_tx,
-            gas_value: super::units::Wei::from_u256(targets.gas_value),
-            gas_arg_scaling_factor: targets.gas_arg_scaling_factor,
-        },
-        derived.to_vec(),
-        Some(verification.sender()),
-        has_voting_verifier,
-    );
-
-    let result = super::sustained::run_sustained_loop(
-        SustainedPlan {
-            tps,
-            duration_secs,
-            key_cycle,
-        },
-        Some(nonces),
-        make_task,
-        Some(verification.send_done()),
-        spinner,
-    )
-    .await?;
-    its_verification::finish_sustained(
-        verification,
+    let submitter = its_evm_source::ItsEvmSubmitter {
+        rpc_url: evm_rpc_url.parse()?,
+        its_proxy: targets.its_proxy_addr,
+        token_id: targets.token_id.into(),
+        destination_chain: dest.to_string(),
+        receiver: targets.receiver_bytes.clone(),
+        amount: sizing.amount_per_tx,
+        gas_value: super::units::Wei::from_u256(targets.gas_value),
+        gas_arg_scaling_factor: targets.gas_arg_scaling_factor,
+    };
+    let destination_address = targets.its_proxy_addr.to_string();
+    its_verification::run_sustained(
         args,
-        result,
-        &format!("{}", targets.its_proxy_addr),
+        SolanaItsTarget {
+            rpc_url: args.destination_rpc.to_string(),
+        },
+        &format!("[0/{duration_secs}s] starting sustained ITS send..."),
+        &destination_address,
         sizing.total_expected,
         sizing.num_keys,
-        test_start,
+        |context| async move {
+            let make_task = its_evm_source::its_sustained_tasks(
+                submitter,
+                derived.to_vec(),
+                Some(context.verify_tx),
+                has_voting_verifier,
+            );
+            super::sustained::run_sustained_loop(
+                SustainedPlan {
+                    tps,
+                    duration_secs,
+                    key_cycle,
+                },
+                Some(nonces),
+                make_task,
+                Some(context.send_done),
+                context.spinner,
+            )
+            .await
+        },
     )
     .await
 }
@@ -421,7 +410,7 @@ async fn run_burst_pipeline(
     finish_burst(
         args,
         SolanaItsTarget {
-            rpc_url: args.destination_rpc.clone(),
+            rpc_url: args.destination_rpc.to_string(),
         },
         burst,
         ItsBurstReport {

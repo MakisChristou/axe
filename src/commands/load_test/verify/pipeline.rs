@@ -97,6 +97,9 @@ fn is_pending_contract_error(error: &CosmwasmQueryError, pending: CosmwasmQueryP
 async fn observe_contract_query<T: DeserializeOwned>(
     lcd: &str,
     contract: &str,
+    // CosmWasm smart-query messages have contract-specific wire shapes. The
+    // response is converted to `T` immediately below; keeping only this
+    // transport boundary dynamic avoids a misleading shared query enum.
     query: &serde_json::Value,
     pending: CosmwasmQueryPending,
 ) -> Result<ContractQueryObservation<T>> {

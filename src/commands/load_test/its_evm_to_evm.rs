@@ -27,8 +27,6 @@ use super::its_verification;
 use super::its_verification::{EvmItsTarget, ItsBurstReport, finish_burst};
 use super::metrics::ComputeUnitSummary;
 use super::run_sizing::{RunMode, RunSizing as ValidatedRunSizing, SustainedPlan};
-use super::verification_session::VerificationSession;
-use super::verify::VerificationRoute;
 use super::{LoadTestArgs, validate_evm_rpc};
 use crate::config::ChainsConfig;
 use crate::evm::InterchainTokenService;
@@ -48,8 +46,8 @@ pub async fn run(
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
-    let source_rpc_url = args.source_rpc.clone();
-    let dest_rpc_url = args.destination_rpc.clone();
+    let source_rpc_url = args.source_rpc.to_string();
+    let dest_rpc_url = args.destination_rpc.to_string();
     validate_evm_rpc(&source_rpc_url).await?;
     validate_evm_rpc(&dest_rpc_url).await?;
 
@@ -402,56 +400,47 @@ async fn run_sustained_pipeline(
         .axelar
         .contract_address("VotingVerifier", &args.source_chain)
         .is_ok();
-    let mut verification = VerificationSession::start(
-        VerificationRoute::from_args(&args),
+    let submitter = its_evm_source::ItsEvmSubmitter {
+        rpc_url: source_rpc_url.parse()?,
+        its_proxy: targets.its_proxy_addr,
+        token_id: targets.token_id.into(),
+        destination_chain: args.destination_axelar_id.to_string(),
+        receiver: targets.receiver_bytes.clone(),
+        amount: sizing.amount_per_tx,
+        gas_value: super::units::Wei::from_u256(targets.gas_value),
+        gas_arg_scaling_factor: targets.gas_arg_scaling_factor,
+    };
+    let destination_address = targets.its_proxy_addr.to_string();
+    its_verification::run_sustained(
+        &args,
         EvmItsTarget {
             gateway_addr: dest_gateway_addr,
-            rpc_url: dest_rpc_url.to_string(),
+            rpc_url: dest_rpc_url,
         },
-    );
-
-    let spinner = ui::wait_spinner(&format!(
-        "[0/{duration_secs}s] starting sustained ITS send..."
-    ));
-    verification.attach_spinner(spinner.clone())?;
-
-    let test_start = Instant::now();
-    let make_task = its_evm_source::its_sustained_tasks(
-        its_evm_source::ItsEvmSubmitter {
-            rpc_url: source_rpc_url.parse()?,
-            its_proxy: targets.its_proxy_addr,
-            token_id: targets.token_id.into(),
-            destination_chain: args.destination_axelar_id.clone(),
-            receiver: targets.receiver_bytes.clone(),
-            amount: sizing.amount_per_tx,
-            gas_value: super::units::Wei::from_u256(targets.gas_value),
-            gas_arg_scaling_factor: targets.gas_arg_scaling_factor,
-        },
-        derived,
-        Some(verification.sender()),
-        has_voting_verifier,
-    );
-
-    let result = super::sustained::run_sustained_loop(
-        SustainedPlan {
-            tps,
-            duration_secs,
-            key_cycle,
-        },
-        Some(nonces),
-        make_task,
-        Some(verification.send_done()),
-        spinner,
-    )
-    .await?;
-    its_verification::finish_sustained(
-        verification,
-        &args,
-        result,
-        &format!("{}", targets.its_proxy_addr),
+        &format!("[0/{duration_secs}s] starting sustained ITS send..."),
+        &destination_address,
         sizing.total_expected,
         sizing.num_keys,
-        test_start,
+        |context| async move {
+            let make_task = its_evm_source::its_sustained_tasks(
+                submitter,
+                derived,
+                Some(context.verify_tx),
+                has_voting_verifier,
+            );
+            super::sustained::run_sustained_loop(
+                SustainedPlan {
+                    tps,
+                    duration_secs,
+                    key_cycle,
+                },
+                Some(nonces),
+                make_task,
+                Some(context.send_done),
+                context.spinner,
+            )
+            .await
+        },
     )
     .await
 }
@@ -475,7 +464,7 @@ async fn run_burst_pipeline(pipeline: PipelineContext) -> eyre::Result<()> {
             rpc_url: source_rpc_url.parse()?,
             its_proxy: targets.its_proxy_addr,
             token_id: targets.token_id.into(),
-            destination_chain: args.destination_axelar_id.clone(),
+            destination_chain: args.destination_axelar_id.to_string(),
             receiver: targets.receiver_bytes.clone(),
             amount: sizing.amount_per_tx,
             gas_value: super::units::Wei::from_u256(targets.gas_value),

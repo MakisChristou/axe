@@ -50,7 +50,7 @@ async fn quote_route_gas(args: &LoadTestArgs) -> Option<u128> {
     let cfg = crate::config::ChainsConfig::load(&args.config).ok()?;
     let symbol = cfg
         .chains
-        .get(&args.source_chain)?
+        .get(args.source_chain.as_ref())?
         .token_symbol
         .as_deref()?;
     super::gas_estimate::estimate_route_gas(
@@ -286,7 +286,7 @@ pub async fn run_load_test_with_metrics(
         EvmSubmitter {
             rpc_url: evm_rpc_url.parse()?,
             sender_receiver: sender_receiver_addr,
-            destination_chain: dest_chain.clone(),
+            destination_chain: dest_chain.to_string(),
             destination_address: dest_addr.clone(),
             gas_value,
             fee_mode,
@@ -572,7 +572,7 @@ pub(super) async fn run_sustained_load_test_with_metrics(
         .axelar
         .contract_address("VotingVerifier", &args.source_chain)
         .is_ok();
-    let source_chain = args.source_axelar_id.clone();
+    let source_chain = args.source_axelar_id.to_string();
     let network = args.network;
     let (src_legacy, dst_legacy) =
         super::verify::classify_route(&cfg, &args.source_axelar_id, &args.destination_axelar_id);
@@ -583,7 +583,7 @@ pub(super) async fn run_sustained_load_test_with_metrics(
         EvmSustainedSubmitter {
             rpc_url,
             sender_receiver: sender_receiver_addr,
-            destination_chain: dest_chain,
+            destination_chain: dest_chain.to_string(),
             destination_address: dest_addr,
             gas_value,
             fee_mode,

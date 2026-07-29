@@ -17,8 +17,6 @@ use super::its_verification::{EvmItsTarget, finish_batch};
 use super::metrics::RunIdentity;
 use super::run_sizing::{RunMode, RunSizing, SustainedPlan};
 use super::units::Drops;
-use super::verification_session::VerificationSession;
-use super::verify::VerificationRoute;
 use super::{LoadTestArgs, validate_evm_rpc, xrpl_sender};
 use crate::config::ChainsConfig;
 use crate::ui;
@@ -232,59 +230,48 @@ async fn run_sustained_pipeline(pipeline: SustainedPipeline) -> Result<()> {
         sizing,
         plan,
     } = pipeline;
-    let dest = &args.destination_chain;
     let SustainedPlan {
         tps: tps_n,
         duration_secs,
         key_cycle,
     } = plan;
-    let mut verification = VerificationSession::start(
-        VerificationRoute::from_args(&args),
-        EvmItsTarget {
-            gateway_addr: evm.evm_gateway_addr,
-            rpc_url: args.destination_rpc.clone(),
-        },
-    );
-
-    let spinner = ui::wait_spinner(&format!(
-        "[0/{duration_secs}s] starting sustained XRPL ITS send..."
-    ));
-    verification.attach_spinner(spinner.clone())?;
-
-    let test_start = Instant::now();
 
     // XRPL source has a separate VotingVerifier (XrplVotingVerifier). The
     // existing streaming verifier uses `VotingVerifier/{source}` — which
     // doesn't exist for XRPL — so we run without a voting check and let
     // the Routed → HubApproved → ... stages drive the pipeline.
     let has_voting_verifier = false;
-
-    let result = xrpl_sender::run_sustained(xrpl_sender::SustainedRequest {
-        client: xrpl_client,
-        wallets,
-        destination_multisig: multisig,
-        destination_chain: dest.clone(),
-        destination_address_hex: evm.dest_address_hex.clone(),
-        gas_fee,
-        gmp_dest_chain: "axelar".to_string(),
-        gmp_dest_address: evm.axelarnet_gw_addr.clone(),
-        tps: tps_n,
-        duration_secs,
-        key_cycle,
-        verify_tx: Some(verification.sender()),
-        send_done: Some(verification.send_done()),
-        spinner,
-        has_voting_verifier,
-    })
-    .await?;
-    its_verification::finish_sustained(
-        verification,
+    let destination_chain = args.destination_chain.to_string();
+    let destination_address = evm.its_proxy_addr.to_string();
+    its_verification::run_sustained(
         &args,
-        result,
-        &format!("{}", evm.its_proxy_addr),
+        EvmItsTarget {
+            gateway_addr: evm.evm_gateway_addr,
+            rpc_url: args.destination_rpc.to_string(),
+        },
+        &format!("[0/{duration_secs}s] starting sustained XRPL ITS send..."),
+        &destination_address,
         tps_n as u64 * duration_secs,
         sizing.num_keys,
-        test_start,
+        |context| {
+            xrpl_sender::run_sustained(xrpl_sender::SustainedRequest {
+                client: xrpl_client,
+                wallets,
+                destination_multisig: multisig,
+                destination_chain,
+                destination_address_hex: evm.dest_address_hex.clone(),
+                gas_fee,
+                gmp_dest_chain: "axelar".to_string(),
+                gmp_dest_address: evm.axelarnet_gw_addr.clone(),
+                tps: tps_n,
+                duration_secs,
+                key_cycle,
+                verify_tx: Some(context.verify_tx),
+                send_done: Some(context.send_done),
+                spinner: context.spinner,
+                has_voting_verifier,
+            })
+        },
     )
     .await
 }
@@ -306,7 +293,7 @@ async fn run_burst_pipeline(
         client: xrpl_client.clone(),
         wallets: wallets.to_vec(),
         destination_multisig: *multisig,
-        destination_chain: dest.clone(),
+        destination_chain: dest.to_string(),
         destination_address_hex: evm.dest_address_hex.clone(),
         gas_fee,
         gmp_dest_chain: "axelar".to_string(),
@@ -323,7 +310,7 @@ async fn run_burst_pipeline(
         args,
         EvmItsTarget {
             gateway_addr: evm.evm_gateway_addr,
-            rpc_url: args.destination_rpc.clone(),
+            rpc_url: args.destination_rpc.to_string(),
         },
         &mut report,
         test_start,
@@ -336,30 +323,30 @@ pub(super) fn read_xrpl_chain_config(
     config: &std::path::Path,
     chain_id: &str,
 ) -> Result<(String, String, String)> {
-    let content =
-        std::fs::read_to_string(config).map_err(|e| eyre!("failed to read config: {e}"))?;
-    let root: serde_json::Value = serde_json::from_str(&content)?;
-    let chain = root
-        .pointer(&format!("/chains/{chain_id}"))
-        .ok_or_else(|| eyre!("chain '{chain_id}' not found in config"))?;
+    let config = ChainsConfig::load(config)?;
+    let chain = config.chain(chain_id)?;
     // Prefer `rpc` (HTTP JSON-RPC); fall back to `wssRpc` if only WS is present.
     let rpc = chain
-        .get("rpc")
-        .and_then(|v| v.as_str())
-        .or_else(|| chain.get("wssRpc").and_then(|v| v.as_str()))
+        .rpc
+        .as_ref()
+        .or(chain.wss_rpc.as_ref())
         .ok_or_else(|| eyre!("no rpc for XRPL chain '{chain_id}'"))?
-        .to_string();
+        .clone();
     let multisig = chain
-        .pointer("/contracts/InterchainTokenService/address")
-        .or_else(|| chain.pointer("/contracts/AxelarGateway/address"))
-        .and_then(|v| v.as_str())
+        .contracts
+        .as_ref()
+        .and_then(|contracts| {
+            contracts
+                .get("InterchainTokenService")
+                .or_else(|| contracts.get("AxelarGateway"))
+        })
+        .and_then(|contract| contract.address.as_ref())
         .ok_or_else(|| eyre!("no InterchainTokenService/AxelarGateway address for '{chain_id}'"))?
-        .to_string();
+        .clone();
     let network_type = chain
-        .get("networkType")
-        .and_then(|v| v.as_str())
-        .unwrap_or("testnet")
-        .to_string();
+        .network_type
+        .clone()
+        .unwrap_or_else(|| "testnet".to_string());
     Ok((rpc, multisig, network_type))
 }
 

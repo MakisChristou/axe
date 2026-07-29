@@ -15,8 +15,6 @@ use super::its_verification::{ItsBurstReport, StellarItsTarget, finish_burst};
 use super::keypairs;
 use super::metrics::ComputeUnitSummary;
 use super::run_sizing::{RunMode, RunSizing as ValidatedRunSizing, SustainedPlan};
-use super::verification_session::VerificationSession;
-use super::verify::VerificationRoute;
 use super::{LoadTestArgs, check_evm_balance, validate_evm_rpc};
 use crate::config::ChainsConfig;
 use crate::evm::InterchainTokenService;
@@ -36,7 +34,7 @@ pub async fn run(
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
-    let evm_rpc_url = args.source_rpc.clone();
+    let evm_rpc_url = args.source_rpc.to_string();
     validate_evm_rpc(&evm_rpc_url).await?;
 
     let cfg = ChainsConfig::load(&args.config)?;
@@ -248,7 +246,7 @@ fn resolve_stellar_targets(
     deployer_address: Address,
 ) -> eyre::Result<StellarTargets> {
     let dest = &args.destination_chain;
-    let stellar_rpc = args.destination_rpc.clone();
+    let stellar_rpc = args.destination_rpc.to_string();
     let stellar_network_type = super::read_stellar_network_type(&args.config, dest)?;
     let stellar_gateway_addr =
         super::read_stellar_contract_address(&args.config, dest, "AxelarGateway")?;
@@ -528,22 +526,6 @@ async fn run_sustained_pipeline(
         .axelar
         .contract_address("VotingVerifier", &args.source_axelar_id)
         .is_ok();
-    let mut verification = VerificationSession::start(
-        VerificationRoute::from_args(args),
-        StellarItsTarget {
-            rpc_url: stellar.rpc.clone(),
-            network_type: stellar.network_type.clone(),
-            gateway_contract: stellar.gateway_addr.clone(),
-            signer_pk: stellar.signer_pk,
-        },
-    );
-
-    let spinner = ui::wait_spinner(&format!(
-        "[0/{duration_secs}s] starting sustained ITS send..."
-    ));
-    verification.attach_spinner(spinner.clone())?;
-
-    let test_start = Instant::now();
     let TransferContext {
         rpc_url,
         derived,
@@ -555,42 +537,48 @@ async fn run_sustained_pipeline(
         gas_arg_scaling_factor,
         ..
     } = transfer;
-    let make_task = super::its_evm_source::its_sustained_tasks(
-        super::its_evm_source::ItsEvmSubmitter {
-            rpc_url: rpc_url.parse()?,
-            its_proxy: its_proxy_addr,
-            token_id: token_id.into(),
-            destination_chain: args.destination_axelar_id.clone(),
-            receiver: receiver_bytes,
-            amount: amount_per_tx,
-            gas_value: super::units::Wei::from_u256(gas_value),
-            gas_arg_scaling_factor,
-        },
-        derived,
-        Some(verification.sender()),
-        has_voting_verifier,
-    );
-
-    let result = super::sustained::run_sustained_loop(
-        SustainedPlan {
-            tps,
-            duration_secs,
-            key_cycle,
-        },
-        Some(nonces),
-        make_task,
-        Some(verification.send_done()),
-        spinner,
-    )
-    .await?;
-    its_verification::finish_sustained(
-        verification,
+    let submitter = super::its_evm_source::ItsEvmSubmitter {
+        rpc_url: rpc_url.parse()?,
+        its_proxy: its_proxy_addr,
+        token_id: token_id.into(),
+        destination_chain: args.destination_axelar_id.to_string(),
+        receiver: receiver_bytes,
+        amount: amount_per_tx,
+        gas_value: super::units::Wei::from_u256(gas_value),
+        gas_arg_scaling_factor,
+    };
+    its_verification::run_sustained(
         args,
-        result,
+        StellarItsTarget {
+            rpc_url: stellar.rpc.clone(),
+            network_type: stellar.network_type.clone(),
+            gateway_contract: stellar.gateway_addr.clone(),
+            signer_pk: stellar.signer_pk,
+        },
+        &format!("[0/{duration_secs}s] starting sustained ITS send..."),
         stellar_recipient_addr,
         sizing.total_expected,
         sizing.num_keys,
-        test_start,
+        |context| async move {
+            let make_task = super::its_evm_source::its_sustained_tasks(
+                submitter,
+                derived,
+                Some(context.verify_tx),
+                has_voting_verifier,
+            );
+            super::sustained::run_sustained_loop(
+                SustainedPlan {
+                    tps,
+                    duration_secs,
+                    key_cycle,
+                },
+                Some(nonces),
+                make_task,
+                Some(context.send_done),
+                context.spinner,
+            )
+            .await
+        },
     )
     .await
 }
@@ -613,7 +601,7 @@ async fn run_burst_pipeline(
             rpc_url: transfer.rpc_url.parse()?,
             its_proxy: transfer.its_proxy_addr,
             token_id: transfer.token_id.into(),
-            destination_chain: args.destination_axelar_id.clone(),
+            destination_chain: args.destination_axelar_id.to_string(),
             receiver: transfer.receiver_bytes.clone(),
             amount: transfer.amount_per_tx,
             gas_value: super::units::Wei::from_u256(transfer.gas_value),

@@ -147,7 +147,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
             its_contract: its_addr,
             gateway_contract: gateway_addr,
             token_id: token_id.into(),
-            destination_chain: args.destination_axelar_id.clone(),
+            destination_chain: args.destination_axelar_id.to_string(),
             destination_address_bytes: sui_recipient_bytes,
             gas_token: xlm_addr,
             gas_stroops,

@@ -58,10 +58,18 @@ pub struct ChainConfig {
     pub axelar_id: Option<String>,
     pub name: Option<String>,
     pub rpc: Option<String>,
+    #[serde(rename = "wssRpc")]
+    pub wss_rpc: Option<String>,
+    #[serde(rename = "networkType")]
+    pub network_type: Option<String>,
     #[serde(rename = "chainType")]
     pub chain_type: Option<String>,
     #[serde(rename = "tokenSymbol")]
     pub token_symbol: Option<String>,
+    #[serde(rename = "tokenAddress")]
+    pub token_address: Option<String>,
+    #[serde(rename = "gasScalingFactor")]
+    pub gas_scaling_factor: Option<u32>,
     pub decimals: Option<u8>,
     pub contracts: Option<HashMap<String, ContractEntry>>,
     #[serde(flatten)]
@@ -191,11 +199,60 @@ pub struct ContractEntry {
     pub deployer: Option<String>,
     pub salt: Option<String>,
     pub version: Option<String>,
+    #[serde(rename = "tokenId")]
+    pub token_id: Option<String>,
+    #[serde(rename = "typeArgument")]
+    pub type_argument: Option<String>,
+    pub objects: Option<ContractObjects>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
 
+/// Known named objects recorded inside a deployed contract entry.
+///
+/// Sui deployments store package-owned object IDs here. Unknown object names
+/// remain accepted through `extra`, but business logic can access the objects
+/// it understands without traversing `serde_json::Value`.
+#[derive(Debug, Deserialize)]
+pub struct ContractObjects {
+    #[serde(rename = "TokenId")]
+    pub token_id: Option<String>,
+    #[serde(rename = "GmpChannelId")]
+    pub gmp_channel_id: Option<String>,
+    #[serde(rename = "ItsChannelId")]
+    pub its_channel_id: Option<String>,
+    #[serde(rename = "GmpSingleton")]
+    pub gmp_singleton: Option<String>,
+    #[serde(rename = "ItsSingleton")]
+    pub its_singleton: Option<String>,
+    #[serde(rename = "InterchainTokenService")]
+    pub interchain_token_service: Option<String>,
+    #[serde(rename = "Gateway")]
+    pub gateway: Option<String>,
+    #[serde(rename = "GasService")]
+    pub gas_service: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+impl ChainsConfig {
+    /// Return one typed chain entry by its chains-config key.
+    pub fn chain(&self, chain_id: &str) -> Result<&ChainConfig> {
+        self.chains
+            .get(chain_id)
+            .ok_or_else(|| eyre::eyre!("chain '{chain_id}' not found in config"))
+    }
+}
+
 impl ChainConfig {
+    /// Return one typed contract entry.
+    pub fn contract(&self, contract: &str, chain_id: &str) -> Result<&ContractEntry> {
+        self.contracts
+            .as_ref()
+            .and_then(|contracts| contracts.get(contract))
+            .ok_or_else(|| eyre::eyre!("{contract} not deployed yet for {chain_id}"))
+    }
+
     /// Look up `chains.<this>.contracts.<contract>.address`. Errors with a
     /// `not deployed yet` message if the contract entry or address is
     /// missing — callers can `.ok()` to opt back into `Option` semantics.
@@ -231,13 +288,26 @@ mod tests {
           "axelarId": "hedera",
           "name": "Hedera",
           "rpc": "https://testnet.hashio.io/api",
+          "wssRpc": "wss://testnet.hashio.io/ws",
+          "networkType": "testnet",
           "chainType": "evm",
           "tokenSymbol": "HBAR",
+          "tokenAddress": "0x0000000000000000000000000000000000001234",
+          "gasScalingFactor": 10,
           "decimals": 18,
           "contracts": {
             "AxelarGateway": {
               "address": "0xe432150cce91c13a887f7D836923d5597adD8E31",
               "salt": "v6.0.4"
+            },
+            "AXE": {
+              "tokenId": "0x0101010101010101010101010101010101010101010101010101010101010101",
+              "typeArgument": "0x2::axe::AXE",
+              "objects": {
+                "TokenId": "0x02",
+                "GmpChannelId": "0x03",
+                "FutureObject": "0x04"
+              }
             }
           },
           "explorer": { "url": "https://hashscan.io/testnet" }
@@ -279,12 +349,24 @@ mod tests {
         assert_eq!(hedera.axelar_id.as_deref(), Some("hedera"));
         assert_eq!(hedera.chain_type.as_deref(), Some("evm"));
         assert_eq!(hedera.token_symbol.as_deref(), Some("HBAR"));
+        assert_eq!(
+            hedera.wss_rpc.as_deref(),
+            Some("wss://testnet.hashio.io/ws")
+        );
+        assert_eq!(hedera.network_type.as_deref(), Some("testnet"));
+        assert_eq!(hedera.gas_scaling_factor, Some(10));
         assert_eq!(hedera.decimals, Some(18));
         assert_eq!(
             hedera.contract_address("AxelarGateway", "hedera").unwrap(),
             "0xe432150cce91c13a887f7D836923d5597adD8E31",
         );
         assert!(hedera.contract_address("AxelarMissing", "hedera").is_err());
+        let axe = hedera.contract("AXE", "hedera").unwrap();
+        assert_eq!(axe.type_argument.as_deref(), Some("0x2::axe::AXE"));
+        let objects = axe.objects.as_ref().unwrap();
+        assert_eq!(objects.token_id.as_deref(), Some("0x02"));
+        assert_eq!(objects.gmp_channel_id.as_deref(), Some("0x03"));
+        assert!(objects.extra.contains_key("FutureObject"));
 
         let sol = cfg.chains.get("solana").expect("solana present");
         assert_eq!(sol.chain_type.as_deref(), Some("svm"));

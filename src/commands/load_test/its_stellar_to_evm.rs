@@ -23,8 +23,6 @@ use super::its_verification::{EvmItsTarget, ItsBurstReport, finish_burst};
 use super::metrics::ComputeUnitSummary;
 use super::run_sizing::{RunMode, RunSizing, SustainedPlan};
 use super::units::Stroops;
-use super::verification_session::VerificationSession;
-use super::verify::VerificationRoute;
 use super::{LoadTestArgs, validate_evm_rpc};
 use crate::config::ChainsConfig;
 use crate::stellar::{StellarClient, StellarWallet};
@@ -34,7 +32,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
-    let evm_rpc_url = args.destination_rpc.clone();
+    let evm_rpc_url = args.destination_rpc.to_string();
     validate_evm_rpc(&evm_rpc_url).await?;
 
     let cfg = ChainsConfig::load(&args.config)?;
@@ -61,9 +59,9 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
             gateway_contract: stellar.gateway_addr.clone(),
             gas_token: stellar.xlm_addr.clone(),
             gas_stroops,
-            source_chain: src.clone(),
-            destination_chain: dest.clone(),
-            destination_axelar_id: args.destination_axelar_id.clone(),
+            source_chain: src.to_string(),
+            destination_chain: dest.to_string(),
+            destination_axelar_id: args.destination_axelar_id.to_string(),
             token_id_override: args.token_id.clone(),
             config: args.config.clone(),
             required_transfers: sizing.num_keys,
@@ -280,48 +278,39 @@ async fn run_sustained_pipeline(
         amount_per_tx,
     } = pipeline;
     let duration_secs = plan.duration_secs;
-    let mut verification = VerificationSession::start(
-        VerificationRoute::from_args(&args),
+    let submitter = ItsStellarSubmitter {
+        client: stellar.client.clone(),
+        its_contract: stellar.its_addr.clone(),
+        gateway_contract: stellar.gateway_addr.clone(),
+        token_id: token_id.into(),
+        destination_chain: args.destination_axelar_id.to_string(),
+        destination_address_bytes: evm.dest_address_bytes.clone(),
+        gas_token: stellar.xlm_addr.clone(),
+        gas_stroops,
+        amount_per_tx,
+        axelarnet_gw_addr: evm.axelarnet_gw_addr.clone(),
+    };
+    let destination_address = evm.evm_its_addr.to_string();
+    its_verification::run_sustained(
+        &args,
         EvmItsTarget {
             gateway_addr: evm.evm_gateway_addr,
-            rpc_url: args.destination_rpc.clone(),
+            rpc_url: args.destination_rpc.to_string(),
         },
-    );
-
-    let spinner = ui::wait_spinner(&format!(
-        "[0/{duration_secs}s] starting sustained Stellar ITS send..."
-    ));
-    verification.attach_spinner(spinner.clone())?;
-
-    let test_start = Instant::now();
-    let result = its_stellar_source::run_sustained(SustainedTransferArgs {
-        submitter: ItsStellarSubmitter {
-            client: stellar.client.clone(),
-            its_contract: stellar.its_addr.clone(),
-            gateway_contract: stellar.gateway_addr.clone(),
-            token_id: token_id.into(),
-            destination_chain: args.destination_axelar_id.clone(),
-            destination_address_bytes: evm.dest_address_bytes.clone(),
-            gas_token: stellar.xlm_addr.clone(),
-            gas_stroops,
-            amount_per_tx,
-            axelarnet_gw_addr: evm.axelarnet_gw_addr.clone(),
-        },
-        wallets,
-        plan,
-        verify_tx: Some(verification.sender()),
-        send_done: Some(verification.send_done()),
-        spinner,
-    })
-    .await?;
-    its_verification::finish_sustained(
-        verification,
-        &args,
-        result,
-        &format!("{}", evm.evm_its_addr),
+        &format!("[0/{duration_secs}s] starting sustained Stellar ITS send..."),
+        &destination_address,
         sizing.total_expected,
         sizing.num_keys,
-        test_start,
+        |context| {
+            its_stellar_source::run_sustained(SustainedTransferArgs {
+                submitter,
+                wallets,
+                plan,
+                verify_tx: Some(context.verify_tx),
+                send_done: Some(context.send_done),
+                spinner: context.spinner,
+            })
+        },
     )
     .await
 }
@@ -347,7 +336,7 @@ async fn run_burst_pipeline(pipeline: PipelineContext, wallets: Vec<StellarWalle
             its_contract: stellar.its_addr.clone(),
             gateway_contract: stellar.gateway_addr.clone(),
             token_id: token_id.into(),
-            destination_chain: args.destination_axelar_id.clone(),
+            destination_chain: args.destination_axelar_id.to_string(),
             destination_address_bytes: evm.dest_address_bytes.clone(),
             gas_token: stellar.xlm_addr.clone(),
             gas_stroops,
@@ -363,7 +352,7 @@ async fn run_burst_pipeline(pipeline: PipelineContext, wallets: Vec<StellarWalle
         &args,
         EvmItsTarget {
             gateway_addr: evm.evm_gateway_addr,
-            rpc_url: args.destination_rpc.clone(),
+            rpc_url: args.destination_rpc.to_string(),
         },
         burst,
         ItsBurstReport {

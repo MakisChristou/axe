@@ -11,16 +11,52 @@ use eyre::Result;
 use indicatif::ProgressBar;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
-use super::metrics::{TxMetrics, VerificationReport};
-use super::verification_session::{BatchTarget, MessageMatcher, StreamingResult, StreamingTarget};
+use super::LoadTestArgs;
+use super::metrics::{LoadTestReport, TxMetrics, VerificationReport};
+use super::verification_session::{
+    BatchTarget, MessageMatcher, StreamingResult, StreamingTarget, VerificationSession,
+};
 pub(super) use super::verification_session::{attach_batch, finish_batch};
 use super::verify::{
     self, EvmGmpDestination, EvmGmpStreamingDestination, GmpBatchVerification, PendingTx,
     SolanaGmpDestination, SourceChainType, StellarGmpDestination, StreamingVerification,
     SuiGmpDestination, VerificationRoute,
 };
+
+/// Resources a GMP source adapter needs to feed a streaming verifier.
+pub(super) struct StreamingSendContext {
+    pub verify_tx: mpsc::UnboundedSender<PendingTx>,
+    pub send_done: Arc<AtomicBool>,
+    pub spinner_tx: oneshot::Sender<ProgressBar>,
+}
+
+/// Run the chain-neutral outer lifecycle for a sustained GMP route.
+///
+/// Source adapters still own their pacing, spinner creation, and transaction
+/// semantics. This helper owns only the repeated session startup, channels,
+/// join, and timing merge.
+pub(super) async fn run_streaming<T, F, Fut>(
+    args: &LoadTestArgs,
+    target: T,
+    send: F,
+) -> Result<LoadTestReport>
+where
+    T: StreamingTarget,
+    F: FnOnce(StreamingSendContext) -> Fut,
+    Fut: Future<Output = Result<LoadTestReport>>,
+{
+    let mut verification = VerificationSession::start(VerificationRoute::from_args(args), target);
+    let context = StreamingSendContext {
+        verify_tx: verification.sender(),
+        send_done: verification.send_done(),
+        spinner_tx: verification.spinner_sender()?,
+    };
+    let mut report = send(context).await?;
+    verification.finish(&mut report, args.network).await?;
+    Ok(report)
+}
 
 /// EVM destination. Amplifier and legacy gateways expose different approval
 /// APIs, so the gateway generation is part of the target.

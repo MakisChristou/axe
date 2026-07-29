@@ -46,8 +46,8 @@ impl VerificationRoute {
     pub fn from_args(args: &LoadTestArgs) -> Self {
         Self {
             config: args.config.clone(),
-            source_chain: args.source_axelar_id.clone().into(),
-            destination_chain: args.destination_axelar_id.clone().into(),
+            source_chain: args.source_axelar_id.clone(),
+            destination_chain: args.destination_axelar_id.clone(),
             network: args.network,
         }
     }

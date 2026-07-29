@@ -46,7 +46,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
     let dest = &args.destination_chain;
     let cfg = ChainsConfig::load(&args.config)?;
 
-    let sol_rpc_url = args.destination_rpc.clone();
+    let sol_rpc_url = args.destination_rpc.to_string();
     validate_solana_rpc(&sol_rpc_url).await?;
 
     if cfg.axelar.contract_address("Gateway", dest).is_err() {
@@ -109,7 +109,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
             contracts: its_contracts,
             coin_type,
             token_id,
-            destination_chain: args.destination_axelar_id.clone(),
+            destination_chain: args.destination_axelar_id.to_string(),
             destination_address_bytes: dest_address_bytes,
             transfer_amount: AMOUNT_PER_TX,
             gas_value,

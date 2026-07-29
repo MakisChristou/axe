@@ -5,7 +5,6 @@
 //! `ensure_sender_receiver_on_evm_chain` is `pub(crate)` because
 //! `commands::test_gmp` calls into it for the `--config` sol→evm flow.
 
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use alloy::{
@@ -16,9 +15,8 @@ use alloy::{
     signers::local::PrivateKeySigner,
     sol_types::SolValue,
 };
-use eyre::{Result, WrapErr};
+use eyre::Result;
 use owo_colors::OwoColorize;
-use serde::Deserialize;
 
 use super::metrics::{AmplifierTiming, LoadTestReport, VerificationReport};
 use super::verify;
@@ -26,31 +24,6 @@ use super::{GmpCache, LoadTestArgs, read_cache, save_cache};
 use crate::config::ChainsConfig;
 use crate::evm::read_artifact_bytecode;
 use crate::ui;
-
-/// Subset of the chains-config JSON read by the per-chain helpers in this
-/// module. Each helper picks one field; fields stay `Option<T>` because not
-/// every chain entry carries every key (e.g. only Stellar entries set
-/// `tokenAddress`).
-#[derive(Deserialize)]
-struct ChainsFile {
-    chains: HashMap<String, ChainEntry>,
-}
-
-#[derive(Deserialize)]
-struct ChainEntry {
-    #[serde(rename = "axelarId")]
-    axelar_id: Option<String>,
-    #[serde(rename = "networkType")]
-    network_type: Option<String>,
-    #[serde(rename = "tokenAddress")]
-    token_address: Option<String>,
-    contracts: Option<HashMap<String, ContractEntry>>,
-}
-
-#[derive(Deserialize)]
-struct ContractEntry {
-    address: Option<String>,
-}
 
 pub(crate) async fn ensure_sender_receiver_on_evm_chain(
     chain: &str,
@@ -690,29 +663,19 @@ pub(crate) fn print_final_report(report: &LoadTestReport) {
     println!();
 }
 pub(crate) fn axelar_id_for_chain(config: &std::path::Path, chain_id: &str) -> Result<String> {
-    let content =
-        std::fs::read_to_string(config).map_err(|e| eyre::eyre!("failed to read config: {e}"))?;
-    let file: ChainsFile = serde_json::from_str(&content)
-        .with_context(|| format!("failed to parse config {}", config.display()))?;
-    Ok(file
-        .chains
-        .get(chain_id)
-        .and_then(|c| c.axelar_id.clone())
-        .unwrap_or_else(|| chain_id.to_string()))
+    let config = ChainsConfig::load(config)?;
+    Ok(config.chain(chain_id)?.axelar_id_or(chain_id))
 }
 
 pub(crate) fn read_stellar_network_type(
     config: &std::path::Path,
     chain_id: &str,
 ) -> Result<String> {
-    let content =
-        std::fs::read_to_string(config).map_err(|e| eyre::eyre!("failed to read config: {e}"))?;
-    let file: ChainsFile = serde_json::from_str(&content)
-        .with_context(|| format!("failed to parse config {}", config.display()))?;
-    Ok(file
-        .chains
-        .get(chain_id)
-        .and_then(|c| c.network_type.clone())
+    let config = ChainsConfig::load(config)?;
+    Ok(config
+        .chain(chain_id)?
+        .network_type
+        .clone()
         .unwrap_or_else(|| "testnet".to_string()))
 }
 
@@ -720,13 +683,11 @@ pub(crate) fn read_stellar_token_address(
     config: &std::path::Path,
     chain_id: &str,
 ) -> Result<String> {
-    let content =
-        std::fs::read_to_string(config).map_err(|e| eyre::eyre!("failed to read config: {e}"))?;
-    let file: ChainsFile = serde_json::from_str(&content)
-        .with_context(|| format!("failed to parse config {}", config.display()))?;
-    file.chains
-        .get(chain_id)
-        .and_then(|c| c.token_address.clone())
+    let config = ChainsConfig::load(config)?;
+    config
+        .chain(chain_id)?
+        .token_address
+        .clone()
         .ok_or_else(|| {
             eyre::eyre!("no tokenAddress (XLM Soroban contract) for Stellar chain {chain_id}")
         })
@@ -737,16 +698,11 @@ pub(crate) fn read_stellar_contract_address(
     chain_id: &str,
     contract: &str,
 ) -> Result<String> {
-    let content =
-        std::fs::read_to_string(config).map_err(|e| eyre::eyre!("failed to read config: {e}"))?;
-    let file: ChainsFile = serde_json::from_str(&content)
-        .with_context(|| format!("failed to parse config {}", config.display()))?;
-    file.chains
-        .get(chain_id)
-        .and_then(|c| c.contracts.as_ref())
-        .and_then(|cs| cs.get(contract))
-        .and_then(|c| c.address.clone())
-        .ok_or_else(|| eyre::eyre!("no Stellar contract {contract} for chain {chain_id}"))
+    let config = ChainsConfig::load(config)?;
+    Ok(config
+        .chain(chain_id)?
+        .contract_address(contract, chain_id)?
+        .to_string())
 }
 
 pub(crate) fn load_stellar_main_wallet(
@@ -834,28 +790,19 @@ pub(crate) fn resolve_sui_axe_token(
     cli_token_id: Option<&str>,
     cli_coin_type: Option<&str>,
 ) -> Result<([u8; 32], Option<String>)> {
-    let parse_tid = |s: &str| -> Result<[u8; 32]> {
-        let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(s))
-            .map_err(|e| eyre::eyre!("invalid token id hex: {e}"))?;
-        if bytes.len() != 32 {
-            eyre::bail!("token id must be 32 bytes (got {})", bytes.len());
-        }
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&bytes);
-        Ok(out)
-    };
-
     if let Some(t) = cli_token_id {
-        return Ok((parse_tid(t)?, cli_coin_type.map(str::to_string)));
+        return Ok((
+            parse_token_id_hex(t, "token id")?,
+            cli_coin_type.map(str::to_string),
+        ));
     }
 
     // Fall back to the chain config's AXE entry.
-    let content = std::fs::read_to_string(config)
-        .map_err(|e| eyre::eyre!("failed to read config {}: {e}", config.display()))?;
-    let root: serde_json::Value = serde_json::from_str(&content)?;
-    let axe = root
-        .pointer(&format!("/chains/{sui_chain_id}/contracts/AXE"))
-        .ok_or_else(|| {
+    let config = ChainsConfig::load(config)?;
+    let axe = config
+        .chain(sui_chain_id)?
+        .contract("AXE", sui_chain_id)
+        .map_err(|_| {
             eyre::eyre!(
                 "no `contracts.AXE` entry under chain `{sui_chain_id}` in config — \
                  either pass --token-id, or pre-register AXE via\n  \
@@ -865,15 +812,14 @@ pub(crate) fn resolve_sui_axe_token(
             )
         })?;
     let tid_str = axe
-        .pointer("/objects/TokenId")
-        .and_then(|v| v.as_str())
+        .objects
+        .as_ref()
+        .and_then(|objects| objects.token_id.as_deref())
         .ok_or_else(|| eyre::eyre!("contracts.AXE.objects.TokenId missing in config"))?;
-    let coin_type = cli_coin_type.map(str::to_string).or_else(|| {
-        axe.get("typeArgument")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-    });
-    Ok((parse_tid(tid_str)?, coin_type))
+    let coin_type = cli_coin_type
+        .map(str::to_string)
+        .or_else(|| axe.type_argument.clone());
+    Ok((parse_token_id_hex(tid_str, "token id")?, coin_type))
 }
 
 /// Read a pre-registered AXE ITS token id from chains-config, if one is
@@ -895,28 +841,17 @@ pub(crate) fn read_pre_registered_axe_token(
     config: &std::path::Path,
     chain_axelar_id: &str,
 ) -> Result<Option<alloy::primitives::FixedBytes<32>>> {
-    let content = std::fs::read_to_string(config)
-        .map_err(|e| eyre::eyre!("failed to read config {}: {e}", config.display()))?;
-    let root: serde_json::Value = serde_json::from_str(&content)?;
-    let tid_str = root
-        .pointer(&format!("/chains/{chain_axelar_id}/contracts/AXE/tokenId"))
-        .and_then(|v| v.as_str());
+    let config = ChainsConfig::load(config)?;
+    let tid_str = config
+        .chains
+        .get(chain_axelar_id)
+        .and_then(|chain| chain.contracts.as_ref())
+        .and_then(|contracts| contracts.get("AXE"))
+        .and_then(|axe| axe.token_id.as_deref());
     match tid_str {
-        Some(s) => {
-            let stripped = s.strip_prefix("0x").unwrap_or(s);
-            let bytes = hex::decode(stripped).map_err(|e| {
-                eyre::eyre!("invalid AXE.tokenId hex for chain {chain_axelar_id}: {e}")
-            })?;
-            if bytes.len() != 32 {
-                eyre::bail!(
-                    "AXE.tokenId for chain {chain_axelar_id} must be 32 bytes (got {})",
-                    bytes.len()
-                );
-            }
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&bytes);
-            Ok(Some(alloy::primitives::FixedBytes::from(out)))
-        }
+        Some(value) => Ok(Some(alloy::primitives::FixedBytes::from(
+            parse_token_id_hex(value, &format!("AXE.tokenId for chain {chain_axelar_id}"))?,
+        ))),
         None => Ok(None),
     }
 }
@@ -939,18 +874,19 @@ pub(crate) fn read_pre_registered_axe_token_address(
     config: &std::path::Path,
     chain_axelar_id: &str,
 ) -> Result<Option<Address>> {
-    let content = std::fs::read_to_string(config)
-        .map_err(|e| eyre::eyre!("failed to read config {}: {e}", config.display()))?;
-    let root: serde_json::Value = serde_json::from_str(&content)?;
     // The chains-config schema uses `address` on PascalCase contract entries
     // (validated in axelar-chains-config/tests/schema). Earlier drafts called
     // this `tokenAddress` — reading under that name silently returned None and
     // the caller fell back to ITS.interchainTokenAddress(tokenId), which
     // reverts on the Hedera HTS-fork (its `registeredTokenAddress` view
     // replaces it).
-    let addr_str = root
-        .pointer(&format!("/chains/{chain_axelar_id}/contracts/AXE/address"))
-        .and_then(|v| v.as_str());
+    let config = ChainsConfig::load(config)?;
+    let addr_str = config
+        .chains
+        .get(chain_axelar_id)
+        .and_then(|chain| chain.contracts.as_ref())
+        .and_then(|contracts| contracts.get("AXE"))
+        .and_then(|axe| axe.address.as_deref());
     match addr_str {
         Some(s) => Ok(Some(s.parse().map_err(|e| {
             eyre::eyre!("invalid AXE.address for chain {chain_axelar_id}: {e}")
@@ -1052,29 +988,18 @@ pub(crate) fn resolve_hedera_axe_token(
     hedera_chain_id: &str,
     cli_token_id: Option<&str>,
 ) -> Result<alloy::primitives::FixedBytes<32>> {
-    let parse_tid = |s: &str| -> Result<alloy::primitives::FixedBytes<32>> {
-        let stripped = s.strip_prefix("0x").unwrap_or(s);
-        let bytes = hex::decode(stripped).map_err(|e| eyre::eyre!("invalid hex token id: {e}"))?;
-        if bytes.len() != 32 {
-            eyre::bail!("token id must be 32 bytes (got {})", bytes.len());
-        }
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&bytes);
-        Ok(alloy::primitives::FixedBytes::from(out))
-    };
-
     if let Some(t) = cli_token_id {
-        return parse_tid(t);
+        return Ok(alloy::primitives::FixedBytes::from(parse_token_id_hex(
+            t, "token id",
+        )?));
     }
 
-    let content = std::fs::read_to_string(config)
-        .map_err(|e| eyre::eyre!("failed to read config {}: {e}", config.display()))?;
-    let root: serde_json::Value = serde_json::from_str(&content)?;
-    let tid_str = root
-        .pointer(&format!(
-            "/chains/{hedera_chain_id}/contracts/AXE/tokenId"
-        ))
-        .and_then(|v| v.as_str())
+    let config = ChainsConfig::load(config)?;
+    let tid_str = config
+        .chain(hedera_chain_id)?
+        .contract("AXE", hedera_chain_id)?
+        .token_id
+        .as_deref()
         .ok_or_else(|| {
             eyre::eyre!(
                 "no `contracts.AXE.tokenId` entry under chain `{hedera_chain_id}` in config — \
@@ -1088,7 +1013,18 @@ pub(crate) fn resolve_hedera_axe_token(
                  # then mint via HTS and add the printed token id to chains-config under contracts.AXE.tokenId"
             )
         })?;
-    parse_tid(tid_str)
+    Ok(alloy::primitives::FixedBytes::from(parse_token_id_hex(
+        tid_str,
+        &format!("AXE.tokenId for chain {hedera_chain_id}"),
+    )?))
+}
+
+pub(super) fn parse_token_id_hex(value: &str, label: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(value.strip_prefix("0x").unwrap_or(value))
+        .map_err(|error| eyre::eyre!("invalid {label} hex: {error}"))?;
+    bytes
+        .try_into()
+        .map_err(|bytes: Vec<u8>| eyre::eyre!("{label} must be 32 bytes (got {})", bytes.len()))
 }
 
 pub(crate) fn load_sui_main_wallet() -> Result<crate::sui::SuiWallet> {
@@ -1099,18 +1035,31 @@ pub(crate) fn load_sui_main_wallet() -> Result<crate::sui::SuiWallet> {
     })?;
     crate::sui::SuiWallet::from_secret_str(&key)
 }
-pub(crate) fn sui_object_id(
+#[derive(Clone, Copy)]
+enum SuiChannel {
+    Gmp,
+    Its,
+}
+
+fn read_sui_channel(
     config: &std::path::Path,
     chain_id: &str,
-    pointer_within_chain: &str,
+    channel: SuiChannel,
 ) -> Result<String> {
-    let content =
-        std::fs::read_to_string(config).map_err(|e| eyre::eyre!("failed to read config: {e}"))?;
-    let root: serde_json::Value = serde_json::from_str(&content)?;
-    root.pointer(&format!("/chains/{chain_id}{pointer_within_chain}"))
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .ok_or_else(|| eyre::eyre!("no Sui object {pointer_within_chain} for chain {chain_id}"))
+    let config = ChainsConfig::load(config)?;
+    let objects = config
+        .chain(chain_id)?
+        .contract("Example", chain_id)?
+        .objects
+        .as_ref()
+        .ok_or_else(|| eyre::eyre!("Example.objects missing for Sui chain {chain_id}"))?;
+    let (label, value) = match channel {
+        SuiChannel::Gmp => ("GmpChannelId", objects.gmp_channel_id.as_ref()),
+        SuiChannel::Its => ("ItsChannelId", objects.its_channel_id.as_ref()),
+    };
+    value
+        .cloned()
+        .ok_or_else(|| eyre::eyre!("Example.objects.{label} missing for Sui chain {chain_id}"))
 }
 
 /// Read `(sui_channel_id, sui_rpc)` from the chains config. `rpc_override`
@@ -1122,11 +1071,7 @@ pub(crate) fn sui_dest_lookup(
     sui_chain_id: &str,
     rpc_override: Option<&str>,
 ) -> Result<(String, String)> {
-    let channel = sui_object_id(
-        config,
-        sui_chain_id,
-        "/contracts/Example/objects/GmpChannelId",
-    )?;
+    let channel = read_sui_channel(config, sui_chain_id, SuiChannel::Gmp)?;
     let (config_rpc, _contracts) = crate::sui::read_sui_chain_config(config, sui_chain_id)?;
     let rpc = match rpc_override {
         Some(s) if !s.is_empty() => s.to_string(),
@@ -1146,11 +1091,7 @@ pub(crate) fn sui_its_dest_lookup(
     sui_chain_id: &str,
     rpc_override: Option<&str>,
 ) -> Result<(String, String)> {
-    let channel = sui_object_id(
-        config,
-        sui_chain_id,
-        "/contracts/Example/objects/ItsChannelId",
-    )?;
+    let channel = read_sui_channel(config, sui_chain_id, SuiChannel::Its)?;
     let (config_rpc, _contracts) = crate::sui::read_sui_chain_config(config, sui_chain_id)?;
     let rpc = match rpc_override {
         Some(s) if !s.is_empty() => s.to_string(),
@@ -1172,7 +1113,16 @@ pub(crate) fn read_sui_axe_token_id(
     let hex_str = if let Some(s) = cli_override.filter(|s| !s.is_empty()) {
         s.to_string()
     } else {
-        sui_object_id(config, sui_chain_id, "/contracts/AXE/objects/TokenId")?
+        let config = ChainsConfig::load(config)?;
+        config
+            .chain(sui_chain_id)?
+            .contract("AXE", sui_chain_id)?
+            .objects
+            .as_ref()
+            .and_then(|objects| objects.token_id.clone())
+            .ok_or_else(|| {
+                eyre::eyre!("contracts.AXE.objects.TokenId missing for Sui chain {sui_chain_id}")
+            })?
     };
     let bytes = hex::decode(hex_str.trim_start_matches("0x"))
         .map_err(|e| eyre::eyre!("Sui AXE TokenId hex decode: {e}"))?;
@@ -1223,4 +1173,36 @@ pub(crate) async fn finalize_sui_dest_run_its(
         test_start,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_token_id_hex;
+
+    #[test]
+    fn token_id_parser_accepts_prefixed_and_unprefixed_32_byte_hex() {
+        let encoded = "2a".repeat(32);
+
+        assert_eq!(parse_token_id_hex(&encoded, "token").unwrap(), [0x2a; 32]);
+        assert_eq!(
+            parse_token_id_hex(&format!("0x{encoded}"), "token").unwrap(),
+            [0x2a; 32]
+        );
+    }
+
+    #[test]
+    fn token_id_parser_rejects_malformed_and_wrong_length_values() {
+        assert!(
+            parse_token_id_hex("not-hex", "AXE token id")
+                .unwrap_err()
+                .to_string()
+                .contains("invalid AXE token id hex")
+        );
+        assert!(
+            parse_token_id_hex("00", "AXE token id")
+                .unwrap_err()
+                .to_string()
+                .contains("must be 32 bytes")
+        );
+    }
 }

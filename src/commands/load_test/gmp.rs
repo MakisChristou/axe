@@ -179,13 +179,13 @@ pub(super) async fn run_sol_to_evm(
 
     let gateway_addr = cfg
         .chains
-        .get(dest)
+        .get(dest.as_ref())
         .ok_or_else(|| eyre::eyre!("chain '{}' not found in config", dest))?
         .contract_address("AxelarGateway", dest)?
         .parse()?;
     let gas_service_addr = cfg
         .chains
-        .get(dest)
+        .get(dest.as_ref())
         .ok_or_else(|| eyre::eyre!("chain '{}' not found in config", dest))?
         .contract_address("AxelarGasService", dest)?
         .parse()?;
@@ -205,30 +205,28 @@ pub(super) async fn run_sol_to_evm(
 
     let test_start = Instant::now();
     let mut report = if let Some(plan) = sizing.sustained() {
-        let mut verification = verification_session::VerificationSession::start(
-            verify::VerificationRoute::from_args(&args),
+        gmp_verification::run_streaming(
+            &args,
             gmp_verification::EvmGmpStreamingTarget {
                 address: destination_address.clone(),
                 gateway_addr,
-                rpc_url: args.destination_rpc.clone(),
+                rpc_url: args.destination_rpc.to_string(),
                 legacy: false,
                 message_matcher: verification_session::MessageMatcher::Solana,
             },
-        );
-
-        let mut report = sol_sender::run_sustained_load_test_with_metrics(
-            &args,
-            plan,
-            true,
-            &destination_address,
-            Some(verification.sender()),
-            Some(verification.send_done()),
-            verification.spinner_sender()?,
+            |context| {
+                sol_sender::run_sustained_load_test_with_metrics(
+                    &args,
+                    plan,
+                    true,
+                    &destination_address,
+                    Some(context.verify_tx),
+                    Some(context.send_done),
+                    context.spinner_tx,
+                )
+            },
         )
-        .await?;
-
-        verification.finish(&mut report, args.network).await?;
-        report
+        .await?
     } else {
         let mut report = sol_sender::run_load_test_with_metrics(
             &args,
@@ -265,7 +263,7 @@ pub(super) async fn run_evm_to_sol(
 
     let cfg = ChainsConfig::load(&args.config)?;
 
-    let evm_rpc_url = args.source_rpc.clone();
+    let evm_rpc_url = args.source_rpc.to_string();
 
     // Validate RPCs before doing any work
     validate_evm_rpc(&evm_rpc_url).await?;
@@ -285,13 +283,13 @@ pub(super) async fn run_evm_to_sol(
 
     let gateway_addr = cfg
         .chains
-        .get(src)
+        .get(src.as_ref())
         .ok_or_else(|| eyre::eyre!("chain '{}' not found in config", src))?
         .contract_address("AxelarGateway", src)?
         .parse()?;
     let gas_service_addr = cfg
         .chains
-        .get(src)
+        .get(src.as_ref())
         .ok_or_else(|| eyre::eyre!("chain '{}' not found in config", src))?
         .contract_address("AxelarGasService", src)?
         .parse()?;
@@ -325,31 +323,28 @@ pub(super) async fn run_evm_to_sol(
 
     let test_start = Instant::now();
     let mut report = if let Some(plan) = sizing.sustained() {
-        let mut verification = verification_session::VerificationSession::start(
-            verify::VerificationRoute::from_args(&args),
+        gmp_verification::run_streaming(
+            &args,
             gmp_verification::SolanaGmpStreamingTarget {
                 address: destination_address.to_string(),
-                rpc_url: args.destination_rpc.clone(),
+                rpc_url: args.destination_rpc.to_string(),
             },
-        );
-
-        let mut report =
-            evm_sender::run_sustained_load_test_with_metrics(evm_sender::SustainedLoadRequest {
-                args: args.clone(),
-                plan,
-                sender_receiver: sender_receiver_addr,
-                main_key,
-                evm_rpc_url: evm_rpc_url.clone(),
-                destination_address: destination_address.to_string(),
-                verify_tx: Some(verification.sender()),
-                send_done: Some(verification.send_done()),
-                verify_spinner_tx: verification.spinner_sender()?,
-                evm_destination: false,
-            })
-            .await?;
-
-        verification.finish(&mut report, args.network).await?;
-        report
+            |context| {
+                evm_sender::run_sustained_load_test_with_metrics(evm_sender::SustainedLoadRequest {
+                    args: args.clone(),
+                    plan,
+                    sender_receiver: sender_receiver_addr,
+                    main_key,
+                    evm_rpc_url: evm_rpc_url.clone(),
+                    destination_address: destination_address.to_string(),
+                    verify_tx: Some(context.verify_tx),
+                    send_done: Some(context.send_done),
+                    verify_spinner_tx: context.spinner_tx,
+                    evm_destination: false,
+                })
+            },
+        )
+        .await?
     } else {
         let mut report = evm_sender::run_load_test_with_metrics(
             &args,
@@ -483,8 +478,8 @@ pub(super) async fn run_evm_to_evm(
         verify::classify_route(&cfg, &args.source_axelar_id, &args.destination_axelar_id);
     let legacy_route = src_legacy || dst_legacy;
 
-    let source_rpc_url = args.source_rpc.clone();
-    let dest_rpc_url = args.destination_rpc.clone();
+    let source_rpc_url = args.source_rpc.to_string();
+    let dest_rpc_url = args.destination_rpc.to_string();
 
     // Validate RPCs before doing any work
     validate_evm_rpc(&source_rpc_url).await?;
@@ -516,8 +511,8 @@ pub(super) async fn run_evm_to_evm(
 
     let test_start = Instant::now();
     let mut report = if let Some(plan) = sizing.sustained() {
-        let mut verification = verification_session::VerificationSession::start(
-            verify::VerificationRoute::from_args(&args),
+        gmp_verification::run_streaming(
+            &args,
             gmp_verification::EvmGmpStreamingTarget {
                 address: destination_address.clone(),
                 gateway_addr: dest_gateway_addr,
@@ -525,25 +520,22 @@ pub(super) async fn run_evm_to_evm(
                 legacy: legacy_route,
                 message_matcher: verification_session::MessageMatcher::Exact,
             },
-        );
-
-        let mut report =
-            evm_sender::run_sustained_load_test_with_metrics(evm_sender::SustainedLoadRequest {
-                args: args.clone(),
-                plan,
-                sender_receiver: sender_receiver_addr,
-                main_key,
-                evm_rpc_url: source_rpc_url.clone(),
-                destination_address: destination_address.clone(),
-                verify_tx: Some(verification.sender()),
-                send_done: Some(verification.send_done()),
-                verify_spinner_tx: verification.spinner_sender()?,
-                evm_destination: true,
-            })
-            .await?;
-
-        verification.finish(&mut report, args.network).await?;
-        report
+            |context| {
+                evm_sender::run_sustained_load_test_with_metrics(evm_sender::SustainedLoadRequest {
+                    args: args.clone(),
+                    plan,
+                    sender_receiver: sender_receiver_addr,
+                    main_key,
+                    evm_rpc_url: source_rpc_url.clone(),
+                    destination_address: destination_address.clone(),
+                    verify_tx: Some(context.verify_tx),
+                    send_done: Some(context.send_done),
+                    verify_spinner_tx: context.spinner_tx,
+                    evm_destination: true,
+                })
+            },
+        )
+        .await?
     } else {
         let mut report = evm_sender::run_load_test_with_metrics(
             &args,
@@ -607,27 +599,25 @@ pub(super) async fn run_sol_to_sol(
 
     let test_start = Instant::now();
     let mut report = if let Some(plan) = sizing.sustained() {
-        let mut verification = verification_session::VerificationSession::start(
-            verify::VerificationRoute::from_args(&args),
+        gmp_verification::run_streaming(
+            &args,
             gmp_verification::SolanaGmpStreamingTarget {
                 address: destination_address.to_string(),
-                rpc_url: args.destination_rpc.clone(),
+                rpc_url: args.destination_rpc.to_string(),
             },
-        );
-
-        let mut report = sol_sender::run_sustained_load_test_with_metrics(
-            &args,
-            plan,
-            false,
-            destination_address,
-            Some(verification.sender()),
-            Some(verification.send_done()),
-            verification.spinner_sender()?,
+            |context| {
+                sol_sender::run_sustained_load_test_with_metrics(
+                    &args,
+                    plan,
+                    false,
+                    destination_address,
+                    Some(context.verify_tx),
+                    Some(context.send_done),
+                    context.spinner_tx,
+                )
+            },
         )
-        .await?;
-
-        verification.finish(&mut report, args.network).await?;
-        report
+        .await?
     } else {
         let mut report = sol_sender::run_load_test_with_metrics(
             &args,
@@ -776,55 +766,57 @@ async fn run_stellar_gmp_sustained(
     } = sizing
         .sustained()
         .ok_or_else(|| eyre::eyre!("sustained plan required"))?;
-    let mut verification = verification_session::VerificationSession::start(
-        verify::VerificationRoute::from_args(args),
+    let has_voting_verifier = cfg
+        .axelar
+        .contract_address("VotingVerifier", &args.source_chain)
+        .is_ok();
+    gmp_verification::run_streaming(
+        args,
         gmp_verification::EvmGmpStreamingTarget {
             address: destination_address.to_string(),
             gateway_addr,
-            rpc_url: args.destination_rpc.clone(),
+            rpc_url: args.destination_rpc.to_string(),
             legacy: false,
             message_matcher: verification_session::MessageMatcher::Exact,
         },
-    );
-    let spinner = ui::wait_spinner(&format!(
-        "[0/{duration_secs}s] starting sustained Stellar GMP send..."
-    ));
-    verification
-        .spinner_sender()?
-        .send(spinner.clone())
-        .map_err(|_| eyre::eyre!("GMP verification task stopped before sending"))?;
-    let result = stellar_sender::run_sustained(stellar_sender::SustainedRequest {
-        client: source.client,
-        wallets: source.wallets,
-        example_contract: source.example_contract,
-        gateway_contract: source.gateway_contract,
-        destination_chain: args.destination_axelar_id.clone(),
-        destination_address: destination_address.to_string(),
-        payload_override: source.payload_override,
-        tps,
-        duration_secs,
-        key_cycle,
-        verify_tx: Some(verification.sender()),
-        send_done: Some(verification.send_done()),
-        spinner,
-        has_voting_verifier: cfg
-            .axelar
-            .contract_address("VotingVerifier", &args.source_chain)
-            .is_ok(),
-        destination_contract_addr: sender_receiver_addr,
-        gas_token_contract: source.gas_token_contract,
-        gas_amount: source.gas_amount,
-    })
-    .await?;
-    let mut report = sustained::build_sustained_report(
-        result,
-        RunIdentity::from_sizing(args, sizing),
-        destination_address,
-        sizing.total_expected,
-        sizing.num_keys,
-    );
-    verification.finish(&mut report, args.network).await?;
-    Ok(report)
+        |context| async move {
+            let spinner = ui::wait_spinner(&format!(
+                "[0/{duration_secs}s] starting sustained Stellar GMP send..."
+            ));
+            context
+                .spinner_tx
+                .send(spinner.clone())
+                .map_err(|_| eyre::eyre!("GMP verification task stopped before sending"))?;
+            let result = stellar_sender::run_sustained(stellar_sender::SustainedRequest {
+                client: source.client,
+                wallets: source.wallets,
+                example_contract: source.example_contract,
+                gateway_contract: source.gateway_contract,
+                destination_chain: args.destination_axelar_id.to_string(),
+                destination_address: destination_address.to_string(),
+                payload_override: source.payload_override,
+                tps,
+                duration_secs,
+                key_cycle,
+                verify_tx: Some(context.verify_tx),
+                send_done: Some(context.send_done),
+                spinner,
+                has_voting_verifier,
+                destination_contract_addr: sender_receiver_addr,
+                gas_token_contract: source.gas_token_contract,
+                gas_amount: source.gas_amount,
+            })
+            .await?;
+            Ok(sustained::build_sustained_report(
+                result,
+                RunIdentity::from_sizing(args, sizing),
+                destination_address,
+                sizing.total_expected,
+                sizing.num_keys,
+            ))
+        },
+    )
+    .await
 }
 
 async fn run_stellar_gmp_burst<P: Provider>(
@@ -840,7 +832,7 @@ async fn run_stellar_gmp_burst<P: Provider>(
         wallets: source.wallets,
         example_contract: source.example_contract,
         gateway_contract: source.gateway_contract,
-        destination_chain: args.destination_axelar_id.clone(),
+        destination_chain: args.destination_axelar_id.to_string(),
         destination_address: destination_address.to_string(),
         payload_override: source.payload_override,
         run: RunIdentity::from_sizing(args, sizing),
@@ -872,7 +864,7 @@ pub(super) async fn run_stellar_to_evm(
     let dest = &args.destination_chain;
     let cfg = ChainsConfig::load(&args.config)?;
 
-    let evm_rpc_url = args.destination_rpc.clone();
+    let evm_rpc_url = args.destination_rpc.to_string();
     validate_evm_rpc(&evm_rpc_url).await?;
 
     // A legacy (consensus) EVM destination has no Cosmos Gateway and is verified
@@ -944,7 +936,7 @@ pub(super) async fn run_evm_to_stellar(
     let src = &args.source_chain;
     let dest = &args.destination_chain;
     let cfg = ChainsConfig::load(&args.config)?;
-    let evm_rpc_url = args.source_rpc.clone();
+    let evm_rpc_url = args.source_rpc.to_string();
     validate_evm_rpc(&evm_rpc_url).await?;
 
     // EVM source ITS proxy is reused for GMP — we send via the destination
@@ -971,13 +963,13 @@ pub(super) async fn run_evm_to_stellar(
     // burst-only here.
     let evm_gateway_addr = cfg
         .chains
-        .get(src)
+        .get(src.as_ref())
         .ok_or_else(|| eyre::eyre!("chain '{}' not found in config", src))?
         .contract_address("AxelarGateway", src)?
         .parse()?;
     let evm_gas_service_addr = cfg
         .chains
-        .get(src)
+        .get(src.as_ref())
         .ok_or_else(|| eyre::eyre!("chain '{}' not found in config", src))?
         .contract_address("AxelarGasService", src)?
         .parse()?;
@@ -1039,7 +1031,7 @@ pub(super) async fn run_stellar_to_sol(
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
-    let solana_rpc = args.destination_rpc.clone();
+    let solana_rpc = args.destination_rpc.to_string();
     validate_solana_rpc(&solana_rpc).await?;
 
     ui::kv("source", src);
@@ -1111,7 +1103,7 @@ pub(super) async fn run_stellar_to_sol(
         wallets: wallets.clone(),
         example_contract: stellar_example.clone(),
         gateway_contract: stellar_gateway,
-        destination_chain: args.destination_axelar_id.clone(),
+        destination_chain: args.destination_axelar_id.to_string(),
         destination_address: destination_address.clone(),
         payload_override,
         run: RunIdentity::from_sizing(&args, sizing),
@@ -1211,7 +1203,7 @@ async fn prepare_sui_gmp_source(
     let rpc_url = if args.source_rpc.is_empty() {
         configured_rpc
     } else {
-        args.source_rpc.clone()
+        args.source_rpc.to_string()
     };
     let client = crate::sui::SuiClient::new(&rpc_url);
     let chain_id = client
@@ -1253,7 +1245,7 @@ pub(super) async fn run_sui_to_evm(
     let dest = &args.destination_chain;
     let cfg = ChainsConfig::load(&args.config)?;
 
-    let evm_rpc_url = args.destination_rpc.clone();
+    let evm_rpc_url = args.destination_rpc.to_string();
     validate_evm_rpc(&evm_rpc_url).await?;
 
     // A legacy (consensus) EVM destination has no Cosmos Gateway and is verified
@@ -1305,7 +1297,7 @@ pub(super) async fn run_sui_to_evm(
             client: sui_client,
             wallet: main_wallet,
             contracts: sui_contracts,
-            destination_chain: args.destination_axelar_id.clone(),
+            destination_chain: args.destination_axelar_id.to_string(),
             destination_address: dest_addr_str,
             gas_value,
             gas_budget: super::gmp_sui_source::DEFAULT_GAS_BUDGET,
@@ -1367,7 +1359,7 @@ pub(super) async fn run_sui_to_sol(
     let dest = &args.destination_chain;
     let cfg = ChainsConfig::load(&args.config)?;
 
-    let solana_rpc = args.destination_rpc.clone();
+    let solana_rpc = args.destination_rpc.to_string();
     validate_solana_rpc(&solana_rpc).await?;
 
     // A legacy (consensus) EVM destination has no Cosmos Gateway and is verified
@@ -1388,7 +1380,7 @@ pub(super) async fn run_sui_to_sol(
     let sui_rpc = if args.source_rpc.is_empty() {
         sui_rpc
     } else {
-        args.source_rpc.clone()
+        args.source_rpc.to_string()
     };
     let sui_client = crate::sui::SuiClient::new(&sui_rpc);
     let chain_id = sui_client
@@ -1442,7 +1434,7 @@ pub(super) async fn run_sui_to_sol(
             client: sui_client,
             wallet: main_wallet,
             contracts: sui_contracts,
-            destination_chain: args.destination_axelar_id.clone(),
+            destination_chain: args.destination_axelar_id.to_string(),
             destination_address: destination_address.clone(),
             gas_value,
             gas_budget: super::gmp_sui_source::DEFAULT_GAS_BUDGET,

@@ -10,24 +10,9 @@ use eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
 
 use super::TestType;
+use super::chain_names::{AxelarChainId, ConfigChainId, RpcUrl};
+use crate::config::{ChainConfig, ChainsConfig};
 use crate::ui;
-
-/// Subset of the chains-config JSON read by the resolver. The map is keyed by
-/// the JSON-side chain id (e.g. `"avalanche"`); each entry's `axelarId` may
-/// differ from that key (e.g. `"Avalanche"` for consensus chains).
-#[derive(Deserialize)]
-struct ConfigRoot {
-    chains: HashMap<String, ChainEntry>,
-}
-
-#[derive(Deserialize)]
-struct ChainEntry {
-    #[serde(rename = "axelarId")]
-    axelar_id: Option<String>,
-    #[serde(rename = "chainType")]
-    chain_type: Option<String>,
-    rpc: Option<String>,
-}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct GmpCache {
@@ -36,6 +21,8 @@ pub(crate) struct GmpCache {
         skip_serializing_if = "Option::is_none"
     )]
     pub(crate) sender_receiver_address: Option<String>,
+    // Cache files are a forward-compatible external boundary. Preserve fields
+    // written by newer AXE versions when updating the values this build knows.
     #[serde(flatten)]
     extra: HashMap<String, serde_json::Value>,
 }
@@ -50,6 +37,8 @@ pub(crate) struct ItsCache {
     pub(crate) salt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) mint: Option<String>,
+    // See `GmpCache::extra`: unknown persisted fields must round-trip rather
+    // than disappear when an older binary updates one known field.
     #[serde(flatten)]
     extra: HashMap<String, serde_json::Value>,
 }
@@ -83,13 +72,13 @@ pub(crate) fn save_cache(axelar_id: &str, cache: &GmpCache) -> Result<()> {
     std::fs::write(&path, serde_json::to_string_pretty(cache)?)?;
     Ok(())
 }
-fn chain_type(chains: &HashMap<String, ChainEntry>, chain_id: &str) -> Option<String> {
+fn chain_type(chains: &HashMap<String, ChainConfig>, chain_id: &str) -> Option<String> {
     chains.get(chain_id)?.chain_type.clone()
 }
 
 /// Find chains by chainType, optionally skipping core-* prefixed chains.
 fn find_chains_by_type(
-    chains: &HashMap<String, ChainEntry>,
+    chains: &HashMap<String, ChainConfig>,
     chain_type_filter: &str,
     skip_core: bool,
 ) -> Vec<String> {
@@ -132,17 +121,17 @@ pub(crate) fn infer_test_type(source_type: &str, dest_type: &str) -> Result<Test
         )),
     }
 }
-pub struct ResolvedConfig {
+pub(crate) struct ResolvedConfig {
     pub test_type: TestType,
-    pub source_chain: String,
-    pub destination_chain: String,
+    pub source_chain: ConfigChainId,
+    pub destination_chain: ConfigChainId,
     /// The `axelarId` for the source chain — may differ from the JSON key
     /// (e.g. `"Avalanche"` vs `"avalanche"` for consensus chains).
-    pub source_axelar_id: String,
+    pub source_axelar_id: AxelarChainId,
     /// The `axelarId` for the destination chain.
-    pub destination_axelar_id: String,
-    pub source_rpc: String,
-    pub destination_rpc: String,
+    pub destination_axelar_id: AxelarChainId,
+    pub source_rpc: RpcUrl,
+    pub destination_rpc: RpcUrl,
     pub private_key: Option<String>,
 }
 
@@ -160,7 +149,7 @@ pub(crate) fn resolve_from_config(
 ) -> Result<ResolvedConfig> {
     let config_content = std::fs::read_to_string(config)
         .map_err(|e| eyre::eyre!("failed to read config {}: {e}", config.display()))?;
-    let config_root: ConfigRoot = serde_json::from_str(&config_content)
+    let config_root = ChainsConfig::from_json_str(&config_content)
         .with_context(|| format!("no 'chains' object in config {}", config.display()))?;
     let chains = &config_root.chains;
 
@@ -232,19 +221,19 @@ pub(crate) fn resolve_from_config(
 
     Ok(ResolvedConfig {
         test_type,
-        source_chain,
-        destination_chain,
-        source_axelar_id,
-        destination_axelar_id,
-        source_rpc: resolved_source_rpc,
-        destination_rpc: resolved_destination_rpc,
+        source_chain: ConfigChainId::new(source_chain)?,
+        destination_chain: ConfigChainId::new(destination_chain)?,
+        source_axelar_id: AxelarChainId::new(source_axelar_id)?,
+        destination_axelar_id: AxelarChainId::new(destination_axelar_id)?,
+        source_rpc: RpcUrl::new(resolved_source_rpc)?,
+        destination_rpc: RpcUrl::new(resolved_destination_rpc)?,
         private_key: private_key_override,
     })
 }
 
 /// Auto-detect source/destination chains for a known test type.
 fn detect_unique_source(
-    chains: &HashMap<String, ChainEntry>,
+    chains: &HashMap<String, ChainConfig>,
     override_: Option<String>,
     chain_type: &str,
     skip_core: bool,
@@ -269,7 +258,7 @@ fn detect_unique_source(
 }
 
 fn detect_first_destination(
-    chains: &HashMap<String, ChainEntry>,
+    chains: &HashMap<String, ChainConfig>,
     override_: Option<String>,
     chain_type: &str,
     skip_core: bool,
@@ -289,7 +278,7 @@ fn detect_first_destination(
 }
 
 fn auto_detect_chains(
-    chains: &HashMap<String, ChainEntry>,
+    chains: &HashMap<String, ChainConfig>,
     test_type: TestType,
     source_override: Option<String>,
     dest_override: Option<String>,
@@ -400,7 +389,7 @@ fn auto_detect_chains(
 }
 
 fn auto_detect_stellar_pair(
-    chains: &HashMap<String, ChainEntry>,
+    chains: &HashMap<String, ChainConfig>,
     tt: TestType,
     src_override: Option<String>,
     dst_override: Option<String>,
@@ -441,7 +430,7 @@ fn auto_detect_stellar_pair(
 /// Auto-detect test type and chains when nothing is specified.
 /// Looks at what chain types exist in the config and picks the best match.
 fn auto_detect_all(
-    chains: &HashMap<String, ChainEntry>,
+    chains: &HashMap<String, ChainConfig>,
     source_override: Option<&String>,
     dest_override: Option<String>,
 ) -> Result<(TestType, String, String)> {

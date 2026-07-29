@@ -19,8 +19,6 @@ use super::its_verification::{ItsBurstReport, XrplItsTarget, finish_burst};
 use super::keypairs;
 use super::metrics::ComputeUnitSummary;
 use super::run_sizing::{RunMode, RunSizing, SustainedPlan};
-use super::verification_session::VerificationSession;
-use super::verify::VerificationRoute;
 use super::{LoadTestArgs, check_evm_balance, validate_evm_rpc};
 use crate::config::ChainsConfig;
 use crate::cosmos::lcd_cosmwasm_smart_query;
@@ -57,7 +55,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
-    let evm_rpc_url = args.source_rpc.clone();
+    let evm_rpc_url = args.source_rpc.to_string();
     validate_evm_rpc(&evm_rpc_url).await?;
 
     let cfg = ChainsConfig::load(&args.config)?;
@@ -476,56 +474,46 @@ async fn run_sustained_pipeline(pipeline: SustainedPipeline) -> eyre::Result<()>
         .axelar
         .contract_address("VotingVerifier", &args.source_axelar_id)
         .is_ok();
-    let mut verification = VerificationSession::start(
-        VerificationRoute::from_args(&args),
+    let submitter = super::its_evm_source::ItsEvmSubmitter {
+        rpc_url: evm_rpc_url.parse()?,
+        its_proxy: its_ctx.its_proxy_addr,
+        token_id: its_ctx.token_id.into(),
+        destination_chain: args.destination_axelar_id.to_string(),
+        receiver: its_ctx.receiver_bytes.clone(),
+        amount: its_ctx.amount_per_tx,
+        gas_value: super::units::Wei::from_u256(its_ctx.gas_value),
+        gas_arg_scaling_factor: its_ctx.gas_arg_scaling_factor,
+    };
+    its_verification::run_sustained(
+        &args,
         XrplItsTarget {
             rpc_url: xrpl.xrpl_rpc.clone(),
             recipient: xrpl.recipient_addr.clone(),
         },
-    );
-
-    let spinner = ui::wait_spinner(&format!(
-        "[0/{duration_secs}s] starting sustained ITS send..."
-    ));
-    verification.attach_spinner(spinner.clone())?;
-
-    let test_start = Instant::now();
-    let make_task = super::its_evm_source::its_sustained_tasks(
-        super::its_evm_source::ItsEvmSubmitter {
-            rpc_url: evm_rpc_url.parse()?,
-            its_proxy: its_ctx.its_proxy_addr,
-            token_id: its_ctx.token_id.into(),
-            destination_chain: args.destination_axelar_id.clone(),
-            receiver: its_ctx.receiver_bytes.clone(),
-            amount: its_ctx.amount_per_tx,
-            gas_value: super::units::Wei::from_u256(its_ctx.gas_value),
-            gas_arg_scaling_factor: its_ctx.gas_arg_scaling_factor,
-        },
-        derived,
-        Some(verification.sender()),
-        has_voting_verifier,
-    );
-
-    let result = super::sustained::run_sustained_loop(
-        SustainedPlan {
-            tps,
-            duration_secs,
-            key_cycle,
-        },
-        Some(nonces),
-        make_task,
-        Some(verification.send_done()),
-        spinner,
-    )
-    .await?;
-    its_verification::finish_sustained(
-        verification,
-        &args,
-        result,
+        &format!("[0/{duration_secs}s] starting sustained ITS send..."),
         &xrpl.recipient_addr,
         sizing.total_expected,
         sizing.num_keys,
-        test_start,
+        |context| async move {
+            let make_task = super::its_evm_source::its_sustained_tasks(
+                submitter,
+                derived,
+                Some(context.verify_tx),
+                has_voting_verifier,
+            );
+            super::sustained::run_sustained_loop(
+                SustainedPlan {
+                    tps,
+                    duration_secs,
+                    key_cycle,
+                },
+                Some(nonces),
+                make_task,
+                Some(context.send_done),
+                context.spinner,
+            )
+            .await
+        },
     )
     .await
 }
@@ -549,7 +537,7 @@ async fn run_burst_pipeline(
             rpc_url: evm_rpc_url.parse()?,
             its_proxy: its_ctx.its_proxy_addr,
             token_id: its_ctx.token_id.into(),
-            destination_chain: args.destination_axelar_id.clone(),
+            destination_chain: args.destination_axelar_id.to_string(),
             receiver: its_ctx.receiver_bytes.clone(),
             amount: its_ctx.amount_per_tx,
             gas_value: super::units::Wei::from_u256(its_ctx.gas_value),
@@ -599,15 +587,5 @@ async fn fetch_xrp_token_id(cfg: &ChainsConfig, xrpl_axelar_id: &str) -> eyre::R
     let s = resp
         .as_str()
         .ok_or_else(|| eyre!("XrpTokenId response was not a string: {resp}"))?;
-    let bytes = hex::decode(s.trim_start_matches("0x"))
-        .map_err(|e| eyre!("XrpTokenId hex decode failed: {e} (got {s:?})"))?;
-    if bytes.len() != 32 {
-        return Err(eyre!(
-            "XrpTokenId returned {} bytes, expected 32: {s}",
-            bytes.len()
-        ));
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
+    super::helpers::parse_token_id_hex(s, "XrpTokenId")
 }

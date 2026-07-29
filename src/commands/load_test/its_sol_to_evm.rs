@@ -20,8 +20,6 @@ use super::its_verification::{EvmItsTarget, ItsBurstReport, finish_burst};
 use super::keypairs;
 use super::metrics::ComputeUnitSummary;
 use super::run_sizing::{RunMode, RunSizing, SustainedPlan};
-use super::verification_session::VerificationSession;
-use super::verify::VerificationRoute;
 use super::{ItsCache, read_its_cache, save_its_cache, validate_evm_rpc, validate_solana_rpc};
 use crate::config::ChainsConfig;
 use crate::solana;
@@ -78,7 +76,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
-    let evm_rpc_url = args.destination_rpc.clone();
+    let evm_rpc_url = args.destination_rpc.to_string();
 
     // Validate RPCs
     validate_solana_rpc(&args.source_rpc).await?;
@@ -105,10 +103,10 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
         &main_keypair,
         &rpc_client,
         TokenSetupRequest {
-            solana_rpc: args.source_rpc.clone(),
+            solana_rpc: args.source_rpc.to_string(),
             network: args.network,
-            source_chain: src.clone(),
-            destination_chain: dest.clone(),
+            source_chain: src.to_string(),
+            destination_chain: dest.to_string(),
             num_txs: sizing.num_keys,
             gas_value,
             token_id_override: args.token_id.clone(),
@@ -306,27 +304,12 @@ async fn run_sustained_pipeline(
     transfer: &ItsTransferSpec,
 ) -> eyre::Result<()> {
     let dest = &args.destination_chain;
-    let evm_rpc_url = args.destination_rpc.clone();
+    let evm_rpc_url = args.destination_rpc.to_string();
     let SustainedPlan {
         tps: tps_n,
         duration_secs,
         key_cycle,
     } = plan;
-
-    let mut verification = VerificationSession::start(
-        VerificationRoute::from_args(args),
-        EvmItsTarget {
-            gateway_addr: evm.evm_gateway_addr,
-            rpc_url: evm_rpc_url,
-        },
-    );
-
-    let spinner = ui::wait_spinner(&format!(
-        "[0/{duration_secs}s] starting sustained ITS send..."
-    ));
-    verification.attach_spinner(spinner.clone())?;
-
-    let test_start = Instant::now();
 
     let jobs = keypairs
         .iter()
@@ -335,44 +318,46 @@ async fn run_sustained_pipeline(
             source_account: its_sol_source::source_account(keypair, &transfer.mint),
         })
         .collect();
-    let make_task = its_sol_source::its_sustained_tasks(
-        its_sol_source::ItsSolanaSubmitter {
-            rpc_url: args.source_rpc.clone(),
-            network: args.network,
-            token_id: transfer.token_id.into(),
-            mint: transfer.mint,
-            destination_chain: dest.to_string(),
-            destination_address: transfer.dest_address_bytes.clone(),
-            amount: transfer.amount_per_tx,
-            gas_value: super::units::Lamports::new(hub_gas_value(transfer.gas_value)),
-            metric_context: its_sol_source::MetricContext::HubRouted {
-                hub_address: evm.axelarnet_gw_addr.clone(),
-            },
+    let submitter = its_sol_source::ItsSolanaSubmitter {
+        rpc_url: args.source_rpc.to_string(),
+        network: args.network,
+        token_id: transfer.token_id.into(),
+        mint: transfer.mint,
+        destination_chain: dest.to_string(),
+        destination_address: transfer.dest_address_bytes.clone(),
+        amount: transfer.amount_per_tx,
+        gas_value: super::units::Lamports::new(hub_gas_value(transfer.gas_value)),
+        metric_context: its_sol_source::MetricContext::HubRouted {
+            hub_address: evm.axelarnet_gw_addr.clone(),
         },
-        jobs,
-        Some(verification.sender()),
-    );
-
-    let result = super::sustained::run_sustained_loop(
-        SustainedPlan {
-            tps: tps_n,
-            duration_secs,
-            key_cycle,
-        },
-        None,
-        make_task,
-        Some(verification.send_done()),
-        spinner,
-    )
-    .await?;
-    its_verification::finish_sustained(
-        verification,
+    };
+    let destination_address = evm.its_proxy_addr.to_string();
+    its_verification::run_sustained(
         args,
-        result,
-        &format!("{}", evm.its_proxy_addr),
+        EvmItsTarget {
+            gateway_addr: evm.evm_gateway_addr,
+            rpc_url: evm_rpc_url,
+        },
+        &format!("[0/{duration_secs}s] starting sustained ITS send..."),
+        &destination_address,
         sizing.total_expected,
         sizing.num_keys,
-        test_start,
+        |context| async move {
+            let make_task =
+                its_sol_source::its_sustained_tasks(submitter, jobs, Some(context.verify_tx));
+            super::sustained::run_sustained_loop(
+                SustainedPlan {
+                    tps: tps_n,
+                    duration_secs,
+                    key_cycle,
+                },
+                None,
+                make_task,
+                Some(context.send_done),
+                context.spinner,
+            )
+            .await
+        },
     )
     .await
 }
@@ -399,7 +384,7 @@ async fn run_burst_pipeline(
         .collect();
     let burst = its_sol_source::run_its_burst(
         its_sol_source::ItsSolanaSubmitter {
-            rpc_url: args.source_rpc.clone(),
+            rpc_url: args.source_rpc.to_string(),
             network: args.network,
             token_id: transfer.token_id.into(),
             mint: transfer.mint,

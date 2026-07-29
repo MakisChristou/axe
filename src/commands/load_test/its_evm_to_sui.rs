@@ -62,7 +62,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
-    let evm_rpc_url = args.source_rpc.clone();
+    let evm_rpc_url = args.source_rpc.to_string();
     validate_evm_rpc(&evm_rpc_url).await?;
 
     let cfg = ChainsConfig::load(&args.config)?;
@@ -108,7 +108,7 @@ async fn resolve_evm_context(
 
     let evm_chain_cfg = cfg
         .chains
-        .get(src)
+        .get(src.as_ref())
         .ok_or_else(|| eyre!("source chain '{src}' not found in config"))?;
     let its_proxy_addr: Address = evm_chain_cfg
         .contract_address("InterchainTokenService", src)?
@@ -246,7 +246,7 @@ async fn run_burst_pipeline(
             rpc_url: evm.rpc_url.parse()?,
             its_proxy: evm.its_proxy_addr,
             token_id: evm.token_id.into(),
-            destination_chain: args.destination_axelar_id.clone(),
+            destination_chain: args.destination_axelar_id.to_string(),
             receiver: sui.recipient_bytes.clone(),
             amount: amount_per_tx,
             gas_value: super::units::Wei::from_u256(gas_value),
@@ -307,7 +307,7 @@ async fn run_sustained_pipeline(
             rpc_url: evm.rpc_url.parse()?,
             its_proxy: evm.its_proxy_addr,
             token_id: evm.token_id.into(),
-            destination_chain: args.destination_axelar_id.clone(),
+            destination_chain: args.destination_axelar_id.to_string(),
             receiver: sui.recipient_bytes.clone(),
             amount: amount_per_tx,
             gas_value: super::units::Wei::from_u256(gas_value),

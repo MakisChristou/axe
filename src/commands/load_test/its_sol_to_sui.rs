@@ -74,7 +74,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
-    let sol_rpc = args.source_rpc.clone();
+    let sol_rpc = args.source_rpc.to_string();
     validate_solana_rpc(&sol_rpc).await?;
 
     ui::kv("source", src);
@@ -155,7 +155,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
 
     // ----- Send loop -----
     let test_start = Instant::now();
-    let dest_chain_id = args.destination_axelar_id.clone();
+    let dest_chain_id = args.destination_axelar_id.to_string();
     let submitter = its_sol_source::ItsSolanaSubmitter {
         rpc_url: sol_rpc,
         network: args.network,

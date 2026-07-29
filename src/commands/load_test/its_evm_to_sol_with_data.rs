@@ -21,8 +21,6 @@ use super::keypairs;
 use super::metrics::{ComputeUnitSummary, TxMetrics};
 use super::run_sizing::{RunMode, RunSizing, SustainedPlan};
 use super::submitter::TransactionSubmitter;
-use super::verification_session::VerificationSession;
-use super::verify::VerificationRoute;
 use super::{
     ItsCache, LoadTestArgs, check_evm_balance, read_its_cache, save_its_cache, validate_evm_rpc,
     validate_solana_rpc,
@@ -98,7 +96,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
-    let evm_rpc_url = args.source_rpc.clone();
+    let evm_rpc_url = args.source_rpc.to_string();
 
     validate_evm_rpc(&evm_rpc_url).await?;
     validate_solana_rpc(&args.destination_rpc).await?;
@@ -528,46 +526,37 @@ async fn run_sustained_pipeline(
         .contract_address("VotingVerifier", &args.source_chain)
         .is_ok();
 
-    let mut verification = VerificationSession::start(
-        VerificationRoute::from_args(args),
-        SolanaItsTarget {
-            rpc_url: args.destination_rpc.clone(),
-        },
-    );
-
-    let spinner = ui::wait_spinner(&format!(
-        "[0/{duration_secs}s] starting sustained ITS-with-data send..."
-    ));
-    verification.attach_spinner(spinner.clone())?;
-
-    let test_start = Instant::now();
-    let make_task = its_with_data_sustained_tasks(
-        ItsEvmWithDataSubmitter::new(evm_rpc_url, dest, transfer_ctx)?,
-        derived.to_vec(),
-        verification.sender(),
-        has_voting_verifier,
-    );
-
-    let result = super::sustained::run_sustained_loop(
-        SustainedPlan {
-            tps,
-            duration_secs,
-            key_cycle,
-        },
-        Some(nonces),
-        make_task,
-        Some(verification.send_done()),
-        spinner,
-    )
-    .await?;
-    its_verification::finish_sustained(
-        verification,
+    let submitter = ItsEvmWithDataSubmitter::new(evm_rpc_url, dest, transfer_ctx)?;
+    let destination_address = transfer_ctx.its_proxy_addr.to_string();
+    its_verification::run_sustained(
         args,
-        result,
-        &format!("{}", transfer_ctx.its_proxy_addr),
+        SolanaItsTarget {
+            rpc_url: args.destination_rpc.to_string(),
+        },
+        &format!("[0/{duration_secs}s] starting sustained ITS-with-data send..."),
+        &destination_address,
         sizing.total_expected,
         sizing.num_keys,
-        test_start,
+        |context| async move {
+            let make_task = its_with_data_sustained_tasks(
+                submitter,
+                derived.to_vec(),
+                context.verify_tx,
+                has_voting_verifier,
+            );
+            super::sustained::run_sustained_loop(
+                SustainedPlan {
+                    tps,
+                    duration_secs,
+                    key_cycle,
+                },
+                Some(nonces),
+                make_task,
+                Some(context.send_done),
+                context.spinner,
+            )
+            .await
+        },
     )
     .await
 }
@@ -623,7 +612,7 @@ async fn run_burst_pipeline(
     finish_burst(
         args,
         SolanaItsTarget {
-            rpc_url: args.destination_rpc.clone(),
+            rpc_url: args.destination_rpc.to_string(),
         },
         burst,
         ItsBurstReport {

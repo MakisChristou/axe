@@ -29,7 +29,7 @@ pub(in crate::commands::load_test) async fn run_evm_to_sui(
     ui::kv("destination", dest);
     ui::kv("protocol", "GMP (EVM SenderReceiver → Sui memo)");
 
-    let evm_rpc_url = args.source_rpc.clone();
+    let evm_rpc_url = args.source_rpc.to_string();
     validate_evm_rpc(&evm_rpc_url).await?;
 
     let signer = args
@@ -51,13 +51,13 @@ pub(in crate::commands::load_test) async fn run_evm_to_sui(
 
     let evm_gateway_addr = cfg
         .chains
-        .get(src)
+        .get(src.as_ref())
         .ok_or_else(|| eyre::eyre!("chain '{}' not found in config", src))?
         .contract_address("AxelarGateway", src)?
         .parse()?;
     let evm_gas_service_addr = cfg
         .chains
-        .get(src)
+        .get(src.as_ref())
         .ok_or_else(|| eyre::eyre!("chain '{}' not found in config", src))?
         .contract_address("AxelarGasService", src)?
         .parse()?;
@@ -110,7 +110,7 @@ pub(in crate::commands::load_test) async fn run_sol_to_sui(
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
-    let solana_rpc = args.source_rpc.clone();
+    let solana_rpc = args.source_rpc.to_string();
     validate_solana_rpc(&solana_rpc).await?;
 
     ui::kv("source", src);
@@ -208,7 +208,7 @@ pub(in crate::commands::load_test) async fn run_stellar_to_sui(
         wallets: wallets.clone(),
         example_contract: stellar_example.clone(),
         gateway_contract: stellar_gateway,
-        destination_chain: args.destination_axelar_id.clone(),
+        destination_chain: args.destination_axelar_id.to_string(),
         destination_address: sui_channel.clone(),
         payload_override,
         run: RunIdentity::from_sizing(&args, sizing),

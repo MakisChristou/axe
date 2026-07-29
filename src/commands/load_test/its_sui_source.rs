@@ -30,7 +30,7 @@ pub(super) async fn prepare_source(args: &LoadTestArgs) -> Result<PreparedSuiIts
     let rpc = if args.source_rpc.is_empty() {
         default_rpc
     } else {
-        args.source_rpc.clone()
+        args.source_rpc.to_string()
     };
     let client = SuiClient::new(&rpc);
     let contracts = crate::sui::read_sui_its_config(&args.config, source_chain)?;

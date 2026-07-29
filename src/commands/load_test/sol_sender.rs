@@ -200,9 +200,9 @@ pub async fn run_load_test_with_metrics(
         .collect();
     let burst = super::submitter::run_burst(
         SolanaSubmitter {
-            rpc_url: args.source_rpc.clone(),
+            rpc_url: args.source_rpc.to_string(),
             network: args.network,
-            destination_chain: args.destination_chain.clone(),
+            destination_chain: args.destination_chain.to_string(),
             destination_address: destination_address.to_string(),
         },
         jobs,
@@ -331,9 +331,9 @@ pub(super) async fn run_sustained_load_test_with_metrics(
 
     let dest_chain = args.destination_chain.clone();
     let dest_addr = destination_address.to_string();
-    let solana_rpc = args.source_rpc.clone();
+    let solana_rpc = args.source_rpc.to_string();
     let evm_dest = evm_destination;
-    let source_chain = args.source_axelar_id.clone();
+    let source_chain = args.source_axelar_id.to_string();
     let network = args.network;
 
     // Check if source chain has a voting verifier (for correct initial phase).
@@ -347,7 +347,7 @@ pub(super) async fn run_sustained_load_test_with_metrics(
         SolanaSustainedSubmitter {
             rpc_url: solana_rpc,
             network,
-            destination_chain: dest_chain,
+            destination_chain: dest_chain.to_string(),
             destination_address: dest_addr,
         },
         move |key_index, _nonce| SolanaSubmitJob {

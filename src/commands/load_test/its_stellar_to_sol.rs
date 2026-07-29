@@ -24,8 +24,6 @@ use super::its_verification::{ItsBurstReport, SolanaItsTarget, finish_burst};
 use super::metrics::ComputeUnitSummary;
 use super::run_sizing::{RunMode, RunSizing, SustainedPlan};
 use super::units::Stroops;
-use super::verification_session::VerificationSession;
-use super::verify::VerificationRoute;
 use super::{LoadTestArgs, validate_solana_rpc};
 use crate::config::ChainsConfig;
 use crate::stellar::{StellarClient, StellarWallet};
@@ -35,7 +33,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
     let src = &args.source_chain;
     let dest = &args.destination_chain;
 
-    let solana_rpc_url = args.destination_rpc.clone();
+    let solana_rpc_url = args.destination_rpc.to_string();
     validate_solana_rpc(&solana_rpc_url).await?;
 
     let cfg = ChainsConfig::load(&args.config)?;
@@ -247,9 +245,9 @@ async fn prepare_token_and_wallets(
             gateway_contract: stellar.gateway_addr.clone(),
             gas_token: stellar.xlm_addr.clone(),
             gas_stroops,
-            source_chain: src.clone(),
-            destination_chain: dest.clone(),
-            destination_axelar_id: args.destination_axelar_id.clone(),
+            source_chain: src.to_string(),
+            destination_chain: dest.to_string(),
+            destination_axelar_id: args.destination_axelar_id.to_string(),
             token_id_override: args.token_id.clone(),
             config: args.config.clone(),
             required_transfers: sizing.num_keys,
@@ -298,47 +296,38 @@ async fn run_sustained_pipeline(
     plan: SustainedPlan,
 ) -> Result<()> {
     let duration_secs = plan.duration_secs;
-    let mut verification = VerificationSession::start(
-        VerificationRoute::from_args(args),
-        SolanaItsTarget {
-            rpc_url: args.destination_rpc.clone(),
-        },
-    );
-
-    let spinner = ui::wait_spinner(&format!(
-        "[0/{duration_secs}s] starting sustained Stellar ITS send..."
-    ));
-    verification.attach_spinner(spinner.clone())?;
-
-    let test_start = Instant::now();
-    let result = its_stellar_source::run_sustained(SustainedTransferArgs {
-        submitter: ItsStellarSubmitter {
-            client: stellar.client.clone(),
-            its_contract: stellar.its_addr.clone(),
-            gateway_contract: stellar.gateway_addr.clone(),
-            token_id: transfer.token_id.into(),
-            destination_chain: args.destination_axelar_id.clone(),
-            destination_address_bytes: solana.address_bytes.clone(),
-            gas_token: stellar.xlm_addr.clone(),
-            gas_stroops: transfer.gas_stroops,
-            amount_per_tx: transfer.amount_per_tx,
-            axelarnet_gw_addr: transfer.axelarnet_gw_addr.clone(),
-        },
-        wallets,
-        plan,
-        verify_tx: Some(verification.sender()),
-        send_done: Some(verification.send_done()),
-        spinner,
-    })
-    .await?;
-    its_verification::finish_sustained(
-        verification,
+    let submitter = ItsStellarSubmitter {
+        client: stellar.client.clone(),
+        its_contract: stellar.its_addr.clone(),
+        gateway_contract: stellar.gateway_addr.clone(),
+        token_id: transfer.token_id.into(),
+        destination_chain: args.destination_axelar_id.to_string(),
+        destination_address_bytes: solana.address_bytes.clone(),
+        gas_token: stellar.xlm_addr.clone(),
+        gas_stroops: transfer.gas_stroops,
+        amount_per_tx: transfer.amount_per_tx,
+        axelarnet_gw_addr: transfer.axelarnet_gw_addr.clone(),
+    };
+    let destination_address = solana.recipient.to_string();
+    its_verification::run_sustained(
         args,
-        result,
-        &solana.recipient.to_string(),
+        SolanaItsTarget {
+            rpc_url: args.destination_rpc.to_string(),
+        },
+        &format!("[0/{duration_secs}s] starting sustained Stellar ITS send..."),
+        &destination_address,
         sizing.total_expected,
         sizing.num_keys,
-        test_start,
+        |context| {
+            its_stellar_source::run_sustained(SustainedTransferArgs {
+                submitter,
+                wallets,
+                plan,
+                verify_tx: Some(context.verify_tx),
+                send_done: Some(context.send_done),
+                spinner: context.spinner,
+            })
+        },
     )
     .await
 }
@@ -366,7 +355,7 @@ async fn run_burst_pipeline(
             its_contract: stellar.its_addr.clone(),
             gateway_contract: stellar.gateway_addr.clone(),
             token_id: token_id.into(),
-            destination_chain: args.destination_axelar_id.clone(),
+            destination_chain: args.destination_axelar_id.to_string(),
             destination_address_bytes: solana.address_bytes.clone(),
             gas_token: stellar.xlm_addr.clone(),
             gas_stroops,
@@ -381,7 +370,7 @@ async fn run_burst_pipeline(
     finish_burst(
         args,
         SolanaItsTarget {
-            rpc_url: args.destination_rpc.clone(),
+            rpc_url: args.destination_rpc.to_string(),
         },
         burst,
         ItsBurstReport {

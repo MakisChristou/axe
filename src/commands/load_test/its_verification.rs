@@ -29,6 +29,7 @@ use super::verify::{
     XrplItsDestination,
 };
 use super::{LoadTestArgs, finish_report};
+use crate::ui;
 
 pub(super) use super::verification_session::finish_batch;
 
@@ -161,8 +162,61 @@ pub(super) async fn finish_burst<T: BatchTarget>(
     finish_batch(args, target, &mut report, test_start).await
 }
 
+/// Resources a source adapter needs to participate in a verified sustained
+/// run. Keeping these together prevents route modules from rebuilding the
+/// verification channel lifecycle by hand.
+pub(super) struct SustainedSendContext {
+    pub verify_tx: mpsc::UnboundedSender<PendingTx>,
+    pub send_done: Arc<AtomicBool>,
+    pub spinner: ProgressBar,
+}
+
+/// Run the chain-neutral outer lifecycle for a sustained ITS route.
+///
+/// The route supplies only its destination verifier and chain-specific send
+/// future. Channel creation, progress-bar handoff, verification joining,
+/// timing merge, report construction, and final output stay identical across
+/// every streaming-capable chain pair.
+pub(super) async fn run_sustained<T, F, Fut>(
+    args: &LoadTestArgs,
+    target: T,
+    spinner_message: &str,
+    destination_address: &str,
+    total_expected: u64,
+    num_keys: usize,
+    send: F,
+) -> Result<()>
+where
+    T: StreamingTarget,
+    F: FnOnce(SustainedSendContext) -> Fut,
+    Fut: Future<Output = Result<SustainedResult>>,
+{
+    let mut verification = VerificationSession::start(VerificationRoute::from_args(args), target);
+    let spinner = ui::wait_spinner(spinner_message);
+    verification.attach_spinner(spinner.clone())?;
+
+    let test_start = Instant::now();
+    let result = send(SustainedSendContext {
+        verify_tx: verification.sender(),
+        send_done: verification.send_done(),
+        spinner,
+    })
+    .await?;
+
+    finish_sustained(
+        verification,
+        args,
+        result,
+        destination_address,
+        total_expected,
+        num_keys,
+        test_start,
+    )
+    .await
+}
+
 /// Join a sustained ITS run's verifier and emit the finished report.
-pub(super) async fn finish_sustained(
+async fn finish_sustained(
     session: VerificationSession,
     args: &LoadTestArgs,
     result: SustainedResult,
