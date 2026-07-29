@@ -218,6 +218,12 @@ struct ActiveVerifier {
     weight: String,
 }
 
+struct VerifierSet {
+    active: Vec<ActiveVerifier>,
+    pre_registered: Vec<String>,
+    pre_registration_only: bool,
+}
+
 /// Per-verifier registration query (fallback when the active set isn't formed yet).
 async fn query_verifier_supports_chain(
     lcd: &str,
@@ -247,6 +253,185 @@ fn truncate_address(addr: &str) -> String {
     }
 }
 
+async fn query_verifier_set(
+    lcd: &str,
+    service_registry: &str,
+    chain: &str,
+    known_verifiers: &[(&str, &str)],
+) -> Result<VerifierSet> {
+    let spinner = ui::wait_spinner("querying ServiceRegistry...");
+    let query = json!({
+        "active_verifiers": {
+            "service_name": "amplifier",
+            "chain_name": chain
+        }
+    });
+    let data = lcd_cosmwasm_smart_query(lcd, service_registry, &query).await?;
+    spinner.finish_and_clear();
+    if let Some(active_list) = data.as_array() {
+        let active = active_list
+            .iter()
+            .map(|entry| ActiveVerifier {
+                address: entry
+                    .pointer("/verifier_info/address")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                weight: entry
+                    .get("weight")
+                    .and_then(Value::as_str)
+                    .unwrap_or("0")
+                    .to_string(),
+            })
+            .collect();
+        return Ok(VerifierSet {
+            active,
+            pre_registered: Vec::new(),
+            pre_registration_only: false,
+        });
+    }
+
+    let spinner = ui::wait_spinner("active set not formed; checking per-verifier registrations...");
+    let mut pre_registered = Vec::new();
+    for (address, _) in known_verifiers {
+        if *address != "TODO"
+            && query_verifier_supports_chain(lcd, service_registry, address, chain)
+                .await
+                .unwrap_or(false)
+        {
+            pre_registered.push((*address).to_string());
+        }
+    }
+    spinner.finish_and_clear();
+    Ok(VerifierSet {
+        active: Vec::new(),
+        pre_registered,
+        pre_registration_only: true,
+    })
+}
+
+fn sorted_verifiers<'a>(known_verifiers: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    let mut sorted = known_verifiers.to_vec();
+    sorted.sort_by_key(|(_, name)| *name);
+    sorted
+}
+
+fn print_verifiers_json(
+    known_verifiers: &[(&str, &str)],
+    verifier_set: &VerifierSet,
+) -> Result<()> {
+    let entries = sorted_verifiers(known_verifiers)
+        .into_iter()
+        .map(|(address, name)| {
+            let active = verifier_set
+                .active
+                .iter()
+                .find(|verifier| verifier.address == address);
+            let registered = verifier_set
+                .pre_registered
+                .iter()
+                .any(|registered| registered == address);
+            json!({
+                "name": name,
+                "address": address,
+                "active": active.is_some(),
+                "registered": active.is_some() || registered,
+                "weight": active.map(|verifier| verifier.weight.as_str()).unwrap_or("-"),
+                "pre_registration_only": verifier_set.pre_registration_only,
+            })
+        })
+        .collect::<Vec<_>>();
+    println!("{}", serde_json::to_string_pretty(&entries)?);
+    Ok(())
+}
+
+fn verifier_status(
+    address: &str,
+    active: Option<&ActiveVerifier>,
+    pre_registered: bool,
+) -> (&'static str, String, String) {
+    if address == "TODO" {
+        return ("? (no address)", "-".to_string(), "TODO".to_string());
+    }
+    let status = if active.is_some() {
+        "Active"
+    } else if pre_registered {
+        "Registered"
+    } else {
+        "---"
+    };
+    let weight = active
+        .map(|verifier| verifier.weight.clone())
+        .unwrap_or_else(|| "-".to_string());
+    (status, weight, truncate_address(address))
+}
+
+fn print_verifiers_table(
+    chain: &str,
+    known_verifiers: &[(&str, &str)],
+    verifier_set: &VerifierSet,
+) {
+    let mut table = Table::new();
+    table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_header(vec!["#", "Name", "Address", "Status", "Weight"]);
+    for (index, (address, name)) in sorted_verifiers(known_verifiers).into_iter().enumerate() {
+        let active = verifier_set
+            .active
+            .iter()
+            .find(|verifier| verifier.address == address);
+        let pre_registered = verifier_set
+            .pre_registered
+            .iter()
+            .any(|registered| registered == address);
+        let (status, weight, display_address) = verifier_status(address, active, pre_registered);
+        table.add_row(vec![
+            Cell::new(index + 1),
+            Cell::new(name),
+            Cell::new(display_address),
+            Cell::new(status),
+            Cell::new(weight),
+        ]);
+    }
+    println!("\n{table}\n");
+
+    let known_active = verifier_set
+        .active
+        .iter()
+        .filter(|verifier| {
+            known_verifiers
+                .iter()
+                .any(|(address, _)| *address == verifier.address)
+        })
+        .count();
+    if verifier_set.pre_registration_only {
+        ui::kv(
+            "active",
+            &format!("0 verifiers for {chain} (active set not yet formed)"),
+        );
+        ui::kv(
+            "registered",
+            &format!(
+                "{}/{} known verifiers have pre-registered for {chain}",
+                verifier_set.pre_registered.len(),
+                known_verifiers.len()
+            ),
+        );
+    } else {
+        ui::kv(
+            "active",
+            &format!("{} verifiers for {chain}", verifier_set.active.len()),
+        );
+        ui::kv(
+            "known",
+            &format!(
+                "{known_active}/{} known verifiers are active",
+                known_verifiers.len()
+            ),
+        );
+    }
+}
+
 pub async fn run(network: Network, chain: String, json_mode: bool) -> Result<()> {
     let known_verifiers = verifiers_for_network(network)?;
     let config_path = config_source::resolve(network, None).await?.into_path();
@@ -260,173 +445,23 @@ pub async fn run(network: Network, chain: String, json_mode: bool) -> Result<()>
         ui::section(&format!("Verifiers: {} / {}", network, chain_axelar_id));
     }
 
-    let spinner = ui::wait_spinner("querying ServiceRegistry...");
-    let verifier_query = json!({
-        "active_verifiers": {
-            "service_name": "amplifier",
-            "chain_name": chain_axelar_id
-        }
-    });
-    let data = lcd_cosmwasm_smart_query(&lcd, &service_registry_addr, &verifier_query).await?;
-    spinner.finish_and_clear();
-
-    // Fall back to per-verifier registration query when the active set isn't
-    // formed yet (e.g., chain newly being onboarded — fewer than min_num_verifiers
-    // have bonded + registered, so ActiveVerifiers errors with "not enough verifiers").
-    let mut active_verifiers: Vec<ActiveVerifier> = Vec::new();
-    let mut pre_registered: Vec<String> = Vec::new();
-    let pre_registration_only = match data.as_array() {
-        Some(active_list) => {
-            for entry in active_list {
-                let address = entry
-                    .pointer("/verifier_info/address")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let weight = entry
-                    .get("weight")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("0")
-                    .to_string();
-                active_verifiers.push(ActiveVerifier { address, weight });
-            }
-            false
-        }
-        None => {
-            let spinner =
-                ui::wait_spinner("active set not formed; checking per-verifier registrations...");
-            for (addr, _) in known_verifiers.iter() {
-                if *addr == "TODO" {
-                    continue;
-                }
-                if query_verifier_supports_chain(
-                    &lcd,
-                    &service_registry_addr,
-                    addr,
-                    &chain_axelar_id,
-                )
-                .await
-                .unwrap_or(false)
-                {
-                    pre_registered.push((*addr).to_string());
-                }
-            }
-            spinner.finish_and_clear();
-            if pre_registered.is_empty() {
-                return Err(eyre::eyre!(
-                    "no verifiers found for chain '{chain_axelar_id}' on {network}. \
-                     Is it an Amplifier chain?"
-                ));
-            }
-            true
-        }
-    };
+    let verifier_set = query_verifier_set(
+        &lcd,
+        &service_registry_addr,
+        &chain_axelar_id,
+        known_verifiers,
+    )
+    .await?;
+    if verifier_set.pre_registration_only && verifier_set.pre_registered.is_empty() {
+        return Err(eyre::eyre!(
+            "no verifiers found for chain '{chain_axelar_id}' on {network}. \
+             Is it an Amplifier chain?"
+        ));
+    }
 
     if json_mode {
-        let mut entries: Vec<Value> = Vec::new();
-        let mut known_sorted: Vec<(&str, &str)> = known_verifiers.to_vec();
-        known_sorted.sort_by_key(|(_, name)| *name);
-
-        for (addr, name) in &known_sorted {
-            let active_info = active_verifiers.iter().find(|v| v.address == *addr);
-            let registered = pre_registered.iter().any(|a| a == *addr);
-            entries.push(json!({
-                "name": name,
-                "address": addr,
-                "active": active_info.is_some(),
-                "registered": active_info.is_some() || registered,
-                "weight": active_info.map(|v| v.weight.as_str()).unwrap_or("-"),
-                "pre_registration_only": pre_registration_only,
-            }));
-        }
-        println!("{}", serde_json::to_string_pretty(&entries)?);
-        return Ok(());
+        return print_verifiers_json(known_verifiers, &verifier_set);
     }
-
-    let mut table = Table::new();
-    table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
-    table.set_content_arrangement(ContentArrangement::Dynamic);
-    table.set_header(vec![
-        Cell::new("#"),
-        Cell::new("Name"),
-        Cell::new("Address"),
-        Cell::new("Status"),
-        Cell::new("Weight"),
-    ]);
-
-    let mut row_num = 0usize;
-
-    let mut known_sorted: Vec<(&str, &str)> = known_verifiers.to_vec();
-    known_sorted.sort_by_key(|(_, name)| *name);
-
-    for (addr, name) in &known_sorted {
-        row_num += 1;
-        let active_info = active_verifiers.iter().find(|v| v.address == *addr);
-        let is_pre_registered = pre_registered.iter().any(|a| a == *addr);
-
-        let is_todo = *addr == "TODO";
-        let status_str = if is_todo {
-            "? (no address)"
-        } else if active_info.is_some() {
-            "Active"
-        } else if is_pre_registered {
-            "Registered"
-        } else {
-            "---"
-        };
-
-        let weight_str = active_info
-            .map(|v| v.weight.clone())
-            .unwrap_or_else(|| "-".to_string());
-
-        let addr_str = if is_todo {
-            "TODO".to_string()
-        } else {
-            truncate_address(addr)
-        };
-
-        table.add_row(vec![
-            Cell::new(row_num),
-            Cell::new(name),
-            Cell::new(addr_str),
-            Cell::new(status_str),
-            Cell::new(weight_str),
-        ]);
-    }
-
-    println!();
-    println!("{table}");
-
-    let known_active = active_verifiers
-        .iter()
-        .filter(|v| known_verifiers.iter().any(|(a, _)| *a == v.address))
-        .count();
-    let total_known = known_verifiers.len();
-    let total_active = active_verifiers.len();
-
-    println!();
-    if pre_registration_only {
-        ui::kv(
-            "active",
-            &format!("0 verifiers for {chain_axelar_id} (active set not yet formed)"),
-        );
-        ui::kv(
-            "registered",
-            &format!(
-                "{}/{total_known} known verifiers have pre-registered for {chain_axelar_id}",
-                pre_registered.len()
-            ),
-        );
-    } else {
-        ui::kv(
-            "active",
-            &format!("{total_active} verifiers for {chain_axelar_id}"),
-        );
-        ui::kv(
-            "known",
-            &format!("{known_active}/{total_known} known verifiers are active"),
-        );
-    }
-
+    print_verifiers_table(&chain_axelar_id, known_verifiers, &verifier_set);
     Ok(())
 }

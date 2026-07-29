@@ -131,6 +131,52 @@ struct ActivityEntry {
     events: Vec<String>,
 }
 
+fn print_program_header(entry: &DiscoveredProgram) {
+    println!(
+        "\n{}",
+        format!(
+            "━━ {} ({}/{}) {} ━━",
+            entry.label, entry.network, entry.chain_name, entry.address
+        )
+        .bold()
+    );
+}
+
+fn print_activity_line(
+    signature: &str,
+    block_time: Option<i64>,
+    succeeded: bool,
+    instruction: Option<&str>,
+    events: &[String],
+) {
+    let time = block_time
+        .map(format_timestamp)
+        .unwrap_or_else(|| "?".to_string());
+    let status = if succeeded {
+        format!("{}", "OK".green())
+    } else {
+        format!("{}", "FAIL".red())
+    };
+    let signature = if signature.len() > 20 {
+        format!("{}...", &signature[..20])
+    } else {
+        signature.to_string()
+    };
+    let events = if events.is_empty() {
+        String::new()
+    } else {
+        format!(" → {}", events.join(", ").dimmed())
+    };
+    println!(
+        "  {} [{}] {:<45} {}{}",
+        time.dimmed(),
+        status,
+        instruction.unwrap_or("?").bold(),
+        signature.dimmed(),
+        events,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
@@ -188,14 +234,7 @@ pub async fn run(
         }
 
         if !json_mode {
-            println!(
-                "\n{}",
-                format!(
-                    "━━ {} ({}/{}) {} ━━",
-                    entry.label, entry.network, entry.chain_name, entry.address
-                )
-                .bold()
-            );
+            print_program_header(entry);
         }
 
         for sig_info in &sigs {
@@ -212,37 +251,12 @@ pub async fn run(
             let (ix_name, args_json, events) = fetch_and_decode(&rpc, sig, &known);
 
             if !json_mode {
-                let time_str = block_time
-                    .map(format_timestamp)
-                    .unwrap_or_else(|| "?".to_string());
-
-                let status_colored = if status == "Success" {
-                    format!("{}", "OK".green())
-                } else {
-                    format!("{}", "FAIL".red())
-                };
-
-                let ix_display = ix_name.as_deref().unwrap_or("?");
-
-                let sig_short = if sig.len() > 20 {
-                    format!("{}...", &sig[..20])
-                } else {
-                    sig.clone()
-                };
-
-                let events_str = if events.is_empty() {
-                    String::new()
-                } else {
-                    format!(" → {}", events.join(", ").dimmed())
-                };
-
-                println!(
-                    "  {} [{}] {:<45} {}{}",
-                    time_str.dimmed(),
-                    status_colored,
-                    ix_display.bold(),
-                    sig_short.dimmed(),
-                    events_str,
+                print_activity_line(
+                    sig,
+                    block_time,
+                    sig_info.err.is_none(),
+                    ix_name.as_deref(),
+                    &events,
                 );
             }
 

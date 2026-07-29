@@ -386,7 +386,7 @@ async fn derive_and_fund_evm_signers(
         &funding_provider,
         &evm_src.signer,
         &derived,
-        gas_extra_per_key,
+        super::units::Wei::from_u128(gas_extra_per_key),
     )
     .await?;
     Ok(derived)

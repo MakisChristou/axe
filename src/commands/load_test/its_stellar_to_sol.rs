@@ -23,6 +23,7 @@ use super::its_verification;
 use super::its_verification::{ItsBurstReport, SolanaItsTarget, finish_burst};
 use super::metrics::ComputeUnitSummary;
 use super::run_sizing::{RunMode, RunSizing, SustainedPlan};
+use super::units::Stroops;
 use super::verification_session::VerificationSession;
 use super::verify::VerificationRoute;
 use super::{LoadTestArgs, validate_solana_rpc};
@@ -133,7 +134,7 @@ impl RemoteDeploymentVerifier for SolanaRemoteDeployment {
 /// (AxelarnetGateway) used for verification routing.
 struct ItsTransferSpec {
     token_id: [u8; 32],
-    gas_stroops: u64,
+    gas_stroops: Stroops,
     axelarnet_gw_addr: String,
     /// Per-transfer amount, already scaled to the resolved token's decimals.
     amount_per_tx: u128,
@@ -227,7 +228,7 @@ async fn prepare_token_and_wallets(
     stellar: &StellarSetup,
     main_wallet: &StellarWallet,
     solana_rpc_url: &str,
-    gas_stroops: u64,
+    gas_stroops: Stroops,
     sizing: &RunSizing,
 ) -> Result<([u8; 32], Vec<StellarWallet>, u128)> {
     let src = &args.source_chain;
@@ -245,7 +246,7 @@ async fn prepare_token_and_wallets(
             its_contract: stellar.its_addr.clone(),
             gateway_contract: stellar.gateway_addr.clone(),
             gas_token: stellar.xlm_addr.clone(),
-            gas_stroops: super::units::Stroops::new(gas_stroops),
+            gas_stroops,
             source_chain: src.clone(),
             destination_chain: dest.clone(),
             destination_axelar_id: args.destination_axelar_id.clone(),
@@ -319,7 +320,7 @@ async fn run_sustained_pipeline(
             destination_chain: args.destination_axelar_id.clone(),
             destination_address_bytes: solana.address_bytes.clone(),
             gas_token: stellar.xlm_addr.clone(),
-            gas_stroops: super::units::Stroops::new(transfer.gas_stroops),
+            gas_stroops: transfer.gas_stroops,
             amount_per_tx: transfer.amount_per_tx,
             axelarnet_gw_addr: transfer.axelarnet_gw_addr.clone(),
         },
@@ -368,7 +369,7 @@ async fn run_burst_pipeline(
             destination_chain: args.destination_axelar_id.clone(),
             destination_address_bytes: solana.address_bytes.clone(),
             gas_token: stellar.xlm_addr.clone(),
-            gas_stroops: super::units::Stroops::new(gas_stroops),
+            gas_stroops,
             amount_per_tx,
             axelarnet_gw_addr: transfer.axelarnet_gw_addr.clone(),
         },

@@ -17,9 +17,9 @@ use super::metrics::ComputeUnitSummary;
 use super::run_sizing::{RunMode, RunSizing as ValidatedRunSizing, SustainedPlan};
 use super::verification_session::VerificationSession;
 use super::verify::VerificationRoute;
-use super::{LoadTestArgs, check_evm_balance, read_its_cache, validate_evm_rpc};
+use super::{LoadTestArgs, check_evm_balance, validate_evm_rpc};
 use crate::config::ChainsConfig;
-use crate::evm::{ERC20, InterchainTokenService};
+use crate::evm::InterchainTokenService;
 use crate::ui;
 use alloy::{
     primitives::{Address, Bytes, FixedBytes, U256},
@@ -177,6 +177,18 @@ struct TokenIdentity {
     deploy_message_id: Option<String>,
 }
 
+impl From<(FixedBytes<32>, Address, Option<String>)> for TokenIdentity {
+    fn from(
+        (token_id, token_addr, deploy_message_id): (FixedBytes<32>, Address, Option<String>),
+    ) -> Self {
+        Self {
+            token_id,
+            token_addr,
+            deploy_message_id,
+        }
+    }
+}
+
 /// Parse the EVM private key, check the funding balance, and emit the
 /// matching UI line. Returns the signer plus the values derived from it
 /// (deployer address, main key bytes, RPC URL).
@@ -279,19 +291,12 @@ async fn resolve_or_deploy_token(
     sizing: &RunSizing,
 ) -> eyre::Result<TokenIdentity> {
     let src = &args.source_chain;
-    let dest = &args.destination_chain;
     let write_provider = ProviderBuilder::new()
         .wallet(evm_src.signer.clone())
         .connect_http(evm_src.rpc_url.parse()?);
     let its_service = InterchainTokenService::new(evm_targets.its_proxy_addr, &write_provider);
-
-    // Resolution order: --token-id → chains-config `contracts.AXE.tokenId`
-    // (only when the configured wallet holds enough AXE *and* the token is
-    // registered on Stellar) → local file cache → fresh deploy. Pre-registration
-    // via chains-config lets CI skip the source + remote deploy; a wallet with
-    // no AXE balance falls through to a fresh deploy (see reusable_config_axe).
     let needed = sizing.amount_per_tx * U256::from(sizing.num_keys);
-    let config_axe = match super::helpers::reusable_config_axe(
+    let config_token = super::helpers::reusable_config_axe(
         &args.config,
         src,
         evm_targets.its_proxy_addr,
@@ -299,110 +304,115 @@ async fn resolve_or_deploy_token(
         evm_src.deployer_address,
         needed,
     )
-    .await?
-    {
-        Some((tid, addr)) => match registered_stellar_token_address(stellar, tid).await? {
-            Some(stellar_token_addr) => Some((tid, addr, stellar_token_addr)),
-            None => {
-                ui::warn("chains-config AXE not registered on Stellar, deploying fresh...");
-                None
-            }
-        },
-        None => None,
-    };
+    .await?;
 
-    let (token_id, token_addr, deploy_message_id) = if let Some(ref tid) = args.token_id {
-        let token_id: FixedBytes<32> = tid.parse().map_err(|e| eyre!("invalid --token-id: {e}"))?;
-        let addr = its_service
-            .interchainTokenAddress(token_id)
-            .call()
-            .await
-            .map_err(|e| eyre!("failed to look up token address for {token_id}: {e}"))?;
-        let stellar_token_addr = require_registered_stellar_token(stellar, token_id).await?;
-        ui::kv("token ID (provided)", &format!("{token_id}"));
-        ui::address("token address", &format!("{addr}"));
-        ui::address("Stellar token", &stellar_token_addr);
-        (token_id, addr, None::<String>)
-    } else if let Some((tid, addr, stellar_token_addr)) = config_axe {
+    if let Some(token_id) = args.token_id.as_deref() {
+        return resolve_provided_token(token_id, stellar, &its_service).await;
+    }
+    if let Some((tid, addr, stellar_token_addr)) =
+        registered_config_token(stellar, config_token).await?
+    {
         ui::kv("token ID (chains-config)", &format!("{tid}"));
         ui::address("token address", &format!("{addr}"));
         ui::address("Stellar token", &stellar_token_addr);
-        (tid, addr, None::<String>)
-    } else {
-        let cache = read_its_cache(src, dest);
-        let cached = cache
-            .get("tokenId")
-            .and_then(|v| v.as_str())
-            .and_then(|tid| tid.parse::<FixedBytes<32>>().ok())
-            .zip(
-                cache
-                    .get("tokenAddress")
-                    .and_then(|v| v.as_str())
-                    .and_then(|a| a.parse::<Address>().ok()),
-            );
-        if let Some((tid, addr)) = cached {
-            let token = ERC20::new(addr, &write_provider);
-            let needed = sizing.amount_per_tx * U256::from(sizing.num_keys);
-            let balance = token
-                .balanceOf(evm_src.deployer_address)
-                .call()
-                .await
-                .unwrap_or_default();
-            if balance >= needed {
-                if let Some(stellar_token_addr) =
-                    registered_stellar_token_address(stellar, tid).await?
-                {
-                    ui::info(&format!("reusing cached ITS token: {addr}"));
-                    ui::kv("token ID (cached)", &format!("{tid}"));
-                    ui::address("Stellar token", &stellar_token_addr);
-                    (tid, addr, None)
-                } else {
-                    ui::warn("cached token is not registered on Stellar, deploying fresh...");
-                    super::its_evm_source::deploy_its_token(
-                        &write_provider,
-                        evm_targets.its_factory_addr,
-                        evm_src.deployer_address,
-                        dest,
-                        sizing.total_supply,
-                        src,
-                        gas_value,
-                    )
-                    .await?
-                }
-            } else {
-                ui::warn(&format!(
-                    "cached token has insufficient supply ({balance} < {needed}), deploying fresh..."
-                ));
-                super::its_evm_source::deploy_its_token(
-                    &write_provider,
-                    evm_targets.its_factory_addr,
-                    evm_src.deployer_address,
-                    dest,
-                    sizing.total_supply,
-                    src,
-                    gas_value,
-                )
-                .await?
-            }
-        } else {
-            super::its_evm_source::deploy_its_token(
-                &write_provider,
-                evm_targets.its_factory_addr,
-                evm_src.deployer_address,
-                dest,
-                sizing.total_supply,
-                src,
-                gas_value,
-            )
-            .await?
-        }
-    };
+        return Ok((tid, addr, None).into());
+    }
+    resolve_cached_or_deploy(
+        args,
+        evm_src,
+        evm_targets,
+        stellar,
+        gas_value,
+        sizing,
+        &write_provider,
+    )
+    .await
+}
 
-    Ok(TokenIdentity {
-        token_id,
-        token_addr,
-        deploy_message_id,
-    })
+async fn resolve_provided_token<P: Provider>(
+    value: &str,
+    stellar: &StellarTargets,
+    its_service: &InterchainTokenService::InterchainTokenServiceInstance<P>,
+) -> eyre::Result<TokenIdentity> {
+    let token_id: FixedBytes<32> = value
+        .parse()
+        .map_err(|e| eyre!("invalid --token-id: {e}"))?;
+    let token_addr = its_service
+        .interchainTokenAddress(token_id)
+        .call()
+        .await
+        .map_err(|e| eyre!("failed to look up token address for {token_id}: {e}"))?;
+    let stellar_token_addr = require_registered_stellar_token(stellar, token_id).await?;
+    ui::kv("token ID (provided)", &format!("{token_id}"));
+    ui::address("token address", &format!("{token_addr}"));
+    ui::address("Stellar token", &stellar_token_addr);
+    Ok((token_id, token_addr, None).into())
+}
+
+async fn registered_config_token(
+    stellar: &StellarTargets,
+    config_token: Option<(FixedBytes<32>, Address)>,
+) -> eyre::Result<Option<(FixedBytes<32>, Address, String)>> {
+    let Some((token_id, token_addr)) = config_token else {
+        return Ok(None);
+    };
+    let Some(stellar_token_addr) = registered_stellar_token_address(stellar, token_id).await?
+    else {
+        ui::warn("chains-config AXE not registered on Stellar, deploying fresh...");
+        return Ok(None);
+    };
+    Ok(Some((token_id, token_addr, stellar_token_addr)))
+}
+
+async fn resolve_cached_or_deploy<P: Provider>(
+    args: &LoadTestArgs,
+    evm_src: &EvmSourceContext,
+    evm_targets: &EvmTargets,
+    stellar: &StellarTargets,
+    gas_value: U256,
+    sizing: &RunSizing,
+    provider: &P,
+) -> eyre::Result<TokenIdentity> {
+    if let Some(cached) =
+        super::its_evm_source::cached_evm_token(&args.source_chain, &args.destination_chain)?
+    {
+        let needed = sizing.amount_per_tx * U256::from(sizing.num_keys);
+        let balance = super::its_evm_source::token_balance(
+            provider,
+            cached.token_address,
+            evm_src.deployer_address,
+        )
+        .await;
+        if balance >= needed {
+            if let Some(stellar_token_addr) =
+                registered_stellar_token_address(stellar, cached.token_id).await?
+            {
+                ui::info(&format!(
+                    "reusing cached ITS token: {}",
+                    cached.token_address
+                ));
+                ui::kv("token ID (cached)", &format!("{}", cached.token_id));
+                ui::address("Stellar token", &stellar_token_addr);
+                return Ok((cached.token_id, cached.token_address, None).into());
+            }
+            ui::warn("cached token is not registered on Stellar, deploying fresh...");
+        } else {
+            ui::warn(&format!(
+                "cached token has insufficient supply ({balance} < {needed}), deploying fresh..."
+            ));
+        }
+    }
+    Ok(super::its_evm_source::deploy_its_token(
+        provider,
+        evm_targets.its_factory_addr,
+        evm_src.deployer_address,
+        &args.destination_chain,
+        sizing.total_supply,
+        &args.source_chain,
+        gas_value,
+    )
+    .await?
+    .into())
 }
 
 async fn require_registered_stellar_token(
@@ -451,7 +461,7 @@ async fn derive_and_fund_signers(
         &funding_provider,
         &evm_src.signer,
         &derived,
-        gas_extra_per_key,
+        super::units::Wei::from_u128(gas_extra_per_key),
     )
     .await?;
     Ok(derived)

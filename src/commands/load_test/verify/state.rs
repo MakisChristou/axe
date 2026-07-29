@@ -43,8 +43,30 @@ impl Phase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum VerificationState {
     Active(Phase),
-    Succeeded { recovered_via_api: bool },
-    Failed { phase: Phase, reason: String },
+    Succeeded {
+        recovered_via_api: bool,
+    },
+    Failed {
+        phase: Phase,
+        failure: VerificationFailure,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum VerificationFailure {
+    #[cfg(test)]
+    Error(String),
+    TimedOut(String),
+}
+
+impl VerificationFailure {
+    fn reason(&self) -> &str {
+        match self {
+            #[cfg(test)]
+            Self::Error(reason) => reason,
+            Self::TimedOut(reason) => reason,
+        }
+    }
 }
 
 /// Fully-discovered ITS hub→destination leg. Keeping these fields together
@@ -238,12 +260,21 @@ impl PendingTx {
 
     /// Mark the tx failed. Ignored if it already reached a terminal state, so
     /// the first recorded reason wins.
+    #[cfg(test)]
     pub(super) fn fail(&mut self, reason: String) -> bool {
+        self.fail_with(VerificationFailure::Error(reason))
+    }
+
+    pub(super) fn time_out(&mut self, label: &str) -> bool {
+        self.fail_with(VerificationFailure::TimedOut(format!("{label}: timed out")))
+    }
+
+    fn fail_with(&mut self, failure: VerificationFailure) -> bool {
         let VerificationState::Active(phase) = self.state else {
             self.reject_transition("mark failed");
             return false;
         };
-        self.state = VerificationState::Failed { phase, reason };
+        self.state = VerificationState::Failed { phase, failure };
         true
     }
 
@@ -254,7 +285,9 @@ impl PendingTx {
             match &self.state {
                 VerificationState::Active(phase) => format!("in phase {phase:?}"),
                 VerificationState::Succeeded { .. } => "successful".to_string(),
-                VerificationState::Failed { reason, .. } => format!("failed ({reason})"),
+                VerificationState::Failed { failure, .. } => {
+                    format!("failed ({})", failure.reason())
+                }
             }
         ));
     }
@@ -265,9 +298,19 @@ impl PendingTx {
 
     pub(super) fn failure_reason(&self) -> Option<&str> {
         match &self.state {
-            VerificationState::Failed { reason, .. } => Some(reason),
+            VerificationState::Failed { failure, .. } => Some(failure.reason()),
             VerificationState::Active(_) | VerificationState::Succeeded { .. } => None,
         }
+    }
+
+    pub(super) fn is_timed_out(&self) -> bool {
+        matches!(
+            self.state,
+            VerificationState::Failed {
+                failure: VerificationFailure::TimedOut(_),
+                ..
+            }
+        )
     }
 
     pub(super) fn recovered_via_api(&self) -> bool {
@@ -506,12 +549,13 @@ mod tests {
     #[test]
     fn keeps_the_first_terminal_verdict() {
         let mut tx = pending(Phase::Approved);
-        assert!(tx.fail("approval: timed out".to_string()));
+        assert!(tx.time_out("approval"));
 
         assert!(!tx.succeed(true));
         assert!(!tx.transition_to(Phase::Executed));
         assert!(!tx.fail("something else".to_string()));
         assert_eq!(tx.failure_reason(), Some("approval: timed out"));
+        assert!(tx.is_timed_out());
     }
 
     #[test]

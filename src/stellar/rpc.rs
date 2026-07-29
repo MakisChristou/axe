@@ -118,14 +118,10 @@ impl StellarClient {
         match self.rpc.get_account(address).await {
             Ok(entry) => Ok(Some(entry.seq_num.0)),
             Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("not found")
-                    || msg.contains("NotFound")
-                    || msg.contains("Account not found")
-                {
+                if matches!(e, stellar_rpc_client::Error::NotFound(_, _)) {
                     Ok(None)
                 } else {
-                    Err(eyre!("get_account({address}) failed: {msg}"))
+                    Err(eyre!("get_account({address}) failed: {e}"))
                 }
             }
         }
@@ -215,14 +211,10 @@ impl StellarClient {
         match self.rpc.get_account(address).await {
             Ok(entry) => Ok(Some(entry.balance)),
             Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("not found")
-                    || msg.contains("NotFound")
-                    || msg.contains("Account not found")
-                {
+                if matches!(e, stellar_rpc_client::Error::NotFound(_, _)) {
                     Ok(None)
                 } else {
-                    Err(eyre!("get_account({address}) balance: {msg}"))
+                    Err(eyre!("get_account({address}) balance: {e}"))
                 }
             }
         }

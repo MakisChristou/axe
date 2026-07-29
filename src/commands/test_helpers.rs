@@ -37,6 +37,20 @@ impl CosmosTxContext<'_> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HubExecutionDisposition {
+    AlreadyExecuted,
+    Failed,
+}
+
+fn classify_hub_execution_error(error: &eyre::Report) -> HubExecutionDisposition {
+    if error.to_string().contains("already executed") {
+        HubExecutionDisposition::AlreadyExecuted
+    } else {
+        HubExecutionDisposition::Failed
+    }
+}
+
 /// Subset of the VotingVerifier `poll` query response read by
 /// `wait_for_poll_votes`. Numeric fields like `quorum` and the per-vote
 /// counts arrive as JSON strings (CosmWasm Uint128 encoding), so they're
@@ -356,8 +370,7 @@ pub async fn execute_on_axelarnet_gateway(
             ));
         }
         Err(e) => {
-            let msg = format!("{e}");
-            if msg.contains("already executed") {
+            if classify_hub_execution_error(&e) == HubExecutionDisposition::AlreadyExecuted {
                 ui::success(&format!(
                     "message already executed on hub by relayer — continuing to {destination_chain_label}"
                 ));

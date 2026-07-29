@@ -23,6 +23,51 @@ const MAINNET_FALLBACKS: &[&str] = &[
     "https://sui-mainnet-rpc.publicnode.com",
 ];
 
+#[derive(Debug, thiserror::Error)]
+enum SuiRpcError {
+    #[error("Sui RPC {endpoint} HTTP {status}: {body}")]
+    Http {
+        endpoint: String,
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    #[error("Sui RPC {endpoint} {method}: {payload}")]
+    Rpc {
+        endpoint: String,
+        method: String,
+        payload: Value,
+        message: String,
+    },
+    #[error("Sui RPC {endpoint} non-JSON: {source}")]
+    NonJson {
+        endpoint: String,
+        source: serde_json::Error,
+    },
+    #[error("Sui RPC {endpoint} body read failed: {source}")]
+    Body {
+        endpoint: String,
+        source: reqwest::Error,
+    },
+    #[error("Sui RPC {endpoint} request failed: {source}")]
+    Request {
+        endpoint: String,
+        source: reqwest::Error,
+    },
+    #[error("Sui RPC exhausted all endpoints")]
+    Exhausted,
+}
+
+impl SuiRpcError {
+    fn is_query_events_indexer_pending(&self) -> bool {
+        matches!(
+            self,
+            Self::Rpc { message, .. }
+                if message.contains("Could not find the referenced transaction events")
+                    && message.contains("TransactionDigest")
+        )
+    }
+}
+
 #[derive(Clone)]
 pub struct SuiClient {
     primary: String,
@@ -52,15 +97,25 @@ impl SuiClient {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
-                .expect("reqwest client build"),
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
     /// JSON-RPC call with silent fallback on transient failures.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        self.call_typed(method, params)
+            .await
+            .map_err(eyre::Report::new)
+    }
+
+    async fn call_typed(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> std::result::Result<Value, SuiRpcError> {
         let mut endpoints = vec![self.primary.clone()];
         endpoints.extend(self.fallbacks.iter().cloned());
-        let mut last_err: Option<eyre::Report> = None;
+        let mut last_err = None;
         for endpoint in &endpoints {
             let body = json!({
                 "jsonrpc": "2.0",
@@ -74,17 +129,26 @@ impl SuiClient {
                     match resp.text().await {
                         Ok(text) => {
                             if !status.is_success() {
-                                last_err = Some(eyre!(
-                                    "Sui RPC {endpoint} HTTP {status}: {}",
-                                    text.chars().take(300).collect::<String>()
-                                ));
+                                last_err = Some(SuiRpcError::Http {
+                                    endpoint: endpoint.clone(),
+                                    status,
+                                    body: text.chars().take(300).collect(),
+                                });
                                 continue;
                             }
                             match serde_json::from_str::<Value>(&text) {
                                 Ok(v) => {
                                     if let Some(err) = v.get("error") {
-                                        last_err =
-                                            Some(eyre!("Sui RPC {endpoint} {method}: {err}"));
+                                        last_err = Some(SuiRpcError::Rpc {
+                                            endpoint: endpoint.clone(),
+                                            method: method.to_string(),
+                                            payload: err.clone(),
+                                            message: err
+                                                .get("message")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or_default()
+                                                .to_string(),
+                                        });
                                         // RPC-level error usually applies on every endpoint.
                                         // But still try fallbacks for transient issues.
                                         continue;
@@ -92,24 +156,33 @@ impl SuiClient {
                                     return Ok(v.get("result").cloned().unwrap_or(Value::Null));
                                 }
                                 Err(e) => {
-                                    last_err = Some(eyre!("Sui RPC {endpoint} non-JSON: {e}"));
+                                    last_err = Some(SuiRpcError::NonJson {
+                                        endpoint: endpoint.clone(),
+                                        source: e,
+                                    });
                                     continue;
                                 }
                             }
                         }
                         Err(e) => {
-                            last_err = Some(eyre!("Sui RPC {endpoint} body read failed: {e}"));
+                            last_err = Some(SuiRpcError::Body {
+                                endpoint: endpoint.clone(),
+                                source: e,
+                            });
                             continue;
                         }
                     }
                 }
                 Err(e) => {
-                    last_err = Some(eyre!("Sui RPC {endpoint} request failed: {e}"));
+                    last_err = Some(SuiRpcError::Request {
+                        endpoint: endpoint.clone(),
+                        source: e,
+                    });
                     continue;
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| eyre!("Sui RPC exhausted all endpoints")))
+        Err(last_err.unwrap_or(SuiRpcError::Exhausted))
     }
 
     pub async fn get_chain_identifier(&self) -> Result<String> {
@@ -292,7 +365,7 @@ impl SuiClient {
         let mut cursor: Value = Value::Null;
         for _ in 0..MAX_PAGES {
             let r = match self
-                .call(
+                .call_typed(
                     "suix_queryEvents",
                     json!([
                         {"MoveEventType": move_event_type},
@@ -304,8 +377,8 @@ impl SuiClient {
                 .await
             {
                 Ok(result) => result,
-                Err(err) if is_query_events_indexer_pending(&err) => return Ok(false),
-                Err(err) => return Err(err),
+                Err(err) if err.is_query_events_indexer_pending() => return Ok(false),
+                Err(err) => return Err(eyre::Report::new(err)),
             };
             let arr = r
                 .get("data")
@@ -346,12 +419,6 @@ impl SuiClient {
         }
         Ok(false)
     }
-}
-
-fn is_query_events_indexer_pending(error: &eyre::Report) -> bool {
-    let message = error.to_string();
-    message.contains("Could not find the referenced transaction events")
-        && message.contains("TransactionDigest")
 }
 
 pub(super) fn owner_addr_hex(a: &SuiAddress) -> String {

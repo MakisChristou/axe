@@ -15,12 +15,35 @@ use super::run_sizing::{RunMode, RunSizing, SustainedPlan};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TxOutcome {
     Succeeded,
-    Failed(String),
+    Failed(TxFailure),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TxFailure {
+    reason: String,
+    kind: TxFailureKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TxFailureKind {
+    RateLimited,
+    Other,
+}
+
+impl TxFailure {
+    fn classified(reason: String) -> Self {
+        let kind = if reason.contains("429") {
+            TxFailureKind::RateLimited
+        } else {
+            TxFailureKind::Other
+        };
+        Self { reason, kind }
+    }
 }
 
 impl TxOutcome {
     pub(crate) fn failed(error: impl Into<String>) -> Self {
-        Self::Failed(error.into())
+        Self::Failed(TxFailure::classified(error.into()))
     }
 
     pub(crate) fn from_external(
@@ -31,7 +54,7 @@ impl TxOutcome {
         if success {
             Self::Succeeded
         } else {
-            Self::Failed(error.unwrap_or_else(|| fallback.into()))
+            Self::failed(error.unwrap_or_else(|| fallback.into()))
         }
     }
 
@@ -42,8 +65,18 @@ impl TxOutcome {
     fn error(&self) -> Option<&str> {
         match self {
             Self::Succeeded => None,
-            Self::Failed(error) => Some(error),
+            Self::Failed(failure) => Some(&failure.reason),
         }
+    }
+
+    fn is_rate_limited(&self) -> bool {
+        matches!(
+            self,
+            Self::Failed(TxFailure {
+                kind: TxFailureKind::RateLimited,
+                ..
+            })
+        )
     }
 }
 
@@ -73,7 +106,7 @@ impl<'de> Deserialize<'de> for TxOutcome {
         let fields = Fields::deserialize(deserializer)?;
         match (fields.success, fields.error) {
             (true, None) => Ok(Self::Succeeded),
-            (false, Some(error)) => Ok(Self::Failed(error)),
+            (false, Some(error)) => Ok(Self::failed(error)),
             (true, Some(_)) => Err(D::Error::custom(
                 "successful transaction cannot contain an error",
             )),
@@ -151,7 +184,7 @@ impl TxMetrics {
         submit_time_ms: u64,
         error: impl Into<String>,
     ) -> Self {
-        Self::from_outcome(signature, submit_time_ms, TxOutcome::Failed(error.into()))
+        Self::from_outcome(signature, submit_time_ms, TxOutcome::failed(error))
     }
 
     pub(crate) fn is_success(&self) -> bool {
@@ -162,15 +195,19 @@ impl TxMetrics {
         self.outcome.error()
     }
 
+    pub(crate) fn is_rate_limited(&self) -> bool {
+        self.outcome.is_rate_limited()
+    }
+
     pub(crate) fn mark_failed(&mut self, error: impl Into<String>) {
-        self.outcome = TxOutcome::Failed(error.into());
+        self.outcome = TxOutcome::failed(error);
     }
 
     /// Rewrite the failure reason in place, keeping the success/failure state
     /// intact. Used to scrub private RPC URLs out of upstream error strings.
     pub(crate) fn map_error(&mut self, rewrite: impl FnOnce(&str) -> String) {
-        if let TxOutcome::Failed(error) = &mut self.outcome {
-            *error = rewrite(error);
+        if let TxOutcome::Failed(failure) = &mut self.outcome {
+            failure.reason = rewrite(&failure.reason);
         }
     }
 }
@@ -426,6 +463,21 @@ pub struct PeakThroughput {
 pub struct FailureCategory {
     pub reason: String,
     pub count: u64,
+    #[serde(skip)]
+    pub(crate) kind: FailureCategoryKind,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(crate) enum FailureCategoryKind {
+    #[default]
+    Error,
+    TimedOut,
+}
+
+impl FailureCategory {
+    pub(crate) fn is_timed_out(&self) -> bool {
+        self.kind == FailureCategoryKind::TimedOut
+    }
 }
 
 #[cfg(test)]
@@ -438,7 +490,7 @@ mod tests {
         let outcome = if success {
             TxOutcome::Succeeded
         } else {
-            TxOutcome::Failed("test failure".to_string())
+            TxOutcome::failed("test failure")
         };
         TxMetrics {
             latency_ms,
@@ -531,10 +583,7 @@ mod tests {
         assert_eq!(failed_json["error"], "test failure");
 
         let round_trip: TxMetrics = serde_json::from_value(failed_json).unwrap();
-        assert_eq!(
-            round_trip.outcome,
-            TxOutcome::Failed("test failure".to_string())
-        );
+        assert_eq!(round_trip.outcome, TxOutcome::failed("test failure"));
     }
 
     #[test]
@@ -542,6 +591,19 @@ mod tests {
         let mut invalid = serde_json::to_value(metric(true, None, None)).unwrap();
         invalid["success"] = serde_json::Value::Bool(false);
         assert!(serde_json::from_value::<TxMetrics>(invalid).is_err());
+    }
+
+    #[test]
+    fn transaction_failure_classifies_rate_limits_at_the_boundary() {
+        let rate_limited = TxMetrics::failed("", 0, "HTTP 429: too many requests");
+        let ordinary = TxMetrics::failed("", 0, "execution reverted");
+
+        assert!(rate_limited.is_rate_limited());
+        assert!(!ordinary.is_rate_limited());
+
+        let round_trip: TxMetrics =
+            serde_json::from_value(serde_json::to_value(rate_limited).unwrap()).unwrap();
+        assert!(round_trip.is_rate_limited());
     }
 
     #[test]

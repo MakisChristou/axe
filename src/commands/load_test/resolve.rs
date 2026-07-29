@@ -7,8 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use eyre::{Result, WrapErr};
-use serde::Deserialize;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
 
 use super::TestType;
 use crate::ui;
@@ -30,6 +29,31 @@ struct ChainEntry {
     rpc: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct GmpCache {
+    #[serde(
+        rename = "senderReceiverAddress",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) sender_receiver_address: Option<String>,
+    #[serde(flatten)]
+    extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct ItsCache {
+    #[serde(rename = "tokenId", skip_serializing_if = "Option::is_none")]
+    pub(crate) token_id: Option<String>,
+    #[serde(rename = "tokenAddress", skip_serializing_if = "Option::is_none")]
+    pub(crate) token_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) salt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) mint: Option<String>,
+    #[serde(flatten)]
+    extra: HashMap<String, serde_json::Value>,
+}
+
 pub(crate) fn cache_path(axelar_id: &str) -> PathBuf {
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -37,15 +61,21 @@ pub(crate) fn cache_path(axelar_id: &str) -> PathBuf {
     data_dir.join(format!("load-test-{axelar_id}.json"))
 }
 
-pub(crate) fn read_cache(axelar_id: &str) -> serde_json::Value {
-    let path = cache_path(axelar_id);
-    std::fs::read_to_string(&path)
+fn read_json_cache<T>(path: &std::path::Path) -> T
+where
+    T: Default + serde::de::DeserializeOwned,
+{
+    std::fs::read_to_string(path)
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({}))
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default()
 }
 
-pub(crate) fn save_cache(axelar_id: &str, cache: &serde_json::Value) -> Result<()> {
+pub(crate) fn read_cache(axelar_id: &str) -> GmpCache {
+    read_json_cache(&cache_path(axelar_id))
+}
+
+pub(crate) fn save_cache(axelar_id: &str, cache: &GmpCache) -> Result<()> {
     let path = cache_path(axelar_id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -213,6 +243,51 @@ pub(crate) fn resolve_from_config(
 }
 
 /// Auto-detect source/destination chains for a known test type.
+fn detect_unique_source(
+    chains: &HashMap<String, ChainEntry>,
+    override_: Option<String>,
+    chain_type: &str,
+    skip_core: bool,
+    missing_label: &str,
+    multiple_label: &str,
+) -> Result<String> {
+    if let Some(source) = override_ {
+        return Ok(source);
+    }
+    let found = find_chains_by_type(chains, chain_type, skip_core);
+    match found.as_slice() {
+        [] => Err(eyre::eyre!("no {missing_label} chain found in config")),
+        [source] => {
+            ui::info(&format!("auto-detected source: {source}"));
+            Ok(source.clone())
+        }
+        _ => Err(eyre::eyre!(
+            "multiple {multiple_label} chains found: {}. Use --source-chain to pick one.",
+            found.join(", ")
+        )),
+    }
+}
+
+fn detect_first_destination(
+    chains: &HashMap<String, ChainEntry>,
+    override_: Option<String>,
+    chain_type: &str,
+    skip_core: bool,
+    missing_label: &str,
+) -> Result<String> {
+    if let Some(destination) = override_ {
+        return Ok(destination);
+    }
+    let found = find_chains_by_type(chains, chain_type, skip_core);
+    let destination = found
+        .first()
+        .ok_or_else(|| eyre::eyre!("no {missing_label} chain found in config"))?;
+    ui::info(&format!(
+        "auto-detected destination: {destination} (use --destination-chain to override)"
+    ));
+    Ok(destination.clone())
+}
+
 fn auto_detect_chains(
     chains: &HashMap<String, ChainEntry>,
     test_type: TestType,
@@ -221,75 +296,15 @@ fn auto_detect_chains(
 ) -> Result<(String, String)> {
     match test_type {
         TestType::SolToEvm => {
-            let source = match source_override {
-                Some(s) => s,
-                None => {
-                    let svm = find_chains_by_type(chains, "svm", false);
-                    match svm.len() {
-                        0 => return Err(eyre::eyre!("no SVM (Solana) chain found in config")),
-                        1 => {
-                            ui::info(&format!("auto-detected source: {}", svm[0]));
-                            svm[0].clone()
-                        }
-                        _ => {
-                            return Err(eyre::eyre!(
-                                "multiple SVM chains found: {}. Use --source-chain to pick one.",
-                                svm.join(", ")
-                            ));
-                        }
-                    }
-                }
-            };
-            let dest = match dest_override {
-                Some(d) => d,
-                None => {
-                    let evm = find_chains_by_type(chains, "evm", true);
-                    if evm.is_empty() {
-                        return Err(eyre::eyre!("no EVM chain found in config"));
-                    }
-                    ui::info(&format!(
-                        "auto-detected destination: {} (use --destination-chain to override)",
-                        evm[0]
-                    ));
-                    evm[0].clone()
-                }
-            };
+            let source =
+                detect_unique_source(chains, source_override, "svm", false, "SVM (Solana)", "SVM")?;
+            let dest = detect_first_destination(chains, dest_override, "evm", true, "EVM")?;
             Ok((source, dest))
         }
         TestType::EvmToSol => {
-            let source = match source_override {
-                Some(s) => s,
-                None => {
-                    let evm = find_chains_by_type(chains, "evm", true);
-                    match evm.len() {
-                        0 => return Err(eyre::eyre!("no EVM chain found in config")),
-                        1 => {
-                            ui::info(&format!("auto-detected source: {}", evm[0]));
-                            evm[0].clone()
-                        }
-                        _ => {
-                            return Err(eyre::eyre!(
-                                "multiple EVM chains found: {}. Use --source-chain to pick one.",
-                                evm.join(", ")
-                            ));
-                        }
-                    }
-                }
-            };
-            let dest = match dest_override {
-                Some(d) => d,
-                None => {
-                    let svm = find_chains_by_type(chains, "svm", false);
-                    if svm.is_empty() {
-                        return Err(eyre::eyre!("no SVM (Solana) chain found in config"));
-                    }
-                    ui::info(&format!(
-                        "auto-detected destination: {} (use --destination-chain to override)",
-                        svm[0]
-                    ));
-                    svm[0].clone()
-                }
-            };
+            let source = detect_unique_source(chains, source_override, "evm", true, "EVM", "EVM")?;
+            let dest =
+                detect_first_destination(chains, dest_override, "svm", false, "SVM (Solana)")?;
             Ok((source, dest))
         }
         TestType::EvmToEvm => {
@@ -324,17 +339,17 @@ fn auto_detect_chains(
             Ok((source, dest))
         }
         TestType::SolToSol => {
-            let source = match source_override {
-                Some(s) => s,
-                None => {
+            let source = source_override.map_or_else(
+                || {
                     let svm = find_chains_by_type(chains, "svm", false);
-                    if svm.is_empty() {
-                        return Err(eyre::eyre!("no SVM (Solana) chain found in config"));
-                    }
-                    ui::info(&format!("auto-detected source: {}", svm[0]));
-                    svm[0].clone()
-                }
-            };
+                    let source = svm
+                        .first()
+                        .ok_or_else(|| eyre::eyre!("no SVM (Solana) chain found in config"))?;
+                    ui::info(&format!("auto-detected source: {source}"));
+                    Ok::<_, eyre::Report>(source.clone())
+                },
+                Ok,
+            )?;
             let dest = match dest_override {
                 Some(d) => d,
                 None => {
@@ -349,75 +364,14 @@ fn auto_detect_chains(
             Ok((source, dest))
         }
         TestType::XrplToEvm => {
-            let source = match source_override {
-                Some(s) => s,
-                None => {
-                    let xrpl = find_chains_by_type(chains, "xrpl", false);
-                    match xrpl.len() {
-                        0 => return Err(eyre::eyre!("no XRPL chain found in config")),
-                        1 => {
-                            ui::info(&format!("auto-detected source: {}", xrpl[0]));
-                            xrpl[0].clone()
-                        }
-                        _ => {
-                            return Err(eyre::eyre!(
-                                "multiple XRPL chains found: {}. Use --source-chain to pick one.",
-                                xrpl.join(", ")
-                            ));
-                        }
-                    }
-                }
-            };
-            let dest = match dest_override {
-                Some(d) => d,
-                None => {
-                    let evm = find_chains_by_type(chains, "evm", true);
-                    if evm.is_empty() {
-                        return Err(eyre::eyre!("no EVM chain found in config"));
-                    }
-                    ui::info(&format!(
-                        "auto-detected destination: {} (use --destination-chain to override)",
-                        evm[0]
-                    ));
-                    evm[0].clone()
-                }
-            };
+            let source =
+                detect_unique_source(chains, source_override, "xrpl", false, "XRPL", "XRPL")?;
+            let dest = detect_first_destination(chains, dest_override, "evm", true, "EVM")?;
             Ok((source, dest))
         }
         TestType::EvmToXrpl => {
-            let source = match source_override {
-                Some(s) => s,
-                None => {
-                    let evm = find_chains_by_type(chains, "evm", true);
-                    match evm.len() {
-                        0 => return Err(eyre::eyre!("no EVM chain found in config")),
-                        1 => {
-                            ui::info(&format!("auto-detected source: {}", evm[0]));
-                            evm[0].clone()
-                        }
-                        _ => {
-                            return Err(eyre::eyre!(
-                                "multiple EVM chains found: {}. Use --source-chain to pick one.",
-                                evm.join(", ")
-                            ));
-                        }
-                    }
-                }
-            };
-            let dest = match dest_override {
-                Some(d) => d,
-                None => {
-                    let xrpl = find_chains_by_type(chains, "xrpl", false);
-                    if xrpl.is_empty() {
-                        return Err(eyre::eyre!("no XRPL chain found in config"));
-                    }
-                    ui::info(&format!(
-                        "auto-detected destination: {} (use --destination-chain to override)",
-                        xrpl[0]
-                    ));
-                    xrpl[0].clone()
-                }
-            };
+            let source = detect_unique_source(chains, source_override, "evm", true, "EVM", "EVM")?;
+            let dest = detect_first_destination(chains, dest_override, "xrpl", false, "XRPL")?;
             Ok((source, dest))
         }
         TestType::StellarToEvm
@@ -582,15 +536,11 @@ pub(crate) fn its_cache_path(src: &str, dst: &str) -> PathBuf {
     data_dir.join(format!("its-load-test-{src}-{dst}.json"))
 }
 
-pub(crate) fn read_its_cache(src: &str, dst: &str) -> serde_json::Value {
-    let path = its_cache_path(src, dst);
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({}))
+pub(crate) fn read_its_cache(src: &str, dst: &str) -> ItsCache {
+    read_json_cache(&its_cache_path(src, dst))
 }
 
-pub(crate) fn save_its_cache(src: &str, dst: &str, cache: &serde_json::Value) -> Result<()> {
+pub(crate) fn save_its_cache(src: &str, dst: &str, cache: &ItsCache) -> Result<()> {
     let path = its_cache_path(src, dst);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -619,17 +569,14 @@ pub(crate) fn find_cached_salt(token_id: &str) -> Option<String> {
         let Ok(text) = std::fs::read_to_string(entry.path()) else {
             continue;
         };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        let Ok(cache) = serde_json::from_str::<ItsCache>(&text) else {
             continue;
         };
-        let tid = v
-            .get("tokenId")
-            .and_then(|t| t.as_str())
-            .unwrap_or_default();
+        let tid = cache.token_id.as_deref().unwrap_or_default();
         if tid.trim_start_matches("0x").to_lowercase() == want
-            && let Some(salt) = v.get("salt").and_then(|s| s.as_str())
+            && let Some(salt) = cache.salt
         {
-            return Some(salt.to_string());
+            return Some(salt);
         }
     }
     None
@@ -644,4 +591,54 @@ pub(crate) fn detect_network_from_config(
     crate::types::Network::ALL
         .into_iter()
         .find(|network| name == network.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    fn cache_fixture(name: &str) -> PathBuf {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "axe-{name}-{}-{}.json",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn missing_cache_is_an_empty_object() {
+        let path = cache_fixture("missing-cache");
+
+        let cache: ItsCache = read_json_cache(&path);
+
+        assert!(cache.token_id.is_none());
+        assert!(cache.extra.is_empty());
+    }
+
+    #[test]
+    fn malformed_cache_preserves_empty_cache_fallback() {
+        let path = cache_fixture("malformed-cache");
+        std::fs::write(&path, "{").unwrap();
+
+        let cache = read_json_cache::<ItsCache>(&path);
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(cache.token_id.is_none());
+        assert!(cache.extra.is_empty());
+    }
+
+    #[test]
+    fn valid_cache_is_parsed() {
+        let path = cache_fixture("valid-cache");
+        std::fs::write(&path, r#"{"tokenId":"0x01","futureField":7}"#).unwrap();
+
+        let cache: ItsCache = read_json_cache(&path);
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(cache.token_id.as_deref(), Some("0x01"));
+        assert_eq!(cache.extra["futureField"], 7);
+    }
 }

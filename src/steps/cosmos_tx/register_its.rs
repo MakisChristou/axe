@@ -16,6 +16,48 @@ use crate::cosmos::{
 };
 use crate::ui;
 
+struct ItsHubRegistration {
+    hub_address: String,
+    governance_address: String,
+    edge_contract: String,
+    message_translator: String,
+}
+
+fn read_registration(ctx: &DeployContext) -> Result<ItsHubRegistration> {
+    let content = fs::read_to_string(&ctx.target_json)?;
+    let root: Value = serde_json::from_str(&content)?;
+    let edge_contract = root
+        .pointer(&format!(
+            "/chains/{}/contracts/InterchainTokenService/address",
+            ctx.axelar_id
+        ))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "no InterchainTokenService address for {} — run DeployInterchainTokenService first",
+                ctx.axelar_id
+            )
+        })?
+        .to_string();
+    let message_translator = root
+        .pointer("/axelar/contracts/ItsAbiTranslator/address")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| eyre::eyre!("no axelar.contracts.ItsAbiTranslator.address in target JSON"))?
+        .to_string();
+    Ok(ItsHubRegistration {
+        hub_address: read_axelar_contract_field(
+            &ctx.target_json,
+            "/axelar/contracts/InterchainTokenService/address",
+        )?,
+        governance_address: read_axelar_contract_field(
+            &ctx.target_json,
+            "/axelar/governanceAddress",
+        )?,
+        edge_contract,
+        message_translator,
+    })
+}
+
 pub(super) async fn run_register_its_on_hub(
     ctx: &mut DeployContext,
     tx: StepTxContext<'_>,
@@ -34,43 +76,14 @@ pub(super) async fn run_register_its_on_hub(
     } = tx;
     ui::info(&format!("registering {chain_axelar_id} on ITS Hub..."));
 
-    let its_hub_addr = read_axelar_contract_field(
-        &ctx.target_json,
-        "/axelar/contracts/InterchainTokenService/address",
-    )?;
-    let governance_address =
-        read_axelar_contract_field(&ctx.target_json, "/axelar/governanceAddress")?;
-
-    // Read the ITS edge contract (EVM proxy address) from target JSON
-    let content = fs::read_to_string(&ctx.target_json)?;
-    let root: Value = serde_json::from_str(&content)?;
-    let its_edge_contract = root
-        .pointer(&format!(
-            "/chains/{}/contracts/InterchainTokenService/address",
-            ctx.axelar_id
-        ))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            eyre::eyre!(
-                "no InterchainTokenService address for {} — run DeployInterchainTokenService first",
-                ctx.axelar_id
-            )
-        })?
-        .to_string();
-
-    // Read msg_translator (ItsAbiTranslator address)
-    let msg_translator = root
-        .pointer("/axelar/contracts/ItsAbiTranslator/address")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| eyre::eyre!("no axelar.contracts.ItsAbiTranslator.address in target JSON"))?
-        .to_string();
+    let registration = read_registration(ctx)?;
 
     let execute_msg = json!({
         "register_chains": {
             "chains": [{
                 "chain": chain_axelar_id,
-                "its_edge_contract": its_edge_contract,
-                "msg_translator": msg_translator,
+                "its_edge_contract": registration.edge_contract,
+                "msg_translator": registration.message_translator,
                 "truncation": {
                     "max_uint_bits": 256,
                     "max_decimals_when_truncating": 255
@@ -86,11 +99,11 @@ pub(super) async fn run_register_its_on_hub(
     ));
 
     let sender = if use_governance {
-        &governance_address
+        &registration.governance_address
     } else {
         axelar_address
     };
-    let inner_msg = build_execute_msg_any(sender, &its_hub_addr, &execute_msg)?;
+    let inner_msg = build_execute_msg_any(sender, &registration.hub_address, &execute_msg)?;
 
     let messages = if use_governance {
         let deposit_amount = read_axelar_contract_field(
@@ -100,7 +113,8 @@ pub(super) async fn run_register_its_on_hub(
         .unwrap_or_else(|_| DEFAULT_PROPOSAL_DEPOSIT_UAXL.to_string());
         let title = format!("Register {chain_axelar_id} on ITS Hub");
         let summary = format!(
-            "Register {chain_axelar_id} ITS edge contract ({its_edge_contract}) on InterchainTokenService Hub"
+            "Register {chain_axelar_id} ITS edge contract ({}) on InterchainTokenService Hub",
+            registration.edge_contract
         );
         vec![build_submit_proposal_any(
             axelar_address,

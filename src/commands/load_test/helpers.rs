@@ -19,11 +19,10 @@ use alloy::{
 use eyre::{Result, WrapErr};
 use owo_colors::OwoColorize;
 use serde::Deserialize;
-use serde_json::json;
 
-use super::metrics::{AmplifierTiming, LoadTestReport};
+use super::metrics::{AmplifierTiming, LoadTestReport, VerificationReport};
 use super::verify;
-use super::{LoadTestArgs, read_cache, save_cache};
+use super::{GmpCache, LoadTestArgs, read_cache, save_cache};
 use crate::config::ChainsConfig;
 use crate::evm::read_artifact_bytecode;
 use crate::ui;
@@ -100,7 +99,7 @@ async fn get_code_with_retry<P: Provider>(provider: &P, addr: Address) -> Result
 }
 
 pub(crate) async fn deploy_or_reuse_sender_receiver<R: Provider, W: Provider>(
-    cache: &serde_json::Value,
+    cache: &GmpCache,
     cache_key: &str,
     read_provider: &R,
     write_provider: &W,
@@ -108,7 +107,7 @@ pub(crate) async fn deploy_or_reuse_sender_receiver<R: Provider, W: Provider>(
     gas_service_addr: Address,
     label: &str,
 ) -> Result<Address> {
-    if let Some(addr_str) = cache.get("senderReceiverAddress").and_then(|v| v.as_str()) {
+    if let Some(addr_str) = cache.sender_receiver_address.as_deref() {
         let addr: Address = addr_str.parse()?;
         let code = get_code_with_retry(read_provider, addr).await?;
         let needs_redeploy = if code.is_empty() {
@@ -142,7 +141,7 @@ pub(crate) async fn deploy_or_reuse_sender_receiver<R: Provider, W: Provider>(
             let new_addr =
                 deploy_sender_receiver(write_provider, gateway_addr, gas_service_addr).await?;
             let mut cache = cache.clone();
-            cache["senderReceiverAddress"] = json!(format!("{new_addr}"));
+            cache.sender_receiver_address = Some(new_addr.to_string());
             save_cache(cache_key, &cache)?;
             Ok(new_addr)
         } else {
@@ -153,7 +152,7 @@ pub(crate) async fn deploy_or_reuse_sender_receiver<R: Provider, W: Provider>(
         ui::info(&format!("deploying SenderReceiver on {label} chain..."));
         let addr = deploy_sender_receiver(write_provider, gateway_addr, gas_service_addr).await?;
         let mut cache = cache.clone();
-        cache["senderReceiverAddress"] = json!(format!("{addr}"));
+        cache.sender_receiver_address = Some(addr.to_string());
         save_cache(cache_key, &cache)?;
         Ok(addr)
     }
@@ -372,7 +371,7 @@ async fn choose_deploy_artifact<P: alloy::providers::Provider>(
     code.extend_from_slice(&(gateway, gas_service).abi_encode_params());
     let probe = TransactionRequest::default().with_deploy_code(Bytes::from(code));
     match provider.call(probe).await {
-        Err(e) if is_unsupported_opcode(&e.to_string()) => {
+        Err(e) if is_unsupported_opcode(&e) => {
             ui::info("destination rejects PUSH0 (pre-Shanghai EVM); using paris bytecode...");
             Ok(PARIS)
         }
@@ -382,9 +381,43 @@ async fn choose_deploy_artifact<P: alloy::providers::Provider>(
 
 /// True if an error is a chain rejecting an opcode the bytecode uses (e.g.
 /// `PUSH0` on a pre-Shanghai EVM) — the signal to use the paris build.
-fn is_unsupported_opcode(err: &str) -> bool {
-    let s = err.to_lowercase();
-    s.contains("push0") || s.contains("invalid opcode")
+fn is_unsupported_opcode(error: &alloy::transports::TransportError) -> bool {
+    let Some(response) = error.as_error_resp() else {
+        return false;
+    };
+    let message = response.message.to_lowercase();
+    if message.contains("push0") || message.contains("invalid opcode") {
+        return true;
+    }
+    response.data.as_ref().is_some_and(|data| {
+        let data = data.get().to_lowercase();
+        data.contains("push0") || data.contains("invalid opcode")
+    })
+}
+
+fn is_retryable_evm_transport(error: &alloy::transports::TransportError) -> bool {
+    if error
+        .as_error_resp()
+        .is_some_and(|response| response.is_retry_err())
+    {
+        return true;
+    }
+    let Some(transport) = error.as_transport_err() else {
+        return false;
+    };
+    if transport.is_retry_err() {
+        return true;
+    }
+    if transport
+        .as_http_error()
+        .is_some_and(|http| matches!(http.status, 502..=504))
+    {
+        return true;
+    }
+    transport
+        .as_custom()
+        .and_then(|source| source.downcast_ref::<reqwest::Error>())
+        .is_some_and(|source| source.is_timeout() || source.is_connect())
 }
 
 /// Deploy the SenderReceiver from a specific bytecode artifact and return its
@@ -403,11 +436,11 @@ async fn deploy_with_artifact<P: alloy::providers::Provider>(
     // Wrap `send_transaction` with retry on transient transport / 5xx /
     // 429 errors — observed flakes on HL and Hedera mainnet RPCs where
     // the same submission succeeds on retry. Real reverts (insufficient
-    // funds, custom errors) skip the retry per `is_transient_default`.
+    // funds, custom errors) are typed RPC responses and skip the retry.
     let pending = crate::retry::retry_async(
         "deploy_sender_receiver.send_transaction",
         crate::retry::DEFAULT_ATTEMPTS,
-        crate::retry::is_transient_default,
+        is_retryable_evm_transport,
         || {
             let tx = fee_mode.apply(
                 TransactionRequest::default().with_deploy_code(Bytes::from(deploy_code.clone())),
@@ -470,6 +503,155 @@ fn print_pipeline_counts(report: &LoadTestReport) {
     println!("  pipeline         {}", parts.join("  "));
 }
 
+fn print_end_to_end_latency(verification: &VerificationReport) {
+    match (
+        verification.avg_executed_secs,
+        verification.min_executed_secs,
+        verification.max_executed_secs,
+    ) {
+        (Some(avg), Some(min), Some(max)) => {
+            println!("  end-to-end       avg {avg:.1}s │ min {min:.1}s │ max {max:.1}s");
+        }
+        (Some(avg), _, Some(max)) => println!("  end-to-end       avg {avg:.1}s │ max {max:.1}s"),
+        (Some(avg), _, _) => println!("  end-to-end       avg {avg:.1}s"),
+        _ => {}
+    }
+}
+
+fn print_latency_percentiles(report: &LoadTestReport) {
+    let mut latencies: Vec<f64> = report
+        .transactions
+        .iter()
+        .filter_map(|tx| tx.amplifier_timing.as_ref()?.executed_secs)
+        .collect();
+    latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    if !latencies.is_empty() {
+        let percentile = |p: f64| {
+            let index = ((latencies.len() as f64 * p) as usize).min(latencies.len() - 1);
+            latencies[index]
+        };
+        println!(
+            "  latency          p50 {:.1}s │ p90 {:.1}s │ p99 {:.1}s",
+            percentile(0.50),
+            percentile(0.90),
+            percentile(0.99),
+        );
+    }
+}
+
+fn print_verification_throughput(verification: &VerificationReport) {
+    let throughput = &verification.peak_throughput;
+    let rates = [
+        ("voted", throughput.voted_tps),
+        ("routed", throughput.routed_tps),
+        ("hub approved", throughput.hub_approved_tps),
+        ("approved", throughput.approved_tps),
+        ("executed", throughput.executed_tps),
+    ];
+    let rates = rates
+        .into_iter()
+        .filter_map(|(name, rate)| rate.map(|rate| (name, rate)))
+        .collect::<Vec<_>>();
+    if !rates.is_empty() {
+        println!("  throughput (sustained, tx/s)");
+        for (name, rate) in rates {
+            println!("    {name:<14} {rate:.1}");
+        }
+    }
+}
+
+fn print_verification_segments(report: &LoadTestReport, verification: &VerificationReport) {
+    let source = &report.source_chain;
+    let destination = &report.destination_chain;
+    let mut steps: Vec<(f64, &str, String)> = Vec::new();
+    if let Some(total) = report.avg_latency_ms.map(|millis| millis / 1000.0) {
+        steps.push((total, "confirm", format!("({source})")));
+    }
+    let pipeline_steps = [
+        (verification.avg_voted_secs, "voted", "(axelar)".to_string()),
+        (
+            verification.avg_routed_secs,
+            "routed",
+            "(axelar)".to_string(),
+        ),
+        (
+            verification.avg_hub_approved_secs,
+            "hub approved",
+            "(axelar hub)".to_string(),
+        ),
+        (
+            verification.avg_approved_secs,
+            "approved",
+            format!("({destination})"),
+        ),
+        (
+            verification.avg_executed_secs,
+            "executed",
+            format!("({destination})"),
+        ),
+    ];
+    steps.extend(
+        pipeline_steps
+            .into_iter()
+            .filter_map(|(total, name, location)| total.map(|total| (total, name, location))),
+    );
+    steps.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut previous = None;
+    let last = steps.len().saturating_sub(1);
+    for (index, (total, name, location)) in steps.into_iter().enumerate() {
+        let step = previous.map_or(total, |prior| total - prior);
+        let connector = if index == last { "└─" } else { "├─" };
+        println!(
+            "  {} step {step:.1}s │ total {total:.1}s  {}",
+            format!("{connector} {name:<13}").dimmed(),
+            location.dimmed(),
+        );
+        previous = Some(total);
+    }
+}
+
+fn print_verification_failures(verification: &VerificationReport) {
+    if verification.recovered_via_api > 0 {
+        println!();
+        println!(
+            "  recovered via GMP-API final check: {}",
+            verification.recovered_via_api
+        );
+    }
+    if verification.stuck > 0 {
+        let detail = verification
+            .stuck_at
+            .iter()
+            .map(|category| format!("{} at {}", category.count, category.reason))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!();
+        println!(
+            "  stuck            {}/{} ({:.1}%) — {detail}",
+            verification.stuck,
+            verification.total_verified,
+            if verification.total_verified > 0 {
+                verification.stuck as f64 / verification.total_verified as f64 * 100.0
+            } else {
+                0.0
+            },
+        );
+    }
+    println!(
+        "  failures         {}",
+        verification.failed - verification.stuck
+    );
+    for category in &verification.failure_reasons {
+        if !category.is_timed_out() {
+            println!(
+                "                   {} × {}",
+                category.count, category.reason
+            );
+        }
+    }
+}
+
 pub(crate) fn print_final_report(report: &LoadTestReport) {
     println!();
     println!(
@@ -498,167 +680,12 @@ pub(crate) fn print_final_report(report: &LoadTestReport) {
 
     if let Some(ref v) = report.verification {
         println!();
-
-        // Per-stage pipeline counts (computed from transaction records).
-        // Shown even when verification times out so partial progress is visible.
         print_pipeline_counts(report);
-
-        // End-to-end line
-        match (
-            v.avg_executed_secs,
-            v.min_executed_secs,
-            v.max_executed_secs,
-        ) {
-            (Some(avg), Some(min), Some(max)) => {
-                println!(
-                    "  end-to-end       avg {avg:.1}s \u{2502} min {min:.1}s \u{2502} max {max:.1}s"
-                );
-            }
-            (Some(avg), _, Some(max)) => {
-                println!("  end-to-end       avg {avg:.1}s \u{2502} max {max:.1}s");
-            }
-            (Some(avg), _, _) => {
-                println!("  end-to-end       avg {avg:.1}s");
-            }
-            _ => {}
-        }
-
-        // Sustained throughput per pipeline step (tx/s over each step's full span).
-        {
-            let p = &v.peak_throughput;
-            let mut parts = Vec::new();
-            if let Some(t) = p.voted_tps {
-                parts.push(("voted", t));
-            }
-            if let Some(t) = p.routed_tps {
-                parts.push(("routed", t));
-            }
-            if let Some(t) = p.hub_approved_tps {
-                parts.push(("hub approved", t));
-            }
-            if let Some(t) = p.approved_tps {
-                parts.push(("approved", t));
-            }
-            if let Some(t) = p.executed_tps {
-                parts.push(("executed", t));
-            }
-            if !parts.is_empty() {
-                println!("  throughput (sustained, tx/s)");
-                for (name, rate) in &parts {
-                    println!("    {name:<14} {rate:.1}");
-                }
-            }
-        }
-
-        // Latency percentiles (end-to-end, send → executed).
-        {
-            let mut latencies: Vec<f64> = report
-                .transactions
-                .iter()
-                .filter_map(|t| t.amplifier_timing.as_ref()?.executed_secs)
-                .collect();
-            latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let n = latencies.len();
-            if n > 0 {
-                let pct = |p: f64| -> f64 {
-                    let idx = ((n as f64 * p) as usize).min(n - 1);
-                    latencies[idx]
-                };
-                println!(
-                    "  latency          p50 {:.1}s │ p90 {:.1}s │ p99 {:.1}s",
-                    pct(0.50),
-                    pct(0.90),
-                    pct(0.99),
-                );
-            }
-        }
-
-        // Segment breakdown — show step duration + cumulative total.
-        // Each avg_*_secs value is cumulative from tx send. Step = current - previous.
-        // Steps are sorted by cumulative time so ITS hub_approved (which can precede
-        // routed) displays in the correct chronological order.
-        let src = &report.source_chain;
-        let dst = &report.destination_chain;
-
-        // Collect all available steps with their cumulative totals and labels.
-        let mut steps: Vec<(f64, &str, String)> = Vec::new();
-        if let Some(total) = report.avg_latency_ms.map(|ms| ms / 1000.0) {
-            steps.push((total, "confirm", format!("({src})")));
-        }
-        if let Some(total) = v.avg_voted_secs {
-            steps.push((total, "voted", "(axelar)".to_string()));
-        }
-        if let Some(total) = v.avg_routed_secs {
-            steps.push((total, "routed", "(axelar)".to_string()));
-        }
-        if let Some(total) = v.avg_hub_approved_secs {
-            steps.push((total, "hub approved", "(axelar hub)".to_string()));
-        }
-        if let Some(total) = v.avg_approved_secs {
-            steps.push((total, "approved", format!("({dst})")));
-        }
-        if let Some(total) = v.avg_executed_secs {
-            steps.push((total, "executed", format!("({dst})")));
-        }
-
-        // Sort by cumulative time so steps display in chronological order.
-        steps.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
-        let mut prev: Option<f64> = None;
-        for (i, (total, name, location)) in steps.iter().enumerate() {
-            let step = prev.map_or(*total, |p| total - p);
-            let is_last = i == steps.len() - 1;
-            let connector = if is_last {
-                "\u{2514}\u{2500}"
-            } else {
-                "\u{251c}\u{2500}"
-            };
-            println!(
-                "  {} step {step:.1}s \u{2502} total {total:.1}s  {}",
-                format!("{connector} {name:<13}").dimmed(),
-                location.dimmed(),
-            );
-            prev = Some(*total);
-        }
-
-        // Recovered via the final GMP-API check (executed on-chain despite a
-        // polling-loop timeout — counted as successful, surfaced distinctly).
-        if v.recovered_via_api > 0 {
-            println!();
-            println!(
-                "  recovered via GMP-API final check: {}",
-                v.recovered_via_api
-            );
-        }
-
-        // Stuck
-        if v.stuck > 0 {
-            let stuck_detail: Vec<String> = v
-                .stuck_at
-                .iter()
-                .map(|c| format!("{} at {}", c.count, c.reason))
-                .collect();
-            println!();
-            println!(
-                "  stuck            {}/{} ({:.1}%) \u{2014} {}",
-                v.stuck,
-                v.total_verified,
-                if v.total_verified > 0 {
-                    v.stuck as f64 / v.total_verified as f64 * 100.0
-                } else {
-                    0.0
-                },
-                stuck_detail.join(", "),
-            );
-        }
-
-        // Failures
-        println!("  failures         {}", v.failed - v.stuck,);
-        for cat in &v.failure_reasons {
-            if !cat.reason.contains("timed out") {
-                println!("                   {} \u{00d7} {}", cat.count, cat.reason);
-            }
-        }
+        print_end_to_end_latency(v);
+        print_verification_throughput(v);
+        print_latency_percentiles(report);
+        print_verification_segments(report, v);
+        print_verification_failures(v);
     }
     println!();
 }
@@ -745,10 +772,10 @@ pub(crate) async fn ensure_sender_receiver(
     rpc_url: &str,
     gateway_addr: Address,
     gas_service_addr: Address,
-    cache: serde_json::Value,
+    cache: GmpCache,
     evm_private_key: Option<&str>,
-) -> Result<(Address, impl Provider)> {
-    if let Some(addr_str) = cache.get("senderReceiverAddress").and_then(|v| v.as_str()) {
+) -> Result<(Address, impl Provider + use<>)> {
+    if let Some(addr_str) = cache.sender_receiver_address.as_deref() {
         let read_provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
         let addr: Address = addr_str.parse()?;
         let code = get_code_with_retry(&read_provider, addr).await?;
@@ -791,7 +818,7 @@ pub(crate) async fn ensure_sender_receiver(
         .connect_http(rpc_url.parse()?);
     let addr = deploy_sender_receiver(&write_provider, gateway_addr, gas_service_addr).await?;
     let mut cache = cache;
-    cache["senderReceiverAddress"] = json!(format!("{addr}"));
+    cache.sender_receiver_address = Some(addr.to_string());
     save_cache(&args.destination_chain, &cache)?;
     Ok((addr, write_provider))
 }

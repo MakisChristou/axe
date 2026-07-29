@@ -125,6 +125,38 @@ struct EvmActivityEntry {
     params: serde_json::Value,
 }
 
+fn print_contract_header(entry: &EvmContractEntry) {
+    let address = format!("{:x}", entry.address);
+    let short = format!("0x{}...{}", &address[..4], &address[36..]);
+    println!(
+        "\n{}",
+        format!(
+            "━━ {} ({}/{}) {} ━━",
+            entry.label, entry.network, entry.chain_name, short
+        )
+        .bold()
+    );
+}
+
+fn print_event_line(block: u64, event_name: &str, params: &str, transaction_hash: Option<&str>) {
+    let transaction = transaction_hash
+        .map(|hash| {
+            if hash.len() > 14 {
+                format!("{}...", &hash[..14])
+            } else {
+                hash.to_string()
+            }
+        })
+        .unwrap_or_default();
+    println!(
+        "  {} {:<42} {}  {}",
+        format!("blk {block}").dimmed(),
+        event_name.bold(),
+        params.dimmed(),
+        transaction.dimmed(),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
@@ -185,19 +217,7 @@ pub async fn run(
         };
 
         if !json_mode {
-            let addr_short = format!(
-                "0x{}...{}",
-                &format!("{:x}", entry.address)[..4],
-                &format!("{:x}", entry.address)[36..]
-            );
-            println!(
-                "\n{}",
-                format!(
-                    "━━ {} ({}/{}) {} ━━",
-                    entry.label, entry.network, entry.chain_name, addr_short
-                )
-                .bold()
-            );
+            print_contract_header(entry);
         }
 
         for log in &recent_logs {
@@ -229,24 +249,7 @@ pub async fn run(
             let params_json = params_to_json(&params);
 
             if !json_mode {
-                let tx_short = tx_hash
-                    .as_deref()
-                    .map(|h| {
-                        if h.len() > 14 {
-                            format!("{}...", &h[..14])
-                        } else {
-                            h.to_string()
-                        }
-                    })
-                    .unwrap_or_default();
-
-                println!(
-                    "  {} {:<42} {}  {}",
-                    format!("blk {block_num}").dimmed(),
-                    short_name.bold(),
-                    params_summary.dimmed(),
-                    tx_short.dimmed(),
-                );
+                print_event_line(block_num, short_name, &params_summary, tx_hash.as_deref());
             }
 
             all_entries.push(EvmActivityEntry {

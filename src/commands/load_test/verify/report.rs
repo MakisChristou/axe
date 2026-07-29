@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use super::state::{PendingTx, Phase};
 use crate::commands::load_test::metrics::{
-    AmplifierTiming, FailureCategory, PeakThroughput, TxMetrics, VerificationReport,
+    AmplifierTiming, FailureCategory, FailureCategoryKind, PeakThroughput, TxMetrics,
+    VerificationReport,
 };
 
 /// Compute peak throughput per pipeline step using 5-second sliding windows
@@ -82,7 +83,7 @@ pub(super) fn compute_verification_report(
 ) -> VerificationReport {
     let mut successful = 0u64;
     let mut failed = 0u64;
-    let mut failure_reasons: std::collections::HashMap<String, u64> =
+    let mut failure_reasons: std::collections::HashMap<(String, FailureCategoryKind), u64> =
         std::collections::HashMap::new();
     let mut stuck_count = 0u64;
     let mut stuck_phases: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
@@ -98,10 +99,17 @@ pub(super) fn compute_verification_report(
         if tx.is_failed() {
             failed += 1;
             if let Some(reason) = tx.failure_reason() {
-                *failure_reasons.entry(reason.to_string()).or_insert(0) += 1;
+                let kind = if tx.is_timed_out() {
+                    FailureCategoryKind::TimedOut
+                } else {
+                    FailureCategoryKind::Error
+                };
+                *failure_reasons
+                    .entry((reason.to_string(), kind))
+                    .or_insert(0) += 1;
 
                 // Categorize stuck txs by the phase they got stuck at
-                if reason.contains("timed out") {
+                if tx.is_timed_out() {
                     stuck_count += 1;
                     let phase = stuck_phase(tx);
                     *stuck_phases.entry(phase).or_insert(0) += 1;
@@ -121,12 +129,20 @@ pub(super) fn compute_verification_report(
 
     let failure_categories: Vec<FailureCategory> = failure_reasons
         .into_iter()
-        .map(|(reason, count)| FailureCategory { reason, count })
+        .map(|((reason, kind), count)| FailureCategory {
+            reason,
+            count,
+            kind,
+        })
         .collect();
 
     let stuck_at: Vec<FailureCategory> = stuck_phases
         .into_iter()
-        .map(|(reason, count)| FailureCategory { reason, count })
+        .map(|(reason, count)| FailureCategory {
+            reason,
+            count,
+            kind: FailureCategoryKind::TimedOut,
+        })
         .collect();
 
     let all_timings: Vec<&AmplifierTiming> = txs.iter().map(|t| &t.timing).collect();
@@ -178,13 +194,14 @@ pub(super) fn compute_verification_report(
 
 /// Determine which phase a timed-out tx got stuck at (the last phase it didn't complete).
 fn stuck_phase(tx: &PendingTx) -> String {
-    match tx.phase().expect("failed tx retains its last active phase") {
-        Phase::Voted => "voted".into(),
-        Phase::Routed => "routed".into(),
-        Phase::HubApproved => "hub approved".into(),
-        Phase::DiscoverSecondLeg => "second-leg discovery".into(),
-        Phase::Approved => "approved".into(),
-        Phase::Executed => "executed".into(),
+    match tx.phase() {
+        Some(Phase::Voted) => "voted".into(),
+        Some(Phase::Routed) => "routed".into(),
+        Some(Phase::HubApproved) => "hub approved".into(),
+        Some(Phase::DiscoverSecondLeg) => "second-leg discovery".into(),
+        Some(Phase::Approved) => "approved".into(),
+        Some(Phase::Executed) => "executed".into(),
+        None => "unknown".into(),
     }
 }
 

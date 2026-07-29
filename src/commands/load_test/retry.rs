@@ -17,15 +17,13 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = TxMetrics>,
 {
-    for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
+    let mut attempt = 0;
+    loop {
         let result = submit().await;
-        if result.is_success()
-            || attempt == MAX_RATE_LIMIT_RETRIES
-            || !result.error().is_some_and(|error| error.contains("429"))
-        {
+        if result.is_success() || attempt == MAX_RATE_LIMIT_RETRIES || !result.is_rate_limited() {
             return result;
         }
         tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+        attempt += 1;
     }
-    unreachable!("inclusive retry loop always returns on its final attempt")
 }

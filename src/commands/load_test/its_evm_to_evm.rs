@@ -19,7 +19,8 @@ use std::time::Instant;
 
 use super::its_evm_source::{
     self, EvmSource, EvmTokenRunSizing as RunSizing, ItsContracts, deploy_its_token,
-    derive_and_fund_keys, distribute_tokens, init_evm_source, resolve_its_contracts,
+    derive_and_fund_keys, distribute_tokens, hub_gas_extra_per_key, init_evm_source,
+    resolve_its_contracts,
 };
 use super::its_prerequisites::{self, GatewayRequirement};
 use super::its_verification;
@@ -28,9 +29,9 @@ use super::metrics::ComputeUnitSummary;
 use super::run_sizing::{RunMode, RunSizing as ValidatedRunSizing, SustainedPlan};
 use super::verification_session::VerificationSession;
 use super::verify::VerificationRoute;
-use super::{LoadTestArgs, read_its_cache, validate_evm_rpc};
+use super::{LoadTestArgs, validate_evm_rpc};
 use crate::config::ChainsConfig;
-use crate::evm::{ERC20, InterchainTokenService};
+use crate::evm::InterchainTokenService;
 use crate::ui;
 use alloy::{
     primitives::{Address, Bytes, FixedBytes, U256},
@@ -84,21 +85,7 @@ pub async fn run(
     )
     .await?;
 
-    // compute_run_sizing assumes 18 decimals (the EVM-source convention). For
-    // Hedera HTS-fork AXE the registered token is 6 decimals — 1e16 sub-units
-    // there is 10^10 AXE, way over wallet balance and rejected by the source
-    // burn. Rescale after we know the real on-chain decimals.
-    {
-        let read_provider = ProviderBuilder::new().connect_http(source_rpc_url.parse()?);
-        super::its_evm_source::rescale_sizing_for_decimals(
-            &mut sizing.amount_per_tx,
-            &mut sizing.amount_per_key,
-            &mut sizing.total_supply,
-            &read_provider,
-            token.token_addr,
-        )
-        .await?;
-    }
+    rescale_token_sizing(&mut sizing, &source_rpc_url, token.token_addr).await?;
 
     if let Some(ref deploy_msg_id) = token.deploy_message_id {
         // Use axelar IDs (not the config keys) — the ITS Hub records messages
@@ -121,7 +108,7 @@ pub async fn run(
         &evm_source.main_key,
         &source_rpc_url,
         sizing.num_keys,
-        hub_gas_extra_per_key(&sizing, gas_value_wei),
+        hub_gas_extra_per_key(&sizing, super::units::Wei::from_u128(gas_value_wei)),
         &args.source_axelar_id,
     )
     .await?;
@@ -167,11 +154,40 @@ pub async fn run(
     }
 }
 
+async fn rescale_token_sizing(
+    sizing: &mut RunSizing,
+    source_rpc_url: &str,
+    token: Address,
+) -> eyre::Result<()> {
+    let provider = ProviderBuilder::new().connect_http(source_rpc_url.parse()?);
+    super::its_evm_source::rescale_sizing_for_decimals(
+        &mut sizing.amount_per_tx,
+        &mut sizing.amount_per_key,
+        &mut sizing.total_supply,
+        &provider,
+        token,
+    )
+    .await
+    .map(|_| ())
+}
+
 /// Resolved interchain token: cached, user-supplied, or freshly deployed.
 struct TokenIdentity {
     token_id: FixedBytes<32>,
     token_addr: Address,
     deploy_message_id: Option<String>,
+}
+
+impl From<(FixedBytes<32>, Address, Option<String>)> for TokenIdentity {
+    fn from(
+        (token_id, token_addr, deploy_message_id): (FixedBytes<32>, Address, Option<String>),
+    ) -> Self {
+        Self {
+            token_id,
+            token_addr,
+            deploy_message_id,
+        }
+    }
 }
 
 /// Per-tx send parameters consumed by both the sustained and burst pipelines.
@@ -219,25 +235,9 @@ async fn resolve_or_deploy_token(
     gas_value: U256,
 ) -> eyre::Result<TokenIdentity> {
     let src = &args.source_chain;
-    let dest = &args.destination_chain;
-    // The ITS edge / hub identify the destination by its axelarId, which differs
-    // from the config key for consensus chains ("avalanche" key vs "Avalanche"
-    // axelarId). Passing the key to deployRemoteInterchainToken makes the source
-    // revert with `UntrustedChain()`, so the on-chain destination name must be
-    // the axelarId. (`dest` stays the key for cache/config lookups.)
-    let dest_its = args.destination_axelar_id.as_str();
     let write_provider = ProviderBuilder::new()
         .wallet(evm_source.signer.clone())
         .connect_http(evm_rpc_url.parse()?);
-
-    let its_service = InterchainTokenService::new(its.its_proxy_addr, &write_provider);
-
-    // Resolution order: --token-id → chains-config `contracts.AXE.tokenId`
-    // (only if the configured wallet actually holds enough of it) → local file
-    // cache → fresh deploy. The chains-config layer lets CI runs (whose wallet
-    // already holds the AXE supply) skip the source + remote deploy and
-    // collapse to a single interchainTransfer; a different wallet with no AXE
-    // balance falls through to a fresh deploy (see reusable_config_axe).
     let needed = sizing.amount_per_tx * U256::from(sizing.num_keys);
     let config_axe = super::helpers::reusable_config_axe(
         &args.config,
@@ -249,122 +249,115 @@ async fn resolve_or_deploy_token(
     )
     .await?;
 
-    let (token_id, token_addr, deploy_message_id) = if let Some(ref tid) = args.token_id {
-        let token_id: FixedBytes<32> = tid.parse().map_err(|e| eyre!("invalid --token-id: {e}"))?;
-        let addr = its_service
-            .interchainTokenAddress(token_id)
-            .call()
-            .await
-            .map_err(|e| eyre!("failed to look up token address for {token_id}: {e}"))?;
-        ui::kv("token ID (provided)", &format!("{token_id}"));
-        ui::address("token address", &format!("{addr}"));
-        // Reuse an existing token on a chain it isn't on yet: if the destination
-        // lacks this token, remote-deploy it there using the salt axe recorded
-        // when it first deployed the token (its local cache) — no fresh mint.
-        let dest_provider = ProviderBuilder::new().connect_http(dest_rpc_url.parse()?);
-        let dest_has_token = !dest_provider.get_code_at(addr).await?.is_empty();
-        let deploy_message_id = if dest_has_token {
-            None
-        } else {
-            let salt_hex = super::find_cached_salt(tid).ok_or_else(|| {
-                eyre!(
-                    "token {tid} is not registered on '{dest}' and no deploy salt is cached; \
-                     run an ITS test once from the token's home chain so axe records its salt"
-                )
-            })?;
-            let salt: FixedBytes<32> = salt_hex
-                .parse()
-                .map_err(|e| eyre!("cached salt for {tid} is invalid: {e}"))?;
-            let msg_id = super::its_evm_source::remote_deploy_existing_token(
-                &write_provider,
-                its.its_factory_addr,
-                salt,
-                dest_its,
-                gas_value,
-            )
-            .await?;
-            Some(msg_id)
-        };
-        (token_id, addr, deploy_message_id)
-    } else if let Some((tid, addr)) = config_axe {
+    if let Some(token_id) = args.token_id.as_deref() {
+        return resolve_provided_token(
+            args,
+            its,
+            token_id,
+            dest_rpc_url,
+            gas_value,
+            &write_provider,
+        )
+        .await;
+    }
+    if let Some((tid, addr)) = config_axe {
         ui::kv("token ID (chains-config)", &format!("{tid}"));
         ui::address("token address", &format!("{addr}"));
-        (tid, addr, None)
-    } else {
-        let cache = read_its_cache(src, dest);
-        let cached = cache
-            .get("tokenId")
-            .and_then(|v| v.as_str())
-            .and_then(|tid| tid.parse::<FixedBytes<32>>().ok())
-            .zip(
-                cache
-                    .get("tokenAddress")
-                    .and_then(|v| v.as_str())
-                    .and_then(|a| a.parse::<Address>().ok()),
-            );
+        return Ok((tid, addr, None).into());
+    }
+    resolve_cached_or_deploy(args, evm_source, its, sizing, gas_value, &write_provider).await
+}
 
-        if let Some((tid, addr)) = cached {
-            let token = ERC20::new(addr, &write_provider);
-            let needed = sizing.amount_per_tx * U256::from(sizing.num_keys);
-            let balance = token
-                .balanceOf(evm_source.deployer_address)
-                .call()
-                .await
-                .unwrap_or_default();
-            if balance >= needed {
-                ui::info(&format!("reusing cached ITS token: {addr}"));
-                ui::kv("token ID (cached)", &format!("{tid}"));
-                (tid, addr, None)
-            } else {
-                ui::warn(&format!(
-                    "cached token has insufficient supply ({balance} < {needed}), deploying fresh..."
-                ));
-                deploy_its_token(
-                    &write_provider,
-                    its.its_factory_addr,
-                    evm_source.deployer_address,
-                    dest_its,
-                    sizing.total_supply,
-                    src,
-                    gas_value,
-                )
-                .await?
-            }
-        } else {
-            deploy_its_token(
-                &write_provider,
-                its.its_factory_addr,
-                evm_source.deployer_address,
-                dest_its,
-                sizing.total_supply,
-                src,
-                gas_value,
-            )
-            .await?
+async fn resolve_provided_token<P: Provider>(
+    args: &LoadTestArgs,
+    its: &ItsContracts,
+    value: &str,
+    destination_rpc: &str,
+    gas_value: U256,
+    provider: &P,
+) -> eyre::Result<TokenIdentity> {
+    let token_id: FixedBytes<32> = value
+        .parse()
+        .map_err(|e| eyre!("invalid --token-id: {e}"))?;
+    let token_addr = InterchainTokenService::new(its.its_proxy_addr, provider)
+        .interchainTokenAddress(token_id)
+        .call()
+        .await
+        .map_err(|e| eyre!("failed to look up token address for {token_id}: {e}"))?;
+    ui::kv("token ID (provided)", &format!("{token_id}"));
+    ui::address("token address", &format!("{token_addr}"));
+
+    let destination = ProviderBuilder::new().connect_http(destination_rpc.parse()?);
+    if !destination.get_code_at(token_addr).await?.is_empty() {
+        return Ok((token_id, token_addr, None).into());
+    }
+    let salt_value = super::find_cached_salt(value).ok_or_else(|| {
+        eyre!(
+            "token {value} is not registered on '{}' and no deploy salt is cached; \
+             run an ITS test once from the token's home chain so axe records its salt",
+            args.destination_chain
+        )
+    })?;
+    let salt = salt_value
+        .parse()
+        .map_err(|e| eyre!("cached salt for {value} is invalid: {e}"))?;
+    let message_id = its_evm_source::remote_deploy_existing_token(
+        provider,
+        its.its_factory_addr,
+        salt,
+        &args.destination_axelar_id,
+        gas_value,
+    )
+    .await?;
+    Ok((token_id, token_addr, Some(message_id)).into())
+}
+
+async fn resolve_cached_or_deploy<P: Provider>(
+    args: &LoadTestArgs,
+    evm_source: &EvmSource,
+    its: &ItsContracts,
+    sizing: &RunSizing,
+    gas_value: U256,
+    provider: &P,
+) -> eyre::Result<TokenIdentity> {
+    if let Some(cached) =
+        its_evm_source::cached_evm_token(&args.source_chain, &args.destination_chain)?
+    {
+        let needed = sizing.amount_per_tx * U256::from(sizing.num_keys);
+        let balance = its_evm_source::token_balance(
+            provider,
+            cached.token_address,
+            evm_source.deployer_address,
+        )
+        .await;
+        if balance >= needed {
+            ui::info(&format!(
+                "reusing cached ITS token: {}",
+                cached.token_address
+            ));
+            ui::kv("token ID (cached)", &format!("{}", cached.token_id));
+            return Ok((cached.token_id, cached.token_address, None).into());
         }
-    };
-
-    Ok(TokenIdentity {
-        token_id,
-        token_addr,
-        deploy_message_id,
-    })
+        ui::warn(&format!(
+            "cached token has insufficient supply ({balance} < {needed}), deploying fresh..."
+        ));
+    }
+    Ok(deploy_its_token(
+        provider,
+        its.its_factory_addr,
+        evm_source.deployer_address,
+        &args.destination_axelar_id,
+        sizing.total_supply,
+        &args.source_chain,
+        gas_value,
+    )
+    .await?
+    .into())
 }
 
 /// Compute the per-key hub-gas funding amount for this run. Burst mode fires
 /// each key once; sustained mode fires each key `ceil(duration / key_cycle)`
 /// times with a 20% buffer.
-fn hub_gas_extra_per_key(sizing: &RunSizing, gas_value_wei: u128) -> u128 {
-    let hub_gas_value_wei = gas_value_wei.saturating_mul(2);
-    if sizing.is_burst() {
-        hub_gas_value_wei
-    } else {
-        let rounds = sizing.transactions_per_key();
-        let buffered = rounds + rounds / 5 + 1;
-        hub_gas_value_wei.saturating_mul(buffered as u128)
-    }
-}
-
 struct PipelineContext {
     args: LoadTestArgs,
     cfg: ChainsConfig,

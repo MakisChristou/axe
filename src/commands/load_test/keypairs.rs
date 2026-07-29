@@ -6,7 +6,7 @@ use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use anchor_lang::prelude::system_instruction;
 use eyre::{Result, eyre};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 use solana_client::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::{
@@ -16,6 +16,7 @@ use solana_sdk::{
     transaction::Transaction,
 };
 
+use super::units::{Lamports, Wei};
 use crate::ui;
 
 /// When a key drops below this balance, it gets topped up.
@@ -29,6 +30,14 @@ const FUNDING_RESERVE: u64 = 5_000_000;
 
 /// Solana transfer fee per transaction.
 const TRANSFER_FEE: u64 = 5_000;
+
+pub fn clone_keypair(keypair: &Keypair) -> Result<Keypair> {
+    let bytes = keypair.to_bytes();
+    let seed: [u8; 32] = bytes[..32]
+        .try_into()
+        .map_err(|_| eyre!("Solana keypair did not contain a 32-byte seed"))?;
+    Ok(Keypair::new_from_array(seed))
+}
 
 /// Deterministically derive `count` keypairs from a main keypair.
 ///
@@ -63,8 +72,7 @@ pub fn ensure_funded(rpc_url: &str, main: &Keypair, derived: &[Keypair]) -> Resu
 
     let check_pb = ProgressBar::new(derived.len() as u64);
     check_pb.set_style(
-        ProgressStyle::with_template("  {bar:40.cyan/dim} {pos}/{len} keys checked")
-            .unwrap()
+        ui::progress_bar_style("  {bar:40.cyan/dim} {pos}/{len} keys checked")
             .progress_chars("=> "),
     );
     for (i, kp) in derived.iter().enumerate() {
@@ -113,9 +121,7 @@ pub fn ensure_funded(rpc_url: &str, main: &Keypair, derived: &[Keypair]) -> Resu
 
     let pb = ProgressBar::new(to_fund.len() as u64);
     pb.set_style(
-        ProgressStyle::with_template("  {bar:40.cyan/dim} {pos}/{len} keys funded")
-            .unwrap()
-            .progress_chars("=> "),
+        ui::progress_bar_style("  {bar:40.cyan/dim} {pos}/{len} keys funded").progress_chars("=> "),
     );
 
     for (i, amount) in &to_fund {
@@ -142,9 +148,9 @@ pub fn ensure_funded_for_sustained(
     main: &Keypair,
     derived: &[Keypair],
     fires_per_key: u64,
-    gas_lamports: u64,
+    gas: Lamports,
 ) -> Result<Vec<u64>> {
-    let cost_per_tx = gas_lamports + TRANSFER_FEE; // gas + tx fee
+    let cost_per_tx = gas.get() + TRANSFER_FEE; // gas + tx fee
     let target = cost_per_tx
         .saturating_mul(fires_per_key)
         .max(TARGET_LAMPORTS_PER_KEY);
@@ -164,8 +170,7 @@ pub fn ensure_funded_for_sustained(
 
     let check_pb = ProgressBar::new(derived.len() as u64);
     check_pb.set_style(
-        ProgressStyle::with_template("  {bar:40.cyan/dim} {pos}/{len} keys checked")
-            .unwrap()
+        ui::progress_bar_style("  {bar:40.cyan/dim} {pos}/{len} keys checked")
             .progress_chars("=> "),
     );
     for (i, kp) in derived.iter().enumerate() {
@@ -213,9 +218,7 @@ pub fn ensure_funded_for_sustained(
 
     let pb = ProgressBar::new(to_fund.len() as u64);
     pb.set_style(
-        ProgressStyle::with_template("  {bar:40.cyan/dim} {pos}/{len} keys funded")
-            .unwrap()
-            .progress_chars("=> "),
+        ui::progress_bar_style("  {bar:40.cyan/dim} {pos}/{len} keys funded").progress_chars("=> "),
     );
 
     for (i, amount) in &to_fund {
@@ -284,8 +287,12 @@ pub async fn ensure_funded_evm_with_extra<P: Provider>(
     provider: &P,
     main_signer: &PrivateKeySigner,
     derived: &[PrivateKeySigner],
-    extra_wei: u128,
+    extra: Wei,
 ) -> Result<()> {
+    let extra_wei: u128 = extra
+        .as_u256()
+        .try_into()
+        .map_err(|_| eyre!("per-key EVM funding amount exceeds u128"))?;
     let min_needed = MIN_WEI_PER_KEY + extra_wei;
     let target = TARGET_WEI_PER_KEY + extra_wei;
 
@@ -293,8 +300,7 @@ pub async fn ensure_funded_evm_with_extra<P: Provider>(
 
     let check_pb = ProgressBar::new(derived.len() as u64);
     check_pb.set_style(
-        ProgressStyle::with_template("  {bar:40.cyan/dim} {pos}/{len} keys checked")
-            .unwrap()
+        ui::progress_bar_style("  {bar:40.cyan/dim} {pos}/{len} keys checked")
             .progress_chars("=> "),
     );
     for (i, signer) in derived.iter().enumerate() {
@@ -342,9 +348,7 @@ pub async fn ensure_funded_evm_with_extra<P: Provider>(
 
     let pb = ProgressBar::new(to_fund.len() as u64);
     pb.set_style(
-        ProgressStyle::with_template("  {bar:40.cyan/dim} {pos}/{len} keys funded")
-            .unwrap()
-            .progress_chars("=> "),
+        ui::progress_bar_style("  {bar:40.cyan/dim} {pos}/{len} keys funded").progress_chars("=> "),
     );
 
     // Legacy (pre-1559) chains break alloy's default fee estimation; send the
@@ -444,8 +448,7 @@ pub async fn ensure_funded_xrpl(
     let mut balances = Vec::with_capacity(derived.len());
     let check_pb = ProgressBar::new(derived.len() as u64);
     check_pb.set_style(
-        ProgressStyle::with_template("  {bar:40.cyan/dim} {pos}/{len} XRPL keys checked")
-            .unwrap()
+        ui::progress_bar_style("  {bar:40.cyan/dim} {pos}/{len} XRPL keys checked")
             .progress_chars("=> "),
     );
     for w in derived {
@@ -486,8 +489,7 @@ pub async fn ensure_funded_xrpl(
 
     let pb = ProgressBar::new(to_fund.len() as u64);
     pb.set_style(
-        ProgressStyle::with_template("  {bar:40.cyan/dim} {pos}/{len} XRPL keys funded")
-            .unwrap()
+        ui::progress_bar_style("  {bar:40.cyan/dim} {pos}/{len} XRPL keys funded")
             .progress_chars("=> "),
     );
 

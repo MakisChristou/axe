@@ -32,7 +32,7 @@ use alloy::{
     rpc::types::TransactionReceipt,
     signers::local::PrivateKeySigner,
 };
-use eyre::eyre;
+use eyre::{Result, eyre};
 
 use super::identifiers::TokenId;
 use super::keypairs;
@@ -40,7 +40,7 @@ use super::metrics::TxMetrics;
 use super::run_sizing::RunSizing;
 use super::submitter::TransactionSubmitter;
 use super::units::Wei;
-use super::{LoadTestArgs, check_evm_balance, save_its_cache};
+use super::{ItsCache, LoadTestArgs, check_evm_balance, read_its_cache, save_its_cache};
 use crate::commands::test_its::{
     extract_contract_call_event, extract_token_deployed_event, generate_salt,
 };
@@ -62,6 +62,23 @@ const EVM_RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 const TOKEN_NAME: &str = "AXE";
 const TOKEN_SYMBOL: &str = "AXE";
 const TOKEN_DECIMALS: u8 = 18;
+
+fn prior_attempt_may_have_landed(error: &alloy::contract::Error) -> bool {
+    let alloy::contract::Error::TransportError(transport) = error else {
+        return false;
+    };
+    let Some(response) = transport.as_error_resp() else {
+        return false;
+    };
+    let message = response.message.to_lowercase();
+    [
+        "nonce too low",
+        "already known",
+        "replacement transaction underpriced",
+    ]
+    .iter()
+    .any(|signature| message.contains(signature))
+}
 
 /// Validated run shape plus the shared token economics used by EVM-source
 /// ITS routes.
@@ -238,7 +255,7 @@ pub(super) async fn derive_and_fund_keys(
     main_key: &[u8; 32],
     evm_rpc_url: &str,
     num_keys: usize,
-    hub_gas_extra_per_key: u128,
+    hub_gas_extra_per_key: Wei,
     source_axelar_id: &str,
 ) -> eyre::Result<Vec<PrivateKeySigner>> {
     // Hedera quirk: a freshly funded EVM address auto-creates a Hedera
@@ -268,6 +285,61 @@ pub(super) async fn derive_and_fund_keys(
     .await?;
 
     Ok(derived)
+}
+
+/// Compute the per-key hub-gas funding amount for an EVM-source ITS run.
+pub(super) fn hub_gas_extra_per_key(sizing: &RunSizing, gas_value: Wei) -> Wei {
+    let hub_gas_value = gas_value.saturating_mul(2);
+    if sizing.is_burst() {
+        hub_gas_value
+    } else {
+        let rounds = sizing.transactions_per_key();
+        let buffered = rounds + rounds / 5 + 1;
+        hub_gas_value.saturating_mul(buffered)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct CachedEvmToken {
+    pub(super) token_id: FixedBytes<32>,
+    pub(super) token_address: Address,
+}
+
+pub(super) fn cached_evm_token(
+    source_chain: &str,
+    destination_chain: &str,
+) -> Result<Option<CachedEvmToken>> {
+    let cache = read_its_cache(source_chain, destination_chain);
+    let Some(token_id) = cache
+        .token_id
+        .as_deref()
+        .and_then(|value| value.parse().ok())
+    else {
+        return Ok(None);
+    };
+    let Some(token_address) = cache
+        .token_address
+        .as_deref()
+        .and_then(|value| value.parse().ok())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(CachedEvmToken {
+        token_id,
+        token_address,
+    }))
+}
+
+pub(super) async fn token_balance<P: Provider>(
+    provider: &P,
+    token_address: Address,
+    holder: Address,
+) -> U256 {
+    ERC20::new(token_address, provider)
+        .balanceOf(holder)
+        .call()
+        .await
+        .unwrap_or_default()
 }
 
 /// Deploy a new interchain token and its remote counterpart.
@@ -354,11 +426,10 @@ pub(super) async fn deploy_its_token<P: Provider>(
         Err(_) => None,
     };
 
-    let cache = serde_json::json!({
-        "tokenId": format!("{token_id}"),
-        "tokenAddress": format!("{token_addr}"),
-        "salt": format!("{salt}"),
-    });
+    let mut cache = ItsCache::default();
+    cache.token_id = Some(token_id.to_string());
+    cache.token_address = Some(token_addr.to_string());
+    cache.salt = Some(salt.to_string());
     save_its_cache(source_chain, dest_chain, &cache)?;
 
     super::helpers::hint_persist_axe_token(source_chain, &token_id);
@@ -713,18 +784,15 @@ pub(super) async fn execute_interchain_transfer<P: Provider>(
         let pending = match call.send().await {
             Ok(p) => p,
             Err(e) => {
-                let es = e.to_string();
                 // "nonce too low" / "already known" ⇒ a prior attempt actually
                 // landed; return its receipt instead of a spurious failure.
                 if let Some(h) = last_hash
-                    && (es.contains("nonce too low")
-                        || es.contains("already known")
-                        || es.contains("replacement transaction underpriced"))
+                    && prior_attempt_may_have_landed(&e)
                     && let Ok(Some(receipt)) = provider.get_transaction_receipt(h).await
                 {
                     return receipt_to_metrics(&receipt, h, its_proxy, submit_start);
                 }
-                return make_failure(submit_start, &es);
+                return make_failure(submit_start, &e.to_string());
             }
         };
 

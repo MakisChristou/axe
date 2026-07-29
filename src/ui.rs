@@ -54,14 +54,20 @@ pub fn address(label: &str, addr: &str) {
 /// Call `.finish_and_clear()` or `.finish_with_message()` when done.
 pub fn wait_spinner(msg: &str) -> ProgressBar {
     let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::with_template("  {spinner:.cyan} {msg}")
-            .unwrap()
-            .tick_strings(&["|", "/", "-", "\\", ""]),
-    );
+    if let Ok(style) = ProgressStyle::with_template("  {spinner:.cyan} {msg}") {
+        pb.set_style(style.tick_strings(&["|", "/", "-", "\\", ""]));
+    }
     pb.set_message(msg.to_string());
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
     pb
+}
+
+pub fn progress_spinner_style(template: &str) -> ProgressStyle {
+    ProgressStyle::with_template(template).unwrap_or_else(|_| ProgressStyle::default_spinner())
+}
+
+pub fn progress_bar_style(template: &str) -> ProgressStyle {
+    ProgressStyle::with_template(template).unwrap_or_else(|_| ProgressStyle::default_bar())
 }
 
 /// Print a key-value pair: "  key: value" with key dimmed

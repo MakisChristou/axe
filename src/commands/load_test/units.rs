@@ -10,6 +10,10 @@ use alloy::primitives::U256;
 pub(super) struct Wei(U256);
 
 impl Wei {
+    pub(super) const fn from_u128(value: u128) -> Self {
+        Self(U256::from_limbs([value as u64, (value >> 64) as u64, 0, 0]))
+    }
+
     pub(super) const fn from_u256(value: U256) -> Self {
         Self(value)
     }
@@ -35,6 +39,12 @@ macro_rules! u64_unit {
 
             pub(super) const fn get(self) -> u64 {
                 self.0
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(formatter)
             }
         }
     };

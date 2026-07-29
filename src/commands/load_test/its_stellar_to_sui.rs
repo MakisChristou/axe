@@ -42,6 +42,18 @@ const AMOUNT_PER_TX: u64 = 10_000_000;
 /// Solana destination variants.
 const DEFAULT_GAS_STROOPS: u64 = 100_000_000;
 
+fn parse_gas_stroops(value: Option<&str>) -> Result<super::units::Stroops> {
+    let gas = super::units::Stroops::new(match value {
+        Some(value) => value
+            .parse()
+            .map_err(|error| eyre!("invalid --gas-value: {error}"))?,
+        None => DEFAULT_GAS_STROOPS,
+    });
+    let gas_xlm = gas.get() as f64 / 10_000_000.0;
+    ui::kv("gas", &format!("{} stroops ({gas_xlm:.4} XLM)", gas.get()));
+    Ok(gas)
+}
+
 pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> Result<()> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
@@ -109,12 +121,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
     ui::address("Sui ITS channel (destination)", &sui_its_channel);
 
     // ----- Gas value -----
-    let gas_stroops: u64 = match &args.gas_value {
-        Some(v) => v.parse().map_err(|e| eyre!("invalid --gas-value: {e}"))?,
-        None => DEFAULT_GAS_STROOPS,
-    };
-    let gas_xlm = gas_stroops as f64 / 10_000_000.0;
-    ui::kv("gas", &format!("{gas_stroops} stroops ({gas_xlm:.4} XLM)"));
+    let gas_stroops = parse_gas_stroops(args.gas_value.as_deref())?;
 
     // ----- Send loop: burst (sequential N) or sustained (rate-paced) -----
     let total_to_send = sizing.total_expected;
@@ -143,7 +150,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
             destination_chain: args.destination_axelar_id.clone(),
             destination_address_bytes: sui_recipient_bytes,
             gas_token: xlm_addr,
-            gas_stroops: super::units::Stroops::new(gas_stroops),
+            gas_stroops,
             amount_per_tx: u128::from(AMOUNT_PER_TX),
             axelarnet_gw_addr: String::new(),
         },

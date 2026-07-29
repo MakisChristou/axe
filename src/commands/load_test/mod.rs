@@ -68,7 +68,7 @@ pub(super) use helpers::{
     sui_its_dest_lookup, validate_evm_rpc, validate_solana_rpc,
 };
 pub(super) use resolve::{
-    find_cached_salt, read_cache, read_its_cache, save_cache, save_its_cache,
+    GmpCache, ItsCache, find_cached_salt, read_cache, read_its_cache, save_cache, save_its_cache,
 };
 // `pub(crate)` (not `pub(super)`): cli::resolve_network also detects the
 // network from `--config` filenames.

@@ -140,6 +140,192 @@ fn vote_summary(votes: &[String]) -> String {
         .join(",")
 }
 
+fn vote_row_from_event(
+    transaction: &Value,
+    event: &Value,
+    verifier: &str,
+    voting_verifier: &str,
+) -> Option<VoteRow> {
+    if event.get("type").and_then(Value::as_str) != Some("wasm-voted") {
+        return None;
+    }
+    let mut poll_id = None;
+    let mut votes = None;
+    let mut voter = None;
+    let mut contract = None;
+    for attribute in event
+        .get("attributes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let key = attribute.get("key").and_then(Value::as_str).unwrap_or("");
+        let value = attribute.get("value").and_then(Value::as_str).unwrap_or("");
+        match key {
+            "poll_id" => poll_id = Some(value.trim_matches('"').to_string()),
+            "votes" => votes = serde_json::from_str::<Vec<String>>(value).ok(),
+            "voter" => voter = Some(value),
+            "_contract_address" => contract = Some(value),
+            _ => {}
+        }
+    }
+    if voter != Some(verifier) || contract != Some(voting_verifier) {
+        return None;
+    }
+    Some(VoteRow {
+        height: transaction
+            .get("height")
+            .and_then(Value::as_str)
+            .and_then(|height| height.parse().ok())
+            .unwrap_or(0),
+        tx_hash: transaction
+            .get("hash")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        poll_id: poll_id?,
+        votes: votes.unwrap_or_default(),
+    })
+}
+
+async fn query_vote_rows(
+    rpc: &str,
+    verifier: &str,
+    voting_verifier: &str,
+    limit: usize,
+) -> Result<Vec<VoteRow>> {
+    let filter = format!(
+        "wasm-voted.voter='{verifier}' AND wasm-voted._contract_address='{voting_verifier}'"
+    );
+    let spinner = ui::wait_spinner("querying tx_search...");
+    let mut rows = Vec::new();
+    'pages: for page in 1..=20u32 {
+        let result = rpc_tx_search(rpc, &filter, 100, page, true).await?;
+        let transactions = result
+            .get("txs")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if transactions.is_empty() {
+            break;
+        }
+        for transaction in &transactions {
+            for event in transaction
+                .pointer("/tx_result/events")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(row) =
+                    vote_row_from_event(transaction, event, verifier, voting_verifier)
+                {
+                    rows.push(row);
+                    if rows.len() >= limit {
+                        break 'pages;
+                    }
+                }
+            }
+        }
+        if transactions.len() < 100 {
+            break;
+        }
+    }
+    spinner.finish_and_clear();
+    Ok(rows)
+}
+
+async fn fetch_block_timestamps(
+    rpc: &str,
+    rows: &[VoteRow],
+) -> std::collections::HashMap<u64, String> {
+    let mut timestamps = std::collections::HashMap::new();
+    let mut heights: Vec<u64> = rows.iter().map(|row| row.height).collect();
+    heights.sort_unstable();
+    heights.dedup();
+    let spinner = ui::wait_spinner("fetching block timestamps...");
+    for height in heights.into_iter().take(60) {
+        if let Ok(timestamp) = rpc_block_time(rpc, height).await {
+            timestamps.insert(height, timestamp);
+        }
+    }
+    spinner.finish_and_clear();
+    timestamps
+}
+
+fn print_json_votes(
+    verifier: &str,
+    display_name: Option<&str>,
+    voting_verifier: &str,
+    chain: &str,
+    rows: &[VoteRow],
+    timestamps: &std::collections::HashMap<u64, String>,
+) -> Result<()> {
+    let entries = json!({
+        "verifier": verifier,
+        "name": display_name,
+        "voting_verifier": voting_verifier,
+        "chain": chain,
+        "votes": rows.iter().map(|row| {
+            json!({
+                "height": row.height,
+                "tx_hash": row.tx_hash,
+                "time": timestamps.get(&row.height).cloned().unwrap_or_default(),
+                "poll_id": row.poll_id,
+                "votes": row.votes,
+                "summary": vote_summary(&row.votes),
+            })
+        }).collect::<Vec<_>>(),
+    });
+    println!("{}", serde_json::to_string_pretty(&entries)?);
+    Ok(())
+}
+
+fn print_vote_table(
+    verifier_display: &str,
+    voting_verifier: &str,
+    chain: &str,
+    limit: usize,
+    rows: &[VoteRow],
+    timestamps: &std::collections::HashMap<u64, String>,
+) {
+    let mut table = Table::new();
+    table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_header(vec!["#", "Height", "When", "Poll", "#Msgs", "Vote"]);
+    for (index, row) in rows.iter().enumerate() {
+        let when = timestamps
+            .get(&row.height)
+            .map(|timestamp| relative_time(timestamp))
+            .unwrap_or_else(|| "-".to_string());
+        table.add_row(vec![
+            Cell::new(index + 1),
+            Cell::new(row.height),
+            Cell::new(when),
+            Cell::new(&row.poll_id),
+            Cell::new(row.votes.len()),
+            Cell::new(vote_summary(&row.votes)),
+        ]);
+    }
+    println!("\n{table}\n");
+    let all_yes = rows
+        .iter()
+        .filter(|row| row.votes.iter().all(|vote| vote == "succeeded_on_chain"))
+        .count();
+    ui::kv("verifier", verifier_display);
+    ui::kv("voting-verifier", &format!("{voting_verifier} ({chain})"));
+    ui::kv(
+        "showing",
+        &format!("{} most recent votes (limit={limit})", rows.len()),
+    );
+    ui::kv(
+        "summary",
+        &format!(
+            "{all_yes} all-yes, {} contained any non-yes",
+            rows.len() - all_yes
+        ),
+    );
+}
+
 pub async fn run(
     network: crate::types::Network,
     chain: String,
@@ -181,90 +367,7 @@ pub async fn run(
         ));
     }
 
-    // Walk pages of wasm-voted events for this voter on this voting-verifier.
-    let filter = format!(
-        "wasm-voted.voter='{}' AND wasm-voted._contract_address='{}'",
-        verifier, vv_addr
-    );
-
-    let spinner = ui::wait_spinner("querying tx_search...");
-    let mut rows: Vec<VoteRow> = Vec::new();
-    'outer: for page in 1..=20u32 {
-        let res = rpc_tx_search(&rpc, &filter, 100, page, true).await?;
-        let txs = res.get("txs").and_then(|v| v.as_array()).cloned();
-        let txs = match txs {
-            Some(t) if !t.is_empty() => t,
-            _ => break,
-        };
-        for t in &txs {
-            let height: u64 = t
-                .get("height")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            let hash = t
-                .get("hash")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let events = t
-                .pointer("/tx_result/events")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            for e in &events {
-                if e.get("type").and_then(|v| v.as_str()) != Some("wasm-voted") {
-                    continue;
-                }
-                let attrs = e
-                    .get("attributes")
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                let mut poll_id: Option<String> = None;
-                let mut votes_str: Option<String> = None;
-                let mut voter: Option<String> = None;
-                let mut contract_addr: Option<String> = None;
-                for a in &attrs {
-                    let key = a.get("key").and_then(|v| v.as_str()).unwrap_or("");
-                    let val = a.get("value").and_then(|v| v.as_str()).unwrap_or("");
-                    match key {
-                        "poll_id" => poll_id = Some(val.trim_matches('"').to_string()),
-                        "votes" => votes_str = Some(val.to_string()),
-                        "voter" => voter = Some(val.to_string()),
-                        "_contract_address" => contract_addr = Some(val.to_string()),
-                        _ => {}
-                    }
-                }
-                if voter.as_deref() != Some(verifier.as_str()) {
-                    continue;
-                }
-                if contract_addr.as_deref() != Some(vv_addr.as_str()) {
-                    continue;
-                }
-                let votes: Vec<String> = votes_str
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
-                    .unwrap_or_default();
-                if let Some(pid) = poll_id {
-                    rows.push(VoteRow {
-                        height,
-                        tx_hash: hash.clone(),
-                        poll_id: pid,
-                        votes,
-                    });
-                    if rows.len() >= limit {
-                        break 'outer;
-                    }
-                }
-            }
-        }
-        if txs.len() < 100 {
-            break;
-        }
-    }
-    spinner.finish_and_clear();
-
+    let rows = query_vote_rows(&rpc, &verifier, &vv_addr, limit).await?;
     if rows.is_empty() {
         return Err(eyre::eyre!(
             "no wasm-voted events found for {} on {} (voting-verifier {}).",
@@ -274,89 +377,25 @@ pub async fn run(
         ));
     }
 
-    // Best-effort: fetch one block timestamp per unique height. Cap to avoid abuse.
-    let mut timestamps = std::collections::HashMap::<u64, String>::new();
-    let mut heights: Vec<u64> = rows.iter().map(|r| r.height).collect();
-    heights.sort();
-    heights.dedup();
-    let spinner = ui::wait_spinner("fetching block timestamps...");
-    for h in heights.iter().take(60) {
-        if let Ok(t) = rpc_block_time(&rpc, *h).await {
-            timestamps.insert(*h, t);
-        }
-    }
-    spinner.finish_and_clear();
+    let timestamps = fetch_block_timestamps(&rpc, &rows).await;
 
     if json_mode {
-        let entries = json!({
-            "verifier": verifier,
-            "name": display_name,
-            "voting_verifier": vv_addr,
-            "chain": chain_axelar_id,
-            "votes": rows
-                .iter()
-                .map(|r| {
-                    json!({
-                        "height": r.height,
-                        "tx_hash": r.tx_hash,
-                        "time": timestamps.get(&r.height).cloned().unwrap_or_default(),
-                        "poll_id": r.poll_id,
-                        "votes": r.votes,
-                        "summary": vote_summary(&r.votes),
-                    })
-                })
-                .collect::<Vec<_>>(),
-        });
-        println!("{}", serde_json::to_string_pretty(&entries)?);
-        return Ok(());
+        return print_json_votes(
+            &verifier,
+            display_name,
+            &vv_addr,
+            &chain_axelar_id,
+            &rows,
+            &timestamps,
+        );
     }
-
-    let mut table = Table::new();
-    table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
-    table.set_content_arrangement(ContentArrangement::Dynamic);
-    table.set_header(vec![
-        Cell::new("#"),
-        Cell::new("Height"),
-        Cell::new("When"),
-        Cell::new("Poll"),
-        Cell::new("#Msgs"),
-        Cell::new("Vote"),
-    ]);
-    let mut row_num = 0usize;
-    for r in &rows {
-        row_num += 1;
-        let when = timestamps
-            .get(&r.height)
-            .map(|s| relative_time(s))
-            .unwrap_or_else(|| "-".to_string());
-        table.add_row(vec![
-            Cell::new(row_num),
-            Cell::new(r.height),
-            Cell::new(when),
-            Cell::new(&r.poll_id),
-            Cell::new(r.votes.len()),
-            Cell::new(vote_summary(&r.votes)),
-        ]);
-    }
-    println!();
-    println!("{table}");
-
-    let yes = rows
-        .iter()
-        .filter(|r| r.votes.iter().all(|v| v == "succeeded_on_chain"))
-        .count();
-    let nos = rows.len() - yes;
-    println!();
-    ui::kv("verifier", &verifier_display);
-    ui::kv("voting-verifier", &format!("{vv_addr} ({chain_axelar_id})"));
-    ui::kv(
-        "showing",
-        &format!("{} most recent votes (limit={})", rows.len(), limit),
+    print_vote_table(
+        &verifier_display,
+        &vv_addr,
+        &chain_axelar_id,
+        limit,
+        &rows,
+        &timestamps,
     );
-    ui::kv(
-        "summary",
-        &format!("{yes} all-yes, {nos} contained any non-yes"),
-    );
-
     Ok(())
 }

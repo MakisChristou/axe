@@ -235,49 +235,32 @@ pub struct InterchainTransferRequest<'a> {
     pub gas_value: u64,
 }
 
-pub fn send_its_interchain_transfer(
-    request: InterchainTransferRequest<'_>,
-) -> Result<(String, TxMetrics)> {
-    let InterchainTransferRequest {
-        rpc_url,
-        keypair,
-        network,
-        token_id,
-        source_account,
-        mint,
-        destination_chain,
-        destination_address,
-        amount,
-        gas_value,
-    } = request;
-    let submit_start = Instant::now();
-    let rpc_client = rpc_client(rpc_url);
-    let fee_payer = keypair.pubkey();
-    let its_id = network.solana_its_id();
-
-    let (its_root_pda, _) = find_its_root_pda(network);
-    let (token_manager_pda, _) = find_token_manager_pda(network, &its_root_pda, token_id);
-
+fn build_interchain_transfer_instruction(
+    request: &InterchainTransferRequest<'_>,
+    fee_payer: Pubkey,
+) -> Instruction {
+    let its_id = request.network.solana_its_id();
+    let (its_root_pda, _) = find_its_root_pda(request.network);
+    let (token_manager_pda, _) =
+        find_token_manager_pda(request.network, &its_root_pda, request.token_id);
     let token_program = Pubkey::from_str_const("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
-    let token_manager_ata = get_associated_token_address(&token_manager_pda, mint, &token_program);
-
-    let gateway_program = network.solana_gateway_id();
+    let token_manager_ata =
+        get_associated_token_address(&token_manager_pda, request.mint, &token_program);
+    let gateway_program = request.network.solana_gateway_id();
     let (gateway_root_pda, _) = Pubkey::find_program_address(&[b"gateway"], &gateway_program);
     let (call_contract_signing_pda, _) =
         Pubkey::find_program_address(&[b"gtw-call-contract"], &its_id);
     let (gateway_event_authority, _) =
         Pubkey::find_program_address(&[b"__event_authority"], &gateway_program);
-
-    let gas_service_program = network.solana_gas_service_id();
+    let gas_service_program = request.network.solana_gas_service_id();
     let (gas_treasury, _) = Pubkey::find_program_address(&[b"gas-service"], &gas_service_program);
     let (gas_event_authority, _) =
         Pubkey::find_program_address(&[b"__event_authority"], &gas_service_program);
-
     let (event_authority, _) = Pubkey::find_program_address(&[b"__event_authority"], &its_id);
 
     let accounts = vec![
         AccountMeta::new(fee_payer, true),
-        AccountMeta::new_readonly(fee_payer, true), // authority = fee_payer
+        AccountMeta::new_readonly(fee_payer, true),
         AccountMeta::new_readonly(gateway_root_pda, false),
         AccountMeta::new_readonly(gateway_event_authority, false),
         AccountMeta::new_readonly(gateway_program, false),
@@ -288,8 +271,8 @@ pub fn send_its_interchain_transfer(
         AccountMeta::new_readonly(its_root_pda, false),
         AccountMeta::new(token_manager_pda, false),
         AccountMeta::new_readonly(token_program, false),
-        AccountMeta::new(*mint, false),
-        AccountMeta::new(*source_account, false),
+        AccountMeta::new(*request.mint, false),
+        AccountMeta::new(*request.source_account, false),
         AccountMeta::new(token_manager_ata, false),
         AccountMeta::new_readonly(
             Pubkey::from_str_const("11111111111111111111111111111111"),
@@ -298,24 +281,60 @@ pub fn send_its_interchain_transfer(
         AccountMeta::new_readonly(event_authority, false),
         AccountMeta::new_readonly(its_id, false),
     ];
-
-    let ix_data = solana_axelar_its::instruction::InterchainTransfer {
-        token_id: *token_id,
-        destination_chain: destination_chain.to_string(),
-        destination_address: destination_address.to_vec(),
-        amount,
-        gas_value,
+    let data = solana_axelar_its::instruction::InterchainTransfer {
+        token_id: *request.token_id,
+        destination_chain: request.destination_chain.to_string(),
+        destination_address: request.destination_address.to_vec(),
+        amount: request.amount,
+        gas_value: request.gas_value,
         caller_program_id: None,
         caller_pda_seeds: None,
         data: None,
     }
     .data();
-
-    let ix = Instruction {
+    Instruction {
         program_id: its_id,
         accounts,
-        data: ix_data,
-    };
+        data,
+    }
+}
+
+fn simulation_diagnostics(
+    rpc_client: &solana_client::rpc_client::RpcClient,
+    transaction: &Transaction,
+) -> String {
+    match rpc_client.simulate_transaction(transaction) {
+        Ok(simulation) => {
+            let logs = simulation.value.logs.unwrap_or_default();
+            let header = match simulation.value.err {
+                Some(error) => format!("simulation error: {error:?}"),
+                None => "simulation succeeded but submit failed".to_string(),
+            };
+            if logs.is_empty() {
+                header
+            } else {
+                let body = logs
+                    .iter()
+                    .map(|line| format!("    {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("{header}\n  program logs:\n{body}")
+            }
+        }
+        Err(error) => format!("simulate_transaction follow-up failed: {error}"),
+    }
+}
+
+pub fn send_its_interchain_transfer(
+    request: InterchainTransferRequest<'_>,
+) -> Result<(String, TxMetrics)> {
+    let InterchainTransferRequest {
+        rpc_url, keypair, ..
+    } = request;
+    let submit_start = Instant::now();
+    let rpc_client = rpc_client(rpc_url);
+    let fee_payer = keypair.pubkey();
+    let ix = build_interchain_transfer_instruction(&request, fee_payer);
 
     let blockhash = rpc_client.get_latest_blockhash()?;
     let message = Message::new_with_blockhash(&[ix], Some(&fee_payer), &blockhash);
@@ -327,30 +346,7 @@ pub fn send_its_interchain_transfer(
     let signature = match rpc_client.send_and_confirm_transaction(&transaction) {
         Ok(sig) => sig,
         Err(send_err) => {
-            // Pre-flight rejected the tx — re-run simulate to capture the
-            // program logs the original error swallows. This makes
-            // diagnostics actionable instead of "Program failed to complete; N".
-            let log_dump = match rpc_client.simulate_transaction(&transaction) {
-                Ok(sim) => {
-                    let v = sim.value;
-                    let logs = v.logs.unwrap_or_default();
-                    let header = match v.err {
-                        Some(e) => format!("simulation error: {e:?}"),
-                        None => "simulation succeeded but submit failed".to_string(),
-                    };
-                    if logs.is_empty() {
-                        header
-                    } else {
-                        let body = logs
-                            .iter()
-                            .map(|l| format!("    {l}"))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        format!("{header}\n  program logs:\n{body}")
-                    }
-                }
-                Err(sim_err) => format!("simulate_transaction follow-up failed: {sim_err}"),
-            };
+            let log_dump = simulation_diagnostics(&rpc_client, &transaction);
             return Err(eyre::eyre!("{send_err}\n  ↳ {log_dump}"));
         }
     };

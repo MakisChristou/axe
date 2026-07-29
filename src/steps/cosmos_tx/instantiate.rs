@@ -20,237 +20,229 @@ use crate::evm::get_salt_from_key;
 use crate::ui;
 use crate::utils::compute_domain_separator;
 
-pub(super) async fn run_instantiate(ctx: &mut DeployContext, tx: StepTxContext<'_>) -> Result<()> {
-    let StepTxContext {
-        signing_key,
-        axelar_address,
-        lcd,
-        chain_id,
-        fee_denom,
-        gas_price,
-        use_governance,
-        chain_axelar_id,
-        env,
-        proposal_key,
-    } = tx;
-    ui::info(&format!(
-        "instantiating chain contracts for {chain_axelar_id}..."
-    ));
+struct ChainContractAddresses {
+    coordinator: String,
+    rewards: String,
+    multisig: String,
+    codec: String,
+    governance: String,
+}
 
-    let coordinator_addr =
-        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Coordinator/address")?;
-    let rewards_addr =
-        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Rewards/address")?;
-    let multisig_addr =
-        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Multisig/address")?;
-    let _router_addr =
-        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Router/address")?;
-    let chain_codec_addr =
-        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/ChainCodecEvm/address")?;
-    let governance_address =
-        read_axelar_contract_field(&ctx.target_json, "/axelar/governanceAddress")?;
+struct ChainCodeIds {
+    gateway: u64,
+    verifier: u64,
+    prover: u64,
+}
 
+struct InstantiatePlan {
+    execute_msg: Value,
+    deployment_name: String,
+    salt_key: String,
+    domain_separator: String,
+    contract_admin: &'static str,
+    codes: ChainCodeIds,
+}
+
+fn read_chain_contract_addresses(ctx: &DeployContext) -> Result<ChainContractAddresses> {
+    read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Router/address")?;
+    Ok(ChainContractAddresses {
+        coordinator: read_axelar_contract_field(
+            &ctx.target_json,
+            "/axelar/contracts/Coordinator/address",
+        )?,
+        rewards: read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Rewards/address")?,
+        multisig: read_axelar_contract_field(
+            &ctx.target_json,
+            "/axelar/contracts/Multisig/address",
+        )?,
+        codec: read_axelar_contract_field(
+            &ctx.target_json,
+            "/axelar/contracts/ChainCodecEvm/address",
+        )?,
+        governance: read_axelar_contract_field(&ctx.target_json, "/axelar/governanceAddress")?,
+    })
+}
+
+async fn fetch_chain_code_ids(ctx: &DeployContext, lcd: &str) -> Result<ChainCodeIds> {
     ui::info("fetching code IDs...");
-    let gateway_hash = read_axelar_contract_field(
-        &ctx.target_json,
-        "/axelar/contracts/Gateway/storeCodeProposalCodeHash",
-    )?;
-    let verifier_hash = read_axelar_contract_field(
-        &ctx.target_json,
-        "/axelar/contracts/VotingVerifier/storeCodeProposalCodeHash",
-    )?;
-    let prover_hash = read_axelar_contract_field(
-        &ctx.target_json,
-        "/axelar/contracts/MultisigProver/storeCodeProposalCodeHash",
-    )?;
-
-    let gateway_code_id = lcd_fetch_code_id(lcd, &gateway_hash).await?;
-    let verifier_code_id = lcd_fetch_code_id(lcd, &verifier_hash).await?;
-    let prover_code_id = lcd_fetch_code_id(lcd, &prover_hash).await?;
+    let hash = |contract| {
+        read_axelar_contract_field(
+            &ctx.target_json,
+            &format!("/axelar/contracts/{contract}/storeCodeProposalCodeHash"),
+        )
+    };
+    let gateway = lcd_fetch_code_id(lcd, &hash("Gateway")?).await?;
+    let verifier = lcd_fetch_code_id(lcd, &hash("VotingVerifier")?).await?;
+    let prover = lcd_fetch_code_id(lcd, &hash("MultisigProver")?).await?;
     ui::kv(
         "code IDs",
-        &format!("gateway={gateway_code_id}, verifier={verifier_code_id}, prover={prover_code_id}"),
+        &format!("gateway={gateway}, verifier={verifier}, prover={prover}"),
     );
+    Ok(ChainCodeIds {
+        gateway,
+        verifier,
+        prover,
+    })
+}
 
-    let content = fs::read_to_string(&ctx.target_json)?;
-    let root: Value = serde_json::from_str(&content)?;
-    let vv_config = root
-        .pointer(&format!(
-            "/axelar/contracts/VotingVerifier/{chain_axelar_id}"
-        ))
-        .ok_or_else(|| eyre::eyre!("no VotingVerifier.{chain_axelar_id} config"))?;
-    let mp_config = root
-        .pointer(&format!(
-            "/axelar/contracts/MultisigProver/{chain_axelar_id}"
-        ))
-        .ok_or_else(|| eyre::eyre!("no MultisigProver.{chain_axelar_id} config"))?;
-
-    let salt_key = ctx.state.cosm_salt.clone();
-    let salt_bytes = get_salt_from_key(&salt_key);
-    let salt_b64 = base64::engine::general_purpose::STANDARD.encode(salt_bytes.as_slice());
-
-    let domain_separator = compute_domain_separator(&ctx.target_json, &ctx.axelar_id)?;
-    let domain_sep_hex = alloy::hex::encode(domain_separator.as_slice());
-
-    let contract_admin = match env {
+fn contract_admin(env: &str) -> &'static str {
+    match env {
         "devnet-amplifier" => "axelar1zlr7e5qf3sz7yf890rkh9tcnu87234k6k7ytd9",
         "testnet" => "axelar1wxej3l9aczsns3harrtdzk7rct29jl47tvu8mp",
         "mainnet" => "axelar1nctnr9x0qexemeld5w7w752rmqdsqqv92dw9am",
         _ => "axelar12qvsvse32cjyw60ztysd3v655aj5urqeup82ky",
+    }
+}
+
+fn build_instantiate_plan(
+    ctx: &DeployContext,
+    tx: &StepTxContext<'_>,
+    addresses: &ChainContractAddresses,
+    codes: ChainCodeIds,
+) -> Result<InstantiatePlan> {
+    let root: Value = serde_json::from_str(&fs::read_to_string(&ctx.target_json)?)?;
+    let verifier = root
+        .pointer(&format!(
+            "/axelar/contracts/VotingVerifier/{}",
+            tx.chain_axelar_id
+        ))
+        .ok_or_else(|| eyre::eyre!("no VotingVerifier.{} config", tx.chain_axelar_id))?;
+    let prover = root
+        .pointer(&format!(
+            "/axelar/contracts/MultisigProver/{}",
+            tx.chain_axelar_id
+        ))
+        .ok_or_else(|| eyre::eyre!("no MultisigProver.{} config", tx.chain_axelar_id))?;
+    let salt_key = ctx.state.cosm_salt.clone();
+    let salt =
+        base64::engine::general_purpose::STANDARD.encode(get_salt_from_key(&salt_key).as_slice());
+    let domain_separator =
+        alloy::hex::encode(compute_domain_separator(&ctx.target_json, &ctx.axelar_id)?.as_slice());
+    let admin = contract_admin(tx.env);
+    let deployment_name = format!(
+        "{}-{}-{}-{}",
+        tx.chain_axelar_id, codes.gateway, codes.verifier, codes.prover
+    );
+    let admin_address = match tx.env {
+        "testnet" => "axelar1w7y7v26rtnrj4vrx6q3qq4hfsmc68hhsxnadlf",
+        _ => prover
+            .get("adminAddress")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                eyre::eyre!("no adminAddress in MultisigProver config for {}", tx.env)
+            })?,
     };
-
-    let deployment_name =
-        format!("{chain_axelar_id}-{gateway_code_id}-{verifier_code_id}-{prover_code_id}");
-
     let execute_msg = json!({
         "instantiate_chain_contracts": {
             "deployment_name": deployment_name,
-            "salt": salt_b64,
-            "params": {
-                "manual": {
-                    "gateway": {
-                        "code_id": gateway_code_id,
-                        "label": format!("Gateway-{chain_axelar_id}"),
-                        "msg": null,
-                        "contract_admin": contract_admin
+            "salt": salt,
+            "params": { "manual": {
+                "gateway": {
+                    "code_id": codes.gateway,
+                    "label": format!("Gateway-{}", tx.chain_axelar_id),
+                    "msg": null,
+                    "contract_admin": admin
+                },
+                "verifier": {
+                    "code_id": codes.verifier,
+                    "label": format!("VotingVerifier-{}", tx.chain_axelar_id),
+                    "msg": {
+                        "governance_address": verifier["governanceAddress"],
+                        "service_name": verifier["serviceName"],
+                        "source_gateway_address": verifier["sourceGatewayAddress"],
+                        "voting_threshold": verifier["votingThreshold"],
+                        "block_expiry": verifier["blockExpiry"].as_u64().unwrap_or(DEFAULT_VV_BLOCK_EXPIRY).to_string(),
+                        "confirmation_height": verifier["confirmationHeight"],
+                        "source_chain": tx.chain_axelar_id,
+                        "rewards_address": addresses.rewards,
+                        "msg_id_format": verifier["msgIdFormat"],
+                        "chain_codec_address": addresses.codec,
+                        "address_format": verifier["addressFormat"]
                     },
-                    "verifier": {
-                        "code_id": verifier_code_id,
-                        "label": format!("VotingVerifier-{chain_axelar_id}"),
-                        "msg": {
-                            "governance_address": vv_config["governanceAddress"],
-                            "service_name": vv_config["serviceName"],
-                            "source_gateway_address": vv_config["sourceGatewayAddress"],
-                            "voting_threshold": vv_config["votingThreshold"],
-                            "block_expiry": vv_config["blockExpiry"].as_u64().unwrap_or(DEFAULT_VV_BLOCK_EXPIRY).to_string(),
-                            "confirmation_height": vv_config["confirmationHeight"],
-                            "source_chain": chain_axelar_id,
-                            "rewards_address": rewards_addr,
-                            "msg_id_format": vv_config["msgIdFormat"],
-                            "chain_codec_address": chain_codec_addr,
-                            "address_format": vv_config["addressFormat"]
-                        },
-                        "contract_admin": contract_admin
+                    "contract_admin": admin
+                },
+                "prover": {
+                    "code_id": codes.prover,
+                    "label": format!("MultisigProver-{}", tx.chain_axelar_id),
+                    "msg": {
+                        "governance_address": prover["governanceAddress"],
+                        "admin_address": admin_address,
+                        "multisig_address": addresses.multisig,
+                        "signing_threshold": prover["signingThreshold"],
+                        "service_name": prover["serviceName"],
+                        "chain_name": tx.chain_axelar_id,
+                        "verifier_set_diff_threshold": prover["verifierSetDiffThreshold"],
+                        "key_type": prover["keyType"],
+                        "domain_separator": domain_separator,
+                        "notify_signing_session": false,
+                        "expect_full_message_payloads": false,
+                        "sig_verifier_address": null,
+                        "chain_codec_address": addresses.codec
                     },
-                    "prover": {
-                        "code_id": prover_code_id,
-                        "label": format!("MultisigProver-{chain_axelar_id}"),
-                        "msg": {
-                            "governance_address": mp_config["governanceAddress"],
-                            "admin_address": match env {
-                                "testnet" => "axelar1w7y7v26rtnrj4vrx6q3qq4hfsmc68hhsxnadlf",
-                                _ => mp_config.get("adminAddress").and_then(|v| v.as_str())
-                                    .ok_or_else(|| eyre::eyre!("no adminAddress in MultisigProver config for {env}"))?,
-                            },
-                            "multisig_address": multisig_addr,
-                            "signing_threshold": mp_config["signingThreshold"],
-                            "service_name": mp_config["serviceName"],
-                            "chain_name": chain_axelar_id,
-                            "verifier_set_diff_threshold": mp_config["verifierSetDiffThreshold"],
-                            "key_type": mp_config["keyType"],
-                            "domain_separator": domain_sep_hex,
-                            "notify_signing_session": false,
-                            "expect_full_message_payloads": false,
-                            "sig_verifier_address": null,
-                            "chain_codec_address": chain_codec_addr
-                        },
-                        "contract_admin": contract_admin
-                    }
+                    "contract_admin": admin
                 }
-            }
+            }}
         }
     });
+    Ok(InstantiatePlan {
+        execute_msg,
+        deployment_name,
+        salt_key,
+        domain_separator,
+        contract_admin: admin,
+        codes,
+    })
+}
 
-    let json_str = serde_json::to_string_pretty(&execute_msg)?;
-    ui::info(&format!(
-        "execute msg: {}",
-        ui::truncated_json(&json_str, 3)
-    ));
-
-    let sender = if use_governance {
-        &governance_address
-    } else {
-        axelar_address
-    };
-    let inner_msg = build_execute_msg_any(sender, &coordinator_addr, &execute_msg)?;
-
-    let messages = if use_governance {
-        let deposit_amount = read_axelar_contract_field(
-            &ctx.target_json,
-            "/axelar/govProposalExpeditedDepositAmount",
-        )
-        .unwrap_or_else(|_| DEFAULT_PROPOSAL_DEPOSIT_UAXL.to_string());
-        let title = format!("Instantiate chain contracts for {chain_axelar_id}");
-        let summary = format!(
-            "Instantiate Gateway, VotingVerifier and MultisigProver contracts for {chain_axelar_id} via Coordinator"
-        );
-        vec![build_submit_proposal_any(
-            axelar_address,
-            vec![inner_msg],
-            &title,
-            &summary,
-            &deposit_amount,
-            fee_denom,
-            true,
-        )?]
-    } else {
-        vec![inner_msg]
-    };
-
-    let tx_resp = sign_and_broadcast_cosmos_tx(
-        signing_key,
-        axelar_address,
-        lcd,
-        chain_id,
-        fee_denom,
-        gas_price,
-        messages,
-    )
-    .await?;
-
-    // Save deployment name to target json
-    let content = fs::read_to_string(&ctx.target_json)?;
-    let mut root: Value = serde_json::from_str(&content)?;
-    let coord = root
+fn save_instantiate_plan(
+    ctx: &DeployContext,
+    chain_axelar_id: &str,
+    plan: &InstantiatePlan,
+) -> Result<()> {
+    let mut root: Value = serde_json::from_str(&fs::read_to_string(&ctx.target_json)?)?;
+    let coordinator = root
         .pointer_mut("/axelar/contracts/Coordinator")
-        .and_then(|v| v.as_object_mut())
+        .and_then(Value::as_object_mut)
         .ok_or_else(|| eyre::eyre!("no Coordinator config"))?;
-    if coord.get("deployments").is_none() {
-        coord.insert("deployments".to_string(), json!({}));
+    if coordinator.get("deployments").is_none() {
+        coordinator.insert("deployments".to_string(), json!({}));
     }
-    coord["deployments"].as_object_mut().unwrap().insert(
-        chain_axelar_id.to_string(),
-        json!({
-            "deploymentName": deployment_name,
-            "salt": salt_key
-        }),
-    );
-
-    if let Some(vv) = root.pointer_mut(&format!(
-        "/axelar/contracts/VotingVerifier/{chain_axelar_id}"
-    )) {
-        vv["codeId"] = json!(verifier_code_id);
-        vv["contractAdmin"] = json!(contract_admin);
-    }
-    if let Some(mp) = root.pointer_mut(&format!(
-        "/axelar/contracts/MultisigProver/{chain_axelar_id}"
-    )) {
-        mp["codeId"] = json!(prover_code_id);
-        mp["domainSeparator"] = json!(format!("0x{domain_sep_hex}"));
-        mp["contractAdmin"] = json!(contract_admin);
-    }
-    if let Some(gw) = root.pointer_mut(&format!("/axelar/contracts/Gateway/{chain_axelar_id}")) {
-        gw["codeId"] = json!(gateway_code_id);
-        gw["contractAdmin"] = json!(contract_admin);
-    } else if let Some(gateway_obj) = root
-        .pointer_mut("/axelar/contracts/Gateway")
-        .and_then(|v| v.as_object_mut())
-    {
-        gateway_obj.insert(
+    coordinator["deployments"]
+        .as_object_mut()
+        .ok_or_else(|| eyre::eyre!("Coordinator.deployments is not an object"))?
+        .insert(
             chain_axelar_id.to_string(),
             json!({
-                "codeId": gateway_code_id,
-                "contractAdmin": contract_admin
+                "deploymentName": plan.deployment_name,
+                "salt": plan.salt_key
+            }),
+        );
+    if let Some(verifier) = root.pointer_mut(&format!(
+        "/axelar/contracts/VotingVerifier/{chain_axelar_id}"
+    )) {
+        verifier["codeId"] = json!(plan.codes.verifier);
+        verifier["contractAdmin"] = json!(plan.contract_admin);
+    }
+    if let Some(prover) = root.pointer_mut(&format!(
+        "/axelar/contracts/MultisigProver/{chain_axelar_id}"
+    )) {
+        prover["codeId"] = json!(plan.codes.prover);
+        prover["domainSeparator"] = json!(format!("0x{}", plan.domain_separator));
+        prover["contractAdmin"] = json!(plan.contract_admin);
+    }
+    if let Some(gateway) = root.pointer_mut(&format!("/axelar/contracts/Gateway/{chain_axelar_id}"))
+    {
+        gateway["codeId"] = json!(plan.codes.gateway);
+        gateway["contractAdmin"] = json!(plan.contract_admin);
+    } else if let Some(gateways) = root
+        .pointer_mut("/axelar/contracts/Gateway")
+        .and_then(Value::as_object_mut)
+    {
+        gateways.insert(
+            chain_axelar_id.to_string(),
+            json!({
+                "codeId": plan.codes.gateway,
+                "contractAdmin": plan.contract_admin
             }),
         );
     }
@@ -258,17 +250,75 @@ pub(super) async fn run_instantiate(ctx: &mut DeployContext, tx: StepTxContext<'
         &ctx.target_json,
         serde_json::to_string_pretty(&root)? + "\n",
     )?;
+    Ok(())
+}
 
-    if use_governance {
+pub(super) async fn run_instantiate(ctx: &mut DeployContext, tx: StepTxContext<'_>) -> Result<()> {
+    ui::info(&format!(
+        "instantiating chain contracts for {}...",
+        tx.chain_axelar_id
+    ));
+    let addresses = read_chain_contract_addresses(ctx)?;
+    let codes = fetch_chain_code_ids(ctx, tx.lcd).await?;
+    let plan = build_instantiate_plan(ctx, &tx, &addresses, codes)?;
+    let json_str = serde_json::to_string_pretty(&plan.execute_msg)?;
+    ui::info(&format!(
+        "execute msg: {}",
+        ui::truncated_json(&json_str, 3)
+    ));
+    let sender = if tx.use_governance {
+        &addresses.governance
+    } else {
+        tx.axelar_address
+    };
+    let inner_msg = build_execute_msg_any(sender, &addresses.coordinator, &plan.execute_msg)?;
+    let messages = if tx.use_governance {
+        let deposit_amount = read_axelar_contract_field(
+            &ctx.target_json,
+            "/axelar/govProposalExpeditedDepositAmount",
+        )
+        .unwrap_or_else(|_| DEFAULT_PROPOSAL_DEPOSIT_UAXL.to_string());
+        let title = format!("Instantiate chain contracts for {}", tx.chain_axelar_id);
+        let summary = format!(
+            "Instantiate Gateway, VotingVerifier and MultisigProver contracts for {} via Coordinator",
+            tx.chain_axelar_id
+        );
+        vec![build_submit_proposal_any(
+            tx.axelar_address,
+            vec![inner_msg],
+            &title,
+            &summary,
+            &deposit_amount,
+            tx.fee_denom,
+            true,
+        )?]
+    } else {
+        vec![inner_msg]
+    };
+    let tx_resp = sign_and_broadcast_cosmos_tx(
+        tx.signing_key,
+        tx.axelar_address,
+        tx.lcd,
+        tx.chain_id,
+        tx.fee_denom,
+        tx.gas_price,
+        messages,
+    )
+    .await?;
+    save_instantiate_plan(ctx, tx.chain_axelar_id, &plan)?;
+    if tx.use_governance {
         let proposal_id = extract_proposal_id(&tx_resp)?;
         ui::kv("proposal submitted", &proposal_id.to_string());
         ui::action_required(&[
             "Vote on the proposal:",
-            &format!("./vote_{env}_proposal.sh {env}-nodes {proposal_id}"),
+            &format!(
+                "./vote_{}_proposal.sh {}-nodes {proposal_id}",
+                tx.env, tx.env
+            ),
         ]);
         ctx.state
             .proposals
-            .insert(proposal_key.to_string(), proposal_id);
+            .insert(tx.proposal_key.to_string(), proposal_id);
     } else {
         ui::success("direct execution completed");
     }

@@ -16,6 +16,35 @@ use crate::cosmos::{
 };
 use crate::ui;
 
+fn reward_pool_messages(
+    env: &str,
+    chain: &str,
+    voting_verifier: &str,
+    multisig: &str,
+) -> [Value; 2] {
+    let (epoch_duration, participation_threshold, rewards_per_epoch) = match env {
+        "devnet-amplifier" => ("100", json!(["7", "10"]), "100"),
+        "mainnet" => ("14845", json!(["8", "10"]), "3424660000"),
+        _ => ("600", json!(["7", "10"]), "100"),
+    };
+    let create = |contract: &str| {
+        json!({
+            "create_pool": {
+                "params": {
+                    "epoch_duration": epoch_duration,
+                    "participation_threshold": participation_threshold,
+                    "rewards_per_epoch": rewards_per_epoch
+                },
+                "pool_id": {
+                    "chain_name": chain,
+                    "contract": contract
+                }
+            }
+        })
+    };
+    [create(voting_verifier), create(multisig)]
+}
+
 pub(super) async fn run_create_reward_pools(
     ctx: &mut DeployContext,
     tx: StepTxContext<'_>,
@@ -45,43 +74,8 @@ pub(super) async fn run_create_reward_pools(
         &format!("/axelar/contracts/VotingVerifier/{chain_axelar_id}/address"),
     )?;
 
-    // Rewards-pool params per network. epoch_duration is in cosmos blocks
-    // (testnet/stagenet share the 600 default; mainnet's 14845 ≈ 24h at
-    // ~5.8s/block). participation_threshold is a ratio, rewards_per_epoch in
-    // uaxl. These match `axelar-contract-deployments` epoch params for the
-    // amplifier rewards pool.
-    let (epoch_duration, participation_threshold, rewards_per_epoch) = match env {
-        "devnet-amplifier" => ("100", json!(["7", "10"]), "100"),
-        "mainnet" => ("14845", json!(["8", "10"]), "3424660000"),
-        _ => ("600", json!(["7", "10"]), "100"),
-    };
-
-    let msg1 = json!({
-        "create_pool": {
-            "params": {
-                "epoch_duration": epoch_duration,
-                "participation_threshold": participation_threshold,
-                "rewards_per_epoch": rewards_per_epoch
-            },
-            "pool_id": {
-                "chain_name": chain_axelar_id,
-                "contract": voting_verifier_addr
-            }
-        }
-    });
-    let msg2 = json!({
-        "create_pool": {
-            "params": {
-                "epoch_duration": epoch_duration,
-                "participation_threshold": participation_threshold,
-                "rewards_per_epoch": rewards_per_epoch
-            },
-            "pool_id": {
-                "chain_name": chain_axelar_id,
-                "contract": multisig_addr
-            }
-        }
-    });
+    let [msg1, msg2] =
+        reward_pool_messages(env, chain_axelar_id, &voting_verifier_addr, &multisig_addr);
 
     let sender = if use_governance {
         &governance_address

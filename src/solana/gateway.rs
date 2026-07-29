@@ -481,9 +481,7 @@ fn verify_signature(
     // SetComputeUnitLimit: program_id = ComputeBudget111..., data = [0x02, limit_u32_le]
     let cu_limit: u32 = 400_000;
     let cu_ix = Instruction {
-        program_id: "ComputeBudget111111111111111111111111111111"
-            .parse()
-            .unwrap(),
+        program_id: Pubkey::from_str_const("ComputeBudget111111111111111111111111111111"),
         accounts: vec![],
         data: [&[0x02], cu_limit.to_le_bytes().as_slice()].concat(),
     };
@@ -593,8 +591,9 @@ pub fn approve_messages_on_gateway(
     ) {
         Ok(sig) => ui::tx_hash("init session", &sig.to_string()),
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("already in use") {
+            if classify_idempotent_gateway_error(GatewayOperation::InitializeSession, &e)
+                == GatewayErrorDisposition::AlreadyApplied
+            {
                 ui::info("verification session already initialized");
             } else {
                 return Err(e);
@@ -625,8 +624,9 @@ pub fn approve_messages_on_gateway(
                 ui::info(&format!("  signature {}/{num_signers} verified", i + 1));
             }
             Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("SlotAlreadyVerified") || msg.contains("already") {
+                if classify_idempotent_gateway_error(GatewayOperation::VerifySignature, &e)
+                    == GatewayErrorDisposition::AlreadyApplied
+                {
                     ui::info(&format!(
                         "  signature {}/{num_signers} already verified",
                         i + 1
@@ -659,8 +659,9 @@ pub fn approve_messages_on_gateway(
                 ui::tx_hash(&format!("approve msg {}", i + 1), &sig.to_string());
             }
             Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("already in use") {
+                if classify_idempotent_gateway_error(GatewayOperation::ApproveMessage, &e)
+                    == GatewayErrorDisposition::AlreadyApplied
+                {
                     ui::info(&format!("  message {} already approved", i + 1));
                 } else {
                     return Err(eyre::eyre!("failed to approve message {}: {e}", i + 1));
@@ -671,6 +672,39 @@ pub fn approve_messages_on_gateway(
 
     ui::success("all messages approved on Solana gateway");
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum GatewayOperation {
+    InitializeSession,
+    VerifySignature,
+    ApproveMessage,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GatewayErrorDisposition {
+    AlreadyApplied,
+    Fatal,
+}
+
+fn classify_idempotent_gateway_error(
+    operation: GatewayOperation,
+    error: &eyre::Report,
+) -> GatewayErrorDisposition {
+    let message = error.to_string();
+    let already_applied = match operation {
+        GatewayOperation::InitializeSession | GatewayOperation::ApproveMessage => {
+            message.contains("already in use")
+        }
+        GatewayOperation::VerifySignature => {
+            message.contains("SlotAlreadyVerified") || message.contains("already")
+        }
+    };
+    if already_applied {
+        GatewayErrorDisposition::AlreadyApplied
+    } else {
+        GatewayErrorDisposition::Fatal
+    }
 }
 
 /// Execute an approved GMP message on the Memo program.
@@ -747,9 +781,7 @@ pub fn execute_on_memo(
 
     let cu_limit: u32 = 400_000;
     let cu_ix = Instruction {
-        program_id: "ComputeBudget111111111111111111111111111111"
-            .parse()
-            .unwrap(),
+        program_id: Pubkey::from_str_const("ComputeBudget111111111111111111111111111111"),
         accounts: vec![],
         data: [&[0x02], cu_limit.to_le_bytes().as_slice()].concat(),
     };

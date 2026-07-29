@@ -12,6 +12,7 @@ use super::keypairs;
 use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentity, TxMetrics};
 use super::run_sizing::SustainedPlan;
 use super::submitter::TransactionSubmitter;
+use super::units::Wei;
 use crate::evm::{ContractCall, SenderReceiver};
 use crate::types::Network;
 use crate::ui;
@@ -121,7 +122,7 @@ struct EvmSubmitter {
     sender_receiver: Address,
     destination_chain: String,
     destination_address: String,
-    gas_value_wei: u128,
+    gas_value: Wei,
     fee_mode: super::gas_mode::EvmFeeMode,
 }
 
@@ -144,13 +145,51 @@ impl TransactionSubmitter for EvmSubmitter {
                 &self.destination_chain,
                 &self.destination_address,
                 &job.payload,
-                self.gas_value_wei,
+                self.gas_value,
                 EvmTxOpts {
                     nonce: None,
                     fee_mode: self.fee_mode,
                 },
             )
         })
+        .await
+    }
+}
+
+struct EvmSustainedSubmitter {
+    rpc_url: reqwest::Url,
+    sender_receiver: Address,
+    destination_chain: String,
+    destination_address: String,
+    gas_value: Wei,
+    fee_mode: super::gas_mode::EvmFeeMode,
+}
+
+struct EvmSustainedSubmitJob {
+    signer: PrivateKeySigner,
+    payload: Vec<u8>,
+    nonce: Option<u64>,
+}
+
+impl TransactionSubmitter for EvmSustainedSubmitter {
+    type Job = EvmSustainedSubmitJob;
+
+    async fn submit(&self, job: Self::Job) -> TxMetrics {
+        let provider = ProviderBuilder::new()
+            .wallet(job.signer)
+            .connect_http(self.rpc_url.clone());
+        execute_and_record_evm(
+            &provider,
+            self.sender_receiver,
+            &self.destination_chain,
+            &self.destination_address,
+            &job.payload,
+            self.gas_value,
+            EvmTxOpts {
+                nonce: job.nonce,
+                fee_mode: self.fee_mode,
+            },
+        )
         .await
     }
 }
@@ -191,6 +230,7 @@ pub async fn run_load_test_with_metrics(
         Some(v) => v.parse().map_err(|e| eyre!("invalid --gas-value: {e}"))?,
         None => default_gas_value_wei(args).await,
     };
+    let gas_value = Wei::from_u128(gas_value_wei);
 
     // Hedera quirk: sending HBAR to a fresh EVM address auto-creates a Hedera
     // account, but the mirror node lags before the new account is visible to
@@ -217,7 +257,7 @@ pub async fn run_load_test_with_metrics(
     } else {
         let d = keypairs::derive_evm_signers(main_key, num_txs)?;
         ui::info(&format!("derived {} EVM signing keys", d.len()));
-        keypairs::ensure_funded_evm_with_extra(&funding_provider, &main_signer, &d, gas_value_wei)
+        keypairs::ensure_funded_evm_with_extra(&funding_provider, &main_signer, &d, gas_value)
             .await?;
         d
     };
@@ -248,7 +288,7 @@ pub async fn run_load_test_with_metrics(
             sender_receiver: sender_receiver_addr,
             destination_chain: dest_chain.clone(),
             destination_address: dest_addr.clone(),
-            gas_value_wei,
+            gas_value,
             fee_mode,
         },
         jobs,
@@ -315,21 +355,20 @@ async fn execute_and_record_evm<P: Provider>(
     dest_chain: &str,
     dest_addr: &str,
     payload: &[u8],
-    gas_value_wei: u128,
+    gas_value: Wei,
     opts: EvmTxOpts,
 ) -> TxMetrics {
     let submit_start = Instant::now();
     let payload_hash = alloy::hex::encode(keccak256(payload));
 
     let sr = SenderReceiver::new(sender_receiver_addr, provider);
-    let gas_value = alloy::primitives::U256::from(gas_value_wei);
     let mut base_call = sr
         .sendPayload(
             dest_chain.to_string(),
             dest_addr.to_string(),
             Bytes::from(payload.to_vec()),
         )
-        .value(gas_value);
+        .value(gas_value.as_u256());
     // Legacy (pre-1559) chains: send a type-0 tx with an explicit gas_price.
     if let Some(gp) = opts.fee_mode.legacy_gas_price() {
         base_call = base_call.gas_price(gp);
@@ -401,6 +440,94 @@ pub(super) struct SustainedLoadRequest {
     pub evm_destination: bool,
 }
 
+struct EvmSustainedSetup {
+    payload: Option<Vec<u8>>,
+    gas_value: Wei,
+    derived: Vec<PrivateKeySigner>,
+    fee_mode: super::gas_mode::EvmFeeMode,
+    nonces: Vec<u64>,
+    counter_pda: Pubkey,
+}
+
+async fn prepare_evm_sustained(
+    args: &LoadTestArgs,
+    plan: SustainedPlan,
+    main_key: [u8; 32],
+    evm_rpc_url: &str,
+) -> eyre::Result<EvmSustainedSetup> {
+    let memo_program_id = memo_program_id(args.network);
+    let (counter_pda, _) = Pubkey::find_program_address(&[b"counter"], &memo_program_id);
+    let payload = args
+        .payload
+        .as_deref()
+        .map(|value| hex::decode(value.strip_prefix("0x").unwrap_or(value)))
+        .transpose()?;
+    let gas_value_wei = match &args.gas_value {
+        Some(value) => value
+            .parse()
+            .map_err(|error| eyre!("invalid --gas-value: {error}"))?,
+        None => default_gas_value_wei(args).await,
+    };
+    let gas_value = Wei::from_u128(gas_value_wei);
+    let pool_size = plan.tps * plan.key_cycle;
+    let derived = keypairs::derive_evm_signers(&main_key, pool_size)?;
+    ui::info(&format!(
+        "derived {} EVM signing keys (pool: {} tx/s × {}s cycle)",
+        pool_size, plan.tps, plan.key_cycle
+    ));
+    let main_signer = PrivateKeySigner::from_bytes(&main_key.into())
+        .map_err(|error| eyre!("invalid main EVM key: {error}"))?;
+    let funding_provider = ProviderBuilder::new()
+        .wallet(main_signer.clone())
+        .connect_http(evm_rpc_url.parse()?);
+    let rounds = plan.duration_secs.div_ceil(plan.key_cycle as u64);
+    let buffered_rounds = rounds + rounds / 5 + 1;
+    keypairs::ensure_funded_evm_with_extra(
+        &funding_provider,
+        &main_signer,
+        &derived,
+        gas_value.saturating_mul(buffered_rounds),
+    )
+    .await?;
+    let fee_mode = super::gas_mode::EvmFeeMode::detect(&funding_provider).await?;
+    let nonce_provider = ProviderBuilder::new().connect_http(evm_rpc_url.parse()?);
+    let mut nonces = Vec::with_capacity(pool_size);
+    for signer in &derived {
+        nonces.push(
+            nonce_provider
+                .get_transaction_count(signer.address())
+                .await?,
+        );
+    }
+    Ok(EvmSustainedSetup {
+        payload,
+        gas_value,
+        derived,
+        fee_mode,
+        nonces,
+        counter_pda,
+    })
+}
+
+fn sustained_spinners(
+    duration_secs: u64,
+    sender: tokio::sync::oneshot::Sender<indicatif::ProgressBar>,
+) -> indicatif::ProgressBar {
+    let multi = indicatif::MultiProgress::new();
+    let style = ui::progress_spinner_style("  {spinner:.cyan} {msg}")
+        .tick_strings(&["|", "/", "-", "\\", ""]);
+    let send_spinner = multi.add(indicatif::ProgressBar::new_spinner());
+    send_spinner.set_style(style.clone());
+    send_spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+    send_spinner.set_message(format!("[0/{duration_secs}s] starting sustained send..."));
+    let verify_spinner = multi.add(indicatif::ProgressBar::new_spinner());
+    verify_spinner.set_style(style);
+    verify_spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+    verify_spinner.set_message("pipeline: waiting for src-confirmed txs...");
+    let _ = sender.send(verify_spinner);
+    send_spinner
+}
+
 pub(super) async fn run_sustained_load_test_with_metrics(
     request: SustainedLoadRequest,
 ) -> eyre::Result<LoadTestReport> {
@@ -424,71 +551,18 @@ pub(super) async fn run_sustained_load_test_with_metrics(
     let pool_size = tps * key_cycle;
     let total_expected = plan.total_transactions();
 
-    let memo_program_id = memo_program_id(args.network);
-    let (counter_pda, _) = Pubkey::find_program_address(&[b"counter"], &memo_program_id);
-
-    let payload: Option<Vec<u8>> = match &args.payload {
-        Some(hex_str) => Some(hex::decode(hex_str.strip_prefix("0x").unwrap_or(hex_str))?),
-        None => None,
-    };
-    let gas_value_wei: u128 = match &args.gas_value {
-        Some(v) => v.parse().map_err(|e| eyre!("invalid --gas-value: {e}"))?,
-        None => default_gas_value_wei(&args).await,
-    };
-
-    // Derive pool
-    let derived = keypairs::derive_evm_signers(&main_key, pool_size)?;
-    ui::info(&format!(
-        "derived {} EVM signing keys (pool: {} tx/s × {}s cycle)",
-        pool_size, tps, key_cycle
-    ));
-
-    // Fund pool keys.
-    let main_signer = PrivateKeySigner::from_bytes(&main_key.into())
-        .map_err(|e| eyre!("invalid main EVM key: {e}"))?;
-    let funding_provider = ProviderBuilder::new()
-        .wallet(main_signer.clone())
-        .connect_http(evm_rpc_url.parse()?);
-    let rounds_per_key = duration_secs.div_ceil(key_cycle as u64);
-    let buffered_rounds = rounds_per_key + rounds_per_key / 5 + 1;
-    let gas_total_per_key = gas_value_wei.saturating_mul(buffered_rounds as u128);
-    keypairs::ensure_funded_evm_with_extra(
-        &funding_provider,
-        &main_signer,
-        &derived,
-        gas_total_per_key,
-    )
-    .await?;
-
-    // Legacy (pre-1559) source chains need type-0 txs; detect once and apply to
-    // each streamed send. No-op on 1559 chains.
-    let fee_mode = super::gas_mode::EvmFeeMode::detect(&funding_provider).await?;
-
-    // Pre-fetch initial nonces.
-    let nonce_provider = ProviderBuilder::new().connect_http(evm_rpc_url.parse()?);
-    let mut nonces: Vec<u64> = Vec::with_capacity(pool_size);
-    for signer in &derived {
-        let n = nonce_provider
-            .get_transaction_count(signer.address())
-            .await?;
-        nonces.push(n);
-    }
+    let setup = prepare_evm_sustained(&args, plan, main_key, &evm_rpc_url).await?;
+    let EvmSustainedSetup {
+        payload,
+        gas_value,
+        derived,
+        fee_mode,
+        nonces,
+        counter_pda,
+    } = setup;
 
     // Create MultiProgress AFTER funding so spinners don't flicker during setup.
-    let multi = indicatif::MultiProgress::new();
-    let spinner_style = indicatif::ProgressStyle::with_template("  {spinner:.cyan} {msg}")
-        .unwrap()
-        .tick_strings(&["|", "/", "-", "\\", ""]);
-    let spinner = multi.add(indicatif::ProgressBar::new_spinner());
-    spinner.set_style(spinner_style.clone());
-    spinner.enable_steady_tick(std::time::Duration::from_millis(100));
-    spinner.set_message(format!("[0/{duration_secs}s] starting sustained send..."));
-
-    let verify_spinner = multi.add(indicatif::ProgressBar::new_spinner());
-    verify_spinner.set_style(spinner_style);
-    verify_spinner.enable_steady_tick(std::time::Duration::from_millis(100));
-    verify_spinner.set_message("pipeline: waiting for src-confirmed txs...");
-    let _ = verify_spinner_tx.send(verify_spinner);
+    let spinner = sustained_spinners(duration_secs, verify_spinner_tx);
 
     let dest_chain = args.destination_chain.clone();
     let dest_addr = destination_address.to_string();
@@ -504,72 +578,34 @@ pub(super) async fn run_sustained_load_test_with_metrics(
         super::verify::classify_route(&cfg, &args.source_axelar_id, &args.destination_axelar_id);
     let legacy_route = src_legacy || dst_legacy;
 
-    let make_task: super::sustained::MakeTask =
-        Box::new(move |key_idx: usize, nonce: Option<u64>| {
-            let tx_payload = if evm_destination {
+    let rpc_url = rpc_url_str.parse()?;
+    let make_task = super::sustained::submission_tasks(
+        EvmSustainedSubmitter {
+            rpc_url,
+            sender_receiver: sender_receiver_addr,
+            destination_chain: dest_chain,
+            destination_address: dest_addr,
+            gas_value,
+            fee_mode,
+        },
+        move |key_index, nonce| EvmSustainedSubmitJob {
+            signer: derived[key_index].clone(),
+            payload: if evm_destination {
                 super::sol_sender::make_payload(&payload)
             } else {
                 make_executable_payload(&payload, &counter_pda)
-            };
-            let dc = dest_chain.clone();
-            let da = dest_addr.clone();
-            let sr = sender_receiver_addr;
-            let gv = gas_value_wei;
-            let url = rpc_url_str.clone();
-            let vtx = verify_tx.clone();
-            let sc = source_chain.clone();
-            let has_vv = has_voting_verifier;
-            let legacy = legacy_route;
-            let fm = fee_mode;
-
-            let provider = ProviderBuilder::new()
-                .wallet(derived[key_idx].clone())
-                .connect_http(url.parse().expect("invalid RPC URL"));
-
-            Box::pin(async move {
-                let mut result = execute_and_record_evm(
-                    &provider,
-                    sr,
-                    &dc,
-                    &da,
-                    &tx_payload,
-                    gv,
-                    EvmTxOpts {
-                        nonce,
-                        fee_mode: fm,
-                    },
-                )
-                .await;
-                // Stream successful txs to the concurrent verification pipeline.
-                if result.is_success()
-                    && let Some(ref tx_sender) = vtx
-                {
-                    // Use signature length as a proxy for idx — the verify task
-                    // will overwrite idx from the timings vec anyway.
-                    match super::verify::tx_to_pending_solana(
-                        &result,
-                        0,
-                        &sc,
-                        has_vv,
-                        super::verify::SourceChainType::Evm,
-                        network,
-                        legacy,
-                    ) {
-                        Ok(pending) => {
-                            if tx_sender.send(pending).is_err() {
-                                eprintln!(
-                                    "warning: verification channel closed, tx won't be verified"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            result.mark_failed(format!("failed to build verification state: {e}"));
-                        }
-                    }
-                }
-                result
-            })
-        });
+            },
+            nonce,
+        },
+        verify_tx,
+        super::sustained::GmpPendingTxAdapter {
+            source_chain,
+            has_voting_verifier,
+            source_type: super::verify::SourceChainType::Evm,
+            network,
+            legacy: legacy_route,
+        },
+    );
 
     let result = super::sustained::run_sustained_loop(
         SustainedPlan {

@@ -25,6 +25,52 @@ use crate::ui;
 
 const TOTAL_STEPS: usize = 8;
 
+async fn relay_message(
+    cfg: &ChainsConfig,
+    state: &crate::state::State,
+    axelar_id: &str,
+    sent: &source::SentGmp,
+) -> Result<String> {
+    ui::section("Amplifier Routing");
+    let (signing_key, axelar_address) = derive_axelar_wallet(&state.mnemonic)?;
+    let (lcd, chain_id, fee_denom, gas_price) = cfg.axelar.cosmos_tx_params()?;
+    let cosm_gateway = cfg.axelar.contract_address("Gateway", axelar_id)?;
+    let voting_verifier = cfg.axelar.contract_address("VotingVerifier", axelar_id)?;
+    let multisig_prover = cfg.axelar.contract_address("MultisigProver", axelar_id)?;
+    ui::address("cosmos gateway", cosm_gateway);
+    ui::address("voting verifier", voting_verifier);
+    ui::address("axelar address", &axelar_address);
+
+    let message = json!({
+        "cc_id": {
+            "message_id": sent.message_id,
+            "source_chain": axelar_id,
+        },
+        "destination_chain": sent.destination_chain,
+        "destination_address": sent.destination_address,
+        "source_address": sent.source_address,
+        "payload_hash": alloy::hex::encode(sent.payload_hash.as_slice()),
+    });
+    relay::run_full_sequence(
+        &relay::AmplifierContext {
+            axelar_address,
+            lcd,
+            chain_id,
+            fee_denom,
+            gas_price,
+            cosm_gateway: cosm_gateway.to_string(),
+            voting_verifier: Some(voting_verifier.to_string()),
+            multisig_prover: multisig_prover.to_string(),
+        },
+        &signing_key,
+        &message,
+        axelar_id,
+        &sent.message_id,
+        TOTAL_STEPS,
+    )
+    .await
+}
+
 pub async fn run(axelar_id: Option<String>) -> Result<()> {
     let axelar_id = resolve_axelar_id(axelar_id)?;
     let mut state = read_state(&axelar_id)?;
@@ -68,69 +114,18 @@ pub async fn run(axelar_id: Option<String>) -> Result<()> {
 
     let sent =
         send_evm_call_contract(&provider, sender_receiver_addr, &axelar_id, 1, TOTAL_STEPS).await?;
-    let source::SentGmp {
-        destination_chain,
-        destination_address,
-        source_address,
-        message_id,
-        payload_bytes,
-        payload_hash,
-    } = sent;
-
-    ui::section("Amplifier Routing");
-
-    let (signing_key, axelar_address) = derive_axelar_wallet(&state.mnemonic)?;
-    let (lcd, chain_id, fee_denom, gas_price) = cfg.axelar.cosmos_tx_params()?;
-
-    let cosm_gateway = cfg.axelar.contract_address("Gateway", &axelar_id)?;
-    let voting_verifier = cfg.axelar.contract_address("VotingVerifier", &axelar_id)?;
-    let multisig_prover = cfg.axelar.contract_address("MultisigProver", &axelar_id)?;
-
-    ui::address("cosmos gateway", cosm_gateway);
-    ui::address("voting verifier", voting_verifier);
-    ui::address("axelar address", &axelar_address);
-
-    let gmp_msg = json!({
-        "cc_id": {
-            "message_id": message_id,
-            "source_chain": axelar_id,
-        },
-        "destination_chain": destination_chain,
-        "destination_address": destination_address,
-        "source_address": source_address,
-        "payload_hash": alloy::hex::encode(payload_hash.as_slice()),
-    });
-
-    let ctx = relay::AmplifierContext {
-        axelar_address: axelar_address.clone(),
-        lcd: lcd.clone(),
-        chain_id: chain_id.clone(),
-        fee_denom: fee_denom.clone(),
-        gas_price,
-        cosm_gateway: cosm_gateway.to_string(),
-        voting_verifier: Some(voting_verifier.to_string()),
-        multisig_prover: multisig_prover.to_string(),
-    };
-    let execute_data_hex = relay::run_full_sequence(
-        &ctx,
-        &signing_key,
-        &gmp_msg,
-        &axelar_id,
-        &message_id,
-        TOTAL_STEPS,
-    )
-    .await?;
+    let execute_data_hex = relay_message(&cfg, &state, &axelar_id, &sent).await?;
 
     approve_and_execute_evm(destination::EvmExecutionRequest {
         provider: &provider,
         gateway: gateway_addr,
         sender_receiver: sender_receiver_addr,
         source_chain: &axelar_id,
-        source_address: &source_address,
-        message_id: &message_id,
+        source_address: &sent.source_address,
+        message_id: &sent.message_id,
         execute_data_hex: &execute_data_hex,
-        payload_bytes: &payload_bytes,
-        payload_hash,
+        payload_bytes: &sent.payload_bytes,
+        payload_hash: sent.payload_hash,
         step_idx_approve: 7,
         step_idx_execute: 8,
         total_steps: TOTAL_STEPS,
@@ -149,6 +144,181 @@ pub async fn run(axelar_id: Option<String>) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Config-based GMP test (supports EVM + Solana)
 // ---------------------------------------------------------------------------
+
+fn check_svm_balances(
+    source_type: ChainType,
+    destination_type: ChainType,
+    source_rpc: &str,
+    destination: &str,
+    destination_config: &crate::config::ChainConfig,
+) -> Result<()> {
+    if source_type != ChainType::Svm && destination_type != ChainType::Svm {
+        return Ok(());
+    }
+    let keypair = crate::solana::load_keypair(None)?;
+    if source_type == ChainType::Svm {
+        crate::solana::check_solana_balance(
+            source_rpc,
+            "source",
+            &keypair.pubkey(),
+            crate::solana::MIN_SOL_SEND_LAMPORTS,
+        )?;
+    }
+    if destination_type == ChainType::Svm {
+        let rpc = destination_config
+            .rpc
+            .as_deref()
+            .ok_or_else(|| eyre::eyre!("no RPC for destination chain '{destination}'"))?;
+        crate::solana::check_solana_balance(
+            rpc,
+            "destination",
+            &keypair.pubkey(),
+            crate::solana::MIN_SOL_RELAY_LAMPORTS,
+        )?;
+    }
+    Ok(())
+}
+
+async fn resolve_config_destination_address(
+    source_type: ChainType,
+    destination_type: ChainType,
+    destination: &str,
+    destination_config: &crate::config::ChainConfig,
+    provided: Option<String>,
+) -> Result<Option<String>> {
+    if source_type != ChainType::Svm || destination_type != ChainType::Evm || provided.is_some() {
+        return Ok(provided);
+    }
+    let rpc = destination_config
+        .rpc
+        .as_deref()
+        .ok_or_else(|| eyre::eyre!("no RPC for destination chain '{destination}'"))?;
+    let private_key = std::env::var("EVM_PRIVATE_KEY").map_err(|_| {
+        eyre::eyre!(
+            "EVM_PRIVATE_KEY env var required to deploy/reuse SenderReceiver on '{destination}'"
+        )
+    })?;
+    let gateway = destination_config
+        .contract_address("AxelarGateway", destination)?
+        .parse()?;
+    let gas_service = destination_config
+        .contract_address("AxelarGasService", destination)?
+        .parse()?;
+    ui::section(&format!("Destination SenderReceiver ({destination})"));
+    let address = crate::commands::load_test::ensure_sender_receiver_on_evm_chain(
+        destination,
+        rpc,
+        &private_key,
+        gateway,
+        gas_service,
+    )
+    .await?;
+    ui::address("SenderReceiver", &format!("{address}"));
+    Ok(Some(format!("{address}")))
+}
+
+async fn execute_config_destination(
+    destination_type: ChainType,
+    destination_config: &crate::config::ChainConfig,
+    source: &str,
+    destination: &str,
+    network: crate::types::Network,
+    sent: &source::SentGmp,
+    execute_data_hex: &str,
+) -> Result<()> {
+    let rpc = destination_config
+        .rpc
+        .as_deref()
+        .ok_or_else(|| eyre::eyre!("no RPC for destination chain '{destination}'"))?;
+    match destination_type {
+        ChainType::Svm => destination::approve_and_execute_svm(destination::SvmExecutionRequest {
+            dst_rpc: rpc,
+            network,
+            source_chain: source,
+            destination_chain: destination,
+            source_address: &sent.source_address,
+            destination_address: &sent.destination_address,
+            message_id: &sent.message_id,
+            payload_bytes: &sent.payload_bytes,
+            payload_hash: sent.payload_hash,
+            execute_data_hex,
+            step_idx_approve: 7,
+            step_idx_execute: 8,
+            total_steps: 8,
+        }),
+        ChainType::Evm => {
+            let sender_receiver = sent
+                .destination_address
+                .parse()
+                .map_err(|e| eyre::eyre!("invalid --destination-address: {e}"))?;
+            let private_key = std::env::var("EVM_PRIVATE_KEY").map_err(|_| {
+                eyre::eyre!("EVM_PRIVATE_KEY env var required for sol→evm GMP destination")
+            })?;
+            let provider = ProviderBuilder::new()
+                .wallet(private_key.parse::<PrivateKeySigner>()?)
+                .connect_http(rpc.parse()?);
+            let gateway = destination_config
+                .contract_address("AxelarGateway", destination)?
+                .parse()?;
+            ui::address("destination EVM gateway", &format!("{gateway}"));
+            ui::address("destination SenderReceiver", &format!("{sender_receiver}"));
+            approve_and_execute_evm(destination::EvmExecutionRequest {
+                provider: &provider,
+                gateway,
+                sender_receiver,
+                source_chain: source,
+                source_address: &sent.source_address,
+                message_id: &sent.message_id,
+                execute_data_hex,
+                payload_bytes: &sent.payload_bytes,
+                payload_hash: sent.payload_hash,
+                step_idx_approve: 7,
+                step_idx_execute: 8,
+                total_steps: 8,
+            })
+            .await
+        }
+    }
+}
+
+fn config_gmp_message(
+    sent: &source::SentGmp,
+    source: &str,
+    destination: &str,
+) -> serde_json::Value {
+    json!({
+        "cc_id": {
+            "message_id": sent.message_id,
+            "source_chain": source,
+        },
+        "destination_chain": destination,
+        "destination_address": sent.destination_address,
+        "source_address": sent.source_address,
+        "payload_hash": alloy::hex::encode(sent.payload_hash),
+    })
+}
+
+fn print_gmp_completion(started_at: Instant) {
+    ui::section("Complete");
+    ui::success(&format!(
+        "GMP flow complete ({})",
+        ui::format_elapsed(started_at)
+    ));
+}
+
+fn print_config_header(
+    source: &str,
+    source_type: ChainType,
+    destination: &str,
+    destination_type: ChainType,
+) {
+    ui::section(&format!("GMP Test: {source} → {destination}"));
+    ui::kv("source", &format!("{source} ({source_type})"));
+    ui::kv(
+        "destination",
+        &format!("{destination} ({destination_type})"),
+    );
+}
 
 pub async fn run_config(
     config: PathBuf,
@@ -189,9 +359,7 @@ pub async fn run_config(
         .ok_or_else(|| eyre::eyre!("no RPC for source chain '{src}'"))?;
 
     let gmp_start = Instant::now();
-    ui::section(&format!("GMP Test: {src} → {dst}"));
-    ui::kv("source", &format!("{src} ({src_type})"));
-    ui::kv("destination", &format!("{dst} ({dst_type})"));
+    print_config_header(&src, src_type, &dst, dst_type);
 
     let mnemonic = mnemonic_override
         .clone()
@@ -213,69 +381,10 @@ pub async fn run_config(
     )
     .await?;
 
-    // Catch underfunded Solana keys here with a clear error rather than the
-    // cryptic "Attempt to debit an account but found no record of a prior
-    // credit" we'd otherwise get from the RPC at send-time.
-    if src_type == ChainType::Svm || dst_type == ChainType::Svm {
-        let keypair = crate::solana::load_keypair(None)?;
-        if src_type == ChainType::Svm {
-            crate::solana::check_solana_balance(
-                src_rpc,
-                "source",
-                &keypair.pubkey(),
-                crate::solana::MIN_SOL_SEND_LAMPORTS,
-            )?;
-        }
-        if dst_type == ChainType::Svm {
-            let dst_rpc = dst_cfg
-                .rpc
-                .as_deref()
-                .ok_or_else(|| eyre::eyre!("no RPC for destination chain '{dst}'"))?;
-            crate::solana::check_solana_balance(
-                dst_rpc,
-                "destination",
-                &keypair.pubkey(),
-                crate::solana::MIN_SOL_RELAY_LAMPORTS,
-            )?;
-        }
-    }
-
-    // For sol→evm without an explicit `--destination-address`, reuse the
-    // load-test SenderReceiver cache and auto-deploy a fresh receiver on the
-    // destination chain if needed. Same logic the sol-to-evm load-test
-    // already uses, so the cache is shared between the two commands.
-    let destination_address: Option<String> = if src_type == ChainType::Svm
-        && dst_type == ChainType::Evm
-        && destination_address.is_none()
-    {
-        let dst_rpc = dst_cfg
-            .rpc
-            .as_deref()
-            .ok_or_else(|| eyre::eyre!("no RPC for destination chain '{dst}'"))?;
-        let evm_pk = std::env::var("EVM_PRIVATE_KEY").map_err(|_| {
-            eyre::eyre!(
-                "EVM_PRIVATE_KEY env var required to deploy/reuse SenderReceiver on '{dst}'"
-            )
-        })?;
-        let gateway_addr: alloy::primitives::Address =
-            dst_cfg.contract_address("AxelarGateway", &dst)?.parse()?;
-        let gas_service_addr: alloy::primitives::Address = dst_cfg
-            .contract_address("AxelarGasService", &dst)?
-            .parse()?;
-        ui::section(&format!("Destination SenderReceiver ({dst})"));
-        let addr = crate::commands::load_test::ensure_sender_receiver_on_evm_chain(
-            &dst,
-            dst_rpc,
-            &evm_pk,
-            gateway_addr,
-            gas_service_addr,
-        )
-        .await?;
-        ui::address("SenderReceiver", &format!("{addr}"));
-        Some(format!("{addr}"))
-    } else {
-        destination_address
-    };
+    check_svm_balances(src_type, dst_type, src_rpc, &dst, dst_cfg)?;
+    let destination_address =
+        resolve_config_destination_address(src_type, dst_type, &dst, dst_cfg, destination_address)
+            .await?;
 
     let sent = match src_type {
         ChainType::Svm => source::send_svm_call_contract(
@@ -292,16 +401,6 @@ pub async fn run_config(
             ));
         }
     };
-    let source::SentGmp {
-        destination_chain: _,
-        destination_address,
-        source_address,
-        message_id,
-        payload_bytes,
-        payload_hash,
-    } = sent;
-    let payload_hash_hex = alloy::hex::encode(payload_hash);
-
     let cosm_gateway = cfg.axelar.contract_address("Gateway", &src)?;
     let voting_verifier = cfg.axelar.contract_address("VotingVerifier", &src).ok();
     let multisig_prover = cfg.axelar.contract_address("MultisigProver", &dst)?;
@@ -313,16 +412,7 @@ pub async fn run_config(
     }
     ui::address("axelar address", &axelar_address);
 
-    let gmp_msg = json!({
-        "cc_id": {
-            "message_id": message_id,
-            "source_chain": src,
-        },
-        "destination_chain": dst,
-        "destination_address": destination_address,
-        "source_address": source_address,
-        "payload_hash": payload_hash_hex,
-    });
+    let gmp_msg = config_gmp_message(&sent, &src, &dst);
 
     let ctx = relay::AmplifierContext {
         axelar_address: axelar_address.clone(),
@@ -335,73 +425,18 @@ pub async fn run_config(
         multisig_prover: multisig_prover.to_string(),
     };
     let execute_data_hex =
-        relay::run_full_sequence(&ctx, &signing_key, &gmp_msg, &src, &message_id, 8).await?;
+        relay::run_full_sequence(&ctx, &signing_key, &gmp_msg, &src, &sent.message_id, 8).await?;
+    execute_config_destination(
+        dst_type,
+        dst_cfg,
+        &src,
+        &dst,
+        network,
+        &sent,
+        &execute_data_hex,
+    )
+    .await?;
 
-    match dst_type {
-        ChainType::Svm => {
-            let dst_rpc = dst_cfg
-                .rpc
-                .as_deref()
-                .ok_or_else(|| eyre::eyre!("no RPC for destination chain '{dst}'"))?;
-            destination::approve_and_execute_svm(destination::SvmExecutionRequest {
-                dst_rpc,
-                network,
-                source_chain: &src,
-                destination_chain: &dst,
-                source_address: &source_address,
-                destination_address: &destination_address,
-                message_id: &message_id,
-                payload_bytes: &payload_bytes,
-                payload_hash,
-                execute_data_hex: &execute_data_hex,
-                step_idx_approve: 7,
-                step_idx_execute: 8,
-                total_steps: 8,
-            })?;
-        }
-        ChainType::Evm => {
-            let dst_rpc = dst_cfg
-                .rpc
-                .as_deref()
-                .ok_or_else(|| eyre::eyre!("no RPC for destination chain '{dst}'"))?;
-            let sender_receiver: alloy::primitives::Address = destination_address
-                .parse()
-                .map_err(|e| eyre::eyre!("invalid --destination-address: {e}"))?;
-            let evm_pk = std::env::var("EVM_PRIVATE_KEY").map_err(|_| {
-                eyre::eyre!("EVM_PRIVATE_KEY env var required for sol→evm GMP destination")
-            })?;
-            let evm_signer: PrivateKeySigner = evm_pk.parse()?;
-            let dst_provider = ProviderBuilder::new()
-                .wallet(evm_signer)
-                .connect_http(dst_rpc.parse()?);
-            let gateway_addr: alloy::primitives::Address =
-                dst_cfg.contract_address("AxelarGateway", &dst)?.parse()?;
-            ui::address("destination EVM gateway", &format!("{gateway_addr}"));
-            ui::address("destination SenderReceiver", &format!("{sender_receiver}"));
-
-            approve_and_execute_evm(destination::EvmExecutionRequest {
-                provider: &dst_provider,
-                gateway: gateway_addr,
-                sender_receiver,
-                source_chain: &src,
-                source_address: &source_address,
-                message_id: &message_id,
-                execute_data_hex: &execute_data_hex,
-                payload_bytes: &payload_bytes,
-                payload_hash,
-                step_idx_approve: 7,
-                step_idx_execute: 8,
-                total_steps: 8,
-            })
-            .await?;
-        }
-    }
-
-    ui::section("Complete");
-    ui::success(&format!(
-        "GMP flow complete ({})",
-        ui::format_elapsed(gmp_start)
-    ));
-
+    print_gmp_completion(gmp_start);
     Ok(())
 }

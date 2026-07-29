@@ -5,33 +5,22 @@
 //! lifetime, timing merge, and completion live in
 //! [`super::verification_session`], shared with the ITS routes.
 
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::time::Instant;
-
 use alloy::primitives::Address;
 use alloy::providers::Provider;
 use eyre::Result;
 use indicatif::ProgressBar;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc;
 
-use super::metrics::{LoadTestReport, TxMetrics, VerificationReport};
-use super::verification_session::{MessageMatcher, StreamingResult, StreamingTarget};
+use super::metrics::{TxMetrics, VerificationReport};
+use super::verification_session::{BatchTarget, MessageMatcher, StreamingResult, StreamingTarget};
+pub(super) use super::verification_session::{attach_batch, finish_batch};
 use super::verify::{
     self, EvmGmpDestination, EvmGmpStreamingDestination, GmpBatchVerification, PendingTx,
     SolanaGmpDestination, SourceChainType, StellarGmpDestination, StreamingVerification,
     SuiGmpDestination, VerificationRoute,
 };
-use super::{LoadTestArgs, finish_report};
-
-/// A destination capable of verifying a completed batch of GMP calls.
-pub(super) trait GmpBatchTarget {
-    fn verify_batch(
-        self,
-        route: VerificationRoute,
-        metrics: &mut [TxMetrics],
-    ) -> impl Future<Output = Result<VerificationReport>>;
-}
 
 /// EVM destination. Amplifier and legacy gateways expose different approval
 /// APIs, so the gateway generation is part of the target.
@@ -43,7 +32,7 @@ pub(super) struct EvmGmpTarget<P> {
     pub legacy: bool,
 }
 
-impl<P: Provider> GmpBatchTarget for EvmGmpTarget<P> {
+impl<P: Provider> BatchTarget for EvmGmpTarget<P> {
     async fn verify_batch(
         self,
         route: VerificationRoute,
@@ -72,7 +61,7 @@ pub(super) struct SolanaGmpTarget {
     pub source_type: SourceChainType,
 }
 
-impl GmpBatchTarget for SolanaGmpTarget {
+impl BatchTarget for SolanaGmpTarget {
     fn verify_batch(
         self,
         route: VerificationRoute,
@@ -101,7 +90,7 @@ pub(super) struct StellarGmpTarget {
     pub source_type: SourceChainType,
 }
 
-impl GmpBatchTarget for StellarGmpTarget {
+impl BatchTarget for StellarGmpTarget {
     fn verify_batch(
         self,
         route: VerificationRoute,
@@ -130,7 +119,7 @@ pub(super) struct SuiGmpTarget {
     pub source_type: SourceChainType,
 }
 
-impl GmpBatchTarget for SuiGmpTarget {
+impl BatchTarget for SuiGmpTarget {
     fn verify_batch(
         self,
         route: VerificationRoute,
@@ -217,24 +206,4 @@ impl StreamingTarget for SolanaGmpStreamingTarget {
             spinner,
         })
     }
-}
-
-pub(super) async fn finish_batch<T: GmpBatchTarget>(
-    args: &LoadTestArgs,
-    target: T,
-    report: &mut LoadTestReport,
-    test_start: Instant,
-) -> Result<()> {
-    attach_batch(args, target, report).await?;
-    finish_report(report, test_start)
-}
-
-pub(super) async fn attach_batch<T: GmpBatchTarget>(
-    args: &LoadTestArgs,
-    target: T,
-    report: &mut LoadTestReport,
-) -> Result<()> {
-    let route = VerificationRoute::from_args(args);
-    report.verification = Some(target.verify_batch(route, &mut report.transactions).await?);
-    Ok(())
 }

@@ -195,10 +195,9 @@ pub async fn check_cosmos_routed(
     };
     let data = resp.get("data").or_else(|| resp.as_array().map(|_| &resp));
     Ok(match data {
-        Some(arr) if arr.is_array() => {
-            let items = arr.as_array().unwrap();
-            !items.is_empty() && !items.iter().all(|v| v.is_null())
-        }
+        Some(arr) => arr
+            .as_array()
+            .is_some_and(|items| !items.is_empty() && !items.iter().all(|value| value.is_null())),
         _ => false,
     })
 }

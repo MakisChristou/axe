@@ -16,6 +16,7 @@ use super::its_verification;
 use super::its_verification::{EvmItsTarget, finish_batch};
 use super::metrics::RunIdentity;
 use super::run_sizing::{RunMode, RunSizing, SustainedPlan};
+use super::units::Drops;
 use super::verification_session::VerificationSession;
 use super::verify::VerificationRoute;
 use super::{LoadTestArgs, validate_evm_rpc, xrpl_sender};
@@ -47,14 +48,14 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
 
     let evm_targets = resolve_evm_targets(&cfg, dest)?;
 
-    let gas_fee_drops = parse_gas_fee_drops(args.gas_value.as_deref())?;
+    let gas_fee = parse_gas_fee_drops(args.gas_value.as_deref())?;
     let wallets = fund_ephemeral_wallets(
         &xrpl_client,
         &main_wallet,
         &xrpl_rpc,
         &xrpl_network_type,
         &sizing,
-        gas_fee_drops,
+        gas_fee,
     )
     .await?;
     let multisig = parse_address(&xrpl_multisig_addr)?;
@@ -67,7 +68,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
                 wallets,
                 multisig,
                 evm: evm_targets,
-                gas_fee_drops,
+                gas_fee,
                 sizing,
                 plan,
             })
@@ -80,7 +81,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
                 &wallets,
                 &multisig,
                 &evm_targets,
-                gas_fee_drops,
+                gas_fee,
             )
             .await
         }
@@ -154,8 +155,8 @@ fn resolve_evm_targets(cfg: &ChainsConfig, dest: &str) -> Result<EvmTargets> {
 /// `xrpl_sender::DEFAULT_GAS_FEE_DROPS`, and emit the matching UI line.
 /// ITS routes via the hub (two commands: source→hub, hub→destination), so
 /// we pay 2× the per-command gas value.
-fn parse_gas_fee_drops(gas_value: Option<&str>) -> Result<u64> {
-    let gas_fee_drops: u64 = match gas_value {
+fn parse_gas_fee_drops(gas_value: Option<&str>) -> Result<Drops> {
+    let gas_fee_drops = match gas_value {
         Some(v) => v
             .parse::<u64>()
             .map_err(|e| eyre!("invalid --gas-value: {e}"))?,
@@ -169,7 +170,7 @@ fn parse_gas_fee_drops(gas_value: Option<&str>) -> Result<u64> {
             gas_fee_drops as f64 / 1_000_000.0
         ),
     );
-    Ok(gas_fee_drops)
+    Ok(Drops::new(gas_fee_drops))
 }
 
 /// Derive ephemeral wallets and ensure each one is funded for the planned
@@ -180,7 +181,7 @@ async fn fund_ephemeral_wallets(
     xrpl_rpc: &str,
     xrpl_network_type: &str,
     sizing: &RunSizing,
-    gas_fee_drops: u64,
+    gas_fee: Drops,
 ) -> Result<Vec<XrplWallet>> {
     // Each wallet needs: base reserve (~10 XRP) + txs_per_key * (gas + net transfer + base fee).
     // The on-wire payment is `gas_fee_drops + NET_TRANSFER_DROPS` (relayer subtracts
@@ -188,7 +189,7 @@ async fn fund_ephemeral_wallets(
     let per_wallet_drops: u64 = 10_000_000u64
         + sizing
             .transactions_per_key()
-            .saturating_mul(gas_fee_drops + xrpl_sender::NET_TRANSFER_DROPS + 100);
+            .saturating_mul(gas_fee.get() + xrpl_sender::NET_TRANSFER_DROPS + 100);
 
     // Pass RPC URL so devnet vs testnet vs mainnet is inferred from the
     // actual endpoint (devnet-amplifier mislabels its xrpl networkType).
@@ -215,7 +216,7 @@ struct SustainedPipeline {
     wallets: Vec<XrplWallet>,
     multisig: AccountId,
     evm: EvmTargets,
-    gas_fee_drops: u64,
+    gas_fee: Drops,
     sizing: RunSizing,
     plan: SustainedPlan,
 }
@@ -227,7 +228,7 @@ async fn run_sustained_pipeline(pipeline: SustainedPipeline) -> Result<()> {
         wallets,
         multisig,
         evm,
-        gas_fee_drops,
+        gas_fee,
         sizing,
         plan,
     } = pipeline;
@@ -264,7 +265,7 @@ async fn run_sustained_pipeline(pipeline: SustainedPipeline) -> Result<()> {
         destination_multisig: multisig,
         destination_chain: dest.clone(),
         destination_address_hex: evm.dest_address_hex.clone(),
-        gas_fee_drops,
+        gas_fee,
         gmp_dest_chain: "axelar".to_string(),
         gmp_dest_address: evm.axelarnet_gw_addr.clone(),
         tps: tps_n,
@@ -296,7 +297,7 @@ async fn run_burst_pipeline(
     wallets: &[XrplWallet],
     multisig: &AccountId,
     evm: &EvmTargets,
-    gas_fee_drops: u64,
+    gas_fee: Drops,
 ) -> Result<()> {
     let dest = &args.destination_chain;
 
@@ -307,7 +308,7 @@ async fn run_burst_pipeline(
         destination_multisig: *multisig,
         destination_chain: dest.clone(),
         destination_address_hex: evm.dest_address_hex.clone(),
-        gas_fee_drops,
+        gas_fee,
         gmp_dest_chain: "axelar".to_string(),
         gmp_dest_address: evm.axelarnet_gw_addr.clone(),
         run: RunIdentity::burst(args),

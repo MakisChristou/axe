@@ -87,6 +87,140 @@ pub(in crate::commands::load_test::verify) enum EvmDestinationVerifier<'a, P: Pr
     },
 }
 
+async fn check_evm_amplifier_destination<P: Provider>(
+    gw_contract: &AxelarAmplifierGateway::AxelarAmplifierGatewayInstance<&P>,
+    require_observed_approval: bool,
+    source_chain: &str,
+    txs: &[PendingTx],
+    indices: &[usize],
+) -> Result<Vec<DestinationObservation>> {
+    let mut futures = Vec::with_capacity(indices.len());
+    for &index in indices {
+        let Some(phase) = txs[index].phase() else {
+            continue;
+        };
+        let message_id = txs[index].message_id.clone();
+        let source_address = txs[index].source_address.clone();
+        let contract_address = txs[index].contract_addr;
+        let payload_hash = required_payload_hash(&txs[index])?;
+        futures.push(async move {
+            let approved = check_evm_is_message_approved(
+                gw_contract,
+                source_chain,
+                &message_id,
+                &source_address,
+                contract_address,
+                payload_hash,
+            )
+            .await?;
+            let executed =
+                check_evm_is_message_executed(gw_contract, source_chain, &message_id).await?;
+            let status = match phase {
+                Phase::Approved if executed => DestinationStatus::Executed { command_id: None },
+                Phase::Approved if approved => DestinationStatus::Approved { command_id: None },
+                Phase::Approved if !require_observed_approval => {
+                    DestinationStatus::Executed { command_id: None }
+                }
+                Phase::Executed if !approved => DestinationStatus::Executed { command_id: None },
+                _ => DestinationStatus::Pending,
+            };
+            Ok(DestinationObservation { index, status })
+        });
+    }
+    let results: Vec<Result<_>> = futures::stream::iter(futures)
+        .buffer_unordered(20)
+        .collect()
+        .await;
+    let mut observations = Vec::with_capacity(results.len());
+    for result in results {
+        match result {
+            Ok(observation) => observations.push(observation),
+            Err(error) => ui::warn(&format!(
+                "destination check RPC error (keeping in-flight for GMP-API recheck): {error}"
+            )),
+        }
+    }
+    Ok(observations)
+}
+
+async fn legacy_approval_status<P: Provider>(
+    gw_contract: &AxelarAmplifierGateway::AxelarAmplifierGatewayInstance<&P>,
+    tx: &PendingTx,
+    from_block: u64,
+    match_by_payload: bool,
+) -> Result<DestinationStatus> {
+    let payload_hash = required_payload_hash(tx)?;
+    let found = if match_by_payload {
+        legacy::find_contract_call_approved_by_payload(
+            gw_contract.provider(),
+            *gw_contract.address(),
+            tx.contract_addr,
+            payload_hash,
+            from_block,
+        )
+        .await?
+    } else {
+        let source_tx_hash = legacy::source_tx_hash_from_message_id(&tx.message_id)?;
+        legacy::find_contract_call_approved(
+            gw_contract.provider(),
+            *gw_contract.address(),
+            tx.contract_addr,
+            payload_hash,
+            source_tx_hash,
+            from_block,
+        )
+        .await?
+    };
+    let Some(command_id) = found else {
+        return Ok(DestinationStatus::Pending);
+    };
+    if check_evm_command_executed(gw_contract, command_id.into()).await? {
+        Ok(DestinationStatus::Executed {
+            command_id: Some(command_id),
+        })
+    } else {
+        Ok(DestinationStatus::Approved {
+            command_id: Some(command_id),
+        })
+    }
+}
+
+async fn check_evm_legacy_destination<P: Provider>(
+    gw_contract: &AxelarAmplifierGateway::AxelarAmplifierGatewayInstance<&P>,
+    from_block: u64,
+    match_by_payload: bool,
+    txs: &[PendingTx],
+    indices: &[usize],
+) -> Result<Vec<DestinationObservation>> {
+    let mut observations = Vec::with_capacity(indices.len());
+    for &index in indices {
+        let tx = &txs[index];
+        let status = match tx.phase() {
+            Some(Phase::Approved) => {
+                legacy_approval_status(gw_contract, tx, from_block, match_by_payload).await?
+            }
+            Some(Phase::Executed) => {
+                let command_id = tx.command_id().ok_or_else(|| {
+                    eyre::eyre!(
+                        "legacy tx {} in Executed phase without a commandId",
+                        tx.message_id
+                    )
+                })?;
+                if check_evm_command_executed(gw_contract, command_id.into()).await? {
+                    DestinationStatus::Executed {
+                        command_id: Some(command_id),
+                    }
+                } else {
+                    DestinationStatus::Pending
+                }
+            }
+            _ => DestinationStatus::Pending,
+        };
+        observations.push(DestinationObservation { index, status });
+    }
+    Ok(observations)
+}
+
 impl<P: Provider> DestinationVerifier for EvmDestinationVerifier<'_, P> {
     fn approval_label(&self) -> &str {
         match self {
@@ -118,138 +252,28 @@ impl<P: Provider> DestinationVerifier for EvmDestinationVerifier<'_, P> {
                     gw_contract,
                     require_observed_approval,
                 } => {
-                    let mut futures = Vec::with_capacity(indices.len());
-                    for &index in indices {
-                        // The pipeline only schedules active txs; a settled one
-                        // has nothing left to observe.
-                        let Some(phase) = txs[index].phase() else {
-                            continue;
-                        };
-                        let message_id = txs[index].message_id.clone();
-                        let source_address = txs[index].source_address.clone();
-                        let contract_address = txs[index].contract_addr;
-                        let payload_hash = required_payload_hash(&txs[index])?;
-                        futures.push(async move {
-                            let approved = check_evm_is_message_approved(
-                                gw_contract,
-                                source_chain,
-                                &message_id,
-                                &source_address,
-                                contract_address,
-                                payload_hash,
-                            )
-                            .await?;
-                            let executed = check_evm_is_message_executed(
-                                gw_contract,
-                                source_chain,
-                                &message_id,
-                            )
-                            .await?;
-                            let status = match phase {
-                                Phase::Approved if executed => {
-                                    DestinationStatus::Executed { command_id: None }
-                                }
-                                Phase::Approved if approved => {
-                                    DestinationStatus::Approved { command_id: None }
-                                }
-                                Phase::Approved if !require_observed_approval => {
-                                    DestinationStatus::Executed { command_id: None }
-                                }
-                                Phase::Executed if !approved => {
-                                    DestinationStatus::Executed { command_id: None }
-                                }
-                                _ => DestinationStatus::Pending,
-                            };
-                            Ok(DestinationObservation { index, status })
-                        });
-                    }
-                    let results: Vec<Result<_>> = futures::stream::iter(futures)
-                        .buffer_unordered(20)
-                        .collect()
-                        .await;
-                    let mut observations = Vec::with_capacity(results.len());
-                    for result in results {
-                        match result {
-                            Ok(observation) => observations.push(observation),
-                            Err(error) => ui::warn(&format!(
-                                "destination check RPC error (keeping in-flight for \
-                                 GMP-API recheck): {error}"
-                            )),
-                        }
-                    }
-                    Ok(observations)
+                    check_evm_amplifier_destination(
+                        gw_contract,
+                        *require_observed_approval,
+                        source_chain,
+                        txs,
+                        indices,
+                    )
+                    .await
                 }
                 Self::Legacy {
                     gw_contract,
                     from_block,
                     match_by_payload,
                 } => {
-                    let mut observations = Vec::with_capacity(indices.len());
-                    for &index in indices {
-                        let tx = &txs[index];
-                        let status = match tx.phase() {
-                            Some(Phase::Approved) => {
-                                let payload_hash = required_payload_hash(tx)?;
-                                let found = if *match_by_payload {
-                                    legacy::find_contract_call_approved_by_payload(
-                                        gw_contract.provider(),
-                                        *gw_contract.address(),
-                                        tx.contract_addr,
-                                        payload_hash,
-                                        *from_block,
-                                    )
-                                    .await?
-                                } else {
-                                    let source_tx_hash =
-                                        legacy::source_tx_hash_from_message_id(&tx.message_id)?;
-                                    legacy::find_contract_call_approved(
-                                        gw_contract.provider(),
-                                        *gw_contract.address(),
-                                        tx.contract_addr,
-                                        payload_hash,
-                                        source_tx_hash,
-                                        *from_block,
-                                    )
-                                    .await?
-                                };
-                                if let Some(command_id) = found {
-                                    if check_evm_command_executed(gw_contract, command_id.into())
-                                        .await?
-                                    {
-                                        DestinationStatus::Executed {
-                                            command_id: Some(command_id),
-                                        }
-                                    } else {
-                                        DestinationStatus::Approved {
-                                            command_id: Some(command_id),
-                                        }
-                                    }
-                                } else {
-                                    DestinationStatus::Pending
-                                }
-                            }
-                            Some(Phase::Executed) => {
-                                let command_id = tx.command_id().ok_or_else(|| {
-                                    eyre::eyre!(
-                                        "legacy tx {} in Executed phase without a commandId",
-                                        tx.message_id
-                                    )
-                                })?;
-                                if check_evm_command_executed(gw_contract, command_id.into())
-                                    .await?
-                                {
-                                    DestinationStatus::Executed {
-                                        command_id: Some(command_id),
-                                    }
-                                } else {
-                                    DestinationStatus::Pending
-                                }
-                            }
-                            _ => DestinationStatus::Pending,
-                        };
-                        observations.push(DestinationObservation { index, status });
-                    }
-                    Ok(observations)
+                    check_evm_legacy_destination(
+                        gw_contract,
+                        *from_block,
+                        *match_by_payload,
+                        txs,
+                        indices,
+                    )
+                    .await
                 }
             }
         })

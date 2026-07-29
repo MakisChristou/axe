@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
 use eyre::{Result, WrapErr, eyre};
 use indicatif::ProgressBar;
@@ -15,8 +16,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use super::identifiers::MessageId;
-use super::metrics::{LoadTestReport, VerificationReport};
+use super::metrics::{LoadTestReport, TxMetrics, VerificationReport};
 use super::verify::{PendingTx, VerificationRoute};
+use super::{LoadTestArgs, finish_report};
 use crate::types::Network;
 
 /// Per-message timings a streaming verifier reports back alongside its
@@ -24,6 +26,35 @@ use crate::types::Network;
 pub(super) use super::verify::StreamingTimings as Timings;
 
 pub(super) type StreamingResult = Result<(VerificationReport, Timings)>;
+
+/// A destination that can verify a completed batch of source transactions.
+pub(super) trait BatchTarget {
+    fn verify_batch(
+        self,
+        route: VerificationRoute,
+        metrics: &mut [TxMetrics],
+    ) -> impl Future<Output = Result<VerificationReport>>;
+}
+
+pub(super) async fn attach_batch<T: BatchTarget>(
+    args: &LoadTestArgs,
+    target: T,
+    report: &mut LoadTestReport,
+) -> Result<()> {
+    let route = VerificationRoute::from_args(args);
+    report.verification = Some(target.verify_batch(route, &mut report.transactions).await?);
+    Ok(())
+}
+
+pub(super) async fn finish_batch<T: BatchTarget>(
+    args: &LoadTestArgs,
+    target: T,
+    report: &mut LoadTestReport,
+    test_start: Instant,
+) -> Result<()> {
+    attach_batch(args, target, report).await?;
+    finish_report(report, test_start)
+}
 
 /// How a timing's message id maps back to the source transaction that
 /// produced it.

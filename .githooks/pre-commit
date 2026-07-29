@@ -17,15 +17,17 @@ cd "$ROOT"
 echo "==> cargo fmt --all --check"
 cargo fmt --all --check
 
-echo "==> cargo clippy --all-targets -- -D warnings (too_many_lines suppressed)"
-# `too_many_lines` is intentionally left at warn in Cargo.toml — the
-# load-test pipeline orchestrators are legitimately long state machines
-# (see the comment in [lints.clippy]). All other polish-refactor lints
-# are now deny-level and gate-enforced.
-cargo clippy --all-targets -- -D warnings \
-    -A clippy::too_many_lines
+echo "==> cargo clippy --locked --all-targets -- -D warnings"
+cargo clippy --locked --all-targets -- -D warnings
 
-echo "==> cargo test --all-targets"
-cargo test --all-targets --quiet
+echo "==> production panic-safety lints"
+cargo clippy --locked --bin axe -- \
+    -D warnings \
+    -D clippy::unwrap_used \
+    -D clippy::expect_used \
+    -D clippy::panic
+
+echo "==> cargo test --locked --all-targets"
+cargo test --locked --all-targets --quiet
 
 echo "pre-commit OK"

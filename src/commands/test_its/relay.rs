@@ -116,6 +116,184 @@ pub(super) struct DestinationRelayRequest<'a, P> {
     pub step_total: usize,
 }
 
+async fn wait_for_hub_approval(lcd: &str, gateway: &str, source_chain: &str, message_id: &str) {
+    let spinner = ui::wait_spinner("Polling hub for approval...");
+    for attempt in 0..AMPLIFIER_POLL_ATTEMPTS_5MIN {
+        if attempt > 0 {
+            tokio::time::sleep(AMPLIFIER_POLL_INTERVAL).await;
+        }
+        if check_hub_approved(lcd, gateway, source_chain, message_id)
+            .await
+            .unwrap_or(false)
+        {
+            spinner.finish_and_clear();
+            ui::success("hub approved first-leg message");
+            return;
+        }
+        spinner.set_message(format!(
+            "Waiting for hub approval (attempt {}/60)...",
+            attempt + 1
+        ));
+    }
+    spinner.finish_and_clear();
+    ui::warn(
+        "hub never reported the message as approved — proceeding anyway since it may have already been forwarded",
+    );
+}
+
+fn validate_second_leg_payload(payload: &[u8], second_leg: &SecondLegInfo) -> Result<()> {
+    let local_hash = alloy::hex::encode(keccak256(payload).as_slice());
+    let expected_hash = second_leg
+        .payload_hash
+        .strip_prefix("0x")
+        .unwrap_or(&second_leg.payload_hash)
+        .to_lowercase();
+    if local_hash != expected_hash {
+        ui::warn("payload hash mismatch between local reconstruction and hub event:");
+        ui::warn(&format!("  local:    0x{local_hash}"));
+        ui::warn(&format!("  expected: 0x{expected_hash}"));
+        return Err(eyre::eyre!(
+            "payload hash mismatch — would cause ITS.execute to revert"
+        ));
+    }
+    ui::success("payload hash matches second-leg event");
+    Ok(())
+}
+
+async fn wait_for_destination_route(lcd: &str, gateway: &str, message_id: &str) -> Result<()> {
+    let spinner = ui::wait_spinner("Polling destination cosm gateway...");
+    for attempt in 0..AMPLIFIER_POLL_ATTEMPTS_10MIN {
+        if attempt > 0 {
+            tokio::time::sleep(AMPLIFIER_POLL_INTERVAL).await;
+        }
+        if check_cosmos_routed(lcd, gateway, crate::types::HubChain::NAME, message_id)
+            .await
+            .unwrap_or(false)
+        {
+            spinner.finish_and_clear();
+            ui::success("destination cosm gateway has the message");
+            return Ok(());
+        }
+        spinner.set_message(format!(
+            "Waiting for routing (attempt {}/120)...",
+            attempt + 1
+        ));
+    }
+    spinner.finish_and_clear();
+    Err(eyre::eyre!(
+        "destination cosm gateway never received second-leg message"
+    ))
+}
+
+async fn construct_destination_proof(
+    tx: CosmosTxContext<'_>,
+    prover: &str,
+    message_id: &str,
+    step_base: usize,
+    step_total: usize,
+) -> Result<Vec<u8>> {
+    ui::step_header(
+        step_base + 3,
+        step_total,
+        "construct_proof on dest MultisigProver",
+    );
+    let message = json!({
+        "construct_proof": [{
+            "source_chain": crate::types::HubChain::NAME,
+            "message_id": message_id,
+        }]
+    });
+    let execute = build_execute_msg_any(tx.axelar_address, prover, &message)?;
+    let response = sign_and_broadcast_cosmos_tx(
+        tx.signing_key,
+        tx.axelar_address,
+        tx.lcd,
+        tx.chain_id,
+        tx.fee_denom,
+        tx.gas_price,
+        vec![execute],
+    )
+    .await?;
+    let session_id = extract_event_attr(&response, "multisig_session_id")?;
+    ui::kv("multisig_session_id", &session_id);
+
+    ui::step_header(step_base + 4, step_total, "Wait for proof signing");
+    let proof = wait_for_proof(tx.lcd, prover, &session_id).await?;
+    ui::success("proof ready");
+    let execute_data = proof["status"]["completed"]["execute_data"]
+        .as_str()
+        .ok_or_else(|| eyre::eyre!("no execute_data in proof response"))?;
+    Ok(alloy::hex::decode(execute_data)?)
+}
+
+struct DestinationExecutionRequest<'a, P> {
+    provider: &'a P,
+    gateway: Address,
+    its_proxy: Address,
+    second_leg: &'a SecondLegInfo,
+    execute_data: Vec<u8>,
+    dest_payload: &'a [u8],
+    step_base: usize,
+    step_total: usize,
+}
+
+async fn approve_and_execute_destination<P: Provider>(
+    request: DestinationExecutionRequest<'_, P>,
+) -> Result<()> {
+    let DestinationExecutionRequest {
+        provider,
+        gateway,
+        its_proxy,
+        second_leg,
+        execute_data,
+        dest_payload,
+        step_base,
+        step_total,
+    } = request;
+    ui::step_header(
+        step_base + 5,
+        step_total,
+        "Submit proof to dest EVM gateway",
+    );
+    let approve = TransactionRequest::default()
+        .to(gateway)
+        .input(Bytes::from(execute_data).into());
+    let pending = provider.send_transaction(approve).await?;
+    crate::evm::broadcast_and_log(pending, "evm approve tx").await?;
+
+    let command_id = keccak256(format!("axelar_{}", second_leg.message_id).as_bytes());
+    ui::kv("commandId", &format!("{command_id}"));
+    let approved = AxelarAmplifierGateway::new(gateway, provider)
+        .isContractCallApproved(
+            command_id,
+            crate::types::HubChain::NAME.to_string(),
+            second_leg.source_address.clone(),
+            its_proxy,
+            keccak256(dest_payload),
+        )
+        .call()
+        .await?;
+    ui::kv("isContractCallApproved", &format!("{approved}"));
+    if !approved {
+        return Err(eyre::eyre!(
+            "gateway says message not approved for ITS proxy + hub source — check source_address case / encoding"
+        ));
+    }
+
+    ui::step_header(step_base + 6, step_total, "Execute on destination ITS");
+    let pending = InterchainTokenService::new(its_proxy, provider)
+        .execute(
+            command_id,
+            crate::types::HubChain::NAME.to_string(),
+            second_leg.source_address.clone(),
+            Bytes::copy_from_slice(dest_payload),
+        )
+        .send()
+        .await?;
+    crate::evm::broadcast_and_log(pending, "its execute tx").await?;
+    Ok(())
+}
+
 /// Drive the second leg actively: wait for hub-routed message → discover its
 /// cc_id → wait for the destination cosm gateway to have it → construct_proof
 /// on the destination MultisigProver → submit to the EVM gateway →
@@ -138,48 +316,16 @@ pub(super) async fn relay_to_destination<P: Provider>(
         step_base,
         step_total,
     } = request;
-    let CosmosTxContext {
-        signing_key,
-        axelar_address,
-        lcd,
-        chain_id,
-        fee_denom,
-        gas_price,
-    } = tx;
     // Wait until the AxelarnetGateway hub has approved the first-leg message.
     // executable_messages is keyed by the *source* chain of the message.
     ui::step_header(step_base, step_total, "Wait for hub approval");
-    let spinner = ui::wait_spinner("Polling hub for approval...");
-    let mut hub_approved = false;
-    for i in 0..AMPLIFIER_POLL_ATTEMPTS_5MIN {
-        if i > 0 {
-            tokio::time::sleep(AMPLIFIER_POLL_INTERVAL).await;
-        }
-        if check_hub_approved(
-            lcd,
-            axelarnet_gateway,
-            src_axelar_id.as_str(),
-            first_leg_message_id,
-        )
-        .await
-        .unwrap_or(false)
-        {
-            hub_approved = true;
-            spinner.finish_and_clear();
-            ui::success("hub approved first-leg message");
-            break;
-        }
-        spinner.set_message(format!(
-            "Waiting for hub approval (attempt {}/60)...",
-            i + 1
-        ));
-    }
-    if !hub_approved {
-        spinner.finish_and_clear();
-        ui::warn(
-            "hub never reported the message as approved — proceeding anyway since it may have already been forwarded",
-        );
-    }
+    wait_for_hub_approval(
+        tx.lcd,
+        axelarnet_gateway,
+        src_axelar_id.as_str(),
+        first_leg_message_id,
+    )
+    .await;
 
     // Discover the second-leg message_id
     ui::step_header(step_base + 1, step_total, "Discover second-leg cc_id");
@@ -200,22 +346,7 @@ pub(super) async fn relay_to_destination<P: Provider>(
     ui::kv("second-leg payload_hash", &second_leg.payload_hash);
 
     // Sanity-check our reconstruction
-    let local_hash = keccak256(dest_payload);
-    let expected_hash_str = second_leg
-        .payload_hash
-        .strip_prefix("0x")
-        .unwrap_or(&second_leg.payload_hash)
-        .to_lowercase();
-    let local_hash_str = alloy::hex::encode(local_hash.as_slice());
-    if local_hash_str != expected_hash_str {
-        ui::warn("payload hash mismatch between local reconstruction and hub event:");
-        ui::warn(&format!("  local:    0x{local_hash_str}"));
-        ui::warn(&format!("  expected: 0x{expected_hash_str}"));
-        return Err(eyre::eyre!(
-            "payload hash mismatch — would cause ITS.execute to revert"
-        ));
-    }
-    ui::success("payload hash matches second-leg event");
+    validate_second_leg_payload(dest_payload, &second_leg)?;
 
     // Wait until the destination cosmos Gateway has the outgoing message
     ui::step_header(
@@ -223,124 +354,27 @@ pub(super) async fn relay_to_destination<P: Provider>(
         step_total,
         "Wait for destination cosmos gateway to publish",
     );
-    let spinner = ui::wait_spinner("Polling destination cosm gateway...");
-    let mut routed = false;
-    for i in 0..AMPLIFIER_POLL_ATTEMPTS_10MIN {
-        if i > 0 {
-            tokio::time::sleep(AMPLIFIER_POLL_INTERVAL).await;
-        }
-        if check_cosmos_routed(
-            lcd,
-            dst_cosm_gateway,
-            crate::types::HubChain::NAME,
-            &second_leg.message_id,
-        )
-        .await
-        .unwrap_or(false)
-        {
-            routed = true;
-            spinner.finish_and_clear();
-            ui::success("destination cosm gateway has the message");
-            break;
-        }
-        spinner.set_message(format!("Waiting for routing (attempt {}/120)...", i + 1));
-    }
-    if !routed {
-        spinner.finish_and_clear();
-        return Err(eyre::eyre!(
-            "destination cosm gateway never received second-leg message"
-        ));
-    }
+    wait_for_destination_route(tx.lcd, dst_cosm_gateway, &second_leg.message_id).await?;
 
-    // construct_proof on destination MultisigProver
-    ui::step_header(
-        step_base + 3,
+    let execute_data = construct_destination_proof(
+        tx,
+        dst_multisig_prover,
+        &second_leg.message_id,
+        step_base,
         step_total,
-        "construct_proof on dest MultisigProver",
-    );
-    let construct_proof_msg = json!({
-        "construct_proof": [{
-            "source_chain": crate::types::HubChain::NAME,
-            "message_id": second_leg.message_id,
-        }]
-    });
-    let construct_any =
-        build_execute_msg_any(axelar_address, dst_multisig_prover, &construct_proof_msg)?;
-    let construct_resp = sign_and_broadcast_cosmos_tx(
-        signing_key,
-        axelar_address,
-        lcd,
-        chain_id,
-        fee_denom,
-        gas_price,
-        vec![construct_any],
     )
     .await?;
-    let session_id = extract_event_attr(&construct_resp, "multisig_session_id")?;
-    ui::kv("multisig_session_id", &session_id);
-
-    // Wait for proof
-    ui::step_header(step_base + 4, step_total, "Wait for proof signing");
-    let proof = wait_for_proof(lcd, dst_multisig_prover, &session_id).await?;
-    ui::success("proof ready");
-
-    let execute_data_hex = proof["status"]["completed"]["execute_data"]
-        .as_str()
-        .ok_or_else(|| eyre::eyre!("no execute_data in proof response"))?;
-    let execute_data = alloy::hex::decode(execute_data_hex)?;
-
-    // Submit to EVM gateway
-    ui::step_header(
-        step_base + 5,
+    approve_and_execute_destination(DestinationExecutionRequest {
+        provider: dst_provider,
+        gateway: dst_evm_gateway,
+        its_proxy: dst_its_proxy,
+        second_leg: &second_leg,
+        execute_data,
+        dest_payload,
+        step_base,
         step_total,
-        "Submit proof to dest EVM gateway",
-    );
-    let approve_tx = TransactionRequest::default()
-        .to(dst_evm_gateway)
-        .input(Bytes::from(execute_data).into());
-    let pending_approve = dst_provider.send_transaction(approve_tx).await?;
-    let _approve_receipt = crate::evm::broadcast_and_log(pending_approve, "evm approve tx").await?;
-
-    // Derive commandId locally from (sourceChain, messageId). The amplifier
-    // gateway computes it as `keccak256(sourceChain || "_" || messageId)` and
-    // this avoids racing the public relayer: when it submits the same proof
-    // first, our approve tx is a no-op and emits no `ContractCallApproved`
-    // event, so parsing the receipt logs would fail.
-    let cmd_preimage = format!("axelar_{}", second_leg.message_id);
-    let command_id = keccak256(cmd_preimage.as_bytes());
-    ui::kv("commandId", &format!("{command_id}"));
-
-    // Sanity: isContractCallApproved on the gateway with the values we'll pass to ITS.execute
-    let gw = AxelarAmplifierGateway::new(dst_evm_gateway, dst_provider);
-    let payload_hash_b32 = keccak256(dest_payload);
-    let approved = gw
-        .isContractCallApproved(
-            command_id,
-            crate::types::HubChain::NAME.to_string(),
-            second_leg.source_address.clone(),
-            dst_its_proxy,
-            payload_hash_b32,
-        )
-        .call()
-        .await?;
-    ui::kv("isContractCallApproved", &format!("{approved}"));
-    if !approved {
-        return Err(eyre::eyre!(
-            "gateway says message not approved for ITS proxy + hub source — check source_address case / encoding"
-        ));
-    }
-
-    // Execute on destination ITS proxy
-    ui::step_header(step_base + 6, step_total, "Execute on destination ITS");
-    let its = InterchainTokenService::new(dst_its_proxy, dst_provider);
-    let exec_call = its.execute(
-        command_id,
-        crate::types::HubChain::NAME.to_string(),
-        second_leg.source_address.clone(),
-        Bytes::copy_from_slice(dest_payload),
-    );
-    let pending_exec = exec_call.send().await?;
-    let _exec_receipt = crate::evm::broadcast_and_log(pending_exec, "its execute tx").await?;
+    })
+    .await?;
 
     Ok(())
 }

@@ -7,6 +7,7 @@ use std::time::Instant;
 use eyre::{Result, eyre};
 use rand::RngCore;
 
+use super::ItsCache;
 use super::identifiers::TokenId;
 use super::metrics::{TxMetrics, TxOutcome};
 use super::run_sizing::{RunSizing, SustainedPlan};
@@ -28,7 +29,7 @@ pub(super) fn scale_to_decimals(whole_tokens: u128, decimals: u32) -> u128 {
     whole_tokens * 10u128.pow(decimals)
 }
 
-pub(super) fn parse_gas_stroops(gas_value: Option<&str>) -> Result<u64> {
+pub(super) fn parse_gas_stroops(gas_value: Option<&str>) -> Result<Stroops> {
     let gas_stroops = match gas_value {
         Some(value) => value
             .parse::<u64>()
@@ -43,7 +44,7 @@ pub(super) fn parse_gas_stroops(gas_value: Option<&str>) -> Result<u64> {
             gas_stroops as f64 / 10_000_000.0
         ),
     );
-    Ok(gas_stroops)
+    Ok(Stroops::new(gas_stroops))
 }
 
 pub(super) fn transfer_amount(decimals: u32) -> u128 {
@@ -66,7 +67,7 @@ pub(super) async fn derive_and_fund_wallets(
     main_wallet: &StellarWallet,
     num_keys: usize,
     use_friendbot: bool,
-    gas_stroops: u64,
+    gas_stroops: Stroops,
     txs_per_key: u64,
 ) -> Result<Vec<StellarWallet>> {
     ui::info(&format!("deriving {num_keys} Stellar keys..."));
@@ -117,6 +118,162 @@ pub(super) struct TokenSetup {
     pub decimals: u32,
 }
 
+async fn resolve_token_override(
+    client: &StellarClient,
+    wallet: &StellarWallet,
+    request: &TokenSetupRequest,
+) -> Result<Option<TokenSetup>> {
+    let Some(token_id_hex) = request.token_id_override.as_deref() else {
+        return Ok(None);
+    };
+    let token_id = match parse_token_id(token_id_hex) {
+        Ok(token_id) => token_id,
+        Err(TokenIdParseError::Hex(error)) => {
+            return Err(eyre!("invalid --token-id: {error}"));
+        }
+        Err(TokenIdParseError::Length) => {
+            return Err(eyre!("--token-id must be 32 bytes"));
+        }
+    };
+    let token_address = client
+        .its_query_token_address(wallet, &request.its_contract, token_id)
+        .await?
+        .ok_or_else(|| eyre!("token id {token_id_hex} not registered on Stellar ITS"))?;
+    let decimals = client
+        .token_decimals(&wallet.public_key_bytes, &token_address)
+        .await?;
+    ui::kv("token ID (provided)", token_id_hex);
+    Ok(Some(TokenSetup {
+        token_id,
+        token_address,
+        decimals,
+    }))
+}
+
+async fn resolve_config_token(
+    client: &StellarClient,
+    wallet: &StellarWallet,
+    request: &TokenSetupRequest,
+) -> Result<Option<TokenSetup>> {
+    let Some(token_id) =
+        super::helpers::read_pre_registered_axe_token(&request.config, &request.source_chain)?
+    else {
+        return Ok(None);
+    };
+    let Some(token_address) = client
+        .its_query_token_address(wallet, &request.its_contract, token_id.0)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let decimals = client
+        .token_decimals(&wallet.public_key_bytes, &token_address)
+        .await?;
+    let needed = required_balance(decimals, request.required_transfers);
+    let balance = client
+        .token_balance(wallet, &token_address, &wallet.public_key_bytes)
+        .await
+        .unwrap_or(0);
+    if balance < needed {
+        ui::warn(&format!(
+            "chains-config AXE balance too low ({balance} < {needed}); configured wallet \
+             isn't the workflow deployer — deploying fresh..."
+        ));
+        return Ok(None);
+    }
+    ui::kv("token ID (chains-config)", &format!("{token_id}"));
+    ui::address("token contract (Stellar)", &token_address);
+    Ok(Some(TokenSetup {
+        token_id: token_id.0,
+        token_address,
+        decimals,
+    }))
+}
+
+async fn deploy_token<V>(
+    client: &StellarClient,
+    wallet: &StellarWallet,
+    remote_verifier: &V,
+    request: &TokenSetupRequest,
+    mut cache: ItsCache,
+) -> Result<TokenSetup>
+where
+    V: RemoteDeploymentVerifier + Sync,
+{
+    let mut salt = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut salt);
+    ui::info("deploying new ITS token on Stellar...");
+    ui::kv("name", TOKEN_NAME);
+    ui::kv("symbol", TOKEN_SYMBOL);
+    ui::kv("decimals", &TOKEN_DECIMALS.to_string());
+    ui::kv("supply", &INITIAL_SUPPLY.to_string());
+    let (deploy, token_id) = client
+        .its_deploy_interchain_token(crate::stellar::DeployInterchainTokenRequest {
+            wallet,
+            its_contract: &request.its_contract,
+            salt,
+            decimals: TOKEN_DECIMALS,
+            name: TOKEN_NAME,
+            symbol: TOKEN_SYMBOL,
+            initial_supply: INITIAL_SUPPLY,
+        })
+        .await?;
+    if !deploy.success {
+        return Err(eyre!("Stellar deploy_interchain_token failed"));
+    }
+    let token_id = token_id.ok_or_else(|| eyre!("deploy_interchain_token returned no token_id"))?;
+    ui::tx_hash("Stellar deploy", &deploy.tx_hash_hex);
+    ui::kv("token ID", &hex::encode(token_id));
+    let token_address = client
+        .its_query_token_address(wallet, &request.its_contract, token_id)
+        .await?
+        .ok_or_else(|| eyre!("could not resolve interchain_token_address after deploy"))?;
+    ui::address("token contract", &token_address);
+    ui::info(&format!(
+        "deploying remote AXE token to {}...",
+        request.destination_chain
+    ));
+    let remote = client
+        .its_deploy_remote_interchain_token(crate::stellar::DeployRemoteInterchainTokenRequest {
+            wallet,
+            its_contract: &request.its_contract,
+            gateway_contract: &request.gateway_contract,
+            salt,
+            destination_chain: &request.destination_axelar_id,
+            gas_token: &request.gas_token,
+            gas_amount: request.gas_stroops.get(),
+        })
+        .await?;
+    if !remote.success {
+        return Err(eyre!("Stellar deploy_remote_interchain_token failed"));
+    }
+    ui::tx_hash("Stellar remote-deploy", &remote.tx_hash_hex);
+    let message_id = format!(
+        "0x{}-{}",
+        remote.tx_hash_hex.to_lowercase(),
+        remote.event_index.unwrap_or(0)
+    );
+    let source_axelar_id = super::axelar_id_for_chain(&request.config, &request.source_chain)?;
+    remote_verifier
+        .wait_for_remote_deploy(
+            &request.config,
+            &source_axelar_id,
+            &request.destination_axelar_id,
+            &message_id,
+        )
+        .await?;
+    cache.token_id = Some(format!("0x{}", hex::encode(token_id)));
+    cache.salt = Some(format!("0x{}", hex::encode(salt)));
+    cache.token_address = Some(token_address.clone());
+    super::save_its_cache(&request.source_chain, &request.destination_chain, &cache)?;
+    remote_verifier.after_remote_deploy(&request.source_chain, token_id);
+    Ok(TokenSetup {
+        token_id,
+        token_address,
+        decimals: TOKEN_DECIMALS,
+    })
+}
+
 pub(super) async fn setup_token<V>(
     client: &StellarClient,
     main_wallet: &StellarWallet,
@@ -126,170 +283,25 @@ pub(super) async fn setup_token<V>(
 where
     V: RemoteDeploymentVerifier + Sync,
 {
-    let TokenSetupRequest {
-        its_contract,
-        gateway_contract,
-        gas_token,
-        gas_stroops,
-        source_chain,
-        destination_chain,
-        destination_axelar_id,
-        token_id_override,
-        config,
-        required_transfers,
-    } = request;
-    let its_contract = its_contract.as_str();
-    let gateway_contract = gateway_contract.as_str();
-    let gas_token = gas_token.as_str();
-    let source_chain = source_chain.as_str();
-    let destination_chain = destination_chain.as_str();
-    let destination_axelar_id = destination_axelar_id.as_str();
-    let token_id_override = token_id_override.as_deref();
-    let config = config.as_path();
-
-    if let Some(token_id_hex) = token_id_override {
-        let token_id = match parse_token_id(token_id_hex) {
-            Ok(token_id) => token_id,
-            Err(TokenIdParseError::Hex(error)) => {
-                return Err(eyre!("invalid --token-id: {error}"));
-            }
-            Err(TokenIdParseError::Length) => {
-                return Err(eyre!("--token-id must be 32 bytes"));
-            }
-        };
-        let token_address = client
-            .its_query_token_address(main_wallet, its_contract, token_id)
-            .await?
-            .ok_or_else(|| eyre!("token id {token_id_hex} not registered on Stellar ITS"))?;
-        let decimals = client
-            .token_decimals(&main_wallet.public_key_bytes, &token_address)
-            .await?;
-        ui::kv("token ID (provided)", token_id_hex);
-        return Ok(TokenSetup {
-            token_id,
-            token_address,
-            decimals,
-        });
+    if let Some(token) = resolve_token_override(client, main_wallet, &request).await? {
+        return Ok(token);
     }
-
-    if let Some(token_id) = super::helpers::read_pre_registered_axe_token(config, source_chain)?
-        && let Some(token_address) = client
-            .its_query_token_address(main_wallet, its_contract, token_id.0)
-            .await?
-    {
-        let decimals = client
-            .token_decimals(&main_wallet.public_key_bytes, &token_address)
-            .await?;
-        let needed = required_balance(decimals, required_transfers);
-        let balance = client
-            .token_balance(main_wallet, &token_address, &main_wallet.public_key_bytes)
-            .await
-            .unwrap_or(0);
-        if balance >= needed {
-            ui::kv("token ID (chains-config)", &format!("{token_id}"));
-            ui::address("token contract (Stellar)", &token_address);
-            return Ok(TokenSetup {
-                token_id: token_id.0,
-                token_address,
-                decimals,
-            });
-        }
-        ui::warn(&format!(
-            "chains-config AXE balance too low ({balance} < {needed}); configured wallet \
-             isn't the workflow deployer — deploying fresh..."
-        ));
+    if let Some(token) = resolve_config_token(client, main_wallet, &request).await? {
+        return Ok(token);
     }
-
-    let cache = super::read_its_cache(source_chain, destination_chain);
+    let cache = super::read_its_cache(&request.source_chain, &request.destination_chain);
     if let Some(cached) = reusable_cached_token(
         client,
         main_wallet,
-        its_contract,
+        &request.its_contract,
         &cache,
-        required_transfers,
+        request.required_transfers,
     )
     .await?
     {
         return Ok(cached);
     }
-
-    let mut salt = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut salt);
-    ui::info("deploying new ITS token on Stellar...");
-    ui::kv("name", TOKEN_NAME);
-    ui::kv("symbol", TOKEN_SYMBOL);
-    ui::kv("decimals", &TOKEN_DECIMALS.to_string());
-    ui::kv("supply", &INITIAL_SUPPLY.to_string());
-
-    let (deploy_invoked, token_id) = client
-        .its_deploy_interchain_token(crate::stellar::DeployInterchainTokenRequest {
-            wallet: main_wallet,
-            its_contract,
-            salt,
-            decimals: TOKEN_DECIMALS,
-            name: TOKEN_NAME,
-            symbol: TOKEN_SYMBOL,
-            initial_supply: INITIAL_SUPPLY,
-        })
-        .await?;
-    if !deploy_invoked.success {
-        return Err(eyre!("Stellar deploy_interchain_token failed"));
-    }
-    let token_id = token_id.ok_or_else(|| eyre!("deploy_interchain_token returned no token_id"))?;
-    ui::tx_hash("Stellar deploy", &deploy_invoked.tx_hash_hex);
-    ui::kv("token ID", &hex::encode(token_id));
-
-    let token_address = client
-        .its_query_token_address(main_wallet, its_contract, token_id)
-        .await?
-        .ok_or_else(|| eyre!("could not resolve interchain_token_address after deploy"))?;
-    ui::address("token contract", &token_address);
-
-    ui::info(&format!(
-        "deploying remote AXE token to {destination_chain}..."
-    ));
-    let remote_invoked = client
-        .its_deploy_remote_interchain_token(crate::stellar::DeployRemoteInterchainTokenRequest {
-            wallet: main_wallet,
-            its_contract,
-            gateway_contract,
-            salt,
-            destination_chain: destination_axelar_id,
-            gas_token,
-            gas_amount: gas_stroops.get(),
-        })
-        .await?;
-    if !remote_invoked.success {
-        return Err(eyre!("Stellar deploy_remote_interchain_token failed"));
-    }
-    ui::tx_hash("Stellar remote-deploy", &remote_invoked.tx_hash_hex);
-    let message_id = format!(
-        "0x{}-{}",
-        remote_invoked.tx_hash_hex.to_lowercase(),
-        remote_invoked.event_index.unwrap_or(0)
-    );
-    let source_axelar_id = super::axelar_id_for_chain(config, source_chain)?;
-    remote_verifier
-        .wait_for_remote_deploy(
-            config,
-            &source_axelar_id,
-            destination_axelar_id,
-            &message_id,
-        )
-        .await?;
-
-    let mut cache = cache;
-    cache["tokenId"] = serde_json::json!(format!("0x{}", hex::encode(token_id)));
-    cache["salt"] = serde_json::json!(format!("0x{}", hex::encode(salt)));
-    cache["tokenAddress"] = serde_json::json!(token_address);
-    super::save_its_cache(source_chain, destination_chain, &cache)?;
-    remote_verifier.after_remote_deploy(source_chain, token_id);
-
-    Ok(TokenSetup {
-        token_id,
-        token_address,
-        decimals: TOKEN_DECIMALS,
-    })
+    deploy_token(client, main_wallet, remote_verifier, &request, cache).await
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -313,13 +325,13 @@ async fn reusable_cached_token(
     client: &StellarClient,
     main_wallet: &StellarWallet,
     its_contract: &str,
-    cache: &serde_json::Value,
+    cache: &ItsCache,
     required_transfers: usize,
 ) -> Result<Option<TokenSetup>> {
-    let Some(token_id_hex) = cache.get("tokenId").and_then(|value| value.as_str()) else {
+    let Some(token_id_hex) = cache.token_id.as_deref() else {
         return Ok(None);
     };
-    let Some(salt_hex) = cache.get("salt").and_then(|value| value.as_str()) else {
+    let Some(salt_hex) = cache.salt.as_deref() else {
         return Ok(None);
     };
     if parse_token_id(salt_hex).is_err() {
@@ -367,8 +379,7 @@ pub(super) async fn distribute_token_balances(
 ) -> Result<()> {
     let balance_progress = indicatif::ProgressBar::new(wallets.len() as u64);
     balance_progress.set_style(
-        indicatif::ProgressStyle::with_template("  {bar:40.cyan/dim} {pos}/{len} balances checked")
-            .unwrap()
+        ui::progress_bar_style("  {bar:40.cyan/dim} {pos}/{len} balances checked")
             .progress_chars("=> "),
     );
     let mut to_fund = Vec::new();
@@ -399,9 +410,7 @@ pub(super) async fn distribute_token_balances(
     ));
     let funding_progress = indicatif::ProgressBar::new(to_fund.len() as u64);
     funding_progress.set_style(
-        indicatif::ProgressStyle::with_template("  {bar:40.cyan/dim} {pos}/{len} keys funded")
-            .unwrap()
-            .progress_chars("=> "),
+        ui::progress_bar_style("  {bar:40.cyan/dim} {pos}/{len} keys funded").progress_chars("=> "),
     );
     for &index in &to_fund {
         let invoked = client
@@ -437,7 +446,7 @@ pub(super) struct TransferRequest {
     pub destination_chain: String,
     pub destination_address_bytes: Vec<u8>,
     pub gas_token: String,
-    pub gas_amount_stroops: u64,
+    pub gas_amount: Stroops,
     pub transfer_amount: u128,
     pub gmp_dest_address: String,
 }
@@ -459,7 +468,7 @@ pub(super) async fn submit_transfer(request: TransferRequest) -> TxMetrics {
             amount: request.transfer_amount,
             data: None,
             gas_token: &request.gas_token,
-            gas_amount: request.gas_amount_stroops,
+            gas_amount: request.gas_amount.get(),
         })
         .await
     {
@@ -524,7 +533,7 @@ impl TransactionSubmitter for ItsStellarSubmitter {
             destination_chain: self.destination_chain.clone(),
             destination_address_bytes: self.destination_address_bytes.clone(),
             gas_token: self.gas_token.clone(),
-            gas_amount_stroops: self.gas_stroops.get(),
+            gas_amount: self.gas_stroops,
             transfer_amount: self.amount_per_tx,
             gmp_dest_address: self.axelarnet_gw_addr.clone(),
         })

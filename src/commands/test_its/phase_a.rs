@@ -54,54 +54,32 @@ pub(super) struct PhaseADeployRequest<'a, P> {
     pub phase_start: Instant,
 }
 
-pub(super) async fn run_phase_a_deploy<P: Provider>(
-    request: PhaseADeployRequest<'_, P>,
-) -> Result<([u8; 32], Address)> {
-    let PhaseADeployRequest {
-        network,
-        src_axelar_id,
-        dst_axelar_id,
-        src_rpc,
-        sol_keypair,
-        sol_pubkey,
-        tx,
-        src_cosm_gateway,
-        voting_verifier,
-        axelarnet_gateway,
-        dst_cosm_gateway,
-        dst_multisig_prover,
-        axelar_rpc,
-        its_hub_address,
-        dst_its_proxy,
-        dst_evm_gateway,
-        dst_provider,
-        its,
-        gas_value,
-        cache_file,
-        phase_start,
-    } = request;
+struct SourceDeployment {
+    salt: [u8; 32],
+    token_id: [u8; 32],
+    message_id: String,
+    sender: String,
+    payload: Vec<u8>,
+    payload_hash: FixedBytes<32>,
+}
 
-    ui::section("Phase A: deploy local + remote (manual relay)");
-
-    // Step A1: generate salt, derive token id
-    let salt = generate_salt();
-    let salt_bytes: [u8; 32] = salt.0;
-    let token_id = crate::solana::interchain_token_id(network, &sol_pubkey, &salt_bytes);
-    let token_id_b32 = FixedBytes::<32>::from(token_id);
-
+fn deploy_source_token<P: Provider>(
+    request: &PhaseADeployRequest<'_, P>,
+) -> Result<SourceDeployment> {
+    let salt = generate_salt().0;
+    let token_id = crate::solana::interchain_token_id(request.network, &request.sol_pubkey, &salt);
     ui::step_header(1, PHASE_A_STEPS, "Generate salt + tokenId");
-    ui::kv("salt", &format!("0x{}", alloy::hex::encode(salt_bytes)));
+    ui::kv("salt", &format!("0x{}", alloy::hex::encode(salt)));
     ui::kv("tokenId", &format!("0x{}", alloy::hex::encode(token_id)));
 
-    // Step A2: Solana — deploy local interchain token
     ui::step_header(2, PHASE_A_STEPS, "Deploy local interchain token (Solana)");
     let spec = crate::types::ITS_CONFIG_SPEC;
-    let local_sig = crate::solana::send_its_deploy_interchain_token(
+    let local_signature = crate::solana::send_its_deploy_interchain_token(
         crate::solana::DeployInterchainTokenRequest {
-            rpc_url: src_rpc,
-            keypair: sol_keypair,
-            network,
-            salt: &salt_bytes,
+            rpc_url: request.src_rpc,
+            keypair: request.sol_keypair,
+            network: request.network,
+            salt: &salt,
             name: spec.name,
             symbol: spec.symbol,
             decimals: spec.decimals,
@@ -109,70 +87,117 @@ pub(super) async fn run_phase_a_deploy<P: Provider>(
             minter: None,
         },
     )?;
-    ui::tx_hash("solana tx", &local_sig);
+    ui::tx_hash("solana tx", &local_signature);
     ui::success(&format!(
         "local mint deployed (initial supply {INITIAL_SUPPLY})"
     ));
 
-    // Step A3: Solana — deploy remote interchain token (fires GMP)
     ui::step_header(
         3,
         PHASE_A_STEPS,
         "Deploy remote interchain token (Solana → hub)",
     );
-    let remote_sig = crate::solana::send_its_deploy_remote_interchain_token(
-        src_rpc,
-        sol_keypair,
-        network,
-        &salt_bytes,
-        dst_axelar_id.as_str(),
-        gas_value,
+    let remote_signature = crate::solana::send_its_deploy_remote_interchain_token(
+        request.src_rpc,
+        request.sol_keypair,
+        request.network,
+        &salt,
+        request.dst_axelar_id.as_str(),
+        request.gas_value,
     )?;
-    ui::tx_hash("solana tx", &remote_sig);
-
-    let first_leg_id = crate::solana::extract_its_message_id(src_rpc, network, &remote_sig)?;
-    ui::kv("first-leg message_id", &first_leg_id);
-
-    // Read the actual on-chain CallContractEvent. The verifiers will look up
-    // the same fields; using on-chain values eliminates encoding-mismatch risk.
-    let gw = crate::solana::extract_gateway_call_contract_payload(src_rpc, &remote_sig)?;
-    ui::kv("gateway sender", &gw.sender);
-    ui::kv("gateway destination_chain", &gw.destination_chain);
-    ui::kv("gateway destination_address", &gw.destination_address);
+    ui::tx_hash("solana tx", &remote_signature);
+    let message_id =
+        crate::solana::extract_its_message_id(request.src_rpc, request.network, &remote_signature)?;
+    ui::kv("first-leg message_id", &message_id);
+    let gateway =
+        crate::solana::extract_gateway_call_contract_payload(request.src_rpc, &remote_signature)?;
+    ui::kv("gateway sender", &gateway.sender);
+    ui::kv("gateway destination_chain", &gateway.destination_chain);
+    ui::kv("gateway destination_address", &gateway.destination_address);
     ui::kv(
         "gateway payload_hash",
-        &format!("0x{}", alloy::hex::encode(gw.payload_hash)),
+        &format!("0x{}", alloy::hex::encode(gateway.payload_hash)),
     );
     ui::kv(
         "gateway payload (len)",
-        &format!("{} bytes", gw.payload.len()),
+        &format!("{} bytes", gateway.payload.len()),
     );
-
-    // Sanity: the local reconstruction should match what the gateway actually saw.
-    let local_payload = encode_send_to_hub_deploy(
-        dst_axelar_id.as_str(),
+    let reconstructed = encode_send_to_hub_deploy(
+        request.dst_axelar_id.as_str(),
         &token_id,
         spec.name,
         spec.symbol,
         spec.decimals,
         None,
     )?;
-    let local_hash = keccak256(&local_payload);
-    if local_hash.as_slice() != gw.payload_hash {
+    let reconstructed_hash = keccak256(&reconstructed);
+    if reconstructed_hash.as_slice() != gateway.payload_hash {
         ui::warn("local payload reconstruction does not match on-chain payload:");
         ui::warn(&format!(
             "  local  : 0x{}",
-            alloy::hex::encode(local_hash.as_slice())
+            alloy::hex::encode(reconstructed_hash.as_slice())
         ));
         ui::warn(&format!(
             "  on-chain: 0x{}",
-            alloy::hex::encode(gw.payload_hash)
+            alloy::hex::encode(gateway.payload_hash)
         ));
     }
+    Ok(SourceDeployment {
+        salt,
+        token_id,
+        message_id,
+        sender: gateway.sender,
+        payload: gateway.payload,
+        payload_hash: gateway.payload_hash.into(),
+    })
+}
 
-    let first_leg_payload = gw.payload.clone();
-    let first_leg_payload_hash = FixedBytes::<32>::from(gw.payload_hash);
-    let gw_sender = gw.sender.clone();
+async fn verify_and_cache_destination<P: Provider>(
+    request: &PhaseADeployRequest<'_, P>,
+    deployment: &SourceDeployment,
+) -> Result<Address> {
+    ui::step_header(11, PHASE_A_STEPS, "Verify destination token deployed");
+    let dest_token_addr = request
+        .its
+        .interchainTokenAddress(deployment.token_id.into())
+        .call()
+        .await?;
+    ui::address("dest token address", &format!("{dest_token_addr}"));
+    let token = ERC20::new(dest_token_addr, request.dst_provider);
+    match token.name().call().await {
+        Ok(name) => ui::success(&format!("dest token responds to name() → \"{name}\"")),
+        Err(error) => {
+            ui::warn(&format!("dest token name() failed: {error}"));
+            ui::info("token may still be propagating — try again or check explorer");
+        }
+    }
+
+    let cache = ItsTestCache {
+        deployer: request.sol_pubkey.to_string(),
+        salt_hex: format!("0x{}", alloy::hex::encode(deployment.salt)),
+        token_id_hex: format!("0x{}", alloy::hex::encode(deployment.token_id)),
+        dest_token_address: format!("{dest_token_addr}"),
+    };
+    if let Err(error) = save_cache(request.cache_file, &cache) {
+        ui::warn(&format!(
+            "failed to write cache to {}: {error}",
+            request.cache_file.display()
+        ));
+    } else {
+        ui::info(&format!(
+            "cached tokenId at {}",
+            request.cache_file.display()
+        ));
+    }
+    Ok(dest_token_addr)
+}
+
+pub(super) async fn run_phase_a_deploy<P: Provider>(
+    request: PhaseADeployRequest<'_, P>,
+) -> Result<([u8; 32], Address)> {
+    ui::section("Phase A: deploy local + remote (manual relay)");
+    let deployment = deploy_source_token(&request)?;
+    let spec = crate::types::ITS_CONFIG_SPEC;
 
     // Step A4: drive source → hub via existing relay_to_hub helper
     ui::step_header(
@@ -181,79 +206,56 @@ pub(super) async fn run_phase_a_deploy<P: Provider>(
         "Source → hub (verify, route, hub-execute)",
     );
     relay_to_hub(HubRelayRequest {
-        axelar_id: src_axelar_id.as_str(),
-        message_id: &first_leg_id,
-        source_address: &gw_sender,
+        axelar_id: request.src_axelar_id.as_str(),
+        message_id: &deployment.message_id,
+        source_address: &deployment.sender,
         destination_chain: crate::types::HubChain::NAME,
-        destination_address: its_hub_address,
-        payload_hash: &first_leg_payload_hash,
-        payload: &first_leg_payload,
-        tx,
-        cosm_gateway: src_cosm_gateway,
-        voting_verifier,
-        axelarnet_gateway,
+        destination_address: request.its_hub_address,
+        payload_hash: &deployment.payload_hash,
+        payload: &deployment.payload,
+        tx: request.tx,
+        cosm_gateway: request.src_cosm_gateway,
+        voting_verifier: request.voting_verifier,
+        axelarnet_gateway: request.axelarnet_gateway,
     })
     .await?;
 
     // Step A5..10: hub → destination EVM, manual proof + execute
-    let deploy_inner = encode_inner_deploy(&token_id, spec.name, spec.symbol, spec.decimals, &[]);
-    let dest_payload_deploy = encode_receive_from_hub(src_axelar_id, &deploy_inner);
+    let deploy_inner = encode_inner_deploy(
+        &deployment.token_id,
+        spec.name,
+        spec.symbol,
+        spec.decimals,
+        &[],
+    );
+    let dest_payload_deploy = encode_receive_from_hub(request.src_axelar_id, &deploy_inner);
 
     relay_to_destination(DestinationRelayRequest {
-        first_leg_message_id: &first_leg_id,
-        src_axelar_id,
+        first_leg_message_id: &deployment.message_id,
+        src_axelar_id: request.src_axelar_id,
         dest_payload: &dest_payload_deploy,
-        dst_its_proxy,
-        dst_evm_gateway,
-        dst_provider,
-        tx,
-        dst_cosm_gateway,
-        dst_multisig_prover,
-        axelarnet_gateway,
-        axelar_rpc,
+        dst_its_proxy: request.dst_its_proxy,
+        dst_evm_gateway: request.dst_evm_gateway,
+        dst_provider: request.dst_provider,
+        tx: request.tx,
+        dst_cosm_gateway: request.dst_cosm_gateway,
+        dst_multisig_prover: request.dst_multisig_prover,
+        axelarnet_gateway: request.axelarnet_gateway,
+        axelar_rpc: request.axelar_rpc,
         step_base: 5,
         step_total: PHASE_A_STEPS,
     })
     .await?;
 
-    // Step A11: verify destination token is deployed
-    ui::step_header(11, PHASE_A_STEPS, "Verify destination token deployed");
-    let dest_token_addr = its.interchainTokenAddress(token_id_b32).call().await?;
-    ui::address("dest token address", &format!("{dest_token_addr}"));
-    let token = ERC20::new(dest_token_addr, dst_provider);
-    match token.name().call().await {
-        Ok(name) => {
-            ui::success(&format!("dest token responds to name() → \"{name}\""));
-        }
-        Err(e) => {
-            ui::warn(&format!("dest token name() failed: {e}"));
-            ui::info("token may still be propagating — try again or check explorer");
-        }
-    }
-
-    // Persist for next run.
-    let cache = ItsTestCache {
-        deployer: sol_pubkey.to_string(),
-        salt_hex: format!("0x{}", alloy::hex::encode(salt_bytes)),
-        token_id_hex: format!("0x{}", alloy::hex::encode(token_id)),
-        dest_token_address: format!("{dest_token_addr}"),
-    };
-    if let Err(e) = save_cache(cache_file, &cache) {
-        ui::warn(&format!(
-            "failed to write cache to {}: {e}",
-            cache_file.display()
-        ));
-    } else {
-        ui::info(&format!("cached tokenId at {}", cache_file.display()));
-    }
+    let dest_token_addr = verify_and_cache_destination(&request, &deployment).await?;
 
     ui::section("Phase A complete");
     ui::success(&format!(
         "deploy + manual relay finished ({})",
-        ui::format_elapsed(phase_start)
+        ui::format_elapsed(request.phase_start)
     ));
 
-    Ok((token_id, dest_token_addr))
+    Ok((deployment.token_id, dest_token_addr))
 }
 
 /// Wait for the destination-chain ITS to deploy the predicted token contract

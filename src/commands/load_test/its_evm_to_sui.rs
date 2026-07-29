@@ -204,7 +204,7 @@ async fn derive_and_fund_signers(
         &read_provider,
         &evm.main_signer,
         &derived,
-        per_call_msg_value_wei.saturating_mul(2),
+        super::units::Wei::from_u128(per_call_msg_value_wei.saturating_mul(2)),
     )
     .await?;
 

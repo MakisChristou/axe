@@ -979,19 +979,15 @@ pub async fn fetch_verifier_set(
         .signers
         .ok_or_else(|| eyre::eyre!("no signers object in verifier set"))?;
 
-    let threshold: u128 = verifier_set
-        .threshold
-        .as_str()
-        .or_else(|| verifier_set.threshold.as_u64().map(|_| ""))
-        .ok_or_else(|| eyre::eyre!("no threshold in verifier set"))
-        .and_then(|s| {
-            if s.is_empty() {
-                Ok(verifier_set.threshold.as_u64().unwrap() as u128)
-            } else {
-                s.parse::<u128>()
-                    .map_err(|e| eyre::eyre!("invalid threshold: {e}"))
-            }
-        })?;
+    let threshold = if let Some(value) = verifier_set.threshold.as_str() {
+        value
+            .parse::<u128>()
+            .map_err(|error| eyre::eyre!("invalid threshold: {error}"))?
+    } else if let Some(value) = verifier_set.threshold.as_u64() {
+        u128::from(value)
+    } else {
+        return Err(eyre::eyre!("no threshold in verifier set"));
+    };
 
     let created_at = verifier_set
         .created_at

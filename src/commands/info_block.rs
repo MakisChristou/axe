@@ -114,7 +114,11 @@ pub async fn run(network: Network, number: Option<u64>, at_time: Option<String>)
             return Ok(());
         }
 
-        let target = parse_at_time(&at_time.unwrap())?;
+        let target = parse_at_time(
+            at_time
+                .as_deref()
+                .ok_or_else(|| eyre::eyre!("missing --at-time value"))?,
+        )?;
         let delta_secs = (target - head_time).num_milliseconds() as f64 / 1000.0;
         let delta_blocks = delta_secs / rate_secs_per_block;
         let predicted_height = head_height as f64 + delta_blocks;

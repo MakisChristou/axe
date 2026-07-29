@@ -276,7 +276,7 @@ fn mark_timed_out_tx(
     if phase == Phase::Executed {
         tx.timing.executed_ok = Some(false);
     }
-    tx.fail(format!("{label}: timed out"));
+    tx.time_out(label);
 }
 
 /// Finalize the polling loop: for every tx that didn't reach `Done`, do a
@@ -314,6 +314,266 @@ pub(super) struct PollPipelineArgs {
     pub display_chain: Option<String>,
     /// Network for the final Axelarscan GMP-API recheck on timed-out txs.
     pub network: crate::types::Network,
+}
+
+struct PhaseCheckData {
+    voted: Vec<(usize, String, String, String)>,
+    routed: Vec<(usize, String)>,
+    hub_approved: Vec<(usize, String)>,
+    destination: Vec<usize>,
+    voting_destination: (String, String),
+}
+
+struct PhaseCheckResults {
+    voted: Vec<(usize, bool)>,
+    routed: Vec<(usize, bool)>,
+    hub_approved: Vec<(usize, bool)>,
+}
+
+struct CosmosPollContext<'a> {
+    lcd: &'a str,
+    voting_verifier: Option<&'a str>,
+    cosm_gateway: Option<&'a str>,
+    axelarnet_gateway: Option<&'a str>,
+    source_chain: &'a str,
+}
+
+fn collect_phase_check_data(
+    txs: &[PendingTx],
+    active: &[usize],
+    destination_chain: &str,
+    destination_address: &str,
+) -> PhaseCheckData {
+    let phases = PhaseIndices::collect(txs, active);
+    let voted = phases
+        .voted
+        .iter()
+        .map(|&index| {
+            (
+                index,
+                txs[index].message_id.clone().into_string(),
+                txs[index].source_address.clone(),
+                txs[index].payload_hash_hex.clone(),
+            )
+        })
+        .collect();
+    let routed = phases
+        .routed
+        .iter()
+        .map(|&index| (index, txs[index].message_id.clone().into_string()))
+        .collect();
+    let hub_approved = phases
+        .hub_approved
+        .iter()
+        .map(|&index| (index, txs[index].message_id.clone().into_string()))
+        .collect();
+    let voting_destination = phases
+        .voted
+        .first()
+        .map(|&index| {
+            (
+                txs[index].gmp_destination_chain.clone(),
+                txs[index].gmp_destination_address.clone(),
+            )
+        })
+        .filter(|(chain, address)| !chain.is_empty() && !address.is_empty())
+        .unwrap_or_else(|| {
+            (
+                destination_chain.to_string(),
+                destination_address.to_string(),
+            )
+        });
+    PhaseCheckData {
+        voted,
+        routed,
+        hub_approved,
+        destination: phases.destination(),
+        voting_destination,
+    }
+}
+
+async fn run_cosmos_phase_checks(
+    context: &CosmosPollContext<'_>,
+    data: &PhaseCheckData,
+) -> Result<PhaseCheckResults> {
+    let (voted, routed, hub_approved) = tokio::join!(
+        async {
+            match (data.voted.is_empty(), context.voting_verifier) {
+                (true, _) => Ok(Vec::new()),
+                (false, Some(verifier)) => {
+                    batch_check_voting_verifier_owned(
+                        context.lcd,
+                        verifier,
+                        context.source_chain,
+                        &data.voting_destination.0,
+                        &data.voting_destination.1,
+                        &data.voted,
+                    )
+                    .await
+                }
+                (false, None) => Ok(data
+                    .voted
+                    .iter()
+                    .map(|(index, ..)| (*index, true))
+                    .collect()),
+            }
+        },
+        async {
+            match (data.routed.is_empty(), context.cosm_gateway) {
+                (true, _) => Ok(Vec::new()),
+                (false, Some(gateway)) => {
+                    batch_check_cosmos_routed_owned(
+                        context.lcd,
+                        gateway,
+                        context.source_chain,
+                        &data.routed,
+                    )
+                    .await
+                }
+                (false, None) => Ok(data
+                    .routed
+                    .iter()
+                    .map(|(index, _)| (*index, true))
+                    .collect()),
+            }
+        },
+        async {
+            match (data.hub_approved.is_empty(), context.axelarnet_gateway) {
+                (true, _) => Ok(Vec::new()),
+                (false, Some(gateway)) => {
+                    batch_check_hub_approved_owned(
+                        context.lcd,
+                        gateway,
+                        context.source_chain,
+                        &data.hub_approved,
+                    )
+                    .await
+                }
+                (false, None) => Ok(data
+                    .hub_approved
+                    .iter()
+                    .map(|(index, _)| (*index, true))
+                    .collect()),
+            }
+        },
+    );
+    Ok(PhaseCheckResults {
+        voted: voted?,
+        routed: routed?,
+        hub_approved: hub_approved?,
+    })
+}
+
+fn apply_phase_check_results(
+    txs: &mut [PendingTx],
+    results: PhaseCheckResults,
+    has_cosm_gateway: bool,
+    has_axelarnet_gateway: bool,
+) -> bool {
+    apply_cosmos_results(
+        txs,
+        results.voted,
+        |timing| &mut timing.voted_secs,
+        if has_cosm_gateway {
+            Phase::Routed
+        } else {
+            Phase::Approved
+        },
+    ) | apply_cosmos_results(
+        txs,
+        results.routed,
+        |timing| &mut timing.routed_secs,
+        if has_axelarnet_gateway {
+            Phase::HubApproved
+        } else {
+            Phase::Approved
+        },
+    ) | apply_cosmos_results(
+        txs,
+        results.hub_approved,
+        |timing| &mut timing.hub_approved_secs,
+        Phase::Approved,
+    )
+}
+
+fn update_pipeline_spinner(
+    spinner: &indicatif::ProgressBar,
+    stats: &mut RealTimeStats,
+    txs: &[PendingTx],
+    total: usize,
+    has_voting_verifier: bool,
+    has_cosm_gateway: bool,
+    has_axelarnet_gateway: bool,
+) {
+    let (voted, routed, hub_approved, approved, executed) = phase_counts(txs);
+    let counts = [voted, routed, hub_approved, approved, executed];
+    stats.update(counts, txs);
+    if voted + routed + approved + executed == 0 {
+        return;
+    }
+    let message = if has_axelarnet_gateway {
+        stats.spinner_msg_its(counts, total, None)
+    } else {
+        stats.spinner_msg_gmp(counts, total, None, has_voting_verifier, has_cosm_gateway)
+    };
+    spinner.set_message(message);
+}
+
+fn finish_pipeline_display(
+    spinner: &indicatif::ProgressBar,
+    txs: &[PendingTx],
+    destination_chain: &str,
+    display_chain: Option<&str>,
+    has_axelarnet_gateway: bool,
+) {
+    let total = txs.len();
+    let (voted, routed, hub_approved, approved, executed) = phase_counts(txs);
+    let hub = if has_axelarnet_gateway {
+        format!("  hub: {hub_approved}/{total}")
+    } else {
+        String::new()
+    };
+    spinner.finish_and_clear();
+    ui::success_annotated(
+        &format!(
+            "voted: {voted}/{total}  routed: {routed}/{total}{hub}  approved: {approved}/{total}  executed: {executed}/{total}"
+        ),
+        display_chain.unwrap_or(destination_chain),
+    );
+}
+
+struct PipelineCheckContext<'a> {
+    cosmos: CosmosPollContext<'a>,
+    destination_chain: &'a str,
+    destination_address: &'a str,
+}
+
+async fn check_pipeline_phases<V: DestinationVerifier>(
+    txs: &mut [PendingTx],
+    active: &[usize],
+    verifier: &V,
+    context: &PipelineCheckContext<'_>,
+) -> Result<bool> {
+    let phase_data = collect_phase_check_data(
+        txs,
+        active,
+        context.destination_chain,
+        context.destination_address,
+    );
+    let phase_results = run_cosmos_phase_checks(&context.cosmos, &phase_data).await?;
+    let mut progressed = apply_phase_check_results(
+        txs,
+        phase_results,
+        context.cosmos.cosm_gateway.is_some(),
+        context.cosmos.axelarnet_gateway.is_some(),
+    );
+    if !phase_data.destination.is_empty() {
+        let observations = verifier
+            .check(context.cosmos.source_chain, txs, &phase_data.destination)
+            .await?;
+        progressed |= apply_destination_observations(txs, observations);
+    }
+    Ok(progressed)
 }
 
 pub(super) async fn poll_pipeline<V: DestinationVerifier>(
@@ -383,172 +643,30 @@ pub(super) async fn poll_pipeline<V: DestinationVerifier>(
             spinner.set_message(format!("verifying pipeline: 0/{total} confirmed..."));
         }
 
-        // --- Phase-grouped batch polling (all phases in parallel) ---
-        // Each cycle: collect ALL txs per phase, fire batch queries for all
-        // phases concurrently. Within each phase, HTTP chunks of COSMOS_BATCH_SIZE
-        // run concurrently too. This keeps poll cycles fast even at 600+ txs.
-        let error_msg: Option<String> = None;
-
-        // Snapshot indices by phase (no borrows held after this).
-        let phases = PhaseIndices::collect(txs, &active);
-        let voted_indices = &phases.voted;
-        let routed_indices = &phases.routed;
-        let hub_indices = &phases.hub_approved;
-
-        // Build owned data for batch queries (avoids holding borrows on txs).
-        let voted_data: Vec<(usize, String, String, String)> = voted_indices
-            .iter()
-            .map(|&i| {
-                (
-                    i,
-                    txs[i].message_id.clone().into_string(),
-                    txs[i].source_address.clone(),
-                    txs[i].payload_hash_hex.clone(),
-                )
-            })
-            .collect();
-        let routed_data: Vec<(usize, String)> = routed_indices
-            .iter()
-            .map(|&i| (i, txs[i].message_id.clone().into_string()))
-            .collect();
-        let hub_data: Vec<(usize, String)> = hub_indices
-            .iter()
-            .map(|&i| (i, txs[i].message_id.clone().into_string()))
-            .collect();
-        let dest_indices = phases.destination();
-        // The VotingVerifier records the message's *first-leg* destination,
-        // which for ITS-hub-routed transfers is (axelar, AxelarnetGateway) —
-        // NOT the final chain. Each tx captured that as gmp_destination_* from
-        // its source-side ContractCall event; for raw GMP it equals the
-        // function-arg destination. Prefer the per-tx value so hub-routed
-        // Sui-destination ITS (e.g. sol→sui) queries (axelar, Hub) instead of
-        // the final Sui channel — the latter returns status "unknown" forever
-        // and the verify phase times out at "voted".
-        let (vv_dest_chain, vv_dest_addr) = voted_indices
-            .first()
-            .map(|&i| {
-                (
-                    txs[i].gmp_destination_chain.clone(),
-                    txs[i].gmp_destination_address.clone(),
-                )
-            })
-            .filter(|(c, a)| !c.is_empty() && !a.is_empty())
-            .unwrap_or_else(|| {
-                (
-                    destination_chain.to_string(),
-                    destination_address.to_string(),
-                )
-            });
-        // Fire Cosmos phases concurrently (each internally chunks into COSMOS_BATCH_SIZE).
-        let (voted_results, routed_results, hub_results) = tokio::join!(
-            // Voted
-            async {
-                if voted_data.is_empty() {
-                    return Ok(Vec::new());
-                }
-                if let Some(vv) = voting_verifier {
-                    batch_check_voting_verifier_owned(
-                        lcd,
-                        vv,
-                        source_chain,
-                        &vv_dest_chain,
-                        &vv_dest_addr,
-                        &voted_data,
-                    )
-                    .await
-                } else {
-                    // No VotingVerifier — all pass immediately
-                    Ok(voted_data.iter().map(|(i, ..)| (*i, true)).collect())
-                }
+        let check_context = PipelineCheckContext {
+            cosmos: CosmosPollContext {
+                lcd,
+                voting_verifier,
+                cosm_gateway,
+                axelarnet_gateway,
+                source_chain,
             },
-            // Routed
-            async {
-                if routed_data.is_empty() {
-                    return Ok(Vec::new());
-                }
-                if let Some(gw) = cosm_gateway {
-                    batch_check_cosmos_routed_owned(lcd, gw, source_chain, &routed_data).await
-                } else {
-                    Ok(routed_data.iter().map(|(i, _)| (*i, true)).collect())
-                }
-            },
-            // HubApproved
-            async {
-                if hub_data.is_empty() {
-                    return Ok(Vec::new());
-                }
-                if let Some(gw) = axelarnet_gateway {
-                    batch_check_hub_approved_owned(lcd, gw, source_chain, &hub_data).await
-                } else {
-                    Ok(hub_data.iter().map(|(i, _)| (*i, true)).collect())
-                }
-            },
-        );
-        let voted_results = voted_results?;
-        let routed_results = routed_results?;
-        let hub_results = hub_results?;
-
-        // Apply Cosmos results.
-        //
-        // No destination Cosmos Gateway (legacy/consensus destination) means
-        // there is no `routed` phase to observe — such a tx skips straight to
-        // the destination approval check so timings stay honest. The same
-        // applies to `hub_approved` when there is no AxelarnetGateway.
-        let cosmos_progress = apply_cosmos_results(
-            txs,
-            voted_results,
-            |timing| &mut timing.voted_secs,
-            if cosm_gateway.is_some() {
-                Phase::Routed
-            } else {
-                Phase::Approved
-            },
-        ) | apply_cosmos_results(
-            txs,
-            routed_results,
-            |timing| &mut timing.routed_secs,
-            if axelarnet_gateway.is_some() {
-                Phase::HubApproved
-            } else {
-                Phase::Approved
-            },
-        ) | apply_cosmos_results(
-            txs,
-            hub_results,
-            |timing| &mut timing.hub_approved_secs,
-            Phase::Approved,
-        );
-        if cosmos_progress {
+            destination_chain,
+            destination_address,
+        };
+        if check_pipeline_phases(txs, &active, verifier, &check_context).await? {
             scheduler.mark_progress();
         }
 
-        // Chain-specific destination observations, followed by one shared
-        // transition/timing application path.
-        if !dest_indices.is_empty() {
-            let observations = verifier.check(source_chain, txs, &dest_indices).await?;
-            if apply_destination_observations(txs, observations) {
-                scheduler.mark_progress();
-            }
-        }
-
-        // Update spinner with multi-phase progress + real-time throughput/latency
-        let (voted, routed, hub_approved, approved, executed) = phase_counts(txs);
-        let counts = [voted, routed, hub_approved, approved, executed];
-        rt_stats.update(counts, txs);
-        if voted + routed + approved + executed > 0 || error_msg.is_some() {
-            let msg = if axelarnet_gateway.is_some() {
-                rt_stats.spinner_msg_its(counts, total, error_msg.as_deref())
-            } else {
-                rt_stats.spinner_msg_gmp(
-                    counts,
-                    total,
-                    error_msg.as_deref(),
-                    voting_verifier.is_some(),
-                    cosm_gateway.is_some(),
-                )
-            };
-            spinner.set_message(msg);
-        }
+        update_pipeline_spinner(
+            &spinner,
+            &mut rt_stats,
+            txs,
+            total,
+            voting_verifier.is_some(),
+            cosm_gateway.is_some(),
+            axelarnet_gateway.is_some(),
+        );
 
         // If no tx has made progress for INACTIVITY_TIMEOUT, stop waiting.
         // During streaming (send still in progress), use 2× timeout to allow for
@@ -570,20 +688,12 @@ pub(super) async fn poll_pipeline<V: DestinationVerifier>(
     )
     .await;
 
-    let total = txs.len();
-    let (voted, routed, hub_approved, approved, executed) = phase_counts(txs);
-    let hub_str = if axelarnet_gateway.is_some() {
-        format!("  hub: {hub_approved}/{total}")
-    } else {
-        String::new()
-    };
-    spinner.finish_and_clear();
-    let label = display_chain.unwrap_or(destination_chain);
-    ui::success_annotated(
-        &format!(
-            "voted: {voted}/{total}  routed: {routed}/{total}{hub_str}  approved: {approved}/{total}  executed: {executed}/{total}"
-        ),
-        label,
+    finish_pipeline_display(
+        &spinner,
+        txs,
+        destination_chain,
+        display_chain,
+        axelarnet_gateway.is_some(),
     );
 
     Ok(compute_peak_throughput(txs))
@@ -895,6 +1005,23 @@ struct ItsHubVerifier<'a> {
     backfill_voted_timing: bool,
 }
 
+type VotingCheckData = (usize, String, String, String);
+type MessageCheckData = (usize, String);
+
+struct ItsHubPhaseData {
+    voted: Vec<VotingCheckData>,
+    hub_approved: Vec<MessageCheckData>,
+    routed: Vec<MessageCheckData>,
+    voting_destination_chain: String,
+    voting_destination_address: String,
+}
+
+struct ItsHubPhaseResults {
+    voted: Vec<(usize, bool)>,
+    hub_approved: Vec<(usize, bool)>,
+    routed: Vec<(usize, bool)>,
+}
+
 impl ItsHubVerifier<'_> {
     fn normalize_start(&self, tx: &mut PendingTx) {
         if self.voting_verifier.is_none() && tx.is_phase(Phase::Voted) {
@@ -902,8 +1029,12 @@ impl ItsHubVerifier<'_> {
         }
     }
 
-    async fn check(&self, txs: &mut [PendingTx], phases: &PhaseIndices) -> Result<bool> {
-        let voted_data = phases
+    fn collect_phase_data(
+        &self,
+        txs: &[PendingTx],
+        phases: &PhaseIndices,
+    ) -> Result<ItsHubPhaseData> {
+        let voted = phases
             .voted
             .iter()
             .map(|&index| {
@@ -915,12 +1046,12 @@ impl ItsHubVerifier<'_> {
                 )
             })
             .collect::<Vec<_>>();
-        let hub_data = phases
+        let hub_approved = phases
             .hub_approved
             .iter()
             .map(|&index| (index, txs[index].message_id.clone().into_string()))
             .collect::<Vec<_>>();
-        let routed_data = phases
+        let routed = phases
             .routed
             .iter()
             .map(|&index| {
@@ -934,7 +1065,7 @@ impl ItsHubVerifier<'_> {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let (voting_destination_chain, voting_destination_address) = voted_data
+        let (voting_destination_chain, voting_destination_address) = voted
             .first()
             .map(|(index, ..)| {
                 (
@@ -944,9 +1075,19 @@ impl ItsHubVerifier<'_> {
             })
             .unwrap_or_default();
 
+        Ok(ItsHubPhaseData {
+            voted,
+            hub_approved,
+            routed,
+            voting_destination_chain,
+            voting_destination_address,
+        })
+    }
+
+    async fn run_phase_checks(&self, data: &ItsHubPhaseData) -> Result<ItsHubPhaseResults> {
         let (voted_results, hub_results, routed_results) = tokio::join!(
             async {
-                if voted_data.is_empty() {
+                if data.voted.is_empty() {
                     return Ok(Vec::new());
                 }
                 if let Some(voting_verifier) = self.voting_verifier {
@@ -954,53 +1095,62 @@ impl ItsHubVerifier<'_> {
                         self.lcd,
                         voting_verifier,
                         self.source_chain,
-                        &voting_destination_chain,
-                        &voting_destination_address,
-                        &voted_data,
+                        &data.voting_destination_chain,
+                        &data.voting_destination_address,
+                        &data.voted,
                     )
                     .await
                 } else {
-                    Ok(voted_data
+                    Ok(data
+                        .voted
                         .iter()
                         .map(|(index, ..)| (*index, true))
                         .collect())
                 }
             },
             async {
-                if hub_data.is_empty() {
+                if data.hub_approved.is_empty() {
                     return Ok(Vec::new());
                 }
                 batch_check_hub_approved_owned(
                     self.lcd,
                     self.axelarnet_gateway,
                     self.source_chain,
-                    &hub_data,
+                    &data.hub_approved,
                 )
                 .await
             },
             async {
-                if routed_data.is_empty() {
+                if data.routed.is_empty() {
                     return Ok(Vec::new());
                 }
                 batch_check_cosmos_routed_owned(
                     self.lcd,
                     self.destination_gateway,
                     "axelar",
-                    &routed_data,
+                    &data.routed,
                 )
                 .await
             },
         );
 
+        Ok(ItsHubPhaseResults {
+            voted: voted_results?,
+            hub_approved: hub_results?,
+            routed: routed_results?,
+        })
+    }
+
+    fn apply_phase_results(&self, txs: &mut [PendingTx], results: ItsHubPhaseResults) -> bool {
         let mut progressed = false;
-        for (index, approved) in voted_results? {
+        for (index, approved) in results.voted {
             if approved {
                 txs[index].timing.voted_secs =
                     Some(txs[index].send_instant.elapsed().as_secs_f64());
                 progressed |= txs[index].transition_to(Phase::HubApproved);
             }
         }
-        for (index, approved) in hub_results? {
+        for (index, approved) in results.hub_approved {
             if approved {
                 let elapsed = txs[index].send_instant.elapsed().as_secs_f64();
                 if self.backfill_voted_timing && txs[index].timing.voted_secs.is_none() {
@@ -1010,16 +1160,18 @@ impl ItsHubVerifier<'_> {
                 progressed |= txs[index].transition_to(Phase::DiscoverSecondLeg);
             }
         }
-        for (index, routed) in routed_results? {
+        for (index, routed) in results.routed {
             if routed {
                 txs[index].timing.routed_secs =
                     Some(txs[index].send_instant.elapsed().as_secs_f64());
                 progressed |= txs[index].transition_to(Phase::Approved);
             }
         }
+        progressed
+    }
 
-        let discovery_requests = phases
-            .discover_second_leg
+    async fn discover_second_legs(&self, txs: &mut [PendingTx], indices: &[usize]) -> Result<bool> {
+        let discovery_requests = indices
             .iter()
             .map(|&index| (index, txs[index].message_id.clone().into_string()))
             .collect::<Vec<_>>();
@@ -1035,6 +1187,7 @@ impl ItsHubVerifier<'_> {
             .buffer_unordered(20)
             .collect()
             .await;
+        let mut progressed = false;
         for result in discovery_results {
             let (index, info) = result?;
             if let Some(info) = info {
@@ -1061,6 +1214,47 @@ impl ItsHubVerifier<'_> {
 
         Ok(progressed)
     }
+
+    async fn check(&self, txs: &mut [PendingTx], phases: &PhaseIndices) -> Result<bool> {
+        let data = self.collect_phase_data(txs, phases)?;
+        let results = self.run_phase_checks(&data).await?;
+        let mut progressed = self.apply_phase_results(txs, results);
+        progressed |= self
+            .discover_second_legs(txs, &phases.discover_second_leg)
+            .await?;
+        Ok(progressed)
+    }
+}
+
+fn update_its_spinner(
+    spinner: &indicatif::ProgressBar,
+    stats: &mut RealTimeStats,
+    txs: &[PendingTx],
+    total: usize,
+) {
+    let (voted, _, hub_approved, approved, executed) = phase_counts(txs);
+    let routed = txs
+        .iter()
+        .filter(|tx| tx.timing.routed_secs.is_some())
+        .count();
+    let counts = [voted, routed, hub_approved, approved, executed];
+    stats.update(counts, txs);
+    if counts.iter().sum::<usize>() > 0 {
+        spinner.set_message(stats.spinner_msg_its(counts, total, None));
+    }
+}
+
+fn finish_its_display(spinner: &indicatif::ProgressBar, txs: &[PendingTx]) {
+    let total = txs.len();
+    let (voted, _, hub_approved, approved, executed) = phase_counts(txs);
+    let routed = txs
+        .iter()
+        .filter(|tx| tx.timing.routed_secs.is_some())
+        .count();
+    spinner.finish_and_clear();
+    ui::success(&format!(
+        "ITS pipeline: voted: {voted}/{total}  hub: {hub_approved}/{total}  routed: {routed}/{total}  approved: {approved}/{total}  executed: {executed}/{total}"
+    ));
 }
 
 pub(super) struct PollItsHubArgs<V> {
@@ -1135,8 +1329,6 @@ pub(super) async fn poll_pipeline_its_hub<V: DestinationVerifier>(
             } => (active, total, sending_complete),
         };
 
-        let error_msg: Option<String> = None;
-
         let phases = PhaseIndices::collect(txs, &active);
         if hub_verifier.check(txs, &phases).await? {
             scheduler.mark_progress();
@@ -1151,17 +1343,7 @@ pub(super) async fn poll_pipeline_its_hub<V: DestinationVerifier>(
             }
         }
 
-        let (voted, _, hub_approved, approved, executed) = phase_counts(txs);
-        let routed = txs
-            .iter()
-            .filter(|t| t.timing.routed_secs.is_some())
-            .count();
-        let counts = [voted, routed, hub_approved, approved, executed];
-        rt_stats.update(counts, txs);
-
-        if voted + hub_approved + routed + approved + executed > 0 || error_msg.is_some() {
-            spinner.set_message(rt_stats.spinner_msg_its(counts, total, error_msg.as_deref()));
-        }
+        update_its_spinner(&spinner, &mut rt_stats, txs, total);
 
         if scheduler.timed_out(sending_complete) {
             break;
@@ -1172,19 +1354,8 @@ pub(super) async fn poll_pipeline_its_hub<V: DestinationVerifier>(
     // Mark remaining non-done txs as failed — but first do an authoritative
     // GMP-API recheck so a slow final leg that executed on-chain is recovered
     // as successful rather than reported as a false timeout.
-    let total = txs.len();
     finalize_timed_out_txs(txs, network, dest.approval_label(), dest.execution_label()).await;
-
-    let (voted, _, hub_approved, approved, executed) = phase_counts(txs);
-    let routed = txs
-        .iter()
-        .filter(|t| t.timing.routed_secs.is_some())
-        .count();
-
-    spinner.finish_and_clear();
-    ui::success(&format!(
-        "ITS pipeline: voted: {voted}/{total}  hub: {hub_approved}/{total}  routed: {routed}/{total}  approved: {approved}/{total}  executed: {executed}/{total}"
-    ));
+    finish_its_display(&spinner, txs);
 
     Ok(compute_peak_throughput(txs))
 }
@@ -1203,6 +1374,123 @@ pub(super) enum ItsEvmDest {
 struct EvmItsDestinationVerifier<'a, P: Provider> {
     gw_contract: &'a AxelarAmplifierGateway::AxelarAmplifierGatewayInstance<&'a P>,
     mode: ItsEvmDest,
+}
+
+async fn check_evm_its_amplifier<P: Provider>(
+    verifier: &EvmItsDestinationVerifier<'_, P>,
+    txs: &[PendingTx],
+    indices: &[usize],
+) -> Result<Vec<DestinationObservation>> {
+    let mut futures = Vec::with_capacity(indices.len());
+    for &index in indices {
+        let tx = &txs[index];
+        let phase = tx
+            .phase()
+            .ok_or_else(|| eyre::eyre!("destination check received an inactive transaction"))?;
+        let second_leg = required_second_leg(tx)?.clone();
+        let payload_hash = required_second_leg_payload_hash(tx)?;
+        futures.push(async move {
+            let destination_address: Address =
+                second_leg.destination_address.parse().wrap_err_with(|| {
+                    format!(
+                        "invalid second-leg EVM destination address {}",
+                        second_leg.destination_address
+                    )
+                })?;
+            let approved = check_evm_is_message_approved(
+                verifier.gw_contract,
+                "axelar",
+                &second_leg.message_id,
+                &second_leg.source_address,
+                destination_address,
+                payload_hash,
+            )
+            .await?;
+            let executed = check_evm_is_message_executed(
+                verifier.gw_contract,
+                "axelar",
+                &second_leg.message_id,
+            )
+            .await?;
+            let status = match phase {
+                Phase::Approved | Phase::Executed if executed => {
+                    DestinationStatus::Executed { command_id: None }
+                }
+                Phase::Approved if approved => DestinationStatus::Approved { command_id: None },
+                _ => DestinationStatus::Pending,
+            };
+            Ok(DestinationObservation { index, status })
+        });
+    }
+    let results: Vec<Result<_>> = futures::stream::iter(futures)
+        .buffer_unordered(20)
+        .collect()
+        .await;
+    results.into_iter().collect()
+}
+
+async fn check_evm_its_legacy<P: Provider>(
+    verifier: &EvmItsDestinationVerifier<'_, P>,
+    from_block: u64,
+    txs: &[PendingTx],
+    indices: &[usize],
+) -> Result<Vec<DestinationObservation>> {
+    let mut observations = Vec::with_capacity(indices.len());
+    for &index in indices {
+        let tx = &txs[index];
+        let second_leg = required_second_leg(tx)?;
+        let destination_address: Address =
+            second_leg.destination_address.parse().wrap_err_with(|| {
+                format!(
+                    "invalid second-leg EVM destination address {}",
+                    second_leg.destination_address
+                )
+            })?;
+        let status = match tx.phase() {
+            Some(Phase::Approved) => {
+                let found = legacy::find_contract_call_approved_by_payload(
+                    verifier.gw_contract.provider(),
+                    *verifier.gw_contract.address(),
+                    destination_address,
+                    required_second_leg_payload_hash(tx)?,
+                    from_block,
+                )
+                .await?;
+                match found {
+                    Some(command_id)
+                        if check_evm_command_executed(verifier.gw_contract, command_id.into())
+                            .await? =>
+                    {
+                        DestinationStatus::Executed {
+                            command_id: Some(command_id),
+                        }
+                    }
+                    Some(command_id) => DestinationStatus::Approved {
+                        command_id: Some(command_id),
+                    },
+                    None => DestinationStatus::Pending,
+                }
+            }
+            Some(Phase::Executed) => {
+                let command_id = tx.command_id().ok_or_else(|| {
+                    eyre::eyre!(
+                        "legacy ITS tx {} in Executed phase without a commandId",
+                        tx.message_id
+                    )
+                })?;
+                if check_evm_command_executed(verifier.gw_contract, command_id.into()).await? {
+                    DestinationStatus::Executed {
+                        command_id: Some(command_id),
+                    }
+                } else {
+                    DestinationStatus::Pending
+                }
+            }
+            _ => DestinationStatus::Pending,
+        };
+        observations.push(DestinationObservation { index, status });
+    }
+    Ok(observations)
 }
 
 impl<P: Provider> DestinationVerifier for EvmItsDestinationVerifier<'_, P> {
@@ -1228,122 +1516,9 @@ impl<P: Provider> DestinationVerifier for EvmItsDestinationVerifier<'_, P> {
     ) -> DestinationCheckFuture<'a> {
         Box::pin(async move {
             match self.mode {
-                ItsEvmDest::Amplifier => {
-                    let mut futures = Vec::with_capacity(indices.len());
-                    for &index in indices {
-                        let tx = &txs[index];
-                        let phase = tx
-                            .phase()
-                            .expect("destination checks only receive active txs");
-                        let second_leg = required_second_leg(tx)?.clone();
-                        let payload_hash = required_second_leg_payload_hash(tx)?;
-                        futures.push(async move {
-                            let destination_address: Address =
-                                second_leg.destination_address.parse().wrap_err_with(|| {
-                                    format!(
-                                        "invalid second-leg EVM destination address {}",
-                                        second_leg.destination_address
-                                    )
-                                })?;
-                            let approved = check_evm_is_message_approved(
-                                self.gw_contract,
-                                "axelar",
-                                &second_leg.message_id,
-                                &second_leg.source_address,
-                                destination_address,
-                                payload_hash,
-                            )
-                            .await?;
-                            let executed = check_evm_is_message_executed(
-                                self.gw_contract,
-                                "axelar",
-                                &second_leg.message_id,
-                            )
-                            .await?;
-                            let status = match phase {
-                                Phase::Approved if executed => {
-                                    DestinationStatus::Executed { command_id: None }
-                                }
-                                Phase::Approved if approved => {
-                                    DestinationStatus::Approved { command_id: None }
-                                }
-                                Phase::Executed if executed => {
-                                    DestinationStatus::Executed { command_id: None }
-                                }
-                                _ => DestinationStatus::Pending,
-                            };
-                            Ok(DestinationObservation { index, status })
-                        });
-                    }
-                    let results: Vec<Result<_>> = futures::stream::iter(futures)
-                        .buffer_unordered(20)
-                        .collect()
-                        .await;
-                    results.into_iter().collect()
-                }
+                ItsEvmDest::Amplifier => check_evm_its_amplifier(self, txs, indices).await,
                 ItsEvmDest::Legacy { from_block } => {
-                    let mut observations = Vec::with_capacity(indices.len());
-                    for &index in indices {
-                        let tx = &txs[index];
-                        let second_leg = required_second_leg(tx)?;
-                        let destination_address: Address =
-                            second_leg.destination_address.parse().wrap_err_with(|| {
-                                format!(
-                                    "invalid second-leg EVM destination address {}",
-                                    second_leg.destination_address
-                                )
-                            })?;
-                        let status = match tx.phase() {
-                            Some(Phase::Approved) => {
-                                let found = legacy::find_contract_call_approved_by_payload(
-                                    self.gw_contract.provider(),
-                                    *self.gw_contract.address(),
-                                    destination_address,
-                                    required_second_leg_payload_hash(tx)?,
-                                    from_block,
-                                )
-                                .await?;
-                                if let Some(command_id) = found {
-                                    if check_evm_command_executed(
-                                        self.gw_contract,
-                                        command_id.into(),
-                                    )
-                                    .await?
-                                    {
-                                        DestinationStatus::Executed {
-                                            command_id: Some(command_id),
-                                        }
-                                    } else {
-                                        DestinationStatus::Approved {
-                                            command_id: Some(command_id),
-                                        }
-                                    }
-                                } else {
-                                    DestinationStatus::Pending
-                                }
-                            }
-                            Some(Phase::Executed) => {
-                                let command_id = tx.command_id().ok_or_else(|| {
-                                    eyre::eyre!(
-                                        "legacy ITS tx {} in Executed phase without a commandId",
-                                        tx.message_id
-                                    )
-                                })?;
-                                if check_evm_command_executed(self.gw_contract, command_id.into())
-                                    .await?
-                                {
-                                    DestinationStatus::Executed {
-                                        command_id: Some(command_id),
-                                    }
-                                } else {
-                                    DestinationStatus::Pending
-                                }
-                            }
-                            _ => DestinationStatus::Pending,
-                        };
-                        observations.push(DestinationObservation { index, status });
-                    }
-                    Ok(observations)
+                    check_evm_its_legacy(self, from_block, txs, indices).await
                 }
             }
         })
@@ -1435,8 +1610,6 @@ pub(super) async fn poll_pipeline_its_hub_evm<P: Provider>(
             } => (active, total, sending_complete),
         };
 
-        let error_msg: Option<String> = None;
-
         let phases = PhaseIndices::collect(txs, &active);
         if hub_verifier.check(txs, &phases).await? {
             scheduler.mark_progress();
@@ -1453,17 +1626,7 @@ pub(super) async fn poll_pipeline_its_hub_evm<P: Provider>(
             }
         }
 
-        let (voted, _, hub_approved, approved, executed) = phase_counts(txs);
-        let routed = txs
-            .iter()
-            .filter(|t| t.timing.routed_secs.is_some())
-            .count();
-        let counts = [voted, routed, hub_approved, approved, executed];
-        rt_stats.update(counts, txs);
-
-        if voted + hub_approved + routed + approved + executed > 0 || error_msg.is_some() {
-            spinner.set_message(rt_stats.spinner_msg_its(counts, total, error_msg.as_deref()));
-        }
+        update_its_spinner(&spinner, &mut rt_stats, txs, total);
 
         if scheduler.timed_out(sending_complete) {
             break;
@@ -1474,7 +1637,6 @@ pub(super) async fn poll_pipeline_its_hub_evm<P: Provider>(
     // Mark remaining non-done txs as failed — but first do an authoritative
     // GMP-API recheck so a slow final leg that executed on-chain is recovered
     // as successful rather than reported as a false timeout.
-    let total = txs.len();
     finalize_timed_out_txs(
         txs,
         network,
@@ -1482,17 +1644,7 @@ pub(super) async fn poll_pipeline_its_hub_evm<P: Provider>(
         destination_verifier.execution_label(),
     )
     .await;
-
-    let (voted, _, hub_approved, approved, executed) = phase_counts(txs);
-    let routed = txs
-        .iter()
-        .filter(|t| t.timing.routed_secs.is_some())
-        .count();
-
-    spinner.finish_and_clear();
-    ui::success(&format!(
-        "ITS pipeline: voted: {voted}/{total}  hub: {hub_approved}/{total}  routed: {routed}/{total}  approved: {approved}/{total}  executed: {executed}/{total}"
-    ));
+    finish_its_display(&spinner, txs);
 
     Ok(compute_peak_throughput(txs))
 }

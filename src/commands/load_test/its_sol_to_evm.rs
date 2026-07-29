@@ -22,7 +22,7 @@ use super::metrics::ComputeUnitSummary;
 use super::run_sizing::{RunMode, RunSizing, SustainedPlan};
 use super::verification_session::VerificationSession;
 use super::verify::VerificationRoute;
-use super::{read_its_cache, save_its_cache, validate_evm_rpc, validate_solana_rpc};
+use super::{ItsCache, read_its_cache, save_its_cache, validate_evm_rpc, validate_solana_rpc};
 use crate::config::ChainsConfig;
 use crate::solana;
 use crate::ui;
@@ -494,109 +494,129 @@ struct TokenSetupRequest {
     evm_rpc_url: String,
 }
 
+type SolanaTokenSetup = ([u8; 32], [u8; 32], solana_sdk::pubkey::Pubkey);
+
 async fn setup_its_token(
     keypair: &Keypair,
-    rpc_client: &solana_client::rpc_client::RpcClient,
+    rpc_client: &RpcClient,
     request: TokenSetupRequest,
-) -> eyre::Result<([u8; 32], [u8; 32], solana_sdk::pubkey::Pubkey)> {
+) -> eyre::Result<SolanaTokenSetup> {
+    if let Some(value) = request.token_id_override.as_deref() {
+        return resolve_token_override(value, request.network);
+    }
+    if let Some(token) = reusable_config_token(keypair, rpc_client, &request)? {
+        return Ok(token);
+    }
+    if let Some(token) = reusable_cached_token(keypair, rpc_client, &request)? {
+        return Ok(token);
+    }
+    deploy_fresh_token(keypair, request).await
+}
+
+fn resolve_token_override(
+    value: &str,
+    network: crate::types::Network,
+) -> eyre::Result<SolanaTokenSetup> {
+    let bytes = hex::decode(value.strip_prefix("0x").unwrap_or(value))
+        .map_err(|e| eyre!("invalid --token-id: {e}"))?;
+    let token_id: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| eyre!("--token-id must be 32 bytes"))?;
+    let (its_root, _) = solana::find_its_root_pda(network);
+    let (mint, _) = solana::find_interchain_token_pda(network, &its_root, &token_id);
+    ui::kv("token ID (provided)", value);
+    Ok((token_id, [0; 32], mint))
+}
+
+fn reusable_config_token(
+    keypair: &Keypair,
+    rpc_client: &RpcClient,
+    request: &TokenSetupRequest,
+) -> eyre::Result<Option<SolanaTokenSetup>> {
+    let Some(token_id) =
+        super::helpers::read_pre_registered_axe_token(&request.config, &request.source_chain)?
+    else {
+        return Ok(None);
+    };
+    let (its_root, _) = solana::find_its_root_pda(request.network);
+    let (mint, _) = solana::find_interchain_token_pda(request.network, &its_root, &token_id.0);
+    if rpc_client.get_account_data(&mint).is_err() {
+        return Ok(None);
+    }
+    let needed = required_solana_token_balance(mint_decimals(rpc_client, &mint), request.num_txs);
+    let balance = deployer_spl_balance(rpc_client, &keypair.pubkey(), &mint);
+    if balance >= needed {
+        ui::kv("token ID (chains-config)", &format!("{token_id}"));
+        ui::address("mint", &mint.to_string());
+        return Ok(Some((token_id.0, [0; 32], mint)));
+    }
+    ui::warn(&format!(
+        "chains-config AXE balance too low ({balance} < {needed}); configured wallet \
+         isn't the workflow deployer — deploying fresh..."
+    ));
+    Ok(None)
+}
+
+fn required_solana_token_balance(decimals: u8, transfers: usize) -> u64 {
+    WHOLE_TOKENS_PER_KEY
+        .saturating_mul(10u64.pow(u32::from(decimals)))
+        .saturating_mul(transfers as u64)
+}
+
+fn reusable_cached_token(
+    keypair: &Keypair,
+    rpc_client: &RpcClient,
+    request: &TokenSetupRequest,
+) -> eyre::Result<Option<SolanaTokenSetup>> {
+    let cache = read_its_cache(&request.source_chain, &request.destination_chain);
+    let Some(token_id) = decode_cache_bytes(cache.token_id.as_deref()) else {
+        return Ok(None);
+    };
+    let salt = decode_cache_bytes(cache.salt.as_deref()).unwrap_or([0; 32]);
+    let (its_root, _) = solana::find_its_root_pda(request.network);
+    let (mint, _) = solana::find_interchain_token_pda(request.network, &its_root, &token_id);
+    if rpc_client.get_account_data(&mint).is_err() {
+        ui::warn("cached token no longer exists, deploying fresh...");
+        return Ok(None);
+    }
+    let needed = required_solana_token_balance(mint_decimals(rpc_client, &mint), request.num_txs);
+    let balance = deployer_spl_balance(rpc_client, &keypair.pubkey(), &mint);
+    if balance < needed {
+        ui::warn(&format!(
+            "cached token has insufficient supply ({balance} < {needed}), deploying fresh..."
+        ));
+        return Ok(None);
+    }
+    ui::info(&format!("reusing cached ITS token: {mint}"));
+    Ok(Some((token_id, salt, mint)))
+}
+
+fn decode_cache_bytes(value: Option<&str>) -> Option<[u8; 32]> {
+    let value = value?;
+    let bytes = hex::decode(value.strip_prefix("0x").unwrap_or(value)).ok()?;
+    bytes.try_into().ok()
+}
+
+async fn deploy_fresh_token(
+    keypair: &Keypair,
+    request: TokenSetupRequest,
+) -> eyre::Result<SolanaTokenSetup> {
     let TokenSetupRequest {
         solana_rpc,
         network,
         source_chain: src,
         destination_chain: dest,
-        num_txs,
         gas_value,
-        token_id_override,
         config,
         evm_gateway: evm_gateway_addr,
         evm_rpc_url,
+        ..
     } = request;
     let solana_rpc = solana_rpc.as_str();
     let src = src.as_str();
     let dest = dest.as_str();
-    let token_id_override = token_id_override.as_deref();
     let config = config.as_path();
     let evm_rpc_url = evm_rpc_url.as_str();
-    if let Some(tid_hex) = token_id_override {
-        let tid_bytes = hex::decode(tid_hex.strip_prefix("0x").unwrap_or(tid_hex))
-            .map_err(|e| eyre!("invalid --token-id: {e}"))?;
-        if tid_bytes.len() != 32 {
-            return Err(eyre!("--token-id must be 32 bytes"));
-        }
-        let mut token_id = [0u8; 32];
-        token_id.copy_from_slice(&tid_bytes);
-        let (its_root, _) = solana::find_its_root_pda(network);
-        let (mint, _) = solana::find_interchain_token_pda(network, &its_root, &token_id);
-        ui::kv("token ID (provided)", tid_hex);
-        return Ok((token_id, [0u8; 32], mint));
-    }
-
-    // chains-config pre-registered AXE: reuse the canonical token when the
-    // configured wallet actually holds enough of it on Solana; otherwise fall
-    // through to the cache / fresh-deploy path (matches the EVM/Stellar
-    // resolvers). Salt is unknown for an adopted token, so return the zero salt.
-    if let Some(tid) = super::helpers::read_pre_registered_axe_token(config, src)? {
-        let (its_root, _) = solana::find_its_root_pda(network);
-        let (mint, _) = solana::find_interchain_token_pda(network, &its_root, &tid.0);
-        if rpc_client.get_account_data(&mint).is_ok() {
-            let decimals = mint_decimals(rpc_client, &mint);
-            let needed = WHOLE_TOKENS_PER_KEY
-                .saturating_mul(10u64.pow(u32::from(decimals)))
-                .saturating_mul(num_txs as u64);
-            let balance = deployer_spl_balance(rpc_client, &keypair.pubkey(), &mint);
-            if balance >= needed {
-                ui::kv("token ID (chains-config)", &format!("{tid}"));
-                ui::address("mint", &mint.to_string());
-                return Ok((tid.0, [0u8; 32], mint));
-            }
-            ui::warn(&format!(
-                "chains-config AXE balance too low ({balance} < {needed}); configured wallet \
-                 isn't the workflow deployer — deploying fresh..."
-            ));
-        }
-    }
-
-    // Check cache
-    let cache = read_its_cache(src, dest);
-    if let Some(tid_hex) = cache.get("tokenId").and_then(|v| v.as_str()) {
-        let tid_bytes = hex::decode(tid_hex.strip_prefix("0x").unwrap_or(tid_hex)).ok();
-        let salt_hex = cache.get("salt").and_then(|v| v.as_str());
-        if let (Some(tid_bytes), Some(salt_hex)) = (tid_bytes, salt_hex)
-            && tid_bytes.len() == 32
-        {
-            let mut token_id = [0u8; 32];
-            token_id.copy_from_slice(&tid_bytes);
-            let mut salt = [0u8; 32];
-            let salt_bytes =
-                hex::decode(salt_hex.strip_prefix("0x").unwrap_or(salt_hex)).unwrap_or_default();
-            if salt_bytes.len() == 32 {
-                salt.copy_from_slice(&salt_bytes);
-            }
-            let (its_root, _) = solana::find_its_root_pda(network);
-            let (mint, _) = solana::find_interchain_token_pda(network, &its_root, &token_id);
-
-            // Verify token still exists on-chain and deployer has enough supply
-            if rpc_client.get_account_data(&mint).is_ok() {
-                let decimals = mint_decimals(rpc_client, &mint);
-                let needed = WHOLE_TOKENS_PER_KEY
-                    .saturating_mul(10u64.pow(u32::from(decimals)))
-                    .saturating_mul(num_txs as u64);
-                let deployer_balance = deployer_spl_balance(rpc_client, &keypair.pubkey(), &mint);
-
-                if deployer_balance >= needed {
-                    ui::info(&format!("reusing cached ITS token: {mint}"));
-                    return Ok((token_id, salt, mint));
-                }
-                ui::warn(&format!(
-                    "cached token has insufficient supply ({deployer_balance} < {needed}), deploying fresh..."
-                ));
-            } else {
-                ui::warn("cached token no longer exists, deploying fresh...");
-            }
-        }
-    }
-
-    // Deploy fresh
     let salt = generate_salt();
     // Mint a large fixed supply so the token can be reused across runs without redeploying.
     let total_supply: u64 = 1_000_000 * 1_000_000_000; // 1M tokens (9 decimals)
@@ -677,12 +697,10 @@ async fn setup_its_token(
     )
     .await?;
 
-    // Save cache
-    let cache = serde_json::json!({
-        "tokenId": hex::encode(token_id),
-        "salt": hex::encode(salt),
-        "mint": mint.to_string(),
-    });
+    let mut cache = ItsCache::default();
+    cache.token_id = Some(hex::encode(token_id));
+    cache.salt = Some(hex::encode(salt));
+    cache.mint = Some(mint.to_string());
     save_its_cache(src, dest, &cache)?;
 
     Ok((token_id, salt, mint))
@@ -705,9 +723,7 @@ fn prepare_keypairs(
     main_keypair: &Keypair,
 ) -> eyre::Result<Vec<Arc<Keypair>>> {
     if num_keys <= 1 {
-        return Ok(vec![Arc::new(Keypair::new_from_array(
-            main_keypair.to_bytes()[..32].try_into().unwrap(),
-        ))]);
+        return Ok(vec![Arc::new(keypairs::clone_keypair(main_keypair)?)]);
     }
 
     let derived = keypairs::derive_keypairs(main_keypair, num_keys)?;

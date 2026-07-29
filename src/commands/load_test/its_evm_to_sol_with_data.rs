@@ -24,7 +24,7 @@ use super::submitter::TransactionSubmitter;
 use super::verification_session::VerificationSession;
 use super::verify::VerificationRoute;
 use super::{
-    LoadTestArgs, check_evm_balance, read_its_cache, save_its_cache, validate_evm_rpc,
+    ItsCache, LoadTestArgs, check_evm_balance, read_its_cache, save_its_cache, validate_evm_rpc,
     validate_solana_rpc,
 };
 use crate::commands::test_its::{
@@ -322,13 +322,13 @@ async fn resolve_its_token<P: Provider>(
 
     let cache = read_its_cache(src, dest);
     let cached = cache
-        .get("tokenId")
-        .and_then(|v| v.as_str())
+        .token_id
+        .as_deref()
         .and_then(|tid| tid.parse::<FixedBytes<32>>().ok())
         .zip(
             cache
-                .get("tokenAddress")
-                .and_then(|v| v.as_str())
+                .token_address
+                .as_deref()
                 .and_then(|a| a.parse::<Address>().ok()),
         );
 
@@ -479,8 +479,13 @@ async fn fund_and_distribute(
     let funding_provider = ProviderBuilder::new()
         .wallet(signer.clone())
         .connect_http(evm_rpc_url.parse()?);
-    keypairs::ensure_funded_evm_with_extra(&funding_provider, signer, derived, gas_extra_per_key)
-        .await?;
+    keypairs::ensure_funded_evm_with_extra(
+        &funding_provider,
+        signer,
+        derived,
+        super::units::Wei::from_u128(gas_extra_per_key),
+    )
+    .await?;
 
     let token_provider = ProviderBuilder::new()
         .wallet(signer.clone())
@@ -706,11 +711,10 @@ async fn deploy_its_token<P: Provider>(
         Err(_) => None,
     };
 
-    let cache = serde_json::json!({
-        "tokenId": format!("{token_id}"),
-        "tokenAddress": format!("{token_addr}"),
-        "salt": format!("{salt}"),
-    });
+    let mut cache = ItsCache::default();
+    cache.token_id = Some(token_id.to_string());
+    cache.token_address = Some(token_addr.to_string());
+    cache.salt = Some(salt.to_string());
     save_its_cache(source_chain, dest_chain, &cache)?;
 
     Ok((token_id, token_addr, deploy_message_id))

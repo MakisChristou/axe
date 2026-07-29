@@ -81,11 +81,13 @@ impl XrplClient {
                 })),
                 Err(e) => {
                     // `actNotFound` → account doesn't exist yet (not an error)
-                    let msg = e.to_string();
-                    if msg.contains("actNotFound") || msg.contains("Account not found") {
+                    if matches!(
+                        &e,
+                        xrpl_http_client::error::Error::Api(code) if code == "actNotFound"
+                    ) {
                         Ok(None)
                     } else {
-                        Err(eyre!("account_info({address}) failed: {msg}"))
+                        Err(eyre!("account_info({address}) failed: {e}"))
                     }
                 }
             }
@@ -269,13 +271,15 @@ impl XrplClient {
                 }))
             }
             Err(e) => {
-                let msg = e.to_string();
                 // `txnNotFound` means the tx is not yet on a validated ledger
                 // (or has been dropped). Treat as "not yet".
-                if msg.contains("txnNotFound") {
+                if matches!(
+                    &e,
+                    xrpl_http_client::error::Error::Api(code) if code == "txnNotFound"
+                ) {
                     Ok(None)
                 } else {
-                    Err(eyre!("tx({tx_hash}) failed: {msg}"))
+                    Err(eyre!("tx({tx_hash}) failed: {e}"))
                 }
             }
         }

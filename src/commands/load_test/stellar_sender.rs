@@ -11,6 +11,7 @@ use super::metrics::{
 use super::run_sizing::SustainedPlan;
 use super::submitter::TransactionSubmitter;
 use super::sustained;
+use super::units::Stroops;
 use crate::stellar::{
     StellarClient, StellarWallet, scval_address_account, scval_bytes, scval_string, scval_token,
 };
@@ -36,13 +37,14 @@ pub const BASE_FEE: u32 = 100_000;
 /// a comfortable default on testnet/devnet.
 pub const DEFAULT_GAS_STROOPS: u64 = 100_000_000; // 10 XLM
 
-pub fn parse_gas_stroops(value: Option<&str>) -> Result<u64> {
-    match value {
+pub fn parse_gas_stroops(value: Option<&str>) -> Result<Stroops> {
+    let value = match value {
         Some(value) => value
             .parse()
             .map_err(|error| eyre!("invalid --gas-value: {error}")),
         None => Ok(DEFAULT_GAS_STROOPS),
-    }
+    }?;
+    Ok(Stroops::new(value))
 }
 
 /// Generate a default ABI-encoded payload compatible with EVM SenderReceiver.
@@ -72,7 +74,7 @@ struct SubmitRequest {
     destination_address: String,
     payload: Vec<u8>,
     gas_token_contract: String,
-    gas_amount_stroops: u64,
+    gas_amount: Stroops,
 }
 
 async fn submit_single(request: SubmitRequest) -> TxMetrics {
@@ -85,7 +87,7 @@ async fn submit_single(request: SubmitRequest) -> TxMetrics {
         destination_address,
         payload,
         gas_token_contract,
-        gas_amount_stroops,
+        gas_amount,
     } = request;
     let submit_start = Instant::now();
     // The on-chain `ContractCall` event is emitted by the example contract
@@ -103,7 +105,7 @@ async fn submit_single(request: SubmitRequest) -> TxMetrics {
         &destination_address,
         &payload,
         &gas_token_contract,
-        gas_amount_stroops,
+        gas_amount.get(),
     ) {
         Ok(a) => a,
         Err(e) => return fail_metrics(submit_start, &source_addr, &format!("args: {e}")),
@@ -161,7 +163,7 @@ struct StellarSubmitter {
     destination_chain: String,
     destination_address: String,
     gas_token_contract: String,
-    gas_amount_stroops: u64,
+    gas_amount: Stroops,
 }
 
 struct StellarSubmitJob {
@@ -182,7 +184,7 @@ impl TransactionSubmitter for StellarSubmitter {
             destination_address: self.destination_address.clone(),
             payload: job.payload,
             gas_token_contract: self.gas_token_contract.clone(),
-            gas_amount_stroops: self.gas_amount_stroops,
+            gas_amount: self.gas_amount,
         })
         .await
     }
@@ -227,7 +229,7 @@ pub(super) struct BurstRequest {
     pub payload_override: Option<Vec<u8>>,
     pub run: RunIdentity,
     pub gas_token_contract: String,
-    pub gas_amount_stroops: u64,
+    pub gas_amount: Stroops,
 }
 
 pub async fn run_burst(request: BurstRequest) -> Result<LoadTestReport> {
@@ -241,7 +243,7 @@ pub async fn run_burst(request: BurstRequest) -> Result<LoadTestReport> {
         payload_override,
         run,
         gas_token_contract,
-        gas_amount_stroops,
+        gas_amount,
     } = request;
     let key_count = wallets.len();
     let jobs = wallets
@@ -260,7 +262,7 @@ pub async fn run_burst(request: BurstRequest) -> Result<LoadTestReport> {
             destination_chain,
             destination_address: destination_address.clone(),
             gas_token_contract,
-            gas_amount_stroops,
+            gas_amount,
         },
         jobs,
         key_count,
@@ -319,7 +321,7 @@ pub(super) struct SustainedRequest {
     pub has_voting_verifier: bool,
     pub destination_contract_addr: alloy::primitives::Address,
     pub gas_token_contract: String,
-    pub gas_amount_stroops: u64,
+    pub gas_amount: Stroops,
 }
 
 pub(super) async fn run_sustained(request: SustainedRequest) -> Result<sustained::SustainedResult> {
@@ -340,7 +342,7 @@ pub(super) async fn run_sustained(request: SustainedRequest) -> Result<sustained
         has_voting_verifier,
         destination_contract_addr,
         gas_token_contract,
-        gas_amount_stroops,
+        gas_amount,
     } = request;
     let client = Arc::new(client.clone());
     let wallets = Arc::new(wallets);
@@ -354,7 +356,7 @@ pub(super) async fn run_sustained(request: SustainedRequest) -> Result<sustained
         let da = destination_address.clone();
         let payload = make_payload(&payload_override);
         let gas_token = gas_token_contract.clone();
-        let gas = gas_amount_stroops;
+        let gas = gas_amount;
         let vtx = verify_tx.clone();
         let has_vv = has_voting_verifier;
         let contract_addr = destination_contract_addr;
@@ -370,7 +372,7 @@ pub(super) async fn run_sustained(request: SustainedRequest) -> Result<sustained
                 destination_address: da,
                 payload,
                 gas_token_contract: gas_token,
-                gas_amount_stroops: gas,
+                gas_amount: gas,
             })
             .await;
             if m.is_success()
@@ -411,7 +413,8 @@ pub(super) async fn run_sustained(request: SustainedRequest) -> Result<sustained
 ///
 /// Callers pass `txs_per_key = 1` for burst mode or `key_cycle` for sustained.
 #[must_use]
-pub fn mainnet_per_key_balance_stroops(gas_stroops_per_tx: u64, txs_per_key: u64) -> i64 {
+pub fn mainnet_per_key_balance_stroops(gas: Stroops, txs_per_key: u64) -> i64 {
+    let gas_stroops_per_tx = gas.get();
     const BASE_RESERVE: i64 = 10_000_000; // 1 XLM
     const SOROBAN_BUFFER: i64 = 30_000_000; // 3 XLM
     let gas: i64 = gas_stroops_per_tx
@@ -450,108 +453,95 @@ pub fn derive_wallets(main_seed: &[u8; 32], count: usize) -> Result<Vec<StellarW
 /// signed by `main_wallet` for each missing key, funded with
 /// `mainnet_starting_balance_stroops` so the derived key can pay the
 /// cross-chain gas value + Soroban resource fees the run plans to spend.
-pub async fn ensure_funded(
+async fn stellar_funding_needs(
     client: &StellarClient,
-    derived: &[StellarWallet],
-    use_friendbot: bool,
-    main_wallet: &StellarWallet,
-    mainnet_starting_balance_stroops: i64,
-) -> Result<()> {
-    let check_pb = indicatif::ProgressBar::new(derived.len() as u64);
-    check_pb.set_style(
-        indicatif::ProgressStyle::with_template(
-            "  {bar:40.cyan/dim} {pos}/{len} Stellar keys checked",
-        )
-        .unwrap()
-        .progress_chars("=> "),
+    wallets: &[StellarWallet],
+    friendbot: bool,
+    required_balance: i64,
+) -> Result<(Vec<usize>, Vec<(usize, i64)>)> {
+    let progress = indicatif::ProgressBar::new(wallets.len() as u64);
+    progress.set_style(
+        ui::progress_bar_style("  {bar:40.cyan/dim} {pos}/{len} Stellar keys checked")
+            .progress_chars("=> "),
     );
-    // missing: account doesn't exist yet (needs CreateAccount).
-    // underfunded: account exists but balance < required (needs Payment top-up).
-    // Only the mainnet branch consumes `underfunded`; testnet/futurenet
-    // Friendbot grants 10,000 XLM per call so any existing account is always
-    // over-budget for our tests.
-    let mut missing: Vec<usize> = Vec::new();
-    let mut underfunded: Vec<(usize, i64)> = Vec::new();
-    for (i, w) in derived.iter().enumerate() {
-        match client.native_balance_stroops(&w.address()).await? {
-            None => missing.push(i),
-            Some(bal) if !use_friendbot && bal < mainnet_starting_balance_stroops => {
-                underfunded.push((i, mainnet_starting_balance_stroops - bal));
+    let mut missing = Vec::new();
+    let mut underfunded = Vec::new();
+    for (index, wallet) in wallets.iter().enumerate() {
+        match client.native_balance_stroops(&wallet.address()).await? {
+            None => missing.push(index),
+            Some(balance) if !friendbot && balance < required_balance => {
+                underfunded.push((index, required_balance - balance));
             }
             Some(_) => {}
         }
-        check_pb.inc(1);
+        progress.inc(1);
     }
-    check_pb.finish_and_clear();
+    progress.finish_and_clear();
+    Ok((missing, underfunded))
+}
 
-    if missing.is_empty() && underfunded.is_empty() {
-        ui::success(&format!(
-            "all {} derived Stellar keys are activated and funded",
-            derived.len()
-        ));
-        return Ok(());
-    }
-
-    if use_friendbot {
-        ui::info(&format!(
-            "funding {}/{} Stellar keys via Friendbot...",
-            missing.len(),
-            derived.len()
-        ));
-        let pb = indicatif::ProgressBar::new(missing.len() as u64);
-        pb.set_style(
-            indicatif::ProgressStyle::with_template(
-                "  {bar:40.cyan/dim} {pos}/{len} Stellar keys funded",
-            )
-            .unwrap()
+async fn fund_with_friendbot(
+    client: &StellarClient,
+    wallets: &[StellarWallet],
+    missing: &[usize],
+) -> Result<()> {
+    ui::info(&format!(
+        "funding {}/{} Stellar keys via Friendbot...",
+        missing.len(),
+        wallets.len()
+    ));
+    let progress = indicatif::ProgressBar::new(missing.len() as u64);
+    progress.set_style(
+        ui::progress_bar_style("  {bar:40.cyan/dim} {pos}/{len} Stellar keys funded")
             .progress_chars("=> "),
-        );
-        for &i in &missing {
-            client
-                .friendbot_fund(&derived[i].address())
-                .await
-                .map_err(|e| eyre!("friendbot fund failed for key {i}: {e}"))?;
-            pb.inc(1);
-        }
-        pb.finish_and_clear();
-        ui::success(&format!(
-            "funded {} Stellar keys via Friendbot",
-            missing.len()
-        ));
-        return Ok(());
+    );
+    for &index in missing {
+        client
+            .friendbot_fund(&wallets[index].address())
+            .await
+            .map_err(|error| eyre!("friendbot fund failed for key {index}: {error}"))?;
+        progress.inc(1);
     }
+    progress.finish_and_clear();
+    ui::success(&format!(
+        "funded {} Stellar keys via Friendbot",
+        missing.len()
+    ));
+    Ok(())
+}
 
-    // Mainnet path: main wallet bootstraps each missing derived key via a
-    // classic CreateAccount op + tops up under-funded ones via Payment.
-    // Sequenced one at a time because each op increments the funder's
-    // sequence number.
+async fn fund_stellar_mainnet(
+    client: &StellarClient,
+    wallets: &[StellarWallet],
+    main_wallet: &StellarWallet,
+    starting_balance: i64,
+    missing: &[usize],
+    underfunded: &[(usize, i64)],
+) -> Result<()> {
     if !missing.is_empty() {
         ui::info(&format!(
             "creating {}/{} Stellar derived accounts from main wallet ({} XLM each)...",
             missing.len(),
-            derived.len(),
-            mainnet_starting_balance_stroops / 10_000_000,
+            wallets.len(),
+            starting_balance / 10_000_000,
         ));
-        let pb = indicatif::ProgressBar::new(missing.len() as u64);
-        pb.set_style(
-            indicatif::ProgressStyle::with_template(
-                "  {bar:40.cyan/dim} {pos}/{len} Stellar accounts created",
-            )
-            .unwrap()
-            .progress_chars("=> "),
+        let progress = indicatif::ProgressBar::new(missing.len() as u64);
+        progress.set_style(
+            ui::progress_bar_style("  {bar:40.cyan/dim} {pos}/{len} Stellar accounts created")
+                .progress_chars("=> "),
         );
-        for &i in &missing {
+        for &index in missing {
             client
                 .create_account_classic(
                     main_wallet,
-                    &derived[i].public_key_bytes,
-                    mainnet_starting_balance_stroops,
+                    &wallets[index].public_key_bytes,
+                    starting_balance,
                 )
                 .await
-                .map_err(|e| eyre!("create_account failed for derived key {i}: {e}"))?;
-            pb.inc(1);
+                .map_err(|error| eyre!("create_account failed for derived key {index}: {error}"))?;
+            progress.inc(1);
         }
-        pb.finish_and_clear();
+        progress.finish_and_clear();
         ui::success(&format!(
             "created {} Stellar derived accounts from main wallet",
             missing.len()
@@ -562,26 +552,60 @@ pub async fn ensure_funded(
             "topping up {} under-funded Stellar derived account(s) from main wallet...",
             underfunded.len()
         ));
-        let pb = indicatif::ProgressBar::new(underfunded.len() as u64);
-        pb.set_style(
-            indicatif::ProgressStyle::with_template(
-                "  {bar:40.cyan/dim} {pos}/{len} Stellar accounts topped up",
-            )
-            .unwrap()
-            .progress_chars("=> "),
+        let progress = indicatif::ProgressBar::new(underfunded.len() as u64);
+        progress.set_style(
+            ui::progress_bar_style("  {bar:40.cyan/dim} {pos}/{len} Stellar accounts topped up")
+                .progress_chars("=> "),
         );
-        for &(i, top_up) in &underfunded {
+        for &(index, top_up) in underfunded {
             client
-                .pay_native_classic(main_wallet, &derived[i].public_key_bytes, top_up)
+                .pay_native_classic(main_wallet, &wallets[index].public_key_bytes, top_up)
                 .await
-                .map_err(|e| eyre!("top-up payment failed for derived key {i}: {e}"))?;
-            pb.inc(1);
+                .map_err(|error| eyre!("top-up payment failed for derived key {index}: {error}"))?;
+            progress.inc(1);
         }
-        pb.finish_and_clear();
+        progress.finish_and_clear();
         ui::success(&format!(
             "topped up {} Stellar derived account(s) from main wallet",
             underfunded.len()
         ));
     }
     Ok(())
+}
+
+pub async fn ensure_funded(
+    client: &StellarClient,
+    derived: &[StellarWallet],
+    use_friendbot: bool,
+    main_wallet: &StellarWallet,
+    mainnet_starting_balance_stroops: i64,
+) -> Result<()> {
+    let (missing, underfunded) = stellar_funding_needs(
+        client,
+        derived,
+        use_friendbot,
+        mainnet_starting_balance_stroops,
+    )
+    .await?;
+
+    if missing.is_empty() && underfunded.is_empty() {
+        ui::success(&format!(
+            "all {} derived Stellar keys are activated and funded",
+            derived.len()
+        ));
+        return Ok(());
+    }
+
+    if use_friendbot {
+        return fund_with_friendbot(client, derived, &missing).await;
+    }
+    fund_stellar_mainnet(
+        client,
+        derived,
+        main_wallet,
+        mainnet_starting_balance_stroops,
+        &missing,
+        &underfunded,
+    )
+    .await
 }

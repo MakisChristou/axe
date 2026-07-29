@@ -25,7 +25,7 @@ use solana_sdk::signature::Signer;
 
 use super::its_sol_source;
 use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentity, TxMetrics};
-use super::run_sizing::{RunSizing, SustainedPlan};
+use super::run_sizing::RunSizing;
 use super::{
     LoadTestArgs, finalize_sui_dest_run_its, load_sui_main_wallet, read_sui_axe_token_id,
     sui_its_dest_lookup, validate_solana_rpc,
@@ -35,6 +35,40 @@ use crate::ui;
 
 const AMOUNT_PER_TX: u64 = 1;
 const TOKEN_PROGRAM_2022: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+
+async fn send_transfers(
+    submitter: its_sol_source::ItsSolanaSubmitter,
+    job: its_sol_source::ItsSolanaSubmitJob,
+    sizing: RunSizing,
+) -> eyre::Result<SendResult> {
+    if let Some(plan) = sizing.sustained() {
+        let spinner = ui::wait_spinner(&format!(
+            "[0/{}s] starting sustained ITS send...",
+            plan.duration_secs
+        ));
+        let result = super::sustained::run_sustained_loop(
+            plan,
+            None,
+            its_sol_source::its_sustained_tasks(submitter, vec![job; sizing.num_keys], None),
+            None,
+            spinner,
+        )
+        .await?;
+        Ok(SendResult {
+            metrics: result.metrics,
+            total_submitted: result.total_submitted,
+            test_duration_secs: result.test_duration_secs,
+        })
+    } else {
+        let result =
+            its_sol_source::run_its_burst(submitter, vec![job; sizing.num_keys], 1).await?;
+        Ok(SendResult {
+            metrics: result.metrics,
+            total_submitted: result.total_submitted,
+            test_duration_secs: result.test_duration_secs,
+        })
+    }
+}
 
 pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> eyre::Result<()> {
     let src = &args.source_chain;
@@ -138,41 +172,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
         source_account: source_ata,
     };
 
-    let send = if let Some(SustainedPlan {
-        tps,
-        duration_secs,
-        key_cycle,
-    }) = sizing.sustained()
-    {
-        let spinner = ui::wait_spinner(&format!(
-            "[0/{duration_secs}s] starting sustained ITS send..."
-        ));
-        let result = super::sustained::run_sustained_loop(
-            SustainedPlan {
-                tps,
-                duration_secs,
-                key_cycle,
-            },
-            None,
-            its_sol_source::its_sustained_tasks(submitter, vec![job; sizing.num_keys], None),
-            None,
-            spinner,
-        )
-        .await?;
-        SendResult {
-            metrics: result.metrics,
-            total_submitted: result.total_submitted,
-            test_duration_secs: result.test_duration_secs,
-        }
-    } else {
-        let num_txs = sizing.num_keys;
-        let result = its_sol_source::run_its_burst(submitter, vec![job; num_txs], 1).await?;
-        SendResult {
-            metrics: result.metrics,
-            total_submitted: result.total_submitted,
-            test_duration_secs: result.test_duration_secs,
-        }
-    };
+    let send = send_transfers(submitter, job, sizing).await?;
 
     let mut report = LoadTestReport::from_transactions(
         ReportInput {

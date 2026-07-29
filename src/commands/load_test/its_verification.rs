@@ -20,7 +20,9 @@ use super::metrics::{
 };
 use super::submitter::BurstResult;
 use super::sustained::SustainedResult;
-use super::verification_session::{StreamingResult, StreamingTarget, VerificationSession};
+use super::verification_session::{
+    BatchTarget, StreamingResult, StreamingTarget, VerificationSession,
+};
 use super::verify::{
     self, EvmItsDestination, ItsBatchVerification, PendingTx, SolanaItsDestination,
     StellarItsDestination, StreamingVerification, SuiItsDestination, VerificationRoute,
@@ -28,14 +30,7 @@ use super::verify::{
 };
 use super::{LoadTestArgs, finish_report};
 
-/// A destination capable of verifying a completed batch of ITS transfers.
-pub(super) trait ItsBatchTarget {
-    fn verify_batch(
-        self,
-        route: VerificationRoute,
-        metrics: &mut [TxMetrics],
-    ) -> impl Future<Output = Result<VerificationReport>>;
-}
+pub(super) use super::verification_session::finish_batch;
 
 /// Build the batch and streaming impls for a destination whose only
 /// difference is which `verify_onchain_*_its` pair it calls.
@@ -60,7 +55,7 @@ macro_rules! its_target {
             }
         }
 
-        impl ItsBatchTarget for $target {
+        impl BatchTarget for $target {
             fn verify_batch(
                 self,
                 route: VerificationRoute,
@@ -144,18 +139,7 @@ pub(super) struct ItsBurstReport {
     pub compute_unit_summary: ComputeUnitSummary,
 }
 
-pub(super) async fn finish_batch<T: ItsBatchTarget>(
-    args: &LoadTestArgs,
-    target: T,
-    report: &mut LoadTestReport,
-    test_start: Instant,
-) -> Result<()> {
-    let route = VerificationRoute::from_args(args);
-    report.verification = Some(target.verify_batch(route, &mut report.transactions).await?);
-    finish_report(report, test_start)
-}
-
-pub(super) async fn finish_burst<T: ItsBatchTarget>(
+pub(super) async fn finish_burst<T: BatchTarget>(
     args: &LoadTestArgs,
     target: T,
     burst: BurstResult,

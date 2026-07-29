@@ -75,8 +75,38 @@ impl TransactionSubmitter for SolanaSubmitter {
                 )
             })
             .await
-            .expect("Solana submit task panicked")
+            .unwrap_or_else(|error| TxMetrics::failed("", 0, format!("task panicked: {error}")))
         }
+    }
+}
+
+struct SolanaSustainedSubmitter {
+    rpc_url: String,
+    network: Network,
+    destination_chain: String,
+    destination_address: String,
+}
+
+impl TransactionSubmitter for SolanaSustainedSubmitter {
+    type Job = SolanaSubmitJob;
+
+    async fn submit(&self, job: Self::Job) -> TxMetrics {
+        let rpc_url = self.rpc_url.clone();
+        let network = self.network;
+        let destination_chain = self.destination_chain.clone();
+        let destination_address = self.destination_address.clone();
+        tokio::task::spawn_blocking(move || {
+            send_sol_tx(
+                &rpc_url,
+                job.signer.as_ref(),
+                network,
+                &destination_chain,
+                &destination_address,
+                &job.payload,
+            )
+        })
+        .await
+        .unwrap_or_else(|error| TxMetrics::failed("", 0, format!("task panicked: {error}")))
     }
 }
 
@@ -93,9 +123,9 @@ fn prepare_keypairs(
     main_keypair: &Keypair,
 ) -> eyre::Result<Vec<Arc<dyn Signer + Send + Sync>>> {
     if num_keys <= 1 {
-        return Ok(vec![Arc::new(Keypair::new_from_array(
-            main_keypair.to_bytes()[..32].try_into().unwrap(),
-        )) as Arc<dyn Signer + Send + Sync>]);
+        return Ok(vec![
+            Arc::new(keypairs::clone_keypair(main_keypair)?) as Arc<dyn Signer + Send + Sync>
+        ]);
     }
 
     let derived = keypairs::derive_keypairs(main_keypair, num_keys)?;
@@ -223,6 +253,51 @@ fn send_sol_tx(
 }
 
 /// Run Solana sustained load test at a controlled TPS rate.
+fn prepare_sustained_keypairs(
+    args: &LoadTestArgs,
+    plan: SustainedPlan,
+) -> eyre::Result<Arc<Vec<Arc<dyn Signer + Send + Sync>>>> {
+    let main_keypair = solana::load_keypair(args.keypair.as_deref())?;
+    let rpc_client = RpcClient::new_with_commitment(
+        &args.source_rpc,
+        solana_commitment_config::CommitmentConfig::finalized(),
+    );
+    let pubkey = main_keypair.pubkey();
+    let balance = rpc_client.get_balance(&pubkey).unwrap_or(0);
+    let sol = balance as f64 / 1e9;
+    ui::kv("wallet", &format!("{pubkey} ({sol:.4} SOL)"));
+    if balance == 0 {
+        return Err(eyre!(
+            "wallet ({pubkey}) has no SOL. {}",
+            fund_hint(args.network, &pubkey)
+        ));
+    }
+    let pool_size = plan.tps * plan.key_cycle;
+    let derived = keypairs::derive_keypairs(&main_keypair, pool_size)?;
+    let fires_per_key = (plan.duration_secs / plan.key_cycle as u64).max(1);
+    let gas_per_tx = match args.network {
+        Network::DevnetAmplifier => 0,
+        _ => solana::pay_gas_lamports(&args.destination_chain),
+    };
+    keypairs::ensure_funded_for_sustained(
+        &args.source_rpc,
+        &main_keypair,
+        &derived,
+        fires_per_key,
+        super::units::Lamports::new(gas_per_tx),
+    )?;
+    ui::info(&format!(
+        "derived {} Solana signing keys (pool: {} tx/s × {}s cycle)",
+        pool_size, plan.tps, plan.key_cycle
+    ));
+    Ok(Arc::new(
+        derived
+            .into_iter()
+            .map(|keypair| Arc::new(keypair) as Arc<dyn Signer + Send + Sync>)
+            .collect(),
+    ))
+}
+
 pub(super) async fn run_sustained_load_test_with_metrics(
     args: &LoadTestArgs,
     plan: SustainedPlan,
@@ -240,52 +315,12 @@ pub(super) async fn run_sustained_load_test_with_metrics(
     let pool_size = tps * key_cycle;
     let total_expected = plan.total_transactions();
 
-    let main_keypair = solana::load_keypair(args.keypair.as_deref())?;
-    let rpc_client = RpcClient::new_with_commitment(
-        &args.source_rpc,
-        solana_commitment_config::CommitmentConfig::finalized(),
-    );
-    let pubkey = main_keypair.pubkey();
-    let balance = rpc_client.get_balance(&pubkey).unwrap_or(0);
-    let sol = balance as f64 / 1e9;
-    ui::kv("wallet", &format!("{pubkey} ({sol:.4} SOL)"));
-    if balance == 0 {
-        return Err(eyre!(
-            "wallet ({pubkey}) has no SOL. {}",
-            fund_hint(args.network, &pubkey)
-        ));
-    }
-
     let payload: Option<Vec<u8>> = match &args.payload {
         Some(hex_str) => Some(hex::decode(hex_str.strip_prefix("0x").unwrap_or(hex_str))?),
         Option::None => Option::None,
     };
 
-    // Derive and fund pool — each key fires duration/cycle times, and each
-    // fire costs `gas_per_tx` lamports in gas (on non-devnet).
-    let derived = keypairs::derive_keypairs(&main_keypair, pool_size)?;
-    let fires_per_key = (duration_secs / key_cycle as u64).max(1);
-    let gas_per_tx: u64 = match args.network {
-        Network::DevnetAmplifier => 0, // devnet-amplifier doesn't pay gas
-        _ => solana::pay_gas_lamports(&args.destination_chain),
-    };
-    let _balances = keypairs::ensure_funded_for_sustained(
-        &args.source_rpc,
-        &main_keypair,
-        &derived,
-        fires_per_key,
-        gas_per_tx,
-    )?;
-    let keypairs_pool: Arc<Vec<Arc<dyn solana_sdk::signer::Signer + Send + Sync>>> = Arc::new(
-        derived
-            .into_iter()
-            .map(|kp| Arc::new(kp) as Arc<dyn solana_sdk::signer::Signer + Send + Sync>)
-            .collect(),
-    );
-    ui::info(&format!(
-        "derived {} Solana signing keys (pool: {} tx/s × {}s cycle)",
-        pool_size, tps, key_cycle
-    ));
+    let keypairs_pool = prepare_sustained_keypairs(args, plan)?;
 
     let memo_program_id = super::evm_sender::memo_program_id(args.network);
     let (counter_pda, _) = Pubkey::find_program_address(&[b"counter"], &memo_program_id);
@@ -308,52 +343,30 @@ pub(super) async fn run_sustained_load_test_with_metrics(
         .contract_address("VotingVerifier", &args.source_chain)
         .is_ok();
 
-    let make_task: sustained::MakeTask = Box::new(move |key_idx: usize, _nonce: Option<u64>| {
-        let kp = Arc::clone(&keypairs_pool[key_idx]);
-        let tx_payload = if evm_dest {
-            make_payload(&payload)
-        } else {
-            super::evm_sender::make_executable_payload(&payload, &counter_pda)
-        };
-        let dc = dest_chain.clone();
-        let da = dest_addr.clone();
-        let rpc = solana_rpc.clone();
-        let vtx = verify_tx.clone();
-        let sc = source_chain.clone();
-        let has_vv = has_voting_verifier;
-
-        Box::pin(async move {
-            let mut result = tokio::task::spawn_blocking(move || {
-                send_sol_tx(&rpc, kp.as_ref(), network, &dc, &da, &tx_payload)
-            })
-            .await
-            .unwrap_or_else(|e| TxMetrics::failed("", 0, format!("task panicked: {e}")));
-            // Stream successful txs to the concurrent verification pipeline.
-            if result.is_success()
-                && let Some(ref tx_sender) = vtx
-            {
-                match super::verify::tx_to_pending_solana(
-                    &result,
-                    0,
-                    &sc,
-                    has_vv,
-                    super::verify::SourceChainType::Svm,
-                    network,
-                    false, // Solana source → EVM dest legacy support lands in a later phase
-                ) {
-                    Ok(pending) => {
-                        if tx_sender.send(pending).is_err() {
-                            eprintln!("warning: verification channel closed, tx won't be verified");
-                        }
-                    }
-                    Err(e) => {
-                        result.mark_failed(format!("failed to build verification state: {e}"));
-                    }
-                }
-            }
-            result
-        })
-    });
+    let make_task = sustained::submission_tasks(
+        SolanaSustainedSubmitter {
+            rpc_url: solana_rpc,
+            network,
+            destination_chain: dest_chain,
+            destination_address: dest_addr,
+        },
+        move |key_index, _nonce| SolanaSubmitJob {
+            signer: Arc::clone(&keypairs_pool[key_index]),
+            payload: if evm_dest {
+                make_payload(&payload)
+            } else {
+                super::evm_sender::make_executable_payload(&payload, &counter_pda)
+            },
+        },
+        verify_tx,
+        sustained::GmpPendingTxAdapter {
+            source_chain,
+            has_voting_verifier,
+            source_type: super::verify::SourceChainType::Svm,
+            network,
+            legacy: false,
+        },
+    );
 
     let result = sustained::run_sustained_loop(
         SustainedPlan {

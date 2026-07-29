@@ -54,10 +54,9 @@ where
             let confirmed = Arc::clone(&confirmed);
             let spinner = spinner.clone();
             tokio::spawn(async move {
-                let _permit = semaphore
-                    .acquire_owned()
-                    .await
-                    .expect("burst semaphore closed unexpectedly");
+                let Ok(_permit) = semaphore.acquire_owned().await else {
+                    return TxMetrics::failed("", 0, "burst semaphore closed unexpectedly");
+                };
                 let metrics = submitter.submit(job).await;
                 if metrics.is_success() {
                     let done = confirmed.fetch_add(1, Ordering::Relaxed) + 1;

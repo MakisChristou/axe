@@ -13,7 +13,7 @@ use crate::evm::{ContractCall, InterchainTokenDeployed};
 pub fn generate_salt() -> FixedBytes<32> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_nanos();
     let encoded = ("its-test", U256::from(nanos)).abi_encode_params();
     keccak256(&encoded)

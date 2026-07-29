@@ -144,11 +144,13 @@ These seven rails cover EVM, Solana, Sui, Stellar, and XRPL source/destination a
 After any Rust edit, run both of these and resolve every diagnostic before handing back:
 
 - `cargo fmt --all --check`
-- `cargo clippy --all-targets -- -D warnings -A clippy::too_many_lines`
+- `cargo clippy --locked --all-targets -- -D warnings`
+- `cargo clippy --locked --bin axe -- -D warnings -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic`
+- `cargo test --locked --all-targets --quiet`
 
-The `-A clippy::too_many_lines` flag is **mandatory** — it matches the project gate in `.githooks/pre-push`. The repo intentionally keeps `too_many_lines = "warn"` in `Cargo.toml` for visibility, but does not deny on it (see the inline rationale next to the lint). Running plain `cargo clippy ... -D warnings` will report ~60 pre-existing too-many-lines warnings on orchestrators that are large by design — those are not your bug to fix.
-
-A passing `cargo check` is not sufficient; the clippy invocation above is the bar.
+A passing `cargo check` is not sufficient. The all-target gate enforces the
+architecture lints, while the binary-only gate prohibits crash shortcuts in
+production without forcing unit tests to avoid `unwrap`/`expect`.
 
 ---
 

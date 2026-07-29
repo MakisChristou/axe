@@ -41,6 +41,240 @@ enum StellarRemoteApproval {
     Executed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteDeployPhase {
+    Voted,
+    HubApproved,
+    DiscoverSecondLeg,
+    Routed,
+    Approved,
+    Executed,
+    Registered,
+    Done,
+}
+
+struct HubDeployContext<'a> {
+    lcd: &'a str,
+    rpc: &'a str,
+    axelarnet_gateway: &'a str,
+    destination_gateway: &'a str,
+    source_chain: &'a str,
+    deploy_message_id: &'a str,
+    routed_source: RoutedSource,
+    routed_label: &'a str,
+    skip_routing: bool,
+}
+
+#[derive(Clone, Copy)]
+enum RoutedSource {
+    Axelar,
+    Discovered,
+}
+
+struct RemoteDeployState {
+    phase: RemoteDeployPhase,
+    second_leg: Option<SecondLegInfo>,
+    command_id: Option<[u8; 32]>,
+}
+
+async fn advance_hub_deploy(
+    context: &HubDeployContext<'_>,
+    state: &mut RemoteDeployState,
+    spinner: &indicatif::ProgressBar,
+) -> Result<bool> {
+    match state.phase {
+        RemoteDeployPhase::Voted | RemoteDeployPhase::HubApproved => {
+            if check_hub_approved(
+                context.lcd,
+                context.axelarnet_gateway,
+                context.source_chain,
+                context.deploy_message_id,
+            )
+            .await
+            .wrap_err("remote deploy hub approval check failed")?
+            {
+                spinner.set_message("remote deploy: hub approved");
+                state.phase = RemoteDeployPhase::DiscoverSecondLeg;
+                return Ok(true);
+            }
+            let message = if state.phase == RemoteDeployPhase::Voted {
+                "remote deploy: waiting for voting..."
+            } else {
+                "remote deploy: waiting for hub approval..."
+            };
+            spinner.set_message(message);
+            Ok(true)
+        }
+        RemoteDeployPhase::DiscoverSecondLeg => {
+            match discover_second_leg(context.rpc, context.deploy_message_id).await {
+                Ok(Some(info)) => {
+                    spinner.set_message(format!(
+                        "remote deploy: second leg discovered ({})",
+                        info.message_id
+                    ));
+                    state.second_leg = Some(info);
+                    state.phase = if context.skip_routing {
+                        RemoteDeployPhase::Approved
+                    } else {
+                        RemoteDeployPhase::Routed
+                    };
+                }
+                Ok(None) => spinner.set_message("remote deploy: discovering second leg..."),
+                Err(error) => {
+                    return Err(error.wrap_err("remote deploy second-leg discovery failed"));
+                }
+            }
+            Ok(true)
+        }
+        RemoteDeployPhase::Routed => {
+            let info = require_second_leg(&state.second_leg)?;
+            let source_chain = match context.routed_source {
+                RoutedSource::Axelar => "axelar",
+                RoutedSource::Discovered => info.source_chain.as_str(),
+            };
+            if check_cosmos_routed(
+                context.lcd,
+                context.destination_gateway,
+                source_chain,
+                &info.message_id,
+            )
+            .await
+            .wrap_err("remote deploy routing check failed")?
+            {
+                spinner.set_message(format!("remote deploy: routed to {}", context.routed_label));
+                state.phase = RemoteDeployPhase::Approved;
+            } else {
+                spinner.set_message("remote deploy: waiting for routing...");
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+struct EvmDeployContext<'a, P: Provider> {
+    gateway: &'a AxelarAmplifierGateway::AxelarAmplifierGatewayInstance<&'a P>,
+    legacy: bool,
+    from_block: u64,
+}
+
+async fn check_legacy_evm_deploy<P: Provider>(
+    context: &EvmDeployContext<'_, P>,
+    state: &mut RemoteDeployState,
+    spinner: &indicatif::ProgressBar,
+) -> Result<()> {
+    match state.phase {
+        RemoteDeployPhase::Approved => {
+            let info = require_second_leg(&state.second_leg)?;
+            let payload_hash = parse_payload_hash(&info.payload_hash)
+                .wrap_err("remote deploy second-leg payload_hash is invalid")?;
+            let destination: Address = info.destination_address.parse().wrap_err_with(|| {
+                format!(
+                    "invalid second-leg destination address {}",
+                    info.destination_address
+                )
+            })?;
+            if let Some(command_id) = legacy::find_contract_call_approved_by_payload(
+                context.gateway.provider(),
+                *context.gateway.address(),
+                destination,
+                payload_hash.into_fixed_bytes(),
+                context.from_block,
+            )
+            .await?
+            {
+                state.command_id = Some(command_id);
+                spinner.set_message("remote deploy: approved on legacy gateway");
+                state.phase = RemoteDeployPhase::Executed;
+            } else {
+                spinner.set_message("remote deploy: waiting for legacy approval...");
+            }
+        }
+        RemoteDeployPhase::Executed => {
+            let command_id = state
+                .command_id
+                .ok_or_else(|| eyre::eyre!("remote deploy missing legacy commandId"))?;
+            if check_evm_command_executed(context.gateway, command_id.into()).await? {
+                state.phase = RemoteDeployPhase::Done;
+            } else {
+                spinner.set_message("remote deploy: waiting for legacy execution...");
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn check_amplifier_evm_deploy<P: Provider>(
+    context: &EvmDeployContext<'_, P>,
+    state: &mut RemoteDeployState,
+    spinner: &indicatif::ProgressBar,
+) -> Result<()> {
+    let info = require_second_leg(&state.second_leg)?;
+    let payload_hash = parse_payload_hash(&info.payload_hash)
+        .wrap_err("remote deploy second-leg payload_hash is invalid")?;
+    let approved = check_evm_is_message_approved(
+        context.gateway,
+        "axelar",
+        &info.message_id,
+        "",
+        Address::ZERO,
+        payload_hash.into_fixed_bytes(),
+    )
+    .await;
+    match (state.phase, approved) {
+        (RemoteDeployPhase::Approved, Ok(true)) => {
+            spinner.set_message("remote deploy: approved on EVM");
+            state.phase = RemoteDeployPhase::Executed;
+        }
+        (RemoteDeployPhase::Approved, Ok(false)) => {
+            state.phase = RemoteDeployPhase::Executed;
+        }
+        (RemoteDeployPhase::Executed, Ok(false)) => {
+            state.phase = RemoteDeployPhase::Done;
+        }
+        (RemoteDeployPhase::Executed, Ok(true)) => {
+            spinner.set_message("remote deploy: waiting for EVM execution...");
+        }
+        (RemoteDeployPhase::Approved, Err(error)) => {
+            return Err(error.wrap_err("remote deploy EVM approval check failed"));
+        }
+        (RemoteDeployPhase::Executed, Err(error)) => {
+            return Err(error.wrap_err("remote deploy EVM execution check failed"));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn advance_evm_destination<P: Provider>(
+    context: &EvmDeployContext<'_, P>,
+    state: &mut RemoteDeployState,
+    spinner: &indicatif::ProgressBar,
+) -> Result<()> {
+    if context.legacy {
+        check_legacy_evm_deploy(context, state, spinner).await
+    } else {
+        check_amplifier_evm_deploy(context, state, spinner).await
+    }
+}
+
+fn ensure_not_timed_out(
+    start: Instant,
+    timeout: Duration,
+    phase: RemoteDeployPhase,
+    spinner: &indicatif::ProgressBar,
+) -> Result<()> {
+    if start.elapsed() < timeout {
+        return Ok(());
+    }
+    spinner.finish_and_clear();
+    eyre::bail!(
+        "remote deploy timed out after {}s at phase {phase:?}",
+        timeout.as_secs()
+    )
+}
+
 /// Wait for an ITS remote deploy message to propagate through the hub pipeline
 /// and execute on the EVM destination. The deploy message ID is `{sig}-1.3`.
 ///
@@ -97,208 +331,42 @@ pub async fn wait_for_its_remote_deploy(
     let spinner = ui::wait_spinner("waiting for remote deploy to propagate through hub...");
     let start = Instant::now();
     let timeout = Duration::from_secs(500);
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum DeployPhase {
-        Voted,
-        HubApproved,
-        DiscoverSecondLeg,
-        Routed,
-        Approved,
-        Executed,
-        Done,
-    }
-
-    let mut phase = if voting_verifier.is_some() {
-        DeployPhase::Voted
-    } else {
-        DeployPhase::HubApproved
+    let hub_context = HubDeployContext {
+        lcd: &lcd,
+        rpc: &rpc,
+        axelarnet_gateway: &axelarnet_gateway,
+        destination_gateway: &cosm_gateway_dest,
+        source_chain,
+        deploy_message_id,
+        routed_source: RoutedSource::Axelar,
+        routed_label: "destination",
+        skip_routing: dest_legacy,
     };
-    let mut second_leg_id: Option<String> = None;
-    let mut second_leg_ph: Option<String> = None;
-    let mut second_leg_dest: Option<String> = None;
-    let mut command_id: Option<[u8; 32]> = None;
+    let evm_context = EvmDeployContext {
+        gateway: &gw_contract,
+        legacy: dest_legacy,
+        from_block,
+    };
+    let mut state = RemoteDeployState {
+        phase: if voting_verifier.is_some() {
+            RemoteDeployPhase::Voted
+        } else {
+            RemoteDeployPhase::HubApproved
+        },
+        second_leg: None,
+        command_id: None,
+    };
 
-    loop {
-        if start.elapsed() >= timeout {
-            spinner.finish_and_clear();
-            eyre::bail!(
-                "remote deploy timed out after {}s at phase {phase:?}",
-                timeout.as_secs()
-            );
+    while state.phase != RemoteDeployPhase::Done {
+        ensure_not_timed_out(start, timeout, state.phase, &spinner)?;
+        if advance_hub_deploy(&hub_context, &mut state, &spinner).await? {
+            tokio::time::sleep(POLL_INTERVAL).await;
+            continue;
         }
-
-        match phase {
-            DeployPhase::Voted => {
-                if let Some(ref vv) = voting_verifier {
-                    // For deploy, we don't have payload_hash — use empty string
-                    // VotingVerifier just needs the message to exist
-                    if check_hub_approved(&lcd, &axelarnet_gateway, source_chain, deploy_message_id)
-                        .await
-                        .wrap_err("remote deploy hub approval check failed")?
-                    {
-                        spinner.set_message("remote deploy: hub approved");
-                        phase = DeployPhase::DiscoverSecondLeg;
-                        continue;
-                    }
-                    // Also try voting verifier directly — but we'd need payload_hash.
-                    // Skip directly to hub_approved check since it implies voted.
-                    let _ = vv; // suppress unused warning
-                }
-                spinner.set_message("remote deploy: waiting for voting...");
-            }
-            DeployPhase::HubApproved => {
-                if check_hub_approved(&lcd, &axelarnet_gateway, source_chain, deploy_message_id)
-                    .await
-                    .wrap_err("remote deploy hub approval check failed")?
-                {
-                    spinner.set_message("remote deploy: hub approved");
-                    phase = DeployPhase::DiscoverSecondLeg;
-                    continue;
-                }
-                spinner.set_message("remote deploy: waiting for hub approval...");
-            }
-            DeployPhase::DiscoverSecondLeg => {
-                match discover_second_leg(&rpc, deploy_message_id).await {
-                    Ok(Some(info)) => {
-                        spinner.set_message(format!(
-                            "remote deploy: second leg discovered ({})",
-                            info.message_id
-                        ));
-                        second_leg_id = Some(info.message_id);
-                        second_leg_ph = Some(info.payload_hash);
-                        second_leg_dest = Some(info.destination_address);
-                        // Legacy dest has no Cosmos Gateway → skip `routed`.
-                        phase = if dest_legacy {
-                            DeployPhase::Approved
-                        } else {
-                            DeployPhase::Routed
-                        };
-                        continue;
-                    }
-                    Ok(None) => {
-                        spinner.set_message("remote deploy: discovering second leg...");
-                    }
-                    Err(e) => return Err(e.wrap_err("remote deploy second-leg discovery failed")),
-                }
-            }
-            DeployPhase::Routed => {
-                let sl_id = second_leg_id
-                    .as_deref()
-                    .ok_or_else(|| eyre::eyre!("remote deploy missing second-leg message_id"))?;
-                if check_cosmos_routed(&lcd, &cosm_gateway_dest, "axelar", sl_id)
-                    .await
-                    .wrap_err("remote deploy routing check failed")?
-                {
-                    spinner.set_message("remote deploy: routed to destination");
-                    phase = DeployPhase::Approved;
-                    continue;
-                }
-                spinner.set_message("remote deploy: waiting for routing...");
-            }
-            DeployPhase::Approved if dest_legacy => {
-                let sl_ph_str = second_leg_ph
-                    .as_deref()
-                    .ok_or_else(|| eyre::eyre!("remote deploy missing second-leg payload_hash"))?;
-                let ph = parse_payload_hash(sl_ph_str)
-                    .wrap_err("remote deploy second-leg payload_hash is invalid")?;
-                let sl_dst = second_leg_dest.as_deref().ok_or_else(|| {
-                    eyre::eyre!("remote deploy missing second-leg destination_address")
-                })?;
-                let dst_addr: Address = sl_dst
-                    .parse()
-                    .wrap_err_with(|| format!("invalid second-leg destination address {sl_dst}"))?;
-                if let Some(cmd_id) = legacy::find_contract_call_approved_by_payload(
-                    gw_contract.provider(),
-                    *gw_contract.address(),
-                    dst_addr,
-                    ph.into_fixed_bytes(),
-                    from_block,
-                )
-                .await?
-                {
-                    command_id = Some(cmd_id);
-                    spinner.set_message("remote deploy: approved on legacy gateway");
-                    phase = DeployPhase::Executed;
-                    continue;
-                }
-                spinner.set_message("remote deploy: waiting for legacy approval...");
-            }
-            DeployPhase::Executed if dest_legacy => {
-                let cmd_id = command_id
-                    .ok_or_else(|| eyre::eyre!("remote deploy missing legacy commandId"))?;
-                if check_evm_command_executed(&gw_contract, cmd_id.into()).await? {
-                    phase = DeployPhase::Done;
-                    continue;
-                }
-                spinner.set_message("remote deploy: waiting for legacy execution...");
-            }
-            DeployPhase::Approved => {
-                let sl_id = second_leg_id
-                    .as_deref()
-                    .ok_or_else(|| eyre::eyre!("remote deploy missing second-leg message_id"))?;
-                let sl_ph_str = second_leg_ph
-                    .as_deref()
-                    .ok_or_else(|| eyre::eyre!("remote deploy missing second-leg payload_hash"))?;
-                let ph = parse_payload_hash(sl_ph_str)
-                    .wrap_err("remote deploy second-leg payload_hash is invalid")?;
-                match check_evm_is_message_approved(
-                    &gw_contract,
-                    "axelar",
-                    sl_id,
-                    "",
-                    Address::ZERO,
-                    ph.into_fixed_bytes(),
-                )
-                .await
-                {
-                    Ok(true) => {
-                        spinner.set_message("remote deploy: approved on EVM");
-                        phase = DeployPhase::Executed;
-                        continue;
-                    }
-                    Ok(false) => {
-                        // Could be already executed — check by trying executed phase
-                        phase = DeployPhase::Executed;
-                        continue;
-                    }
-                    Err(e) => return Err(e.wrap_err("remote deploy EVM approval check failed")),
-                }
-            }
-            DeployPhase::Executed => {
-                let sl_id = second_leg_id
-                    .as_deref()
-                    .ok_or_else(|| eyre::eyre!("remote deploy missing second-leg message_id"))?;
-                let sl_ph_str = second_leg_ph
-                    .as_deref()
-                    .ok_or_else(|| eyre::eyre!("remote deploy missing second-leg payload_hash"))?;
-                let ph = parse_payload_hash(sl_ph_str)
-                    .wrap_err("remote deploy second-leg payload_hash is invalid")?;
-                match check_evm_is_message_approved(
-                    &gw_contract,
-                    "axelar",
-                    sl_id,
-                    "",
-                    Address::ZERO,
-                    ph.into_fixed_bytes(),
-                )
-                .await
-                {
-                    Ok(false) => {
-                        // false = approval consumed = executed
-                        phase = DeployPhase::Done;
-                        continue;
-                    }
-                    Ok(true) => {
-                        spinner.set_message("remote deploy: waiting for EVM execution...");
-                    }
-                    Err(e) => return Err(e.wrap_err("remote deploy EVM execution check failed")),
-                }
-            }
-            DeployPhase::Done => break,
+        advance_evm_destination(&evm_context, &mut state, &spinner).await?;
+        if state.phase != RemoteDeployPhase::Done {
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
-
-        tokio::time::sleep(POLL_INTERVAL).await;
     }
 
     spinner.finish_and_clear();
@@ -309,6 +377,61 @@ pub async fn wait_for_its_remote_deploy(
 /// Wait for a remote ITS token deploy to propagate through the hub and execute
 /// on Stellar. This proves the token is registered before EVM→Stellar
 /// transfers are sent.
+async fn advance_stellar_destination(
+    client: &StellarClient,
+    args: &StellarRemoteDeployWait,
+    state: &mut RemoteDeployState,
+    spinner: &indicatif::ProgressBar,
+) -> Result<()> {
+    let info = require_second_leg(&state.second_leg)?;
+    match state.phase {
+        RemoteDeployPhase::Approved => {
+            match check_stellar_remote_deploy_approval(client, args, info).await? {
+                StellarRemoteApproval::Approved => {
+                    spinner.set_message("remote deploy: approved on Stellar");
+                    state.phase = RemoteDeployPhase::Executed;
+                }
+                StellarRemoteApproval::Executed => {
+                    spinner.set_message("remote deploy: executed on Stellar");
+                    state.phase = RemoteDeployPhase::Registered;
+                }
+                StellarRemoteApproval::Pending => {
+                    spinner.set_message("remote deploy: waiting for Stellar approval...");
+                }
+            }
+        }
+        RemoteDeployPhase::Executed => {
+            if check_stellar_remote_deploy_executed(client, args, info).await? {
+                spinner.set_message("remote deploy: executed on Stellar");
+                state.phase = RemoteDeployPhase::Registered;
+            } else {
+                spinner.set_message("remote deploy: waiting for Stellar execution...");
+            }
+        }
+        RemoteDeployPhase::Registered => {
+            match client
+                .its_registered_token_address_view(
+                    &args.signer_pk,
+                    &args.its_contract,
+                    args.token_id,
+                )
+                .await
+                .wrap_err("remote deploy Stellar token registration check failed")?
+            {
+                Some(token_address) => {
+                    ui::address("Stellar token", &token_address);
+                    state.phase = RemoteDeployPhase::Done;
+                }
+                None => {
+                    spinner.set_message("remote deploy: waiting for Stellar token registration...");
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 pub async fn wait_for_its_remote_deploy_to_stellar(args: StellarRemoteDeployWait) -> Result<()> {
     let cfg = ChainsConfig::load(&args.config)?;
     let (lcd, _, _, _) = cfg.axelar.cosmos_tx_params()?;
@@ -331,134 +454,31 @@ pub async fn wait_for_its_remote_deploy_to_stellar(args: StellarRemoteDeployWait
         ui::wait_spinner("waiting for remote deploy to propagate through hub to Stellar...");
     let start = Instant::now();
     let timeout = Duration::from_secs(500);
+    let hub_context = HubDeployContext {
+        lcd: &lcd,
+        rpc: &rpc,
+        axelarnet_gateway: &axelarnet_gateway,
+        destination_gateway: &cosm_gateway_dest,
+        source_chain: &args.source_chain,
+        deploy_message_id: &args.deploy_message_id,
+        routed_source: RoutedSource::Discovered,
+        routed_label: "Stellar",
+        skip_routing: false,
+    };
+    let mut state = RemoteDeployState {
+        phase: RemoteDeployPhase::HubApproved,
+        second_leg: None,
+        command_id: None,
+    };
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum DeployPhase {
-        HubApproved,
-        DiscoverSecondLeg,
-        Routed,
-        Approved,
-        Executed,
-        Registered,
-        Done,
-    }
-
-    let mut phase = DeployPhase::HubApproved;
-    let mut second_leg: Option<SecondLegInfo> = None;
-
-    loop {
-        if start.elapsed() >= timeout {
-            spinner.finish_and_clear();
-            eyre::bail!(
-                "remote deploy timed out after {}s at phase {phase:?}",
-                timeout.as_secs()
-            );
+    while state.phase != RemoteDeployPhase::Done {
+        ensure_not_timed_out(start, timeout, state.phase, &spinner)?;
+        if !advance_hub_deploy(&hub_context, &mut state, &spinner).await? {
+            advance_stellar_destination(&stellar_client, &args, &mut state, &spinner).await?;
         }
-
-        match phase {
-            DeployPhase::HubApproved => {
-                if check_hub_approved(
-                    &lcd,
-                    &axelarnet_gateway,
-                    &args.source_chain,
-                    &args.deploy_message_id,
-                )
-                .await
-                .wrap_err("remote deploy hub approval check failed")?
-                {
-                    spinner.set_message("remote deploy: hub approved");
-                    phase = DeployPhase::DiscoverSecondLeg;
-                    continue;
-                }
-                spinner.set_message("remote deploy: waiting for hub approval...");
-            }
-            DeployPhase::DiscoverSecondLeg => {
-                match discover_second_leg(&rpc, &args.deploy_message_id).await {
-                    Ok(Some(info)) => {
-                        spinner.set_message(format!(
-                            "remote deploy: second leg discovered ({})",
-                            info.message_id
-                        ));
-                        second_leg = Some(info);
-                        phase = DeployPhase::Routed;
-                        continue;
-                    }
-                    Ok(None) => {
-                        spinner.set_message("remote deploy: discovering second leg...");
-                    }
-                    Err(e) => return Err(e.wrap_err("remote deploy second-leg discovery failed")),
-                }
-            }
-            DeployPhase::Routed => {
-                let info = require_second_leg(&second_leg)?;
-                if check_cosmos_routed(
-                    &lcd,
-                    &cosm_gateway_dest,
-                    &info.source_chain,
-                    &info.message_id,
-                )
-                .await
-                .wrap_err("remote deploy routing check failed")?
-                {
-                    spinner.set_message("remote deploy: routed to Stellar");
-                    phase = DeployPhase::Approved;
-                    continue;
-                }
-                spinner.set_message("remote deploy: waiting for routing...");
-            }
-            DeployPhase::Approved => {
-                let info = require_second_leg(&second_leg)?;
-                match check_stellar_remote_deploy_approval(&stellar_client, &args, info).await? {
-                    StellarRemoteApproval::Approved => {
-                        spinner.set_message("remote deploy: approved on Stellar");
-                        phase = DeployPhase::Executed;
-                        continue;
-                    }
-                    StellarRemoteApproval::Executed => {
-                        spinner.set_message("remote deploy: executed on Stellar");
-                        phase = DeployPhase::Registered;
-                        continue;
-                    }
-                    StellarRemoteApproval::Pending => {
-                        spinner.set_message("remote deploy: waiting for Stellar approval...");
-                    }
-                }
-            }
-            DeployPhase::Executed => {
-                let info = require_second_leg(&second_leg)?;
-                if check_stellar_remote_deploy_executed(&stellar_client, &args, info).await? {
-                    spinner.set_message("remote deploy: executed on Stellar");
-                    phase = DeployPhase::Registered;
-                    continue;
-                }
-                spinner.set_message("remote deploy: waiting for Stellar execution...");
-            }
-            DeployPhase::Registered => {
-                match stellar_client
-                    .its_registered_token_address_view(
-                        &args.signer_pk,
-                        &args.its_contract,
-                        args.token_id,
-                    )
-                    .await
-                    .wrap_err("remote deploy Stellar token registration check failed")?
-                {
-                    Some(token_address) => {
-                        ui::address("Stellar token", &token_address);
-                        phase = DeployPhase::Done;
-                        continue;
-                    }
-                    None => {
-                        spinner.set_message(
-                            "remote deploy: waiting for Stellar token registration...",
-                        );
-                    }
-                }
-            }
-            DeployPhase::Done => break,
+        if state.phase != RemoteDeployPhase::Done {
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
-
-        tokio::time::sleep(POLL_INTERVAL).await;
     }
 
     spinner.finish_and_clear();
@@ -525,6 +545,34 @@ async fn check_stellar_remote_deploy_executed(
 /// Polls: Voted → HubApproved → DiscoverSecondLeg → Routed → Done
 /// (We don't check Solana approval/execution — once routed, the Solana relayer
 /// handles it. We just need the token to exist before sending transfers.)
+fn check_solana_deploy_approval(
+    client: &solana_client::rpc_client::RpcClient,
+    network: crate::types::Network,
+    state: &mut RemoteDeployState,
+    not_found_count: &mut u32,
+    spinner: &indicatif::ProgressBar,
+) -> Result<()> {
+    let info = require_second_leg(&state.second_leg)?;
+    let input = [b"axelar-".as_slice(), info.message_id.as_bytes()].concat();
+    let command_id: [u8; 32] = keccak256(&input).into();
+    match check_solana_incoming_message(client, network, &command_id) {
+        Ok(Some(_)) => state.phase = RemoteDeployPhase::Done,
+        Ok(None) => {
+            *not_found_count += 1;
+            if *not_found_count >= 10 {
+                spinner.set_message("remote deploy: PDA not found, assuming already executed");
+                state.phase = RemoteDeployPhase::Done;
+            } else {
+                spinner.set_message("remote deploy: waiting for Solana approval...");
+            }
+        }
+        Err(error) => {
+            return Err(error.wrap_err("remote deploy Solana approval check failed"));
+        }
+    }
+    Ok(())
+}
+
 pub async fn wait_for_its_remote_deploy_to_solana(
     config: &Path,
     source_chain: &str,
@@ -557,105 +605,38 @@ pub async fn wait_for_its_remote_deploy_to_solana(
         ui::wait_spinner("waiting for remote deploy to propagate through hub to Solana...");
     let start = Instant::now();
     let timeout = Duration::from_secs(500);
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum DeployPhase {
-        HubApproved,
-        DiscoverSecondLeg,
-        Routed,
-        Approved,
-        Done,
-    }
-
-    let mut phase = DeployPhase::HubApproved;
-    let mut second_leg_id: Option<String> = None;
+    let hub_context = HubDeployContext {
+        lcd: &lcd,
+        rpc: &rpc,
+        axelarnet_gateway: &axelarnet_gateway,
+        destination_gateway: &cosm_gateway_dest,
+        source_chain,
+        deploy_message_id,
+        routed_source: RoutedSource::Axelar,
+        routed_label: "Solana",
+        skip_routing: false,
+    };
+    let mut state = RemoteDeployState {
+        phase: RemoteDeployPhase::HubApproved,
+        second_leg: None,
+        command_id: None,
+    };
     let mut approved_not_found_count: u32 = 0;
 
-    loop {
-        if start.elapsed() >= timeout {
-            spinner.finish_and_clear();
-            eyre::bail!(
-                "remote deploy timed out after {}s at phase {phase:?}",
-                timeout.as_secs()
-            );
+    while state.phase != RemoteDeployPhase::Done {
+        ensure_not_timed_out(start, timeout, state.phase, &spinner)?;
+        if !advance_hub_deploy(&hub_context, &mut state, &spinner).await? {
+            check_solana_deploy_approval(
+                &sol_rpc_client,
+                network,
+                &mut state,
+                &mut approved_not_found_count,
+                &spinner,
+            )?;
         }
-
-        match phase {
-            DeployPhase::HubApproved => {
-                if check_hub_approved(&lcd, &axelarnet_gateway, source_chain, deploy_message_id)
-                    .await
-                    .wrap_err("remote deploy hub approval check failed")?
-                {
-                    spinner.set_message("remote deploy: hub approved");
-                    phase = DeployPhase::DiscoverSecondLeg;
-                    continue;
-                }
-                spinner.set_message("remote deploy: waiting for hub approval...");
-            }
-            DeployPhase::DiscoverSecondLeg => {
-                match discover_second_leg(&rpc, deploy_message_id).await {
-                    Ok(Some(info)) => {
-                        spinner.set_message(format!(
-                            "remote deploy: second leg discovered ({})",
-                            info.message_id
-                        ));
-                        second_leg_id = Some(info.message_id);
-                        phase = DeployPhase::Routed;
-                        continue;
-                    }
-                    Ok(None) => {
-                        spinner.set_message("remote deploy: discovering second leg...");
-                    }
-                    Err(e) => return Err(e.wrap_err("remote deploy second-leg discovery failed")),
-                }
-            }
-            DeployPhase::Routed => {
-                let sl_id = second_leg_id
-                    .as_deref()
-                    .ok_or_else(|| eyre::eyre!("remote deploy missing second-leg message_id"))?;
-                if check_cosmos_routed(&lcd, &cosm_gateway_dest, "axelar", sl_id)
-                    .await
-                    .wrap_err("remote deploy routing check failed")?
-                {
-                    spinner.set_message("remote deploy: routed to Solana");
-                    phase = DeployPhase::Approved;
-                    continue;
-                }
-                spinner.set_message("remote deploy: waiting for routing...");
-            }
-            DeployPhase::Approved => {
-                // Check if the Solana gateway has the incoming message.
-                // The PDA may be absent if the message was already executed and
-                // the account was closed, so after enough retries we assume done.
-                let sl_id = second_leg_id
-                    .as_deref()
-                    .ok_or_else(|| eyre::eyre!("remote deploy missing second-leg message_id"))?;
-                let input = [b"axelar-".as_slice(), sl_id.as_bytes()].concat();
-                let cmd_id: [u8; 32] = keccak256(&input).into();
-                match check_solana_incoming_message(&sol_rpc_client, network, &cmd_id) {
-                    Ok(Some(_)) => {
-                        phase = DeployPhase::Done;
-                        continue;
-                    }
-                    Ok(None) => {
-                        approved_not_found_count += 1;
-                        if approved_not_found_count >= 10 {
-                            // PDA never appeared — likely already executed and closed
-                            spinner.set_message(
-                                "remote deploy: PDA not found, assuming already executed",
-                            );
-                            phase = DeployPhase::Done;
-                            continue;
-                        }
-                        spinner.set_message("remote deploy: waiting for Solana approval...");
-                    }
-                    Err(e) => return Err(e.wrap_err("remote deploy Solana approval check failed")),
-                }
-            }
-            DeployPhase::Done => break,
+        if state.phase != RemoteDeployPhase::Done {
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
-
-        tokio::time::sleep(POLL_INTERVAL).await;
     }
 
     spinner.finish_and_clear();

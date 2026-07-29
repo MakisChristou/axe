@@ -19,7 +19,6 @@ use alloy::{
     sol_types::SolValue,
 };
 use eyre::Result;
-use serde_json::json;
 
 use super::evm_sender;
 use super::gmp_verification;
@@ -43,6 +42,108 @@ use crate::ui;
 mod sui_destination;
 
 pub(super) use self::sui_destination::{run_evm_to_sui, run_sol_to_sui, run_stellar_to_sui};
+
+async fn load_evm_signer(
+    args: &LoadTestArgs,
+    rpc_url: &str,
+) -> Result<(PrivateKeySigner, [u8; 32])> {
+    let private_key = args.private_key.as_ref().ok_or_else(|| {
+        eyre::eyre!("EVM private key required. Set EVM_PRIVATE_KEY env var or use --private-key")
+    })?;
+    let signer: PrivateKeySigner = private_key.parse()?;
+    let signer_address = signer.address();
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    check_evm_balance(&provider, signer_address).await?;
+    let balance: u128 = provider.get_balance(signer_address).await?.to();
+    let eth = balance as f64 / 1e18;
+    ui::kv("wallet", &format!("{signer_address} ({eth:.6} ETH)"));
+    let main_key = signer.to_bytes().into();
+    Ok((signer, main_key))
+}
+
+async fn prepare_sol_to_evm_destination(
+    args: &LoadTestArgs,
+    rpc_url: &str,
+    gateway_addr: alloy::primitives::Address,
+    gas_service_addr: alloy::primitives::Address,
+) -> Result<(alloy::primitives::Address, impl Provider)> {
+    let destination = &args.destination_chain;
+    let cache = read_cache(destination);
+    if let Some(addr_str) = cache.sender_receiver_address.as_deref() {
+        let read_provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+        let addr = addr_str.parse()?;
+        let code = read_provider.get_code_at(addr).await?;
+        let needs_redeploy = if code.is_empty() {
+            ui::warn("cached SenderReceiver has no code, redeploying...");
+            true
+        } else {
+            let sender_receiver = crate::evm::SenderReceiver::new(addr, &read_provider);
+            match sender_receiver.gateway().call().await {
+                Ok(onchain_gateway) if onchain_gateway != gateway_addr => {
+                    ui::warn(&format!(
+                        "cached SenderReceiver points to old gateway {onchain_gateway}, expected \
+                         {gateway_addr}, redeploying..."
+                    ));
+                    true
+                }
+                Err(_) => {
+                    ui::warn("cached SenderReceiver gateway check failed, redeploying...");
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !needs_redeploy {
+            ui::info(&format!("SenderReceiver: reusing {addr}"));
+            let private_key = args.private_key.as_deref().ok_or_else(|| {
+                eyre::eyre!(
+                    "EVM private key required to use the cached SenderReceiver. \
+                     Set EVM_PRIVATE_KEY env var or use --private-key"
+                )
+            })?;
+            let signer = private_key.parse::<PrivateKeySigner>()?;
+            let provider = ProviderBuilder::new()
+                .wallet(signer)
+                .connect_http(rpc_url.parse()?);
+            return Ok((addr, provider));
+        }
+        let signer = deployment_signer(args, &read_provider).await?;
+        let provider = ProviderBuilder::new()
+            .wallet(signer)
+            .connect_http(rpc_url.parse()?);
+        let addr = deploy_sender_receiver(&provider, gateway_addr, gas_service_addr).await?;
+        let mut cache = cache;
+        cache.sender_receiver_address = Some(addr.to_string());
+        save_cache(destination, &cache)?;
+        return Ok((addr, provider));
+    }
+
+    let read_provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let signer = deployment_signer(args, &read_provider).await?;
+    ui::info("deploying SenderReceiver on destination chain...");
+    let provider = ProviderBuilder::new()
+        .wallet(signer)
+        .connect_http(rpc_url.parse()?);
+    let addr = deploy_sender_receiver(&provider, gateway_addr, gas_service_addr).await?;
+    let mut cache = cache;
+    cache.sender_receiver_address = Some(addr.to_string());
+    save_cache(destination, &cache)?;
+    Ok((addr, provider))
+}
+
+async fn deployment_signer<P: Provider>(
+    args: &LoadTestArgs,
+    provider: &P,
+) -> Result<PrivateKeySigner> {
+    let private_key = args.private_key.as_ref().ok_or_else(|| {
+        eyre::eyre!(
+            "EVM private key required to deploy SenderReceiver. Set EVM_PRIVATE_KEY env var or use --private-key"
+        )
+    })?;
+    let signer: PrivateKeySigner = private_key.parse()?;
+    check_evm_balance(provider, signer.address()).await?;
+    Ok(signer)
+}
 
 pub(super) async fn run_sol_to_evm(
     args: LoadTestArgs,
@@ -97,92 +198,8 @@ pub(super) async fn run_sol_to_evm(
     // consumed = executed"). Fail fast instead.
     ensure_evm_contract_deployed(rpc_url, "destination AxelarGateway", gateway_addr).await?;
 
-    // --- Deploy/reuse SenderReceiver on destination EVM chain ---
-    let cache = read_cache(dest);
-
-    let (sender_receiver_addr, provider) = if let Some(addr_str) =
-        cache.get("senderReceiverAddress").and_then(|v| v.as_str())
-    {
-        // Try to reuse cached address — only need a read-only provider for the check
-        let read_provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-        let addr: alloy::primitives::Address = addr_str.parse()?;
-        let code = read_provider.get_code_at(addr).await?;
-        // Check if code exists and gateway matches config
-        let needs_redeploy = if code.is_empty() {
-            ui::warn("cached SenderReceiver has no code, redeploying...");
-            true
-        } else {
-            let sr = crate::evm::SenderReceiver::new(addr, &read_provider);
-            match sr.gateway().call().await {
-                Ok(onchain_gw) if onchain_gw != gateway_addr => {
-                    ui::warn(&format!(
-                        "cached SenderReceiver points to old gateway {onchain_gw}, expected {gateway_addr}, redeploying..."
-                    ));
-                    true
-                }
-                Err(_) => {
-                    ui::warn("cached SenderReceiver gateway check failed, redeploying...");
-                    true
-                }
-                _ => false,
-            }
-        };
-        if needs_redeploy {
-            let private_key = args.private_key.as_ref().ok_or_else(|| {
-                eyre::eyre!("EVM private key required to deploy SenderReceiver. Set EVM_PRIVATE_KEY env var or use --private-key")
-            })?;
-            let signer: PrivateKeySigner = private_key.parse()?;
-            check_evm_balance(&read_provider, signer.address()).await?;
-            let write_provider = ProviderBuilder::new()
-                .wallet(signer)
-                .connect_http(rpc_url.parse()?);
-            let new_addr =
-                deploy_sender_receiver(&write_provider, gateway_addr, gas_service_addr).await?;
-            let mut cache = cache;
-            cache["senderReceiverAddress"] = json!(format!("{new_addr}"));
-            save_cache(dest, &cache)?;
-            (new_addr, write_provider)
-        } else {
-            ui::info(&format!("SenderReceiver: reusing {addr}"));
-            // Build a wallet provider against the user's key so the load test
-            // can submit txs through it. We fall through to fail-loud when
-            // no key is set rather than substituting a well-known low-entropy
-            // key — that placeholder existed historically as a stand-in for
-            // a "read-only" provider but the type signature returns a
-            // wallet provider, so any tx submitted through it would have
-            // been a footgun (the placeholder address has zero funds and
-            // is sweepable by anyone who finds the same constant).
-            let private_key = args.private_key.as_deref().ok_or_else(|| {
-                eyre::eyre!(
-                    "EVM private key required to use the cached SenderReceiver. \
-                     Set EVM_PRIVATE_KEY env var or use --private-key"
-                )
-            })?;
-            let signer: PrivateKeySigner = private_key.parse()?;
-            let provider = ProviderBuilder::new()
-                .wallet(signer)
-                .connect_http(rpc_url.parse()?);
-            (addr, provider)
-        }
-    } else {
-        let private_key = args.private_key.as_ref().ok_or_else(|| {
-            eyre::eyre!("EVM private key required to deploy SenderReceiver. Set EVM_PRIVATE_KEY env var or use --private-key")
-        })?;
-        let signer: PrivateKeySigner = private_key.parse()?;
-        let deployer_addr = signer.address();
-        let read_provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-        check_evm_balance(&read_provider, deployer_addr).await?;
-        ui::info("deploying SenderReceiver on destination chain...");
-        let write_provider = ProviderBuilder::new()
-            .wallet(signer)
-            .connect_http(rpc_url.parse()?);
-        let addr = deploy_sender_receiver(&write_provider, gateway_addr, gas_service_addr).await?;
-        let mut cache = cache;
-        cache["senderReceiverAddress"] = json!(format!("{addr}"));
-        save_cache(dest, &cache)?;
-        (addr, write_provider)
-    };
-
+    let (sender_receiver_addr, provider) =
+        prepare_sol_to_evm_destination(&args, rpc_url, gateway_addr, gas_service_addr).await?;
     ui::address("SenderReceiver", &format!("{sender_receiver_addr}"));
     let destination_address = format!("{sender_receiver_addr}");
 
@@ -280,27 +297,11 @@ pub(super) async fn run_evm_to_sol(
         .parse()?;
     ui::address("EVM gateway", &format!("{gateway_addr}"));
 
-    // --- Set up EVM signer ---
-    let private_key = args.private_key.as_ref().ok_or_else(|| {
-        eyre::eyre!("EVM private key required. Set EVM_PRIVATE_KEY env var or use --private-key")
-    })?;
-    let signer: PrivateKeySigner = private_key.parse()?;
-    let signer_address = signer.address();
+    let (signer, main_key) = load_evm_signer(&args, &evm_rpc_url).await?;
     let read_provider = ProviderBuilder::new().connect_http(evm_rpc_url.parse()?);
-    check_evm_balance(&read_provider, signer_address).await?;
-
     let write_provider = ProviderBuilder::new()
         .wallet(signer.clone())
         .connect_http(evm_rpc_url.parse()?);
-
-    // Extract 32-byte private key for deriving sub-wallets
-    let main_key: [u8; 32] = signer.to_bytes().into();
-
-    {
-        let balance: u128 = read_provider.get_balance(signer_address).await?.to();
-        let eth = balance as f64 / 1e18;
-        ui::kv("wallet", &format!("{signer_address} ({eth:.6} ETH)"));
-    }
 
     // --- Deploy/reuse SenderReceiver on source chain ---
     let cache_key = &format!("{src}-evm-to-sol");
@@ -377,6 +378,94 @@ pub(super) async fn run_evm_to_sol(
     finish_report(&mut report, test_start)
 }
 
+#[derive(Clone, Copy)]
+struct EvmGmpContracts {
+    gateway: alloy::primitives::Address,
+    gas_service: alloy::primitives::Address,
+}
+
+fn resolve_evm_gmp_contracts(
+    cfg: &ChainsConfig,
+    chain: &str,
+    gateway_label: &str,
+) -> Result<EvmGmpContracts> {
+    let chain_config = cfg
+        .chains
+        .get(chain)
+        .ok_or_else(|| eyre::eyre!("chain '{}' not found in config", chain))?;
+    let contracts = EvmGmpContracts {
+        gateway: chain_config
+            .contract_address("AxelarGateway", chain)?
+            .parse()?,
+        gas_service: chain_config
+            .contract_address("AxelarGasService", chain)?
+            .parse()?,
+    };
+    ui::address(gateway_label, &format!("{}", contracts.gateway));
+    Ok(contracts)
+}
+
+async fn prepare_evm_gmp_source(
+    chain: &str,
+    rpc_url: &str,
+    signer: PrivateKeySigner,
+    contracts: EvmGmpContracts,
+) -> Result<alloy::primitives::Address> {
+    let read_provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let write_provider = ProviderBuilder::new()
+        .wallet(signer)
+        .connect_http(rpc_url.parse()?);
+    let cache_key = format!("{chain}-evm-to-evm");
+    let sender_receiver = deploy_or_reuse_sender_receiver(
+        &read_cache(&cache_key),
+        &cache_key,
+        &read_provider,
+        &write_provider,
+        contracts.gateway,
+        contracts.gas_service,
+        "source",
+    )
+    .await?;
+    ui::address("SenderReceiver (source)", &format!("{sender_receiver}"));
+    Ok(sender_receiver)
+}
+
+async fn prepare_evm_gmp_destination(
+    chain: &str,
+    rpc_url: &str,
+    signer: PrivateKeySigner,
+    contracts: EvmGmpContracts,
+) -> Result<(alloy::primitives::Address, impl Provider)> {
+    ensure_evm_contract_deployed(rpc_url, "destination AxelarGateway", contracts.gateway).await?;
+    let signer_address = signer.address();
+    let read_provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    if read_provider.get_balance(signer_address).await? == alloy::primitives::U256::ZERO {
+        eyre::bail!(
+            "EVM wallet {signer_address} has no funds on destination chain '{chain}'. \
+             Fund it first."
+        );
+    }
+    let write_provider = ProviderBuilder::new()
+        .wallet(signer)
+        .connect_http(rpc_url.parse()?);
+    let cache_key = format!("{chain}-evm-to-evm-dest");
+    let sender_receiver = deploy_or_reuse_sender_receiver(
+        &read_cache(&cache_key),
+        &cache_key,
+        &read_provider,
+        &write_provider,
+        contracts.gateway,
+        contracts.gas_service,
+        "destination",
+    )
+    .await?;
+    ui::address(
+        "SenderReceiver (destination)",
+        &format!("{sender_receiver}"),
+    );
+    Ok((sender_receiver, read_provider))
+}
+
 pub(super) async fn run_evm_to_evm(
     args: LoadTestArgs,
     _run_start: Instant,
@@ -414,113 +503,14 @@ pub(super) async fn run_evm_to_evm(
     ui::kv("source", src);
     ui::kv("destination", dest);
 
-    // --- Set up EVM signer ---
-    let private_key = args.private_key.as_ref().ok_or_else(|| {
-        eyre::eyre!("EVM private key required. Set EVM_PRIVATE_KEY env var or use --private-key")
-    })?;
-    let signer: PrivateKeySigner = private_key.parse()?;
-    let signer_address = signer.address();
-    let source_read_provider = ProviderBuilder::new().connect_http(source_rpc_url.parse()?);
-    check_evm_balance(&source_read_provider, signer_address).await?;
-
-    let source_write_provider = ProviderBuilder::new()
-        .wallet(signer.clone())
-        .connect_http(source_rpc_url.parse()?);
-
-    let main_key: [u8; 32] = signer.to_bytes().into();
-
-    {
-        let balance: u128 = source_read_provider.get_balance(signer_address).await?.to();
-        let eth = balance as f64 / 1e18;
-        ui::kv("wallet", &format!("{signer_address} ({eth:.6} ETH)"));
-    }
-
-    // --- Source chain: deploy/reuse SenderReceiver (for sending) ---
-    let src_gateway_addr = cfg
-        .chains
-        .get(src)
-        .ok_or_else(|| eyre::eyre!("chain '{}' not found in config", src))?
-        .contract_address("AxelarGateway", src)?
-        .parse()?;
-    let src_gas_service_addr = cfg
-        .chains
-        .get(src)
-        .ok_or_else(|| eyre::eyre!("chain '{}' not found in config", src))?
-        .contract_address("AxelarGasService", src)?
-        .parse()?;
-    ui::address("source gateway", &format!("{src_gateway_addr}"));
-
-    let src_cache_key = &format!("{src}-evm-to-evm");
-    let src_cache = read_cache(src_cache_key);
-    let sender_receiver_addr = deploy_or_reuse_sender_receiver(
-        &src_cache,
-        src_cache_key,
-        &source_read_provider,
-        &source_write_provider,
-        src_gateway_addr,
-        src_gas_service_addr,
-        "source",
-    )
-    .await?;
-    ui::address(
-        "SenderReceiver (source)",
-        &format!("{sender_receiver_addr}"),
-    );
-
-    // --- Destination chain: deploy/reuse SenderReceiver (as receive target) ---
-    let dest_gateway_addr = cfg
-        .chains
-        .get(dest)
-        .ok_or_else(|| eyre::eyre!("chain '{}' not found in config", dest))?
-        .contract_address("AxelarGateway", dest)?
-        .parse()?;
-    let dest_gas_service_addr = cfg
-        .chains
-        .get(dest)
-        .ok_or_else(|| eyre::eyre!("chain '{}' not found in config", dest))?
-        .contract_address("AxelarGasService", dest)?
-        .parse()?;
-    ui::address("destination gateway", &format!("{dest_gateway_addr}"));
-
-    // Bail loudly if the configured gateway has no bytecode — otherwise the
-    // verifier silently reports false-positive 30/30 executed.
-    ensure_evm_contract_deployed(
-        &dest_rpc_url,
-        "destination AxelarGateway",
-        dest_gateway_addr,
-    )
-    .await?;
-
-    let dest_read_provider = ProviderBuilder::new().connect_http(dest_rpc_url.parse()?);
-    let dest_write_provider = ProviderBuilder::new()
-        .wallet(signer.clone())
-        .connect_http(dest_rpc_url.parse()?);
-
-    // Fund the signer on the destination chain if needed for SenderReceiver deployment
-    let dest_balance: u128 = dest_read_provider.get_balance(signer_address).await?.to();
-    if dest_balance == 0 {
-        eyre::bail!(
-            "EVM wallet {signer_address} has no funds on destination chain '{dest}'. \
-             Fund it first."
-        );
-    }
-
-    let dest_cache_key = &format!("{dest}-evm-to-evm-dest");
-    let dest_cache = read_cache(dest_cache_key);
-    let dest_sender_receiver = deploy_or_reuse_sender_receiver(
-        &dest_cache,
-        dest_cache_key,
-        &dest_read_provider,
-        &dest_write_provider,
-        dest_gateway_addr,
-        dest_gas_service_addr,
-        "destination",
-    )
-    .await?;
-    ui::address(
-        "SenderReceiver (destination)",
-        &format!("{dest_sender_receiver}"),
-    );
+    let (signer, main_key) = load_evm_signer(&args, &source_rpc_url).await?;
+    let source_contracts = resolve_evm_gmp_contracts(&cfg, src, "source gateway")?;
+    let sender_receiver_addr =
+        prepare_evm_gmp_source(src, &source_rpc_url, signer.clone(), source_contracts).await?;
+    let destination_contracts = resolve_evm_gmp_contracts(&cfg, dest, "destination gateway")?;
+    let (dest_sender_receiver, dest_read_provider) =
+        prepare_evm_gmp_destination(dest, &dest_rpc_url, signer, destination_contracts).await?;
+    let dest_gateway_addr = destination_contracts.gateway;
 
     let destination_address = format!("{dest_sender_receiver}");
 
@@ -667,6 +657,212 @@ pub(super) async fn run_sol_to_sol(
 // Stellar -> EVM (GMP)
 // ---------------------------------------------------------------------------
 
+struct StellarGmpSource {
+    client: crate::stellar::StellarClient,
+    wallets: Vec<crate::stellar::StellarWallet>,
+    example_contract: String,
+    gateway_contract: String,
+    gas_token_contract: String,
+    gas_amount: super::units::Stroops,
+    payload_override: Option<Vec<u8>>,
+}
+
+async fn prepare_cached_evm_destination(
+    args: &LoadTestArgs,
+    cfg: &ChainsConfig,
+    missing_key_error: &str,
+) -> Result<(
+    alloy::primitives::Address,
+    impl Provider,
+    alloy::primitives::Address,
+)> {
+    let destination = &args.destination_chain;
+    let contracts = resolve_evm_gmp_contracts(cfg, destination, "EVM gateway")?;
+    ensure_evm_contract_deployed(
+        &args.destination_rpc,
+        "destination AxelarGateway",
+        contracts.gateway,
+    )
+    .await?;
+    let private_key = args
+        .private_key
+        .clone()
+        .or_else(|| std::env::var("EVM_PRIVATE_KEY").ok());
+    let cache = read_cache(destination);
+    if cache.sender_receiver_address.is_none() && private_key.is_none() {
+        eyre::bail!("{missing_key_error}");
+    }
+    let (sender_receiver, provider) = ensure_sender_receiver(
+        args,
+        &args.destination_rpc,
+        contracts.gateway,
+        contracts.gas_service,
+        cache,
+        private_key.as_deref(),
+    )
+    .await?;
+    ui::address("SenderReceiver", &format!("{sender_receiver}"));
+    Ok((sender_receiver, provider, contracts.gateway))
+}
+
+async fn prepare_stellar_gmp_source(
+    args: &LoadTestArgs,
+    sizing: RunSizing,
+) -> Result<StellarGmpSource> {
+    let source = &args.source_chain;
+    let network_type = read_stellar_network_type(&args.config, source)?;
+    let use_friendbot = matches!(network_type.as_str(), "testnet" | "futurenet");
+    let client = crate::stellar::StellarClient::new(&args.source_rpc, &network_type)?;
+    ui::kv("network", &network_type);
+
+    let example_contract = read_stellar_contract_address(&args.config, source, "AxelarExample")?;
+    let gateway_contract = read_stellar_contract_address(&args.config, source, "AxelarGateway")?;
+    let gas_token_contract = read_stellar_token_address(&args.config, source)?;
+    ui::address("Stellar AxelarExample", &example_contract);
+    ui::address("Stellar AxelarGateway", &gateway_contract);
+    ui::address("Stellar XLM token", &gas_token_contract);
+
+    let gas_amount = stellar_sender::parse_gas_stroops(args.gas_value.as_deref())?;
+    ui::kv(
+        "gas",
+        &format!(
+            "{gas_amount} stroops ({:.4} XLM)",
+            gas_amount.get() as f64 / 10_000_000.0
+        ),
+    );
+    let main_wallet = load_stellar_main_wallet(args.private_key.as_deref())?;
+    ui::info(&format!("deriving {} Stellar keys...", sizing.num_keys));
+    let wallets =
+        stellar_sender::derive_wallets(&main_wallet.signing_key.to_bytes(), sizing.num_keys)?;
+    let starting_balance =
+        stellar_sender::mainnet_per_key_balance_stroops(gas_amount, sizing.transactions_per_key());
+    stellar_sender::ensure_funded(
+        &client,
+        &wallets,
+        use_friendbot,
+        &main_wallet,
+        starting_balance,
+    )
+    .await?;
+    let payload_override = args
+        .payload
+        .as_deref()
+        .map(|value| hex::decode(value.strip_prefix("0x").unwrap_or(value)))
+        .transpose()?;
+    Ok(StellarGmpSource {
+        client,
+        wallets,
+        example_contract,
+        gateway_contract,
+        gas_token_contract,
+        gas_amount,
+        payload_override,
+    })
+}
+
+async fn run_stellar_gmp_sustained(
+    args: &LoadTestArgs,
+    cfg: &ChainsConfig,
+    source: StellarGmpSource,
+    destination_address: &str,
+    gateway_addr: alloy::primitives::Address,
+    sender_receiver_addr: alloy::primitives::Address,
+    sizing: RunSizing,
+) -> Result<LoadTestReport> {
+    let SustainedPlan {
+        tps,
+        duration_secs,
+        key_cycle,
+    } = sizing
+        .sustained()
+        .ok_or_else(|| eyre::eyre!("sustained plan required"))?;
+    let mut verification = verification_session::VerificationSession::start(
+        verify::VerificationRoute::from_args(args),
+        gmp_verification::EvmGmpStreamingTarget {
+            address: destination_address.to_string(),
+            gateway_addr,
+            rpc_url: args.destination_rpc.clone(),
+            legacy: false,
+            message_matcher: verification_session::MessageMatcher::Exact,
+        },
+    );
+    let spinner = ui::wait_spinner(&format!(
+        "[0/{duration_secs}s] starting sustained Stellar GMP send..."
+    ));
+    verification
+        .spinner_sender()?
+        .send(spinner.clone())
+        .map_err(|_| eyre::eyre!("GMP verification task stopped before sending"))?;
+    let result = stellar_sender::run_sustained(stellar_sender::SustainedRequest {
+        client: source.client,
+        wallets: source.wallets,
+        example_contract: source.example_contract,
+        gateway_contract: source.gateway_contract,
+        destination_chain: args.destination_axelar_id.clone(),
+        destination_address: destination_address.to_string(),
+        payload_override: source.payload_override,
+        tps,
+        duration_secs,
+        key_cycle,
+        verify_tx: Some(verification.sender()),
+        send_done: Some(verification.send_done()),
+        spinner,
+        has_voting_verifier: cfg
+            .axelar
+            .contract_address("VotingVerifier", &args.source_chain)
+            .is_ok(),
+        destination_contract_addr: sender_receiver_addr,
+        gas_token_contract: source.gas_token_contract,
+        gas_amount: source.gas_amount,
+    })
+    .await?;
+    let mut report = sustained::build_sustained_report(
+        result,
+        RunIdentity::from_sizing(args, sizing),
+        destination_address,
+        sizing.total_expected,
+        sizing.num_keys,
+    );
+    verification.finish(&mut report, args.network).await?;
+    Ok(report)
+}
+
+async fn run_stellar_gmp_burst<P: Provider>(
+    args: &LoadTestArgs,
+    source: StellarGmpSource,
+    destination_address: &str,
+    gateway_addr: alloy::primitives::Address,
+    provider: &P,
+    sizing: RunSizing,
+) -> Result<LoadTestReport> {
+    let mut report = stellar_sender::run_burst(stellar_sender::BurstRequest {
+        client: source.client,
+        wallets: source.wallets,
+        example_contract: source.example_contract,
+        gateway_contract: source.gateway_contract,
+        destination_chain: args.destination_axelar_id.clone(),
+        destination_address: destination_address.to_string(),
+        payload_override: source.payload_override,
+        run: RunIdentity::from_sizing(args, sizing),
+        gas_token_contract: source.gas_token_contract,
+        gas_amount: source.gas_amount,
+    })
+    .await?;
+    gmp_verification::attach_batch(
+        args,
+        gmp_verification::EvmGmpTarget {
+            address: destination_address.to_string(),
+            gateway_addr,
+            provider,
+            source_type: verify::SourceChainType::Stellar,
+            legacy: false,
+        },
+        &mut report,
+    )
+    .await?;
+    Ok(report)
+}
+
 pub(super) async fn run_stellar_to_evm(
     args: LoadTestArgs,
     _run_start: Instant,
@@ -693,197 +889,38 @@ pub(super) async fn run_stellar_to_evm(
     ui::kv("destination", dest);
     ui::kv("protocol", "GMP (call_contract)");
 
-    // --- Stellar source-side setup ---
-    let stellar_rpc = &args.source_rpc;
-    let network_type = read_stellar_network_type(&args.config, src)?;
-    let use_friendbot = matches!(network_type.as_str(), "testnet" | "futurenet");
-    let stellar_client = crate::stellar::StellarClient::new(stellar_rpc, &network_type)?;
-    ui::kv("network", &network_type);
-
-    // GMP flow uses `AxelarExample.send(...)` — the high-level wrapper that
-    // internally pays gas via `AxelarGasService` and emits from `AxelarGateway`.
-    // Calling `AxelarGateway.call_contract` directly emits the message but
-    // leaves gas unpaid, which the Axelar relayer rejects as "Insufficient Fee".
-    let stellar_example = read_stellar_contract_address(&args.config, src, "AxelarExample")?;
-    let stellar_gateway = read_stellar_contract_address(&args.config, src, "AxelarGateway")?;
-    let stellar_gas_token = read_stellar_token_address(&args.config, src)?;
-    ui::address("Stellar AxelarExample", &stellar_example);
-    ui::address("Stellar AxelarGateway", &stellar_gateway);
-    ui::address("Stellar XLM token", &stellar_gas_token);
-
-    let gas_stroops = stellar_sender::parse_gas_stroops(args.gas_value.as_deref())?;
-    ui::kv(
-        "gas",
-        &format!(
-            "{gas_stroops} stroops ({:.4} XLM)",
-            gas_stroops as f64 / 10_000_000.0
-        ),
+    let source = prepare_stellar_gmp_source(&args, run_sizing).await?;
+    let missing_key_error = format!(
+        "no SenderReceiver cached for '{dest}' and no EVM private key available. \
+         Set EVM_PRIVATE_KEY (in .env or via --private-key) so axe can deploy the destination \
+         SenderReceiver on first run."
     );
-
-    // --- Stellar main wallet (for deriving ephemeral signers) ---
-    let main_wallet = load_stellar_main_wallet(args.private_key.as_deref())?;
-    let main_seed = main_wallet.signing_key.to_bytes();
-
-    // --- EVM SenderReceiver deploy/reuse (same pattern as run_sol_to_evm) ---
-    let gateway_addr = cfg
-        .chains
-        .get(dest)
-        .ok_or_else(|| eyre::eyre!("chain '{}' not found in config", dest))?
-        .contract_address("AxelarGateway", dest)?
-        .parse()?;
-    let gas_service_addr = cfg
-        .chains
-        .get(dest)
-        .ok_or_else(|| eyre::eyre!("chain '{}' not found in config", dest))?
-        .contract_address("AxelarGasService", dest)?
-        .parse()?;
-    ui::address("EVM gateway", &format!("{gateway_addr}"));
-
-    // Pre-flight: bail if the destination gateway has no bytecode.
-    ensure_evm_contract_deployed(&evm_rpc_url, "destination AxelarGateway", gateway_addr).await?;
-
-    let evm_private_key = args
-        .private_key
-        .clone()
-        .or_else(|| std::env::var("EVM_PRIVATE_KEY").ok());
-    let cache = read_cache(dest);
-    let cached_sr = cache.get("senderReceiverAddress").and_then(|v| v.as_str());
-    if cached_sr.is_none() && evm_private_key.is_none() {
-        eyre::bail!(
-            "no SenderReceiver cached for '{dest}' and no EVM private key available. \
-             Set EVM_PRIVATE_KEY (in .env or via --private-key) so axe can deploy the destination \
-             SenderReceiver on first run."
-        );
-    }
-    let (sender_receiver_addr, provider) = ensure_sender_receiver(
-        &args,
-        &evm_rpc_url,
-        gateway_addr,
-        gas_service_addr,
-        cache,
-        evm_private_key.as_deref(),
-    )
-    .await?;
-    ui::address("SenderReceiver", &format!("{sender_receiver_addr}"));
+    let (sender_receiver_addr, provider, gateway_addr) =
+        prepare_cached_evm_destination(&args, &cfg, &missing_key_error).await?;
     let destination_address = format!("{sender_receiver_addr}");
 
-    // --- Burst vs sustained ---
-    let sustained_params = run_sizing.sustained();
-    let num_keys = run_sizing.num_keys;
-    ui::info(&format!("deriving {num_keys} Stellar keys..."));
-    let wallets = crate::commands::load_test::stellar_sender::derive_wallets(&main_seed, num_keys)?;
-    let txs_per_key = run_sizing.transactions_per_key();
-    let mainnet_starting_balance =
-        crate::commands::load_test::stellar_sender::mainnet_per_key_balance_stroops(
-            gas_stroops,
-            txs_per_key,
-        );
-    crate::commands::load_test::stellar_sender::ensure_funded(
-        &stellar_client,
-        &wallets,
-        use_friendbot,
-        &main_wallet,
-        mainnet_starting_balance,
-    )
-    .await?;
-
-    let payload_override: Option<Vec<u8>> = match &args.payload {
-        Some(hex_str) => Some(hex::decode(hex_str.strip_prefix("0x").unwrap_or(hex_str))?),
-        None => None,
-    };
-
     let test_start = Instant::now();
-    let mut report = if let Some(SustainedPlan {
-        tps,
-        duration_secs,
-        key_cycle,
-    }) = sustained_params
-    {
-        let mut verification = verification_session::VerificationSession::start(
-            verify::VerificationRoute::from_args(&args),
-            gmp_verification::EvmGmpStreamingTarget {
-                address: destination_address.clone(),
-                gateway_addr,
-                rpc_url: evm_rpc_url.clone(),
-                legacy: false,
-                message_matcher: verification_session::MessageMatcher::Exact,
-            },
-        );
-
-        let spinner = ui::wait_spinner(&format!(
-            "[0/{duration_secs}s] starting sustained Stellar GMP send..."
-        ));
-        verification
-            .spinner_sender()?
-            .send(spinner.clone())
-            .map_err(|_| eyre::eyre!("GMP verification task stopped before sending"))?;
-
-        let has_voting_verifier = cfg
-            .axelar
-            .contract_address("VotingVerifier", &args.source_chain)
-            .is_ok();
-
-        let result = crate::commands::load_test::stellar_sender::run_sustained(
-            crate::commands::load_test::stellar_sender::SustainedRequest {
-                client: stellar_client.clone(),
-                wallets,
-                example_contract: stellar_example,
-                gateway_contract: stellar_gateway,
-                destination_chain: args.destination_axelar_id.clone(),
-                destination_address: destination_address.clone(),
-                payload_override,
-                tps,
-                duration_secs,
-                key_cycle,
-                verify_tx: Some(verification.sender()),
-                send_done: Some(verification.send_done()),
-                spinner,
-                has_voting_verifier,
-                destination_contract_addr: sender_receiver_addr,
-                gas_token_contract: stellar_gas_token,
-                gas_amount_stroops: gas_stroops,
-            },
-        )
-        .await?;
-
-        let mut report = sustained::build_sustained_report(
-            result,
-            RunIdentity::from_sizing(&args, run_sizing),
-            &destination_address,
-            run_sizing.total_expected,
-            num_keys,
-        );
-        verification.finish(&mut report, args.network).await?;
-        report
-    } else {
-        let mut report = crate::commands::load_test::stellar_sender::run_burst(
-            crate::commands::load_test::stellar_sender::BurstRequest {
-                client: stellar_client.clone(),
-                wallets: wallets.clone(),
-                example_contract: stellar_example,
-                gateway_contract: stellar_gateway,
-                destination_chain: args.destination_axelar_id.clone(),
-                destination_address: destination_address.clone(),
-                payload_override,
-                run: RunIdentity::from_sizing(&args, run_sizing),
-                gas_token_contract: stellar_gas_token,
-                gas_amount_stroops: gas_stroops,
-            },
-        )
-        .await?;
-        gmp_verification::attach_batch(
+    let mut report = if run_sizing.sustained().is_some() {
+        run_stellar_gmp_sustained(
             &args,
-            gmp_verification::EvmGmpTarget {
-                address: destination_address.to_string(),
-                gateway_addr,
-                provider: &provider,
-                source_type: verify::SourceChainType::Stellar,
-                legacy: false,
-            },
-            &mut report,
+            &cfg,
+            source,
+            &destination_address,
+            gateway_addr,
+            sender_receiver_addr,
+            run_sizing,
         )
-        .await?;
-        report
+        .await?
+    } else {
+        run_stellar_gmp_burst(
+            &args,
+            source,
+            &destination_address,
+            gateway_addr,
+            &provider,
+            run_sizing,
+        )
+        .await?
     };
 
     finish_report(&mut report, test_start)
@@ -1079,7 +1116,7 @@ pub(super) async fn run_stellar_to_sol(
         payload_override,
         run: RunIdentity::from_sizing(&args, sizing),
         gas_token_contract: stellar_xlm,
-        gas_amount_stroops: gas_stroops,
+        gas_amount: gas_stroops,
     })
     .await?;
     report.destination_address = destination_address.clone();
@@ -1162,6 +1199,49 @@ pub(super) async fn run_sol_to_stellar(
 // Sui (Move) sources and destinations — GMP
 // ===========================================================================
 
+async fn prepare_sui_gmp_source(
+    args: &LoadTestArgs,
+) -> Result<(
+    crate::sui::SuiClient,
+    crate::sui::SuiWallet,
+    crate::sui::SuiContractsConfig,
+)> {
+    let (configured_rpc, contracts) =
+        crate::sui::read_sui_chain_config(&args.config, &args.source_chain)?;
+    let rpc_url = if args.source_rpc.is_empty() {
+        configured_rpc
+    } else {
+        args.source_rpc.clone()
+    };
+    let client = crate::sui::SuiClient::new(&rpc_url);
+    let chain_id = client
+        .get_chain_identifier()
+        .await
+        .unwrap_or_else(|_| "?".to_string());
+    ui::kv("Sui chain id", &chain_id);
+
+    let wallet = load_sui_main_wallet()?;
+    ui::kv("Sui wallet", &wallet.address_hex());
+    let balance = client.get_balance(&wallet.address).await?;
+    ui::kv(
+        "Sui balance",
+        &format!("{balance} mist ({:.4} SUI)", balance as f64 / 1e9),
+    );
+    let minimum_balance = super::gmp_sui_source::DEFAULT_GAS_VALUE
+        .get()
+        .saturating_add(super::gmp_sui_source::DEFAULT_GAS_BUDGET.get());
+    if balance < minimum_balance {
+        eyre::bail!(
+            "Sui wallet {} has insufficient SUI: {balance} mist. Need ≥ {} mist. \
+             Get testnet SUI from `https://faucet.sui.io/?address={}`",
+            wallet.address_hex(),
+            minimum_balance,
+            wallet.address_hex(),
+        );
+    }
+    Ok((client, wallet, contracts))
+}
+
 /// Sui source -> any EVM destination, GMP only (sequential burst).
 pub(super) async fn run_sui_to_evm(
     args: LoadTestArgs,
@@ -1190,71 +1270,11 @@ pub(super) async fn run_sui_to_evm(
     ui::kv("destination", dest);
     ui::kv("protocol", "GMP (Example.gmp.send_call)");
 
-    let (sui_rpc, sui_contracts) = crate::sui::read_sui_chain_config(&args.config, src)?;
-    let sui_rpc = if args.source_rpc.is_empty() {
-        sui_rpc
-    } else {
-        args.source_rpc.clone()
-    };
-    let sui_client = crate::sui::SuiClient::new(&sui_rpc);
-    let chain_id = sui_client
-        .get_chain_identifier()
-        .await
-        .unwrap_or_else(|_| "?".to_string());
-    ui::kv("Sui chain id", &chain_id);
-
-    let main_wallet = load_sui_main_wallet()?;
-    ui::kv("Sui wallet", &main_wallet.address_hex());
-    let bal = sui_client.get_balance(&main_wallet.address).await?;
-    let sui_amount = bal as f64 / 1e9;
-    ui::kv("Sui balance", &format!("{bal} mist ({sui_amount:.4} SUI)"));
-    let minimum_balance = super::gmp_sui_source::DEFAULT_GAS_VALUE
-        .get()
-        .saturating_add(super::gmp_sui_source::DEFAULT_GAS_BUDGET.get());
-    if bal < minimum_balance {
-        eyre::bail!(
-            "Sui wallet {} has insufficient SUI: {bal} mist. Need ≥ {} mist. \
-             Get testnet SUI from `https://faucet.sui.io/?address={}`",
-            main_wallet.address_hex(),
-            minimum_balance,
-            main_wallet.address_hex(),
-        );
-    }
-
-    let gateway_addr = cfg
-        .chains
-        .get(dest)
-        .ok_or_else(|| eyre::eyre!("chain '{}' not found in config", dest))?
-        .contract_address("AxelarGateway", dest)?
-        .parse()?;
-    let gas_service_addr = cfg
-        .chains
-        .get(dest)
-        .ok_or_else(|| eyre::eyre!("chain '{}' not found in config", dest))?
-        .contract_address("AxelarGasService", dest)?
-        .parse()?;
-    ui::address("EVM gateway", &format!("{gateway_addr}"));
-    ensure_evm_contract_deployed(&evm_rpc_url, "destination AxelarGateway", gateway_addr).await?;
-
-    let evm_private_key = args
-        .private_key
-        .clone()
-        .or_else(|| std::env::var("EVM_PRIVATE_KEY").ok());
-    let cache = read_cache(dest);
-    let cached_sr = cache.get("senderReceiverAddress").and_then(|v| v.as_str());
-    if cached_sr.is_none() && evm_private_key.is_none() {
-        eyre::bail!("no SenderReceiver cached for '{dest}' and no EVM private key available.");
-    }
-    let (sender_receiver_addr, provider) = ensure_sender_receiver(
-        &args,
-        &evm_rpc_url,
-        gateway_addr,
-        gas_service_addr,
-        cache,
-        evm_private_key.as_deref(),
-    )
-    .await?;
-    ui::address("SenderReceiver", &format!("{sender_receiver_addr}"));
+    let (sui_client, main_wallet, sui_contracts) = prepare_sui_gmp_source(&args).await?;
+    let missing_key_error =
+        format!("no SenderReceiver cached for '{dest}' and no EVM private key available.");
+    let (sender_receiver_addr, provider, gateway_addr) =
+        prepare_cached_evm_destination(&args, &cfg, &missing_key_error).await?;
     let destination_address = format!("{sender_receiver_addr}");
 
     let gas_value = super::gmp_sui_source::parse_gas_value(args.gas_value.as_deref())?;

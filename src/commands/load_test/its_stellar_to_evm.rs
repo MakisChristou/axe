@@ -22,6 +22,7 @@ use super::its_verification;
 use super::its_verification::{EvmItsTarget, ItsBurstReport, finish_burst};
 use super::metrics::ComputeUnitSummary;
 use super::run_sizing::{RunMode, RunSizing, SustainedPlan};
+use super::units::Stroops;
 use super::verification_session::VerificationSession;
 use super::verify::VerificationRoute;
 use super::{LoadTestArgs, validate_evm_rpc};
@@ -59,7 +60,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant, sizing: RunSizing) -> 
             its_contract: stellar.its_addr.clone(),
             gateway_contract: stellar.gateway_addr.clone(),
             gas_token: stellar.xlm_addr.clone(),
-            gas_stroops: super::units::Stroops::new(gas_stroops),
+            gas_stroops,
             source_chain: src.clone(),
             destination_chain: dest.clone(),
             destination_axelar_id: args.destination_axelar_id.clone(),
@@ -260,7 +261,7 @@ struct PipelineContext {
     evm: EvmTargets,
     sizing: RunSizing,
     token_id: [u8; 32],
-    gas_stroops: u64,
+    gas_stroops: Stroops,
     amount_per_tx: u128,
 }
 
@@ -302,7 +303,7 @@ async fn run_sustained_pipeline(
             destination_chain: args.destination_axelar_id.clone(),
             destination_address_bytes: evm.dest_address_bytes.clone(),
             gas_token: stellar.xlm_addr.clone(),
-            gas_stroops: super::units::Stroops::new(gas_stroops),
+            gas_stroops,
             amount_per_tx,
             axelarnet_gw_addr: evm.axelarnet_gw_addr.clone(),
         },
@@ -349,7 +350,7 @@ async fn run_burst_pipeline(pipeline: PipelineContext, wallets: Vec<StellarWalle
             destination_chain: args.destination_axelar_id.clone(),
             destination_address_bytes: evm.dest_address_bytes.clone(),
             gas_token: stellar.xlm_addr.clone(),
-            gas_stroops: super::units::Stroops::new(gas_stroops),
+            gas_stroops,
             amount_per_tx,
             axelarnet_gw_addr: evm.axelarnet_gw_addr.clone(),
         },

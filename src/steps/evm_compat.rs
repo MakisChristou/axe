@@ -188,10 +188,7 @@ pub async fn run(ctx: &DeployContext, private_key: &str) -> Result<()> {
 /// Runs the nine `eth_*` sanity checks. Returns the produced `Check` list
 /// plus the latest block number (so the optional checks at the end can
 /// validate parent-hash consistency without re-querying).
-async fn run_phase_1_health<P: Provider>(
-    provider: &P,
-    deployer_addr: Address,
-) -> (Vec<Check>, Option<u64>) {
+async fn run_chain_identity_checks<P: Provider>(provider: &P) -> (Vec<Check>, Option<u64>) {
     let mut checks = Vec::new();
 
     // 1. eth_chainId — `chainId` is not currently persisted into State, so
@@ -254,12 +251,18 @@ async fn run_phase_1_health<P: Provider>(
         }
     };
 
+    (checks, block_number)
+}
+
+async fn run_block_health_checks<P: Provider>(provider: &P) -> Vec<Check> {
+    let mut checks = Vec::new();
+
     // 4. eth_getBlockByNumber("latest") — accept up to 120s drift from wall clock
     match provider.get_block_by_number(BlockNumberOrTag::Latest).await {
         Ok(Some(block)) => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs();
             let drift = now.abs_diff(block.header.timestamp);
             if drift <= 120 {
@@ -309,6 +312,15 @@ async fn run_phase_1_health<P: Provider>(
             format!("{e}"),
         )),
     }
+
+    checks
+}
+
+async fn run_account_health_checks<P: Provider>(
+    provider: &P,
+    deployer_addr: Address,
+) -> Vec<Check> {
+    let mut checks = Vec::new();
 
     // 6. eth_gasPrice
     match provider.get_gas_price().await {
@@ -367,6 +379,16 @@ async fn run_phase_1_health<P: Provider>(
         Err(e) => checks.push(Check::fail("eth_feeHistory", true, format!("{e}"))),
     }
 
+    checks
+}
+
+async fn run_phase_1_health<P: Provider>(
+    provider: &P,
+    deployer_addr: Address,
+) -> (Vec<Check>, Option<u64>) {
+    let (mut checks, block_number) = run_chain_identity_checks(provider).await;
+    checks.extend(run_block_health_checks(provider).await);
+    checks.extend(run_account_health_checks(provider, deployer_addr).await);
     (checks, block_number)
 }
 

@@ -213,7 +213,7 @@ pub(in crate::commands::load_test) async fn run_stellar_to_sui(
         payload_override,
         run: RunIdentity::from_sizing(&args, sizing),
         gas_token_contract: stellar_xlm,
-        gas_amount_stroops: gas_stroops,
+        gas_amount: gas_stroops,
     })
     .await?;
     report.destination_address = sui_channel.clone();

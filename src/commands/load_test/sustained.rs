@@ -36,6 +36,8 @@ fn scheduled_key_index(tick: u64, offset: usize, plan: SustainedPlan) -> usize {
 /// state without coupling the shared submission driver to a chain family.
 pub(super) trait PendingTxAdapter: Send + Sync + 'static {
     fn to_pending(&self, metrics: &TxMetrics) -> Result<PendingTx>;
+
+    fn verification_channel_closed(&self) {}
 }
 
 pub(super) struct ItsPendingTxAdapter {
@@ -55,6 +57,32 @@ pub(super) struct XrplPendingTxAdapter {
 impl PendingTxAdapter for XrplPendingTxAdapter {
     fn to_pending(&self, metrics: &TxMetrics) -> Result<PendingTx> {
         super::verify::tx_to_pending_xrpl(metrics, self.has_voting_verifier)
+    }
+}
+
+pub(super) struct GmpPendingTxAdapter {
+    pub source_chain: String,
+    pub has_voting_verifier: bool,
+    pub source_type: super::verify::SourceChainType,
+    pub network: crate::types::Network,
+    pub legacy: bool,
+}
+
+impl PendingTxAdapter for GmpPendingTxAdapter {
+    fn to_pending(&self, metrics: &TxMetrics) -> Result<PendingTx> {
+        super::verify::tx_to_pending_solana(
+            metrics,
+            0,
+            &self.source_chain,
+            self.has_voting_verifier,
+            self.source_type,
+            self.network,
+            self.legacy,
+        )
+    }
+
+    fn verification_channel_closed(&self) {
+        eprintln!("warning: verification channel closed, tx won't be verified");
     }
 }
 
@@ -88,7 +116,9 @@ where
             {
                 match verification.to_pending(&metrics) {
                     Ok(pending) => {
-                        let _ = verify_tx.send(pending);
+                        if verify_tx.send(pending).is_err() {
+                            verification.verification_channel_closed();
+                        }
                     }
                     Err(error) => {
                         metrics.mark_failed(format!("failed to build verification state: {error}"));
@@ -111,6 +141,65 @@ where
 /// - `nonces`: pre-fetched nonces for EVM keys (incremented locally per tick).
 /// - `send_done` + verify channel: signalled when the send phase finishes.
 /// - `spinner`: progress bar for live display.
+async fn collect_sustained_metrics(
+    tasks: &mut JoinSet<TxMetrics>,
+    confirmed: &AtomicU64,
+    failed: &AtomicU64,
+    total_submitted: u64,
+    spinner: &indicatif::ProgressBar,
+) -> Result<Vec<TxMetrics>> {
+    let mut metrics = Vec::with_capacity(total_submitted as usize);
+    let mut join_error = None;
+    let mut receipt_interval = tokio::time::interval(Duration::from_secs(1));
+    while !tasks.is_empty() {
+        tokio::select! {
+            joined = tasks.join_next() => {
+                let Some(joined) = joined else {
+                    break;
+                };
+                match joined {
+                    Ok(metric) => metrics.push(metric),
+                    Err(error) => {
+                        if join_error.is_none() {
+                            join_error = Some(error);
+                            tasks.abort_all();
+                        }
+                    }
+                }
+            }
+            _ = receipt_interval.tick() => {
+                let confirmed = confirmed.load(Ordering::Relaxed);
+                let failed = failed.load(Ordering::Relaxed);
+                let in_flight = total_submitted.saturating_sub(confirmed + failed);
+                spinner.set_message(format!(
+                    "waiting for receipts: {confirmed} confirmed  {failed} failed  {in_flight} in-flight"
+                ));
+            }
+        }
+    }
+    if let Some(error) = join_error {
+        spinner.abandon_with_message("send phase failed: task did not complete");
+        return Err(error).wrap_err("sustained send task failed");
+    }
+    Ok(metrics)
+}
+
+fn warn_sustained_failures(metrics: &[TxMetrics]) {
+    let mut errors = std::collections::HashMap::<String, u64>::new();
+    for metric in metrics.iter().filter(|metric| !metric.is_success()) {
+        let reason = metric
+            .error()
+            .unwrap_or("unknown")
+            .chars()
+            .take(120)
+            .collect::<String>();
+        *errors.entry(reason).or_default() += 1;
+    }
+    for (reason, count) in errors {
+        ui::warn(&format!("{count} txs failed: {reason}"));
+    }
+}
+
 pub(super) async fn run_sustained_loop(
     plan: SustainedPlan,
     mut nonces: Option<Vec<u64>>,
@@ -184,43 +273,22 @@ pub(super) async fn run_sustained_loop(
 
     let total_submitted = all_tasks.len() as u64;
 
-    let mut metrics = Vec::with_capacity(total_submitted as usize);
-    let mut join_error = None;
-    let mut receipt_interval = tokio::time::interval(Duration::from_secs(1));
-    while !all_tasks.is_empty() {
-        tokio::select! {
-            joined = all_tasks.join_next() => {
-                match joined.expect("JoinSet reported non-empty but returned no task") {
-                    Ok(metric) => metrics.push(metric),
-                    Err(error) => {
-                        if join_error.is_none() {
-                            join_error = Some(error);
-                            all_tasks.abort_all();
-                        }
-                    }
-                }
-            }
-            _ = receipt_interval.tick() => {
-                let confirmed = src_confirmed.load(Ordering::Relaxed);
-                let failed = src_failed.load(Ordering::Relaxed);
-                let in_flight = total_submitted.saturating_sub(confirmed + failed);
-                spinner.set_message(format!(
-                    "waiting for receipts: {confirmed} confirmed  {failed} failed  {in_flight} in-flight"
-                ));
-            }
-        }
-    }
+    let metrics = collect_sustained_metrics(
+        &mut all_tasks,
+        &src_confirmed,
+        &src_failed,
+        total_submitted,
+        &spinner,
+    )
+    .await;
 
     // Signal verification pipeline that sending is complete.
     if let Some(ref done) = send_done {
         done.store(true, Ordering::Relaxed);
     }
+    let metrics = metrics?;
 
     let test_duration = test_start.elapsed().as_secs_f64();
-    if let Some(error) = join_error {
-        spinner.abandon_with_message("send phase failed: task did not complete");
-        return Err(error).wrap_err("sustained send task failed");
-    }
     let confirmed_count = src_confirmed.load(Ordering::Relaxed);
     // Finish the send spinner with a completion message instead of clearing +
     // printing a separate line. This keeps MultiProgress layout clean when
@@ -229,23 +297,7 @@ pub(super) async fn run_sustained_loop(
         "send phase complete: {confirmed_count}/{total_submitted} src-confirmed in {test_duration:.1}s"
     ));
 
-    let total_failed = metrics.iter().filter(|m| !m.is_success()).count() as u64;
-    if total_failed > 0 {
-        let mut error_counts: std::collections::HashMap<String, u64> =
-            std::collections::HashMap::new();
-        for m in metrics.iter().filter(|m| !m.is_success()) {
-            let reason = m
-                .error()
-                .unwrap_or("unknown")
-                .chars()
-                .take(120)
-                .collect::<String>();
-            *error_counts.entry(reason).or_default() += 1;
-        }
-        for (reason, count) in &error_counts {
-            ui::warn(&format!("{count} txs failed: {reason}"));
-        }
-    }
+    warn_sustained_failures(&metrics);
 
     Ok(SustainedResult {
         metrics,
