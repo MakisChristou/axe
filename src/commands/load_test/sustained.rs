@@ -305,26 +305,16 @@ mod tests {
             let nonce = job
                 .nonce
                 .map_or_else(|| "none".to_string(), |nonce| nonce.to_string());
-            TxMetrics {
-                signature: format!("{}:{nonce}", job.key_index),
-                submit_time_ms: 0,
-                confirm_time_ms: job.succeeds.then_some(0),
-                latency_ms: job.succeeds.then_some(0),
-                compute_units: None,
-                slot: None,
-                outcome: if job.succeeds {
-                    TxOutcome::Succeeded
-                } else {
-                    TxOutcome::failed("submission failed")
-                },
-                payload: Vec::new(),
-                payload_hash: String::new(),
-                source_address: String::new(),
-                gmp_destination_chain: String::new(),
-                gmp_destination_address: String::new(),
-                send_instant: None,
-                amplifier_timing: None,
-            }
+            let outcome = if job.succeeds {
+                TxOutcome::Succeeded
+            } else {
+                TxOutcome::failed("submission failed")
+            };
+            let mut metrics =
+                TxMetrics::from_outcome(format!("{}:{nonce}", job.key_index), 0, outcome);
+            metrics.confirm_time_ms = job.succeeds.then_some(0);
+            metrics.latency_ms = job.succeeds.then_some(0);
+            metrics
         }
     }
 

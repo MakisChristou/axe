@@ -173,29 +173,12 @@ impl Drop for VerificationSession {
 #[cfg(test)]
 mod tests {
     use super::{MessageMatcher, merge_timings};
-    use crate::commands::load_test::metrics::{
-        AmplifierTiming, LoadTestReport, TxMetrics, TxOutcome,
-    };
+    use crate::commands::load_test::metrics::{AmplifierTiming, LoadTestReport, TxMetrics};
     use crate::types::Network;
 
     fn report_with_signature(signature: &str) -> LoadTestReport {
         let mut report = LoadTestReport::default();
-        report.transactions.push(TxMetrics {
-            signature: signature.to_string(),
-            submit_time_ms: 0,
-            confirm_time_ms: None,
-            latency_ms: None,
-            compute_units: None,
-            slot: None,
-            outcome: TxOutcome::Succeeded,
-            payload: Vec::new(),
-            payload_hash: String::new(),
-            source_address: String::new(),
-            gmp_destination_chain: String::new(),
-            gmp_destination_address: String::new(),
-            send_instant: None,
-            amplifier_timing: None,
-        });
+        report.transactions.push(TxMetrics::succeeded(signature, 0));
         report
     }
 

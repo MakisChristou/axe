@@ -124,6 +124,15 @@ If you find yourself reaching for `<'a>` on a bundle struct, ask: is the alloc a
 - Route entry points should read as orchestration: prepare, start verification, submit, finish verification, report. Funding, deployment, signing, RPC decoding, retries, and polling belong one layer down.
 - Preserve established CLI, output, retry, timeout, concurrency, and key-pool behavior during refactors. Add pure contract tests for route validity, scheduling, normalization, and timing merge; live transactions require explicit approval.
 
+#### Canonical refactor smoke rails
+
+After the offline gates pass and live testnet transactions are explicitly approved, run these routes serially with exactly one load transaction each:
+
+- GMP: Flow → Solana, Solana → Flow, and Solana → Sui.
+- ITS: Flow → Solana, Solana → Flow, Stellar → Flow, and XRPL → XRPL EVM.
+
+These seven rails cover EVM, Solana, Sui, Stellar, and XRPL source/destination adapters with the smallest stable fleet currently available. Reuse cached deployments where possible. Do not substitute XRPL EVM → XRPL unless its EVM wallet has both the canonical XRP token and sufficient native gas, and do not use Sui-source ITS until the test wallet owns a registered `Coin<T>`.
+
 ### Deterministic over LLM
 
 - If a rule can be expressed as a lint or a hook, do that — don't rely on review or memory to catch it.

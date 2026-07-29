@@ -132,7 +132,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{TransactionSubmitter, run_burst, run_serial};
-    use crate::commands::load_test::metrics::{TxMetrics, TxOutcome};
+    use crate::commands::load_test::metrics::TxMetrics;
 
     struct FakeSubmitter;
 
@@ -140,22 +140,10 @@ mod tests {
         type Job = u64;
 
         async fn submit(&self, job: Self::Job) -> TxMetrics {
-            TxMetrics {
-                signature: job.to_string(),
-                submit_time_ms: 0,
-                confirm_time_ms: Some(0),
-                latency_ms: Some(0),
-                compute_units: None,
-                slot: None,
-                outcome: TxOutcome::Succeeded,
-                payload: Vec::new(),
-                payload_hash: String::new(),
-                source_address: String::new(),
-                gmp_destination_chain: String::new(),
-                gmp_destination_address: String::new(),
-                send_instant: None,
-                amplifier_timing: None,
-            }
+            let mut metrics = TxMetrics::succeeded(job.to_string(), 0);
+            metrics.confirm_time_ms = Some(0);
+            metrics.latency_ms = Some(0);
+            metrics
         }
     }
 

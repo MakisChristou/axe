@@ -9,8 +9,7 @@
 //! [`super::report::compute_verification_report`].
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::sync::atomic::AtomicBool;
 
 use alloy::primitives::{Address, FixedBytes, keccak256};
 use alloy::providers::Provider;
@@ -19,6 +18,7 @@ use futures::StreamExt;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 
+use super::POLL_INTERVAL;
 use super::PendingTx;
 use super::checks::{
     batch_check_solana_incoming_messages, check_evm_command_executed,
@@ -27,7 +27,6 @@ use super::checks::{
 use super::legacy;
 use super::report::compute_peak_throughput;
 use super::state::{Phase, RealTimeStats, SecondLeg, phase_counts};
-use super::{INACTIVITY_TIMEOUT, POLL_INTERVAL};
 use crate::commands::load_test::identifiers::PayloadHash;
 use crate::commands::load_test::metrics::{AmplifierTiming, PeakThroughput};
 use crate::cosmos::{
@@ -38,6 +37,7 @@ use crate::ui;
 
 mod cosmos;
 mod destination;
+mod scheduler;
 
 use self::cosmos::{
     batch_check_cosmos_routed_owned, batch_check_hub_approved_owned,
@@ -49,6 +49,7 @@ pub(super) use self::destination::{
     StellarDestinationVerifier, SuiDestinationVerifier,
 };
 use self::destination::{DestinationObservation, DestinationStatus};
+use self::scheduler::{PollAction, PollScheduler};
 
 /// Parse a hex-encoded 32-byte payload hash, with or without the `0x`
 /// prefix. Returns an error rather than silently zero-extending so a
@@ -161,90 +162,6 @@ fn apply_destination_observations(
         }
     }
     progressed
-}
-
-#[derive(Debug)]
-enum PollAction {
-    Finished,
-    Waiting,
-    Ready {
-        active: Vec<usize>,
-        total: usize,
-        sending_complete: bool,
-    },
-}
-
-/// Scheduling shared by every polling pipeline: stream ingestion, terminal
-/// detection, idle waiting, and inactivity timeout accounting.
-struct PollScheduler {
-    last_progress: Instant,
-}
-
-impl PollScheduler {
-    fn new() -> Self {
-        Self {
-            last_progress: Instant::now(),
-        }
-    }
-
-    fn next_action(
-        &mut self,
-        txs: &mut Vec<PendingTx>,
-        receiver: Option<&mut mpsc::UnboundedReceiver<PendingTx>>,
-        send_done: Option<&AtomicBool>,
-        mut normalize: impl FnMut(&mut PendingTx),
-    ) -> PollAction {
-        if let Some(receiver) = receiver {
-            while let Ok(mut tx) = receiver.try_recv() {
-                normalize(&mut tx);
-                txs.push(tx);
-            }
-        }
-
-        let sending_complete = send_done.is_none_or(|done| done.load(Ordering::Relaxed));
-        if txs.is_empty() {
-            return if sending_complete {
-                PollAction::Finished
-            } else {
-                PollAction::Waiting
-            };
-        }
-
-        let active = txs
-            .iter()
-            .enumerate()
-            .filter_map(|(index, tx)| tx.is_active().then_some(index))
-            .collect::<Vec<_>>();
-        if active.is_empty() {
-            if sending_complete {
-                PollAction::Finished
-            } else {
-                // All currently-received transactions are terminal. Future
-                // streamed transactions start a fresh inactivity window.
-                self.mark_progress();
-                PollAction::Waiting
-            }
-        } else {
-            PollAction::Ready {
-                active,
-                total: txs.len(),
-                sending_complete,
-            }
-        }
-    }
-
-    fn mark_progress(&mut self) {
-        self.last_progress = Instant::now();
-    }
-
-    fn timed_out(&self, sending_complete: bool) -> bool {
-        let timeout = if sending_complete {
-            INACTIVITY_TIMEOUT
-        } else {
-            INACTIVITY_TIMEOUT * 2
-        };
-        self.last_progress.elapsed() >= timeout
-    }
 }
 
 struct PhaseIndices {
@@ -1586,15 +1503,14 @@ mod tests {
 
     use alloy::primitives::{Address, FixedBytes};
 
+    use super::super::state::PendingTxInput;
     use super::{
         DestinationObservation, DestinationStatus, PendingTx, Phase,
         apply_destination_observations, mark_timed_out_tx, parse_payload_hash,
     };
-    use crate::commands::load_test::metrics::AmplifierTiming;
-    use crate::commands::load_test::verify::state::VerificationState;
 
     fn pending_at(phase: Phase) -> PendingTx {
-        PendingTx {
+        PendingTx::new(PendingTxInput {
             idx: 0,
             message_id: "0xdeadbeef-0".into(),
             send_instant: Instant::now(),
@@ -1605,10 +1521,8 @@ mod tests {
             command_id: None,
             gmp_destination_chain: String::new(),
             gmp_destination_address: String::new(),
-            timing: AmplifierTiming::default(),
-            state: VerificationState::Active(phase),
-            second_leg: None,
-        }
+            initial_phase: phase,
+        })
     }
 
     #[test]
@@ -1620,12 +1534,6 @@ mod tests {
 
         assert!(!tx.is_failed());
         assert!(tx.recovered_via_api());
-        assert_eq!(
-            tx.state,
-            VerificationState::Succeeded {
-                recovered_via_api: true
-            }
-        );
         assert_eq!(tx.timing.executed_ok, Some(true));
         assert!(tx.timing.executed_secs.is_some());
         assert!(tx.failure_reason().is_none());

@@ -1,13 +1,12 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use alloy::primitives::{Address, keccak256};
 use alloy::providers::Provider;
-use eyre::{Result, WrapErr};
+use eyre::Result;
 use tokio::sync::mpsc;
 
-use super::identifiers::{MessageId, PayloadHash};
 use super::metrics::{AmplifierTiming, PeakThroughput, TxMetrics, VerificationReport};
 
 /// Per-message amplifier timings a streaming verifier reports alongside its
@@ -16,7 +15,6 @@ pub type StreamingTimings = Vec<(super::identifiers::MessageId, AmplifierTiming)
 use crate::config::ChainsConfig;
 use crate::cosmos::read_axelar_rpc;
 use crate::evm::AxelarAmplifierGateway;
-use crate::solana::solana_call_contract_index;
 use crate::types::Network;
 use crate::ui;
 
@@ -49,6 +47,7 @@ mod config;
 mod input;
 mod its_deploy;
 mod legacy;
+mod pending;
 mod pipeline;
 mod report;
 mod state;
@@ -63,15 +62,21 @@ pub use self::input::{
     StellarGmpDestination, StellarItsDestination, StreamingVerification, SuiGmpDestination,
     SuiItsDestination, VerificationRoute, XrplItsDestination,
 };
+use self::pending::{
+    PendingGmpBatchArgs, message_id_for_source, pending_tx_for_gmp_batch, pending_tx_for_its_batch,
+};
+pub(super) use self::pending::{
+    tx_to_pending_its, tx_to_pending_solana, tx_to_pending_stellar, tx_to_pending_xrpl,
+};
 use self::pipeline::{
     DestinationVerifier, EvmDestinationVerifier, ItsEvmDest, PollItsHubArgs, PollItsHubEvmArgs,
     PollPipelineArgs, SolanaDestinationVerifier, SolanaItsDestinationVerifier,
     StellarDestinationVerifier, StellarItsDestinationVerifier, SuiDestinationVerifier,
-    SuiItsDestinationVerifier, XrplItsDestinationVerifier, parse_payload_hash, poll_pipeline,
-    poll_pipeline_its_hub, poll_pipeline_its_hub_evm,
+    SuiItsDestinationVerifier, XrplItsDestinationVerifier, poll_pipeline, poll_pipeline_its_hub,
+    poll_pipeline_its_hub_evm,
 };
 use self::report::compute_verification_report;
-use self::state::{Phase, VerificationState};
+use self::state::Phase;
 
 // Re-export `PendingTx` to the parent `load_test` module so the per-pair
 // runners can receive it back from the `tx_to_pending_*` constructors and
@@ -290,115 +295,6 @@ fn streaming_report_and_timings(
         .map(|tx| (tx.message_id.clone(), tx.timing.clone()))
         .collect();
     (report, timings)
-}
-
-fn parse_first_leg_payload_hash(tx: &TxMetrics, required: bool) -> Result<Option<PayloadHash>> {
-    if tx.payload_hash.is_empty() {
-        if required {
-            return Err(eyre::eyre!(
-                "missing payload_hash for confirmed tx {}",
-                tx.signature
-            ));
-        }
-        return Ok(None);
-    }
-    parse_payload_hash(&tx.payload_hash)
-        .map(Some)
-        .wrap_err_with(|| format!("invalid payload_hash for confirmed tx {}", tx.signature))
-}
-
-/// Build a `PendingTx` for an ITS-via-hub batch entry. The four ITS batch
-/// orchestrators (`verify_onchain_{solana,stellar,xrpl,evm}_its`) share the
-/// same struct literal — only the starting `phase` differs, which the caller
-/// computes from `voting_verifier.is_some()` (or hardcodes for EVM-ITS).
-fn pending_tx_for_its_batch(tx: &TxMetrics, idx: usize, initial_phase: Phase) -> Result<PendingTx> {
-    let payload_hash = parse_first_leg_payload_hash(tx, initial_phase == Phase::Voted)?;
-    Ok(PendingTx {
-        idx,
-        message_id: tx.signature.clone().into(),
-        send_instant: tx.send_instant.unwrap_or_else(Instant::now),
-        source_address: tx.source_address.clone(),
-        contract_addr: Address::ZERO,
-        payload_hash,
-        payload_hash_hex: tx.payload_hash.clone(),
-        command_id: None,
-        gmp_destination_chain: tx.gmp_destination_chain.clone(),
-        gmp_destination_address: tx.gmp_destination_address.clone(),
-        timing: AmplifierTiming::default(),
-        state: VerificationState::Active(initial_phase),
-        second_leg: None,
-    })
-}
-
-/// Compute the source-side `message_id` from a confirmed `TxMetrics` based on
-/// the source chain family. EVM/Stellar/Sui pre-format the id in
-/// `tx.signature`; SVM appends the `call_contract` log index.
-///
-/// For SVM, ITS-source paths (its_sol_to_evm, its_sol_to_sui) pre-format the
-/// signature via `solana::extract_its_message_id` because the gateway CPI's
-/// inner-instruction index varies per tx (observed `-1.7` in production vs
-/// the static `-2.1` shape). Detect that by the `-` separator and pass
-/// through; otherwise fall back to the synthetic format for raw GMP paths.
-fn message_id_for_source(
-    tx: &TxMetrics,
-    source_type: SourceChainType,
-    network: Network,
-) -> MessageId {
-    let message_id = match source_type {
-        SourceChainType::Evm | SourceChainType::Stellar | SourceChainType::Sui => {
-            tx.signature.clone()
-        }
-        SourceChainType::Svm => {
-            if tx.signature.contains('-') {
-                tx.signature.clone()
-            } else {
-                format!("{}-{}.1", tx.signature, solana_call_contract_index(network))
-            }
-        }
-    };
-    message_id.into()
-}
-
-/// Build a `PendingTx` for a GMP batch entry. The four GMP batch orchestrators
-/// vary by destination chain — `contract_addr` (parsed for EVM, zero
-/// elsewhere), `command_id` (`Some` for Solana, `None` elsewhere), and the
-/// `gmp_destination_*` fields — so the caller passes those explicitly.
-struct PendingGmpBatchArgs {
-    idx: usize,
-    message_id: MessageId,
-    contract_addr: Address,
-    command_id: Option<[u8; 32]>,
-    gmp_destination_chain: String,
-    gmp_destination_address: String,
-    initial_phase: Phase,
-}
-
-fn pending_tx_for_gmp_batch(tx: &TxMetrics, args: PendingGmpBatchArgs) -> Result<PendingTx> {
-    let PendingGmpBatchArgs {
-        idx,
-        message_id,
-        contract_addr,
-        command_id,
-        gmp_destination_chain,
-        gmp_destination_address,
-        initial_phase,
-    } = args;
-    let payload_hash = parse_first_leg_payload_hash(tx, true)?;
-    Ok(PendingTx {
-        idx,
-        message_id,
-        send_instant: tx.send_instant.unwrap_or_else(Instant::now),
-        source_address: tx.source_address.clone(),
-        contract_addr,
-        payload_hash,
-        payload_hash_hex: tx.payload_hash.clone(),
-        command_id,
-        gmp_destination_chain,
-        gmp_destination_address,
-        timing: AmplifierTiming::default(),
-        state: VerificationState::Active(initial_phase),
-        second_leg: None,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -915,127 +811,6 @@ pub async fn verify_onchain_stellar_gmp(
     .await?;
 
     Ok(compute_verification_report(&txs, metrics, peaks))
-}
-
-/// Convert a confirmed TxMetrics into a PendingTx for Solana verification.
-pub(super) fn tx_to_pending_solana(
-    tx: &TxMetrics,
-    idx: usize,
-    source_chain: &str,
-    has_voting_verifier: bool,
-    source_type: SourceChainType,
-    network: Network,
-    legacy_route: bool,
-) -> Result<PendingTx> {
-    let payload_hash = parse_first_leg_payload_hash(tx, true)?;
-    let message_id = message_id_for_source(tx, source_type, network);
-    let cmd_input = [source_chain.as_bytes(), b"-", message_id.as_bytes()].concat();
-    Ok(PendingTx {
-        idx,
-        message_id,
-        send_instant: tx.send_instant.unwrap_or_else(Instant::now),
-        source_address: tx.source_address.clone(),
-        contract_addr: Address::ZERO,
-        payload_hash,
-        payload_hash_hex: tx.payload_hash.clone(),
-        command_id: Some(keccak256(&cmd_input).into()),
-        gmp_destination_chain: String::new(),
-        gmp_destination_address: String::new(),
-        timing: AmplifierTiming::default(),
-        // Amplifier source ⇒ Voted. A legacy (consensus) source has no
-        // VotingVerifier/router, so it skips straight to Approved (the dest
-        // checker drives it); a no-VV amplifier path keeps the Routed start.
-        state: VerificationState::Active(match (has_voting_verifier, legacy_route) {
-            (true, _) => Phase::Voted,
-            (false, true) => Phase::Approved,
-            (false, false) => Phase::Routed,
-        }),
-        second_leg: None,
-    })
-}
-
-/// Convert a confirmed TxMetrics into a PendingTx for Stellar-sourced GMP.
-/// The `signature` field on the input is the pre-formatted message id
-/// (`0x{lowercase_hex_tx_hash}-{event_index}`) per the `hex_tx_hash_and_event_index`
-/// format of the Stellar `VotingVerifier`.
-pub(super) fn tx_to_pending_stellar(
-    tx: &TxMetrics,
-    has_voting_verifier: bool,
-    contract_addr: Address,
-) -> Result<PendingTx> {
-    let payload_hash = parse_first_leg_payload_hash(tx, true)?;
-    Ok(PendingTx {
-        idx: 0,
-        message_id: tx.signature.clone().into(),
-        send_instant: tx.send_instant.unwrap_or_else(Instant::now),
-        source_address: tx.source_address.clone(),
-        contract_addr,
-        payload_hash,
-        payload_hash_hex: tx.payload_hash.clone(),
-        command_id: None,
-        gmp_destination_chain: String::new(),
-        gmp_destination_address: String::new(),
-        timing: AmplifierTiming::default(),
-        state: VerificationState::Active(if has_voting_verifier {
-            Phase::Voted
-        } else {
-            Phase::Routed
-        }),
-        second_leg: None,
-    })
-}
-
-/// Convert a confirmed TxMetrics into a PendingTx for XRPL-sourced ITS
-/// verification. The `signature` field on the input is the already-formatted
-/// XRPL message id (`0x{lowercase_hex_tx_hash}`), which is what the
-/// `XrplVotingVerifier` / `XrplGateway` expect.
-pub(super) fn tx_to_pending_xrpl(tx: &TxMetrics, has_voting_verifier: bool) -> Result<PendingTx> {
-    let payload_hash = parse_first_leg_payload_hash(tx, has_voting_verifier)?;
-    Ok(PendingTx {
-        idx: 0,
-        message_id: tx.signature.clone().into(),
-        send_instant: tx.send_instant.unwrap_or_else(Instant::now),
-        source_address: tx.source_address.clone(),
-        contract_addr: Address::ZERO,
-        payload_hash,
-        payload_hash_hex: tx.payload_hash.clone(),
-        command_id: None,
-        gmp_destination_chain: tx.gmp_destination_chain.clone(),
-        gmp_destination_address: tx.gmp_destination_address.clone(),
-        timing: AmplifierTiming::default(),
-        state: VerificationState::Active(if has_voting_verifier {
-            Phase::Voted
-        } else {
-            Phase::HubApproved
-        }),
-        second_leg: None,
-    })
-}
-
-/// Convert a confirmed TxMetrics into a PendingTx for ITS hub verification.
-/// ITS messages route through the hub, so gmp_destination_chain/address are
-/// set from the TxMetrics (typically "axelar" / AxelarnetGateway).
-pub(super) fn tx_to_pending_its(tx: &TxMetrics, has_voting_verifier: bool) -> Result<PendingTx> {
-    let payload_hash = parse_first_leg_payload_hash(tx, has_voting_verifier)?;
-    Ok(PendingTx {
-        idx: 0,
-        message_id: tx.signature.clone().into(),
-        send_instant: tx.send_instant.unwrap_or_else(Instant::now),
-        source_address: tx.source_address.clone(),
-        contract_addr: Address::ZERO,
-        payload_hash,
-        payload_hash_hex: tx.payload_hash.clone(),
-        command_id: None,
-        gmp_destination_chain: tx.gmp_destination_chain.clone(),
-        gmp_destination_address: tx.gmp_destination_address.clone(),
-        timing: AmplifierTiming::default(),
-        state: VerificationState::Active(if has_voting_verifier {
-            Phase::Voted
-        } else {
-            Phase::HubApproved
-        }),
-        second_leg: None,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1943,42 +1718,4 @@ pub async fn verify_onchain_evm_its_streaming(
     .await?;
 
     Ok(streaming_report_and_timings(&txs, peaks))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{SourceChainType, message_id_for_source};
-    use crate::commands::load_test::metrics::TxMetrics;
-    use crate::types::Network;
-
-    #[test]
-    fn message_id_normalization_matches_each_source_family_contract() {
-        let network = Network::DevnetAmplifier;
-        let evm = TxMetrics::succeeded("0xabc-4", 0);
-        assert_eq!(
-            message_id_for_source(&evm, SourceChainType::Evm, network).as_ref(),
-            "0xabc-4"
-        );
-
-        let preformatted_solana = TxMetrics::succeeded("signature-1.7", 0);
-        assert_eq!(
-            message_id_for_source(&preformatted_solana, SourceChainType::Svm, network).as_ref(),
-            "signature-1.7"
-        );
-
-        let raw_solana = TxMetrics::succeeded("signature", 0);
-        assert_eq!(
-            message_id_for_source(&raw_solana, SourceChainType::Svm, network).as_ref(),
-            format!(
-                "signature-{}.1",
-                crate::solana::solana_call_contract_index(network)
-            )
-        );
-
-        let stellar = TxMetrics::succeeded("0xstellar-2", 0);
-        assert_eq!(
-            message_id_for_source(&stellar, SourceChainType::Stellar, network).as_ref(),
-            "0xstellar-2"
-        );
-    }
 }

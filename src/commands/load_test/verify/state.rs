@@ -73,18 +73,66 @@ pub(in crate::commands::load_test) struct PendingTx {
     pub(super) payload_hash: Option<PayloadHash>,
     pub(super) payload_hash_hex: String,
     /// Pre-computed command ID for Solana destination checks.
-    pub(super) command_id: Option<[u8; 32]>,
+    command_id: Option<[u8; 32]>,
     /// GMP-level destination chain from ContractCall event (e.g. "axelar" for ITS).
     pub(super) gmp_destination_chain: String,
     /// GMP-level destination address from ContractCall event (e.g. ITS Hub contract).
     pub(super) gmp_destination_address: String,
     pub(super) timing: AmplifierTiming,
-    pub(super) state: VerificationState,
+    state: VerificationState,
     /// Populated atomically when the ITS hub→destination leg is discovered.
-    pub(super) second_leg: Option<SecondLeg>,
+    second_leg: Option<SecondLeg>,
+}
+
+/// Owned initialization data for [`PendingTx`]. Runtime-only timing and
+/// terminal state are deliberately absent so every transaction starts with
+/// identical defaults.
+pub(super) struct PendingTxInput {
+    pub idx: usize,
+    pub message_id: MessageId,
+    pub send_instant: Instant,
+    pub source_address: String,
+    pub contract_addr: Address,
+    pub payload_hash: Option<PayloadHash>,
+    pub payload_hash_hex: String,
+    pub command_id: Option<[u8; 32]>,
+    pub gmp_destination_chain: String,
+    pub gmp_destination_address: String,
+    pub initial_phase: Phase,
 }
 
 impl PendingTx {
+    pub(super) fn new(input: PendingTxInput) -> Self {
+        let PendingTxInput {
+            idx,
+            message_id,
+            send_instant,
+            source_address,
+            contract_addr,
+            payload_hash,
+            payload_hash_hex,
+            command_id,
+            gmp_destination_chain,
+            gmp_destination_address,
+            initial_phase,
+        } = input;
+        Self {
+            idx,
+            message_id,
+            send_instant,
+            source_address,
+            contract_addr,
+            payload_hash,
+            payload_hash_hex,
+            command_id,
+            gmp_destination_chain,
+            gmp_destination_address,
+            timing: AmplifierTiming::default(),
+            state: VerificationState::Active(initial_phase),
+            second_leg: None,
+        }
+    }
+
     pub(super) fn phase(&self) -> Option<Phase> {
         match self.state {
             VerificationState::Active(phase) | VerificationState::Failed { phase, .. } => {
@@ -408,12 +456,11 @@ mod tests {
 
     use alloy::primitives::{Address, FixedBytes};
 
-    use super::{PendingTx, Phase, SecondLeg, VerificationState};
+    use super::{PendingTx, PendingTxInput, Phase, SecondLeg};
     use crate::commands::load_test::identifiers::PayloadHash;
-    use crate::commands::load_test::metrics::AmplifierTiming;
 
     fn pending(phase: Phase) -> PendingTx {
-        PendingTx {
+        PendingTx::new(PendingTxInput {
             idx: 0,
             message_id: "message-1".into(),
             send_instant: Instant::now(),
@@ -424,10 +471,8 @@ mod tests {
             command_id: None,
             gmp_destination_chain: String::new(),
             gmp_destination_address: String::new(),
-            timing: AmplifierTiming::default(),
-            state: VerificationState::Active(phase),
-            second_leg: None,
-        }
+            initial_phase: phase,
+        })
     }
 
     #[test]
