@@ -599,6 +599,20 @@ pub(super) async fn execute_interchain_transfer<P: Provider>(
                     pinned_nonce = Some(expected);
                     continue;
                 }
+                // A rejected send means no tx entered the mempool (nonce not
+                // consumed), so re-sending is safe. Retry transient RPC
+                // rejections with backoff: source-side 429s, and Avalanche's
+                // "state not available for pending block" (a coreth node that
+                // can't serve pending state for the gas/nonce fill — recurs on
+                // the testnet Avalanche RPC).
+                if attempt + 1 < MAX_SUBMIT_ATTEMPTS && is_retryable_send_error(&es) {
+                    ui::warn(&format!(
+                        "source send rejected (transient) — retrying in {}ms: {es}",
+                        500u64 << attempt
+                    ));
+                    tokio::time::sleep(Duration::from_millis(500u64 << attempt)).await;
+                    continue;
+                }
                 return make_failure(submit_start, &es);
             }
         };
@@ -707,6 +721,15 @@ async fn learn_nonce<P: Provider>(provider: &P, tx_hash: TxHash) -> Option<u64> 
         Ok(Some(tx)) => Some(tx.inner.nonce()),
         _ => None,
     }
+}
+
+/// Whether a *rejected send* (no tx submitted) is worth re-sending. Covers the
+/// generic transient RPC signatures plus Avalanche's "state not available for
+/// pending block" (a node that can't serve pending state for the gas/nonce
+/// fill). Safe to retry because a rejected send never consumed the nonce.
+fn is_retryable_send_error(err: &str) -> bool {
+    err.contains("state not available for pending block")
+        || crate::retry::is_transient_default(&err)
 }
 
 /// Parse the node-expected nonce out of a geth-style "nonce too low: next nonce
@@ -821,5 +844,21 @@ mod tests {
     fn none_when_no_next_nonce_phrase() {
         assert_eq!(parse_expected_nonce("nonce too low"), None);
         assert_eq!(parse_expected_nonce("some unrelated error"), None);
+    }
+
+    #[test]
+    fn retryable_send_errors() {
+        use super::is_retryable_send_error;
+        // Avalanche coreth pending-state rejection (the recurring testnet one).
+        assert!(is_retryable_send_error(
+            "error code -32000: state not available for pending block"
+        ));
+        // Generic transient signatures still count.
+        assert!(is_retryable_send_error("HTTP error 429 too many requests"));
+        assert!(is_retryable_send_error("connection reset by peer"));
+        // A deterministic revert must NOT be retried.
+        assert!(!is_retryable_send_error(
+            "execution reverted: TakeTokenFailed"
+        ));
     }
 }
