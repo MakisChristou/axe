@@ -582,6 +582,23 @@ pub(super) async fn execute_interchain_transfer<P: Provider>(
                 {
                     return receipt_to_metrics(&receipt, h, its_proxy, submit_start);
                 }
+                // Stale nonce: the RPC handed alloy an already-consumed nonce
+                // (observed on Avalanche via QuikNode: "nonce too low: next
+                // nonce N, tx nonce N-1"). The node reports the nonce it wants —
+                // pin it and retry so a lagging nonce read doesn't fail the
+                // route. Guarded by `!= pinned_nonce` + the attempt bound so a
+                // persistent mismatch can't loop.
+                if attempt + 1 < MAX_SUBMIT_ATTEMPTS
+                    && es.contains("nonce too low")
+                    && let Some(expected) = parse_expected_nonce(&es)
+                    && Some(expected) != pinned_nonce
+                {
+                    ui::warn(&format!(
+                        "source tx nonce too low — retrying at node-reported nonce {expected}"
+                    ));
+                    pinned_nonce = Some(expected);
+                    continue;
+                }
                 return make_failure(submit_start, &es);
             }
         };
@@ -692,6 +709,18 @@ async fn learn_nonce<P: Provider>(provider: &P, tx_hash: TxHash) -> Option<u64> 
     }
 }
 
+/// Parse the node-expected nonce out of a geth-style "nonce too low: next nonce
+/// N, tx nonce M" error so a stale-nonce send can be retried at the right value.
+fn parse_expected_nonce(err: &str) -> Option<u64> {
+    let after = err.split("next nonce").nth(1)?;
+    let digits: String = after
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
 fn make_failure(submit_start: Instant, error: &str) -> TxMetrics {
     make_failure_with_hash(submit_start, error, None)
 }
@@ -733,11 +762,14 @@ pub(super) async fn rescale_sizing_for_decimals<P: Provider>(
     provider: &P,
     token_addr: Address,
 ) -> eyre::Result<u8> {
-    let decimals = ERC20::new(token_addr, provider)
-        .decimals()
-        .call()
-        .await
-        .map_err(|e| eyre!("failed to read source token decimals at {token_addr}: {e}"))?;
+    // Retry: this read runs on the source RPC (Hedera hard-429s its JSON-RPC
+    // relay), and a transient rate-limit blip on a setup read shouldn't fail
+    // the whole route.
+    let decimals = crate::retry::retry_all("read_source_token_decimals", || async {
+        ERC20::new(token_addr, provider).decimals().call().await
+    })
+    .await
+    .map_err(|e| eyre!("failed to read source token decimals at {token_addr}: {e}"))?;
     if decimals < 18 {
         let divisor = U256::from(10).pow(U256::from(18 - u32::from(decimals)));
         *amount_per_tx /= divisor;
@@ -770,5 +802,24 @@ fn make_failure_with_hash(
         gmp_destination_address: String::new(),
         send_instant: None,
         amplifier_timing: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_expected_nonce;
+
+    #[test]
+    fn parses_geth_nonce_too_low() {
+        // The exact Avalanche/QuikNode wording that failed the cron.
+        let err = "server returned an error response: error code -32000: nonce too low: \
+                   next nonce 246, tx nonce 245";
+        assert_eq!(parse_expected_nonce(err), Some(246));
+    }
+
+    #[test]
+    fn none_when_no_next_nonce_phrase() {
+        assert_eq!(parse_expected_nonce("nonce too low"), None);
+        assert_eq!(parse_expected_nonce("some unrelated error"), None);
     }
 }
