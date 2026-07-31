@@ -1930,7 +1930,21 @@ pub(super) async fn poll_pipeline_its_hub_evm<P: Provider>(
                 .collect()
                 .await;
             for result in evm_results {
-                let (i, phase, approved, executed) = result?;
+                // Same defense as the GMP EVM branch: a persistent second-leg
+                // dest-RPC error (e.g. Hedera 429 rate-limiting, transient
+                // retries already exhausted) must NOT abort the run — keep the
+                // tx in-flight so `finalize_timed_out_txs`'s GMP-API recheck can
+                // recover it if it actually executed on-chain.
+                let (i, phase, approved, executed) = match result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        ui::warn(&format!(
+                            "second-leg destination check RPC error (keeping in-flight for \
+                             GMP-API recheck): {e}"
+                        ));
+                        continue;
+                    }
+                };
                 match phase {
                     // Authoritative fast-path: already executed on the
                     // destination gateway (catches the approve→execute race).
