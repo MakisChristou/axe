@@ -13,6 +13,9 @@ set -euo pipefail
 ROOT=$(git rev-parse --show-toplevel)
 cd "$ROOT"
 
+echo "==> repository style checks"
+.githooks/check-style
+
 echo "==> cargo fmt --all --check"
 cargo fmt --all --check
 

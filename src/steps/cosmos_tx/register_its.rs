@@ -2,8 +2,6 @@
 //! chain's ITS edge contract + ABI translator. Wrapped in a governance
 //! proposal on non-devnet networks like the other cosmos-tx steps.
 
-use std::fs;
-
 use eyre::Result;
 use serde_json::{Value, json};
 
@@ -23,8 +21,8 @@ struct ItsHubRegistration {
     message_translator: String,
 }
 
-fn read_registration(ctx: &DeployContext) -> Result<ItsHubRegistration> {
-    let content = fs::read_to_string(&ctx.target_json)?;
+async fn read_registration(ctx: &DeployContext) -> Result<ItsHubRegistration> {
+    let content = tokio::fs::read_to_string(&ctx.target_json).await?;
     let root: Value = serde_json::from_str(&content)?;
     let edge_contract = root
         .pointer(&format!(
@@ -48,11 +46,13 @@ fn read_registration(ctx: &DeployContext) -> Result<ItsHubRegistration> {
         hub_address: read_axelar_contract_field(
             &ctx.target_json,
             "/axelar/contracts/InterchainTokenService/address",
-        )?,
+        )
+        .await?,
         governance_address: read_axelar_contract_field(
             &ctx.target_json,
             "/axelar/governanceAddress",
-        )?,
+        )
+        .await?,
         edge_contract,
         message_translator,
     })
@@ -76,7 +76,7 @@ pub(super) async fn run_register_its_on_hub(
     } = tx;
     ui::info(&format!("registering {chain_axelar_id} on ITS Hub..."));
 
-    let registration = read_registration(ctx)?;
+    let registration = read_registration(ctx).await?;
 
     let execute_msg = json!({
         "register_chains": {
@@ -110,6 +110,7 @@ pub(super) async fn run_register_its_on_hub(
             &ctx.target_json,
             "/axelar/govProposalExpeditedDepositAmount",
         )
+        .await
         .unwrap_or_else(|_| DEFAULT_PROPOSAL_DEPOSIT_UAXL.to_string());
         let title = format!("Register {chain_axelar_id} on ITS Hub");
         let summary = format!(

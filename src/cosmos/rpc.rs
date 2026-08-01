@@ -2,7 +2,6 @@
 //! cosmos node — no signing, no broadcast. Config readers (`read_axelar_*`)
 //! live here too because they're "where do I point the LCD client" plumbing.
 
-use std::fs;
 use std::path::Path;
 
 use alloy::{
@@ -414,7 +413,7 @@ static LCD_FALLBACK_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new()
 /// in the candidate list — `0` is the primary (no warning), anything ≥ 1 is
 /// a fallback. The endpoint URL is intentionally NOT logged — it can be a
 /// private/paid endpoint from a repo secret.
-fn note_lcd_fallback_use(idx: usize, _used: &str, last_err: Option<&CosmwasmQueryError>) {
+fn note_lcd_fallback_use(idx: usize, last_err: Option<&CosmwasmQueryError>) {
     if idx == 0 {
         return;
     }
@@ -583,7 +582,7 @@ pub async fn lcd_cosmwasm_smart_query_typed(
                                         continue;
                                     }
                                 };
-                                note_lcd_fallback_use(idx, endpoint, last_err.as_ref());
+                                note_lcd_fallback_use(idx, last_err.as_ref());
                                 return Ok(data);
                             }
                             Err(e) => {
@@ -650,15 +649,16 @@ pub async fn lcd_fetch_code_id(lcd: &str, expected_checksum: &str) -> Result<u64
 /// Errors if any of the fields are missing — silent defaults previously
 /// masked config drift (e.g. a missing `gasPrice` falling back to
 /// `0.007uaxl`), so callers should always hit a real on-disk config.
-pub fn read_axelar_config(target_json: &Path) -> Result<(String, String, String, f64)> {
-    crate::config::ChainsConfig::load(target_json)?
+pub async fn read_axelar_config(target_json: &Path) -> Result<(String, String, String, f64)> {
+    crate::config::ChainsConfig::load(target_json)
+        .await?
         .axelar
         .cosmos_tx_params()
 }
 
 /// Read a string field from axelar contracts config
-pub fn read_axelar_contract_field(target_json: &Path, pointer: &str) -> Result<String> {
-    let content = fs::read_to_string(target_json)?;
+pub async fn read_axelar_contract_field(target_json: &Path, pointer: &str) -> Result<String> {
+    let content = tokio::fs::read_to_string(target_json).await?;
     let root: Value = serde_json::from_str(&content)?;
     root.pointer(pointer)
         .and_then(|v| v.as_str())
@@ -667,8 +667,8 @@ pub fn read_axelar_contract_field(target_json: &Path, pointer: &str) -> Result<S
 }
 
 /// Read Axelar RPC url from target json (`/axelar/rpc`).
-pub fn read_axelar_rpc(target_json: &Path) -> Result<String> {
-    let content = fs::read_to_string(target_json)?;
+pub async fn read_axelar_rpc(target_json: &Path) -> Result<String> {
+    let content = tokio::fs::read_to_string(target_json).await?;
     // Parse to `Value` first so a malformed-JSON file surfaces serde's parse
     // error verbatim, matching the original `from_str::<Value>(&content)?`.
     let raw: Value = serde_json::from_str(&content)?;
@@ -710,7 +710,7 @@ fn rpc_fallbacks_for(primary: &str) -> &'static [&'static str] {
 /// flood the report log.
 static RPC_FALLBACK_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
-fn note_rpc_fallback_use(idx: usize, _used: &str, last_err: Option<&eyre::Report>) {
+fn note_rpc_fallback_use(idx: usize, last_err: Option<&eyre::Report>) {
     if idx == 0 {
         return;
     }
@@ -769,7 +769,7 @@ pub async fn rpc_tx_search_event(rpc: &str, event_key: &str, event_value: &str) 
                 }
                 match response.json::<Value>().await {
                     Ok(v) => {
-                        note_rpc_fallback_use(idx, endpoint, last_err.as_ref());
+                        note_rpc_fallback_use(idx, last_err.as_ref());
                         return Ok(v);
                     }
                     Err(e) => {
@@ -915,7 +915,7 @@ pub async fn rpc_block_info(rpc: &str, height: Option<u64>) -> Result<(u64, Stri
             continue;
         };
         let height: u64 = parse_required("block.header.height", Some(&height_str))?;
-        note_rpc_fallback_use(idx, endpoint, last_err.as_ref());
+        note_rpc_fallback_use(idx, last_err.as_ref());
         return Ok((height, time));
     }
 
@@ -935,7 +935,7 @@ pub async fn fetch_verifier_set(
     target_json: &Path,
     chain_axelar_id: &str,
 ) -> Result<(Vec<(Address, u128)>, u128, FixedBytes<32>, String)> {
-    let content = fs::read_to_string(target_json)?;
+    let content = tokio::fs::read_to_string(target_json).await?;
     // Parse to `Value` first so a malformed-JSON file surfaces serde's parse
     // error verbatim, matching the original `from_str::<Value>(&content)?`.
     let raw: Value = serde_json::from_str(&content)?;

@@ -13,6 +13,7 @@ use alloy::{
 };
 use eyre::Result;
 
+use super::{DEST_CHAIN, TOTAL_STEPS};
 use crate::evm::{ERC20, InterchainTokenService, Ownable};
 use crate::timing::{DEST_CHAIN_POLL_ATTEMPTS, DEST_CHAIN_POLL_INTERVAL};
 use crate::ui;
@@ -100,9 +101,6 @@ pub(super) async fn poll_for_balance_on_destination<P: Provider>(
     predicted_addr: Address,
     receiver: Address,
 ) {
-    use super::DEST_CHAIN;
-    use super::TOTAL_STEPS;
-
     ui::step_header(10, TOTAL_STEPS, &format!("Verify transfer on {DEST_CHAIN}"));
     ui::address("token", &format!("{predicted_addr}"));
     ui::address("receiver", &format!("{receiver}"));

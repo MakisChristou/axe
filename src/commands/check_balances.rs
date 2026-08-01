@@ -251,7 +251,7 @@ fn axe_targets(network: Network) -> Vec<ChainTarget> {
 
 pub async fn run(network: Network) -> Result<()> {
     let config_path = config_source::resolve(network, None).await?.into_path();
-    let config = ChainsConfig::load(&config_path)?;
+    let config = ChainsConfig::load(&config_path).await?;
 
     ui::section(&format!("wallet balance check: {network}"));
     ui::kv("config", &config_path.display().to_string());
@@ -486,7 +486,7 @@ async fn probe_solana(chain: &ChainConfig) -> Result<(String, f64)> {
     // SOLANA_PRIVATE_KEY (when set) is a file path written by the workflow's
     // composite action. Falls back to ~/.config/solana/id.json otherwise.
     let key_path = std::env::var("SOLANA_PRIVATE_KEY").ok();
-    let keypair = load_keypair(key_path.as_deref())?;
+    let keypair = load_keypair(key_path.as_deref()).await?;
     let pubkey = keypair.pubkey();
     let client = rpc_client(rpc_url);
     let lamports = crate::retry::retry_all("probe_solana.get_balance", || async {

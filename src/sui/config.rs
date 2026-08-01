@@ -5,7 +5,7 @@
 use eyre::{Result, eyre};
 use sui_sdk_types::Address as SuiAddress;
 
-use crate::config::ChainsConfig;
+use crate::config::{ChainContract, ChainsConfig};
 
 #[derive(Debug, Clone)]
 pub struct SuiContractsConfig {
@@ -16,11 +16,11 @@ pub struct SuiContractsConfig {
 }
 
 /// Read Sui chain config (RPC + key contract object IDs) from the chains config JSON.
-pub fn read_sui_chain_config(
+pub async fn read_sui_chain_config(
     config: &std::path::Path,
     chain_id: &str,
 ) -> Result<(String, SuiContractsConfig)> {
-    let config = ChainsConfig::load(config)?;
+    let config = ChainsConfig::load(config).await?;
     let chain = config.chain(chain_id)?;
     let rpc = chain
         .rpc
@@ -28,7 +28,7 @@ pub fn read_sui_chain_config(
         .ok_or_else(|| eyre!("no rpc for sui chain '{chain_id}'"))?
         .clone();
 
-    let example = chain.contract("Example", chain_id)?;
+    let example = chain.contract(ChainContract::Example, chain_id)?;
     let example_pkg = example
         .address
         .as_deref()
@@ -39,13 +39,13 @@ pub fn read_sui_chain_config(
         .and_then(|objects| objects.gmp_singleton.as_deref())
         .ok_or_else(|| eyre!("no Example.objects.GmpSingleton for '{chain_id}'"))?;
     let gateway_object = chain
-        .contract("AxelarGateway", chain_id)?
+        .contract(ChainContract::AxelarGateway, chain_id)?
         .objects
         .as_ref()
         .and_then(|objects| objects.gateway.as_deref())
         .ok_or_else(|| eyre!("no AxelarGateway.objects.Gateway for '{chain_id}'"))?;
     let gas_service_object = chain
-        .contract("GasService", chain_id)?
+        .contract(ChainContract::GasService, chain_id)?
         .objects
         .as_ref()
         .and_then(|objects| objects.gas_service.as_deref())
@@ -69,10 +69,10 @@ pub fn parse_sui_addr(s: &str) -> Result<SuiAddress> {
 /// Read the AxelarGateway Move-package address for a Sui chain. Used by the
 /// destination-side verifier to construct event-type strings for
 /// `events::MessageApproved` / `events::MessageExecuted`.
-pub fn read_sui_gateway_pkg(config: &std::path::Path, chain_id: &str) -> Result<String> {
-    let config = ChainsConfig::load(config)?;
+pub async fn read_sui_gateway_pkg(config: &std::path::Path, chain_id: &str) -> Result<String> {
+    let config = ChainsConfig::load(config).await?;
     Ok(config
         .chain(chain_id)?
-        .contract_address("AxelarGateway", chain_id)?
+        .contract_address(ChainContract::AxelarGateway, chain_id)?
         .to_string())
 }

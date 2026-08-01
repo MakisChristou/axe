@@ -9,6 +9,7 @@
 use eyre::Result;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, read_keypair_file};
+use tokio::task::spawn_blocking;
 
 use crate::types::Network;
 
@@ -17,6 +18,14 @@ const TOKEN_MANAGER_SEED: &[u8] = b"token-manager";
 const INTERCHAIN_TOKEN_SEED: &[u8] = b"interchain-token";
 const PREFIX_INTERCHAIN_TOKEN_SALT: &[u8] = b"interchain-token-salt";
 const PREFIX_INTERCHAIN_TOKEN_ID: &[u8] = b"interchain-token-id";
+
+pub fn clone_keypair(keypair: &Keypair) -> Keypair {
+    let bytes = keypair.to_bytes();
+    let mut seed = [0; 32];
+    seed.copy_from_slice(&bytes[..32]);
+
+    Keypair::new_from_array(seed)
+}
 
 pub fn find_its_root_pda(network: Network) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[ITS_SEED], &network.solana_its_id())
@@ -78,7 +87,7 @@ pub fn interchain_token_id(network: Network, deployer: &Pubkey, salt: &[u8; 32])
 }
 
 /// Load a Solana keypair from a file path, or fall back to ~/.config/solana/id.json.
-pub fn load_keypair(path: Option<&str>) -> Result<Keypair> {
+pub async fn load_keypair(path: Option<&str>) -> Result<Keypair> {
     let key_path = match path {
         Some(p) => p.to_string(),
         None => {
@@ -89,6 +98,9 @@ pub fn load_keypair(path: Option<&str>) -> Result<Keypair> {
                 .into_owned()
         }
     };
-    read_keypair_file(&key_path)
-        .map_err(|e| eyre::eyre!("failed to read Solana keypair from {key_path}: {e}"))
+    spawn_blocking(move || {
+        read_keypair_file(&key_path)
+            .map_err(|e| eyre::eyre!("failed to read Solana keypair from {key_path}: {e}"))
+    })
+    .await?
 }

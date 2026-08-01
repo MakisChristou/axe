@@ -4,6 +4,7 @@
 //! used by `decode_sol_activity` for machine-readable output.
 
 use owo_colors::OwoColorize;
+use serde_json::json;
 use solana_sdk::pubkey::Pubkey;
 use solana_transaction_status::UiInstruction;
 use std::collections::HashMap;
@@ -637,8 +638,6 @@ fn decode_message_json(args: &[u8], include_destination: bool) -> serde_json::Va
 
 /// Decode instruction arguments into a JSON map (for machine-readable output).
 pub fn decode_instruction_args_json(ix_name: &str, data: &[u8]) -> serde_json::Value {
-    use serde_json::json;
-
     if data.len() <= 8 {
         return json!({});
     }

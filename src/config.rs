@@ -19,12 +19,16 @@
 // schema field that exists for JSON compatibility rather than direct reads.
 #![allow(dead_code)]
 
+mod contract;
+
 use std::collections::HashMap;
 use std::path::Path;
 
 use eyre::{Result, WrapErr};
 use serde::Deserialize;
 use serde_json::Value;
+
+pub use contract::{AxelarChainContract, AxelarGlobalContract, ChainContract};
 
 #[derive(Debug, Deserialize)]
 pub struct ChainsConfig {
@@ -35,8 +39,9 @@ pub struct ChainsConfig {
 }
 
 impl ChainsConfig {
-    pub fn load(path: &Path) -> Result<Self> {
-        let s = std::fs::read_to_string(path)
+    pub async fn load(path: &Path) -> Result<Self> {
+        let s = tokio::fs::read_to_string(path)
+            .await
             .wrap_err_with(|| format!("failed to read chains config '{}'", path.display()))?;
         Self::from_json_str(&s)
             .wrap_err_with(|| format!("failed to parse chains config '{}'", path.display()))
@@ -122,7 +127,12 @@ impl AxelarConfig {
     /// `field not found` message if the contract entry, chain entry, or
     /// address string is missing — callers can `.ok()` to opt back into
     /// `Option` semantics where absence is acceptable.
-    pub fn contract_address(&self, contract: &str, chain: &str) -> Result<&str> {
+    pub fn contract_address(&self, contract: AxelarChainContract, chain: &str) -> Result<&str> {
+        self.contract_address_by_name(contract.key(), chain)
+    }
+
+    /// Look up a dynamic per-chain contract name from an external boundary.
+    pub fn contract_address_by_name(&self, contract: &str, chain: &str) -> Result<&str> {
         let opt = (|| -> Option<&str> {
             self.contracts
                 .as_ref()?
@@ -140,7 +150,12 @@ impl AxelarConfig {
     /// (global) form used by hub-level contracts like AxelarnetGateway,
     /// Router, Multisig, Coordinator, etc., which don't have a per-chain
     /// breakdown at this level.
-    pub fn global_contract_address(&self, contract: &str) -> Result<&str> {
+    pub fn global_contract_address(&self, contract: AxelarGlobalContract) -> Result<&str> {
+        self.global_contract_address_by_name(contract.key())
+    }
+
+    /// Look up a dynamic global contract name from an external boundary.
+    pub fn global_contract_address_by_name(&self, contract: &str) -> Result<&str> {
         let opt = (|| -> Option<&str> {
             self.contracts
                 .as_ref()?
@@ -246,7 +261,12 @@ impl ChainsConfig {
 
 impl ChainConfig {
     /// Return one typed contract entry.
-    pub fn contract(&self, contract: &str, chain_id: &str) -> Result<&ContractEntry> {
+    pub fn contract(&self, contract: ChainContract, chain_id: &str) -> Result<&ContractEntry> {
+        self.contract_by_name(contract.key(), chain_id)
+    }
+
+    /// Return a dynamic contract entry from an external boundary.
+    pub fn contract_by_name(&self, contract: &str, chain_id: &str) -> Result<&ContractEntry> {
         self.contracts
             .as_ref()
             .and_then(|contracts| contracts.get(contract))
@@ -256,7 +276,12 @@ impl ChainConfig {
     /// Look up `chains.<this>.contracts.<contract>.address`. Errors with a
     /// `not deployed yet` message if the contract entry or address is
     /// missing — callers can `.ok()` to opt back into `Option` semantics.
-    pub fn contract_address(&self, contract: &str, axelar_id: &str) -> Result<&str> {
+    pub fn contract_address(&self, contract: ChainContract, axelar_id: &str) -> Result<&str> {
+        self.contract_address_by_name(contract.key(), axelar_id)
+    }
+
+    /// Look up a dynamic contract address from an external boundary.
+    pub fn contract_address_by_name(&self, contract: &str, axelar_id: &str) -> Result<&str> {
         let opt =
             (|| -> Option<&str> { self.contracts.as_ref()?.get(contract)?.address.as_deref() })();
         opt.ok_or_else(|| eyre::eyre!("{contract} not deployed yet for {axelar_id}"))
@@ -357,11 +382,17 @@ mod tests {
         assert_eq!(hedera.gas_scaling_factor, Some(10));
         assert_eq!(hedera.decimals, Some(18));
         assert_eq!(
-            hedera.contract_address("AxelarGateway", "hedera").unwrap(),
+            hedera
+                .contract_address(ChainContract::AxelarGateway, "hedera")
+                .unwrap(),
             "0xe432150cce91c13a887f7D836923d5597adD8E31",
         );
-        assert!(hedera.contract_address("AxelarMissing", "hedera").is_err());
-        let axe = hedera.contract("AXE", "hedera").unwrap();
+        assert!(
+            hedera
+                .contract_address_by_name("AxelarMissing", "hedera")
+                .is_err()
+        );
+        let axe = hedera.contract(ChainContract::Axe, "hedera").unwrap();
         assert_eq!(axe.type_argument.as_deref(), Some("0x2::axe::AXE"));
         let objects = axe.objects.as_ref().unwrap();
         assert_eq!(objects.token_id.as_deref(), Some("0x02"));
@@ -398,14 +429,16 @@ mod tests {
         assert!((gas_price - 0.007).abs() < 1e-12);
 
         assert_eq!(
-            cfg.axelar.contract_address("Gateway", "hedera").unwrap(),
+            cfg.axelar
+                .contract_address(AxelarChainContract::Gateway, "hedera")
+                .unwrap(),
             "axelar1w8frw33jn0yx59845wdgk0yru6fxvgr6hlh4xfdtdf08y5jamcnsyu0z6u",
         );
         // Metadata keys (lastUploadedCodeId) carry no `address` field, so the
         // lookup surfaces as a `field not found` error rather than panicking.
         assert!(
             cfg.axelar
-                .contract_address("Gateway", "lastUploadedCodeId")
+                .contract_address(AxelarChainContract::Gateway, "lastUploadedCodeId")
                 .is_err()
         );
     }

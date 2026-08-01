@@ -1,8 +1,10 @@
 //! Borsh + payload decoding primitives. Functions here turn raw bytes into
 //! typed values or human-readable strings, but never print directly.
 
+use alloy::dyn_abi::DynSolType;
 use eyre::{Result, bail};
 use owo_colors::OwoColorize;
+use solana_axelar_its::encoding::{HubMessage, Message};
 
 use super::format::format_address_bytes;
 
@@ -68,8 +70,6 @@ pub(super) fn decode_payload(payload: &[u8]) -> (String, Option<String>) {
 
 /// Try to decode inner payload data as a known type.
 fn try_decode_payload_content(data: &[u8]) -> Option<String> {
-    use alloy::dyn_abi::DynSolType;
-
     if data.is_empty() {
         return None;
     }
@@ -108,8 +108,6 @@ fn try_decode_payload_content(data: &[u8]) -> Option<String> {
 }
 
 fn try_decode_its_hub_message(data: &[u8]) -> Option<String> {
-    use solana_axelar_its::encoding::HubMessage;
-
     let hub_msg: HubMessage = borsh::from_slice(data).ok()?;
     match hub_msg {
         HubMessage::SendToHub {
@@ -133,8 +131,6 @@ fn try_decode_its_hub_message(data: &[u8]) -> Option<String> {
 }
 
 fn format_its_message(message: &solana_axelar_its::encoding::Message, lines: &mut Vec<String>) {
-    use solana_axelar_its::encoding::Message;
-
     let p = "      ┃ ";
     match message {
         Message::InterchainTransfer(t) => {

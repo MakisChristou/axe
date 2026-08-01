@@ -33,16 +33,16 @@ pub(super) fn cache_path(
     data_dir.join(format!("its-test-{network}-{src}-{dst}-{deployer}.json"))
 }
 
-pub(super) fn read_cache(path: &Path) -> Option<ItsTestCache> {
-    let content = std::fs::read_to_string(path).ok()?;
+pub(super) async fn read_cache(path: &Path) -> Option<ItsTestCache> {
+    let content = tokio::fs::read_to_string(path).await.ok()?;
     serde_json::from_str(&content).ok()
 }
 
-pub(super) fn save_cache(path: &Path, cache: &ItsTestCache) -> eyre::Result<()> {
+pub(super) async fn save_cache(path: &Path, cache: &ItsTestCache) -> eyre::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        tokio::fs::create_dir_all(parent).await?;
     }
-    std::fs::write(path, serde_json::to_string_pretty(cache)?)?;
+    tokio::fs::write(path, serde_json::to_string_pretty(cache)?).await?;
     Ok(())
 }
 
@@ -58,7 +58,7 @@ pub(super) async fn try_load_cached_phase_a<P: Provider>(
     if fresh_token {
         return None;
     }
-    let c = read_cache(cache_file)?;
+    let c = read_cache(cache_file).await?;
     if c.deployer != sol_pubkey.to_string() {
         return None;
     }

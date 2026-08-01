@@ -16,7 +16,7 @@ pub async fn run(ctx: &DeployContext, step: &Step) -> Result<()> {
         )
     })?;
 
-    let (lcd, _, _, _) = read_axelar_config(&ctx.target_json)?;
+    let (lcd, _, _, _) = read_axelar_config(&ctx.target_json).await?;
 
     let spinner = ui::wait_spinner(&format!("polling proposal {proposal_id}..."));
     loop {

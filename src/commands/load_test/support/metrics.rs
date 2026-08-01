@@ -1,0 +1,680 @@
+//! Load test metrics and reports.
+
+use std::time::Instant;
+
+use serde::de::Error as _;
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use super::chain_names::DisplayChainName;
+use super::run_sizing::{RunMode, RunSizing, SustainedPlan};
+
+/// A transaction either succeeded or failed with a reason.
+///
+/// The custom serde representation deliberately preserves the public report
+/// schema (`success: bool`, `error: string | null`) while preventing invalid
+/// combinations inside the load-test implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TxOutcome {
+    Succeeded,
+    Failed(TxFailure),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TxFailure {
+    reason: String,
+    kind: TxFailureKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TxFailureKind {
+    RateLimited,
+    Other,
+}
+
+impl TxFailure {
+    fn classified(reason: String) -> Self {
+        let kind = if reason.contains("429") {
+            TxFailureKind::RateLimited
+        } else {
+            TxFailureKind::Other
+        };
+        Self { reason, kind }
+    }
+}
+
+impl TxOutcome {
+    pub(crate) fn failed(error: impl Into<String>) -> Self {
+        Self::Failed(TxFailure::classified(error.into()))
+    }
+
+    pub(crate) fn from_external(
+        success: bool,
+        error: Option<String>,
+        fallback: impl Into<String>,
+    ) -> Self {
+        if success {
+            Self::Succeeded
+        } else {
+            Self::failed(error.unwrap_or_else(|| fallback.into()))
+        }
+    }
+
+    fn is_success(&self) -> bool {
+        matches!(self, Self::Succeeded)
+    }
+
+    fn error(&self) -> Option<&str> {
+        match self {
+            Self::Succeeded => None,
+            Self::Failed(failure) => Some(&failure.reason),
+        }
+    }
+
+    fn is_rate_limited(&self) -> bool {
+        matches!(
+            self,
+            Self::Failed(TxFailure {
+                kind: TxFailureKind::RateLimited,
+                ..
+            })
+        )
+    }
+}
+
+impl Serialize for TxOutcome {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("TxOutcome", 2)?;
+        state.serialize_field("success", &self.is_success())?;
+        state.serialize_field("error", &self.error())?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TxOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Fields {
+            success: bool,
+            error: Option<String>,
+        }
+
+        let fields = Fields::deserialize(deserializer)?;
+        match (fields.success, fields.error) {
+            (true, None) => Ok(Self::Succeeded),
+            (false, Some(error)) => Ok(Self::failed(error)),
+            (true, Some(_)) => Err(D::Error::custom(
+                "successful transaction cannot contain an error",
+            )),
+            (false, None) => Err(D::Error::custom(
+                "failed transaction must contain an error reason",
+            )),
+        }
+    }
+}
+
+/// Per-transaction metrics collected during load testing.
+///
+/// Identifier and address fields intentionally remain strings here because
+/// this struct is the stable JSON report boundary. Orchestration converts
+/// them to `MessageId`, `PayloadHash`, or chain-SDK address types before
+/// making semantic decisions; wrapping these serialized fields themselves
+/// would add conversion churn without strengthening internal state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxMetrics {
+    pub signature: String,
+    pub submit_time_ms: u64,
+    pub confirm_time_ms: Option<u64>,
+    pub latency_ms: Option<u64>,
+    pub compute_units: Option<u64>,
+    pub slot: Option<u64>,
+    #[serde(flatten)]
+    pub(crate) outcome: TxOutcome,
+
+    /// keccak256 of the payload, hex-encoded (no 0x prefix).
+    #[serde(default)]
+    pub payload_hash: String,
+    /// The source address of the signer.
+    #[serde(default)]
+    pub source_address: String,
+    /// Raw payload bytes (kept in-memory for verification, not serialized).
+    #[serde(skip)]
+    pub payload: Vec<u8>,
+    /// Instant the tx was submitted (for computing T+X timing).
+    #[serde(skip)]
+    pub send_instant: Option<Instant>,
+    /// GMP-level destination chain from ContractCall event (e.g. "axelar" for ITS hub routing).
+    #[serde(default)]
+    pub gmp_destination_chain: String,
+    /// GMP-level destination address from ContractCall event (e.g. ITS Hub contract for ITS).
+    #[serde(default)]
+    pub gmp_destination_address: String,
+    /// Amplifier pipeline timing (populated during verification phase).
+    pub amplifier_timing: Option<AmplifierTiming>,
+}
+
+impl TxMetrics {
+    pub(crate) fn from_outcome(
+        signature: impl Into<String>,
+        submit_time_ms: u64,
+        outcome: TxOutcome,
+    ) -> Self {
+        Self {
+            signature: signature.into(),
+            submit_time_ms,
+            confirm_time_ms: None,
+            latency_ms: None,
+            compute_units: None,
+            slot: None,
+            outcome,
+            payload_hash: String::new(),
+            source_address: String::new(),
+            payload: Vec::new(),
+            send_instant: None,
+            gmp_destination_chain: String::new(),
+            gmp_destination_address: String::new(),
+            amplifier_timing: None,
+        }
+    }
+
+    pub(crate) fn succeeded(signature: impl Into<String>, submit_time_ms: u64) -> Self {
+        Self::from_outcome(signature, submit_time_ms, TxOutcome::Succeeded)
+    }
+
+    pub(crate) fn failed(
+        signature: impl Into<String>,
+        submit_time_ms: u64,
+        error: impl Into<String>,
+    ) -> Self {
+        Self::from_outcome(signature, submit_time_ms, TxOutcome::failed(error))
+    }
+
+    pub(crate) fn is_success(&self) -> bool {
+        self.outcome.is_success()
+    }
+
+    pub(crate) fn error(&self) -> Option<&str> {
+        self.outcome.error()
+    }
+
+    pub(crate) fn is_rate_limited(&self) -> bool {
+        self.outcome.is_rate_limited()
+    }
+
+    pub(crate) fn mark_failed(&mut self, error: impl Into<String>) {
+        self.outcome = TxOutcome::failed(error);
+    }
+
+    /// Rewrite the failure reason in place, keeping the success/failure state
+    /// intact. Used to scrub private RPC URLs out of upstream error strings.
+    pub(crate) fn map_error(&mut self, rewrite: impl FnOnce(&str) -> String) {
+        if let TxOutcome::Failed(failure) = &mut self.outcome {
+            failure.reason = rewrite(&failure.reason);
+        }
+    }
+}
+
+/// Per-step timing through the Amplifier pipeline, relative to tx send time.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AmplifierTiming {
+    /// Seconds from send to message verified on VotingVerifier (quorum reached).
+    pub voted_secs: Option<f64>,
+    /// Seconds from send to message routed on destination Cosmos Gateway.
+    pub routed_secs: Option<f64>,
+    /// Seconds from send to message approved on AxelarnetGateway hub (ITS only).
+    pub hub_approved_secs: Option<f64>,
+    /// Seconds from send to isMessageApproved on EVM gateway.
+    pub approved_secs: Option<f64>,
+    /// Seconds from send to execution on destination contract.
+    pub executed_secs: Option<f64>,
+    /// Whether execution succeeded.
+    pub executed_ok: Option<bool>,
+    /// The message stored by SenderReceiver (if readable).
+    pub stored_message: Option<String>,
+}
+
+/// Comprehensive load test report containing all metrics.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LoadTestReport {
+    pub source_chain: String,
+    pub destination_chain: String,
+    pub destination_address: String,
+    pub protocol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tps: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<u64>,
+    pub num_txs: u64,
+    pub num_keys: usize,
+
+    pub total_submitted: u64,
+    pub total_confirmed: u64,
+    pub total_failed: u64,
+    pub test_duration_secs: f64,
+    pub tps_submitted: f64,
+    pub tps_confirmed: f64,
+    pub landing_rate: f64,
+
+    pub avg_latency_ms: Option<f64>,
+    pub min_latency_ms: Option<u64>,
+    pub max_latency_ms: Option<u64>,
+    pub avg_compute_units: Option<f64>,
+    pub min_compute_units: Option<u64>,
+    pub max_compute_units: Option<u64>,
+
+    pub verification: Option<VerificationReport>,
+    pub transactions: Vec<TxMetrics>,
+}
+
+/// Whether a report should summarize per-transaction compute-unit values.
+///
+/// Some chains do not expose a comparable resource-unit measurement. Keeping
+/// this policy explicit preserves the existing JSON output instead of
+/// accidentally populating compute-unit fields for routes that omitted them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ComputeUnitSummary {
+    Include,
+    Omit,
+}
+
+/// Caller-supplied facts for constructing a load-test report.
+///
+/// Totals, rates, and metric summaries are deliberately absent: they are
+/// derived from `transactions` in one place so route implementations cannot
+/// disagree about how those values are calculated.
+#[derive(Debug)]
+pub(super) struct ReportInput {
+    pub run: RunIdentity,
+    pub destination_address: String,
+    pub num_txs: u64,
+    pub num_keys: usize,
+    pub total_submitted: u64,
+    pub test_duration_secs: f64,
+    pub compute_unit_summary: ComputeUnitSummary,
+}
+
+/// What run this report describes. Every route derives these from the CLI
+/// arguments, so they are filled in at construction rather than patched onto
+/// the finished report afterwards.
+#[derive(Debug, Clone)]
+pub(super) struct RunIdentity {
+    pub source_chain: DisplayChainName,
+    pub destination_chain: DisplayChainName,
+    pub protocol: String,
+    /// The `--tps` / `--duration-secs` pair, absent for burst runs. They are
+    /// only ever meaningful together, so they travel as one value.
+    pub schedule: Option<SustainedSchedule>,
+}
+
+impl RunIdentity {
+    pub(super) fn burst(args: &super::LoadTestArgs) -> Self {
+        Self::from_args(args, None)
+    }
+
+    pub(super) fn sustained(args: &super::LoadTestArgs, plan: SustainedPlan) -> Self {
+        Self::from_args(args, Some(plan))
+    }
+
+    pub(super) fn from_sizing(args: &super::LoadTestArgs, sizing: RunSizing) -> Self {
+        match sizing.mode() {
+            RunMode::Burst { .. } => Self::burst(args),
+            RunMode::Sustained(plan) => Self::sustained(args, plan),
+        }
+    }
+
+    fn from_args(args: &super::LoadTestArgs, plan: Option<SustainedPlan>) -> Self {
+        Self {
+            source_chain: args.source_chain.to_string().into(),
+            destination_chain: args.destination_chain.to_string().into(),
+            protocol: args.protocol.to_string(),
+            schedule: plan.map(|plan| SustainedSchedule {
+                tps: plan.tps as u64,
+                duration_secs: plan.duration_secs,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SustainedSchedule {
+    pub tps: u64,
+    pub duration_secs: u64,
+}
+
+impl LoadTestReport {
+    pub(super) fn from_transactions(input: ReportInput, transactions: Vec<TxMetrics>) -> Self {
+        let total_confirmed = transactions
+            .iter()
+            .filter(|metric| metric.is_success())
+            .count() as u64;
+        let total_failed = transactions
+            .iter()
+            .filter(|metric| !metric.is_success())
+            .count() as u64;
+        let (avg_latency_ms, min_latency_ms, max_latency_ms) =
+            summarize(transactions.iter().filter_map(|metric| metric.latency_ms));
+        let (avg_compute_units, min_compute_units, max_compute_units) =
+            match input.compute_unit_summary {
+                ComputeUnitSummary::Include => summarize(
+                    transactions
+                        .iter()
+                        .filter_map(|metric| metric.compute_units),
+                ),
+                ComputeUnitSummary::Omit => (None, None, None),
+            };
+        let tps_submitted = if input.test_duration_secs > 0.0 {
+            input.total_submitted as f64 / input.test_duration_secs
+        } else {
+            0.0
+        };
+        let tps_confirmed = if input.test_duration_secs > 0.0 {
+            total_confirmed as f64 / input.test_duration_secs
+        } else {
+            0.0
+        };
+        let landing_rate = if input.total_submitted > 0 {
+            total_confirmed as f64 / input.total_submitted as f64
+        } else {
+            0.0
+        };
+
+        Self {
+            source_chain: input.run.source_chain.into_string(),
+            destination_chain: input.run.destination_chain.into_string(),
+            destination_address: input.destination_address,
+            protocol: input.run.protocol,
+            tps: input.run.schedule.map(|schedule| schedule.tps),
+            duration_secs: input.run.schedule.map(|schedule| schedule.duration_secs),
+            num_txs: input.num_txs,
+            num_keys: input.num_keys,
+            total_submitted: input.total_submitted,
+            total_confirmed,
+            total_failed,
+            test_duration_secs: input.test_duration_secs,
+            tps_submitted,
+            tps_confirmed,
+            landing_rate,
+            avg_latency_ms,
+            min_latency_ms,
+            max_latency_ms,
+            avg_compute_units,
+            min_compute_units,
+            max_compute_units,
+            verification: None,
+            transactions,
+        }
+    }
+}
+
+fn summarize(values: impl Iterator<Item = u64>) -> (Option<f64>, Option<u64>, Option<u64>) {
+    let values: Vec<_> = values.collect();
+    if values.is_empty() {
+        return (None, None, None);
+    }
+    (
+        Some(values.iter().sum::<u64>() as f64 / values.len() as f64),
+        values.iter().min().copied(),
+        values.iter().max().copied(),
+    )
+}
+
+/// Report from transaction verification phase.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VerificationReport {
+    pub total_verified: u64,
+    pub successful: u64,
+    pub pending: u64,
+    pub failed: u64,
+    pub success_rate: f64,
+    pub failure_reasons: Vec<FailureCategory>,
+    pub avg_voted_secs: Option<f64>,
+    pub avg_routed_secs: Option<f64>,
+    pub avg_hub_approved_secs: Option<f64>,
+    pub avg_approved_secs: Option<f64>,
+    pub avg_executed_secs: Option<f64>,
+    pub min_executed_secs: Option<f64>,
+    pub max_executed_secs: Option<f64>,
+    /// Seconds from earliest send to last successful execution (for throughput).
+    pub time_to_last_success_secs: Option<f64>,
+    /// Peak throughput (tx/s) observed per pipeline step in a 5s sliding window.
+    #[serde(default)]
+    pub peak_throughput: PeakThroughput,
+    /// Number of txs that timed out before completing all phases.
+    pub stuck: u64,
+    /// Which phase each stuck tx got stuck at.
+    pub stuck_at: Vec<FailureCategory>,
+    /// Number of txs that timed out in the polling loop but were reclassified
+    /// as successful by the final Axelarscan GMP-API check (the message
+    /// actually executed on-chain — a slow final leg, not a real failure).
+    #[serde(default)]
+    pub recovered_via_api: u64,
+}
+
+/// Peak throughput per pipeline step, measured in 5-second sliding windows.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PeakThroughput {
+    pub voted_tps: Option<f64>,
+    pub routed_tps: Option<f64>,
+    pub hub_approved_tps: Option<f64>,
+    pub approved_tps: Option<f64>,
+    pub executed_tps: Option<f64>,
+}
+
+/// Categorized failure count.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailureCategory {
+    pub reason: String,
+    pub count: u64,
+    #[serde(skip)]
+    pub(crate) kind: FailureCategoryKind,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(crate) enum FailureCategoryKind {
+    #[default]
+    Error,
+    TimedOut,
+}
+
+impl FailureCategory {
+    pub(crate) fn is_timed_out(&self) -> bool {
+        self.kind == FailureCategoryKind::TimedOut
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentity, TxMetrics, TxOutcome,
+    };
+
+    fn metric(success: bool, latency_ms: Option<u64>, compute_units: Option<u64>) -> TxMetrics {
+        let outcome = if success {
+            TxOutcome::Succeeded
+        } else {
+            TxOutcome::failed("test failure")
+        };
+        TxMetrics {
+            latency_ms,
+            compute_units,
+            ..TxMetrics::from_outcome("", 0, outcome)
+        }
+    }
+
+    fn input(compute_unit_summary: ComputeUnitSummary) -> ReportInput {
+        ReportInput {
+            run: RunIdentity {
+                source_chain: "source".into(),
+                destination_chain: "destination".into(),
+                protocol: "gmp".to_string(),
+                schedule: None,
+            },
+            destination_address: "address".to_string(),
+            num_txs: 4,
+            num_keys: 2,
+            total_submitted: 4,
+            test_duration_secs: 2.0,
+            compute_unit_summary,
+        }
+    }
+
+    #[test]
+    fn derives_counts_rates_and_metric_summaries() {
+        let report = LoadTestReport::from_transactions(
+            input(ComputeUnitSummary::Include),
+            vec![
+                metric(true, Some(10), Some(100)),
+                metric(true, Some(30), Some(300)),
+                metric(false, None, None),
+            ],
+        );
+
+        assert_eq!(report.total_submitted, 4);
+        assert_eq!(report.total_confirmed, 2);
+        assert_eq!(report.total_failed, 1);
+        assert_eq!(report.tps_submitted, 2.0);
+        assert_eq!(report.tps_confirmed, 1.0);
+        assert_eq!(report.landing_rate, 0.5);
+        assert_eq!(report.avg_latency_ms, Some(20.0));
+        assert_eq!(report.min_latency_ms, Some(10));
+        assert_eq!(report.max_latency_ms, Some(30));
+        assert_eq!(report.avg_compute_units, Some(200.0));
+        assert_eq!(report.min_compute_units, Some(100));
+        assert_eq!(report.max_compute_units, Some(300));
+    }
+
+    #[test]
+    fn omits_compute_unit_summary_when_route_does_not_report_it() {
+        let report = LoadTestReport::from_transactions(
+            input(ComputeUnitSummary::Omit),
+            vec![metric(true, Some(10), Some(100))],
+        );
+
+        assert_eq!(report.avg_compute_units, None);
+        assert_eq!(report.min_compute_units, None);
+        assert_eq!(report.max_compute_units, None);
+    }
+
+    #[test]
+    fn handles_empty_metrics_and_zero_duration() {
+        let mut input = input(ComputeUnitSummary::Include);
+        input.total_submitted = 0;
+        input.test_duration_secs = 0.0;
+
+        let report = LoadTestReport::from_transactions(input, Vec::new());
+
+        assert_eq!(report.total_confirmed, 0);
+        assert_eq!(report.total_failed, 0);
+        assert_eq!(report.tps_submitted, 0.0);
+        assert_eq!(report.tps_confirmed, 0.0);
+        assert_eq!(report.landing_rate, 0.0);
+        assert_eq!(report.avg_latency_ms, None);
+        assert_eq!(report.avg_compute_units, None);
+    }
+
+    #[test]
+    fn transaction_outcome_preserves_report_json_shape() {
+        let success = metric(true, Some(10), None);
+        let success_json = serde_json::to_value(&success).unwrap();
+        assert_eq!(success_json["success"], true);
+        assert_eq!(success_json["error"], serde_json::Value::Null);
+
+        let failed = metric(false, None, None);
+        let failed_json = serde_json::to_value(&failed).unwrap();
+        assert_eq!(failed_json["success"], false);
+        assert_eq!(failed_json["error"], "test failure");
+
+        let round_trip: TxMetrics = serde_json::from_value(failed_json).unwrap();
+        assert_eq!(round_trip.outcome, TxOutcome::failed("test failure"));
+    }
+
+    #[test]
+    fn transaction_outcome_rejects_invalid_json_combinations() {
+        let mut invalid = serde_json::to_value(metric(true, None, None)).unwrap();
+        invalid["success"] = serde_json::Value::Bool(false);
+        assert!(serde_json::from_value::<TxMetrics>(invalid).is_err());
+    }
+
+    #[test]
+    fn transaction_failure_classifies_rate_limits_at_the_boundary() {
+        let rate_limited = TxMetrics::failed("", 0, "HTTP 429: too many requests");
+        let ordinary = TxMetrics::failed("", 0, "execution reverted");
+
+        assert!(rate_limited.is_rate_limited());
+        assert!(!ordinary.is_rate_limited());
+
+        let round_trip: TxMetrics =
+            serde_json::from_value(serde_json::to_value(rate_limited).unwrap()).unwrap();
+        assert!(round_trip.is_rate_limited());
+    }
+
+    #[test]
+    fn report_json_contract_is_stable() {
+        let report = LoadTestReport::from_transactions(
+            input(ComputeUnitSummary::Omit),
+            vec![metric(true, Some(10), None)],
+        );
+
+        assert_eq!(
+            serde_json::to_value(report).unwrap(),
+            serde_json::json!({
+                "source_chain": "source",
+                "destination_chain": "destination",
+                "destination_address": "address",
+                "protocol": "gmp",
+                "num_txs": 4,
+                "num_keys": 2,
+                "total_submitted": 4,
+                "total_confirmed": 1,
+                "total_failed": 0,
+                "test_duration_secs": 2.0,
+                "tps_submitted": 2.0,
+                "tps_confirmed": 0.5,
+                "landing_rate": 0.25,
+                "avg_latency_ms": 10.0,
+                "min_latency_ms": 10,
+                "max_latency_ms": 10,
+                "avg_compute_units": null,
+                "min_compute_units": null,
+                "max_compute_units": null,
+                "verification": null,
+                "transactions": [{
+                    "signature": "",
+                    "submit_time_ms": 0,
+                    "confirm_time_ms": null,
+                    "latency_ms": 10,
+                    "compute_units": null,
+                    "slot": null,
+                    "success": true,
+                    "error": null,
+                    "payload_hash": "",
+                    "source_address": "",
+                    "gmp_destination_chain": "",
+                    "gmp_destination_address": "",
+                    "amplifier_timing": null
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn constructors_initialize_consistent_outcomes_and_defaults() {
+        let succeeded = TxMetrics::succeeded("ok", 12);
+        assert!(succeeded.is_success());
+        assert_eq!(succeeded.error(), None);
+        assert_eq!(succeeded.signature, "ok");
+        assert_eq!(succeeded.submit_time_ms, 12);
+
+        let failed = TxMetrics::failed("bad", 34, "reverted");
+        assert!(!failed.is_success());
+        assert_eq!(failed.error(), Some("reverted"));
+        assert_eq!(failed.confirm_time_ms, None);
+        assert!(failed.payload.is_empty());
+    }
+}

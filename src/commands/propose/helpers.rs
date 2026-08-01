@@ -12,7 +12,7 @@ use eyre::{Result, WrapErr};
 
 use serde_json::Value;
 
-use crate::config::ChainsConfig;
+use crate::config::{AxelarChainContract, AxelarGlobalContract, ChainContract, ChainsConfig};
 use crate::cosmos::lcd_query_proposal;
 use crate::evm::AxelarServiceGovernance;
 use crate::timing::COSMOS_PROPOSAL_POLL_INTERVAL;
@@ -47,14 +47,14 @@ pub fn resolve(network: Network, config: &ChainsConfig, chain: &str) -> Result<R
     let edge_axelar_id = chain_cfg.axelar_id_or(chain);
 
     let asg_address = chain_cfg
-        .contract_address("AxelarServiceGovernance", &edge_axelar_id)
+        .contract_address(ChainContract::AxelarServiceGovernance, &edge_axelar_id)
         .wrap_err("target chain has no AxelarServiceGovernance — deploy/transfer ownership first")?
         .to_string();
     let gateway_address = chain_cfg
-        .contract_address("AxelarGateway", &edge_axelar_id)?
+        .contract_address(ChainContract::AxelarGateway, &edge_axelar_id)?
         .to_string();
     let its_address = chain_cfg
-        .contract_address("InterchainTokenService", &edge_axelar_id)
+        .contract_address(ChainContract::InterchainTokenService, &edge_axelar_id)
         .ok()
         .map(str::to_string);
 
@@ -64,7 +64,7 @@ pub fn resolve(network: Network, config: &ChainsConfig, chain: &str) -> Result<R
         .ok_or_else(|| eyre::eyre!("no rpc for chain '{chain}' in config"))?;
     let multisig_prover = config
         .axelar
-        .contract_address("MultisigProver", &edge_axelar_id)?
+        .contract_address(AxelarChainContract::MultisigProver, &edge_axelar_id)?
         .to_string();
     let axelar_rpc = config.axelar.rpc.clone().ok_or_else(|| {
         eyre::eyre!("no axelar.rpc (Tendermint RPC) in config — needed for relay")
@@ -72,7 +72,7 @@ pub fn resolve(network: Network, config: &ChainsConfig, chain: &str) -> Result<R
 
     let axelarnet_gateway = config
         .axelar
-        .global_contract_address("AxelarnetGateway")?
+        .global_contract_address(AxelarGlobalContract::AxelarnetGateway)?
         .to_string();
     let gov_module = config
         .axelar

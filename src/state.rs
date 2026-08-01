@@ -11,7 +11,6 @@
 //! `axe deploy reset` and re-init.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use alloy::primitives::Address;
@@ -20,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{ChainKey, Network};
 use crate::ui;
+use StepKind as K;
 
 // ---------------------------------------------------------------------------
 // Top-level State
@@ -206,7 +206,6 @@ pub enum StepKind {
 /// `migrate_steps` appends any new entries here onto an existing state file
 /// so partial deployments pick up newly-added stages without manual surgery.
 pub fn default_steps() -> Vec<Step> {
-    use StepKind as K;
     let new_owner = alloy::primitives::address!("49845e5d9985d8dc941462293ed38EEfF18B0eAE");
     let mut steps = vec![
         pending_step("EvmCompatibilityCheck", K::EvmCompat),
@@ -345,13 +344,13 @@ pub fn state_path(axelar_id: &str) -> Result<PathBuf> {
 }
 
 /// Read and deserialize the state file into a typed `State`.
-pub fn read_state(axelar_id: &str) -> Result<State> {
+pub async fn read_state(axelar_id: &str) -> Result<State> {
     let path = state_path(axelar_id)?;
-    read_state_at(&path)
+    read_state_at(&path).await
 }
 
-pub fn read_state_at(path: &Path) -> Result<State> {
-    let content = fs::read_to_string(path).map_err(|e| {
+pub async fn read_state_at(path: &Path) -> Result<State> {
+    let content = tokio::fs::read_to_string(path).await.map_err(|e| {
         eyre::eyre!(
             "failed to read state file {}: {e}. Run `init` first.",
             path.display()
@@ -362,16 +361,16 @@ pub fn read_state_at(path: &Path) -> Result<State> {
 
 /// Serialize and write the state file. The path is derived from
 /// `state.axelar_id` so callers don't need to track it.
-pub fn save_state(state: &State) -> Result<()> {
+pub async fn save_state(state: &State) -> Result<()> {
     let path = state_path(state.axelar_id.as_str())?;
-    save_state_at(state, &path)
+    save_state_at(state, &path).await
 }
 
-pub fn save_state_at(state: &State, path: &Path) -> Result<()> {
+pub async fn save_state_at(state: &State, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        tokio::fs::create_dir_all(parent).await?;
     }
-    fs::write(path, serde_json::to_string_pretty(state)? + "\n")?;
+    tokio::fs::write(path, serde_json::to_string_pretty(state)? + "\n").await?;
     Ok(())
 }
 

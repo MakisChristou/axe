@@ -26,7 +26,7 @@ use eyre::Result;
 async fn run_deploy(command: cli::DeployCommands) -> Result<()> {
     match command {
         cli::DeployCommands::Init => commands::init::run().await,
-        cli::DeployCommands::Status { axelar_id } => commands::status::run(axelar_id),
+        cli::DeployCommands::Status { axelar_id } => commands::status::run(axelar_id).await,
         cli::DeployCommands::Run {
             axelar_id,
             private_key,
@@ -43,7 +43,7 @@ async fn run_deploy(command: cli::DeployCommands) -> Result<()> {
             )
             .await
         }
-        cli::DeployCommands::Reset { axelar_id } => commands::reset::run(axelar_id),
+        cli::DeployCommands::Reset { axelar_id } => commands::reset::run(axelar_id).await,
     }
 }
 
@@ -193,7 +193,8 @@ async fn run_load_test(
         private_key,
         source_rpc,
         destination_rpc,
-    )?;
+    )
+    .await?;
     commands::load_test::run(commands::load_test::LoadTestArgs {
         config,
         network,
@@ -238,15 +239,8 @@ async fn run_test(
             timeout_secs,
         } => {
             let network = cli::resolve_network(global_network, config.as_deref())?;
-            commands::test_express::run_config(
-                config,
-                network,
-                chains,
-                source_tx,
-                recent,
-                timeout_secs,
-            )
-            .await
+            commands::test_express::run_config(network, chains, source_tx, recent, timeout_secs)
+                .await
         }
     }
 }

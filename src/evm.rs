@@ -1,5 +1,5 @@
-use std::fs;
-
+use alloy::signers::k256::PublicKey;
+use alloy::signers::k256::elliptic_curve::sec1::ToEncodedPoint;
 use alloy::{
     hex,
     network::{Network, ReceiptResponse},
@@ -278,8 +278,9 @@ pub fn get_salt_from_key(key: &str) -> FixedBytes<32> {
     keccak256(&encoded)
 }
 
-pub fn read_artifact_bytecode(artifact_path: &str) -> Result<Vec<u8>> {
-    let artifact: Value = serde_json::from_str(&fs::read_to_string(artifact_path)?)?;
+pub async fn read_artifact_bytecode(artifact_path: &str) -> Result<Vec<u8>> {
+    let content = tokio::fs::read_to_string(artifact_path).await?;
+    let artifact: Value = serde_json::from_str(&content)?;
     let bytecode_hex = artifact["bytecode"]
         .as_str()
         .ok_or_else(|| eyre::eyre!("no bytecode field in artifact"))?;
@@ -290,9 +291,6 @@ pub fn read_artifact_bytecode(artifact_path: &str) -> Result<Vec<u8>> {
 
 /// Convert an ECDSA public key (compressed or uncompressed) to an EVM address.
 pub fn pubkey_to_address(pubkey_bytes: &[u8]) -> Result<Address> {
-    use alloy::signers::k256::PublicKey;
-    use alloy::signers::k256::elliptic_curve::sec1::ToEncodedPoint;
-
     let pubkey =
         PublicKey::from_sec1_bytes(pubkey_bytes).map_err(|e| eyre::eyre!("invalid pubkey: {e}"))?;
 

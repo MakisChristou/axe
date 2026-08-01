@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
+use tokio::task::spawn_blocking;
 
 /// Print a step header: "[5/23] Deploying AxelarGateway..."
 pub fn step_header(current: usize, total: usize, name: &str) {
@@ -90,19 +91,30 @@ pub fn action_required(lines: &[&str]) {
     println!();
 }
 
-/// Ask the user to confirm an action on stdin: "  {prompt} [y/N] ".
-/// Returns true only on an explicit yes. A non-interactive stdin (no TTY)
-/// returns false — callers should require an explicit bypass flag there.
-pub fn confirm(prompt: &str) -> bool {
+/// Ask the user to confirm an action on stdin.
+///
+/// Returns false when stdin is not interactive.
+pub async fn confirm(prompt: &str) -> bool {
+    let prompt = prompt.to_string();
+
+    spawn_blocking(move || confirm_blocking(&prompt))
+        .await
+        .unwrap_or(false)
+}
+
+fn confirm_blocking(prompt: &str) -> bool {
     if !io::stdin().is_terminal() {
         return false;
     }
+
     print!("  {} {} ", prompt.bold(), "[y/N]".dimmed());
     let _ = io::stdout().flush();
     let mut input = String::new();
+
     if io::stdin().read_line(&mut input).is_err() {
         return false;
     }
+
     matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 

@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::PathBuf;
 
 use alloy::signers::local::PrivateKeySigner;
@@ -71,7 +70,7 @@ async fn print_axelar_balance(target_json: &std::path::Path, axelar_address: &st
     if !target_json.exists() {
         return Ok(());
     }
-    let (lcd, _, fee_denom, _) = read_axelar_config(target_json)?;
+    let (lcd, _, fee_denom, _) = read_axelar_config(target_json).await?;
     let url = format!("{lcd}/cosmos/bank/v1beta1/balances/{axelar_address}");
     match reqwest::get(&url).await {
         Ok(response) => {
@@ -147,7 +146,7 @@ pub async fn run() -> Result<()> {
         chain_entry["explorer"] = json!({ "name": name, "url": url });
     }
 
-    let content = fs::read_to_string(&target_json)?;
+    let content = tokio::fs::read_to_string(&target_json).await?;
     let mut root: Value = serde_json::from_str(&content)?;
     let chains = root
         .get_mut("chains")
@@ -161,7 +160,7 @@ pub async fn run() -> Result<()> {
         ));
     } else {
         chains.insert(axelar_id.clone(), chain_entry);
-        fs::write(&target_json, serde_json::to_string_pretty(&root)? + "\n")?;
+        tokio::fs::write(&target_json, serde_json::to_string_pretty(&root)? + "\n").await?;
         ui::success(&format!(
             "added chain '{axelar_id}' to {}",
             target_json.display()
@@ -170,7 +169,7 @@ pub async fn run() -> Result<()> {
 
     // --- State file ---
     let dir = data_dir()?;
-    fs::create_dir_all(&dir)?;
+    tokio::fs::create_dir_all(&dir).await?;
 
     let mut state = State {
         axelar_id: ChainKey::new(axelar_id.clone()),
@@ -198,7 +197,7 @@ pub async fn run() -> Result<()> {
 
     ui::section("State");
     let state_file = state_path(&axelar_id)?;
-    save_state(&state)?;
+    save_state(&state).await?;
     ui::kv("state file", &state_file.display().to_string());
     ui::success(&format!("init complete for '{axelar_id}' (env={env})"));
 

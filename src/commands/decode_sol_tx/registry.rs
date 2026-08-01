@@ -1,6 +1,7 @@
 //! Pure data lookups: program IDs, instruction discriminators, account-role
 //! labels, anchor event discriminators. No I/O, no formatting — just tables.
 
+use anchor_lang::Discriminator;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 
@@ -303,7 +304,6 @@ pub(super) fn account_labels(ix_name: &str) -> &'static [&'static str] {
 pub use anchor_lang::event::EVENT_IX_TAG_LE;
 
 pub fn event_name(discriminator: &[u8]) -> Option<&'static str> {
-    use anchor_lang::Discriminator;
     if discriminator.len() < 8 {
         return None;
     }

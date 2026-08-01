@@ -31,7 +31,7 @@ use super::config::parse_sui_addr;
 use super::rpc::{SuiClient, object_ref_from_json, owner_addr_hex};
 use super::tx::{PtbBuilder, sign_and_submit};
 use super::wallet::SuiWallet;
-use crate::config::ChainsConfig;
+use crate::config::{ChainContract, ChainsConfig};
 
 /// Sui's well-known shared `Clock` object id (`0x6`).
 pub const SUI_CLOCK_ADDR_HEX: &str =
@@ -61,18 +61,18 @@ pub struct SuiItsContractsConfig {
 /// config. The Example contract bundles a separate ItsSingleton (vs.
 /// GmpSingleton) so we read both fresh here even though some are duplicated
 /// in `SuiContractsConfig`.
-pub fn read_sui_its_config(
+pub async fn read_sui_its_config(
     config: &std::path::Path,
     chain_id: &str,
 ) -> Result<SuiItsContractsConfig> {
-    let config = ChainsConfig::load(config)?;
+    let config = ChainsConfig::load(config).await?;
     let chain = config.chain(chain_id)?;
-    let example = chain.contract("Example", chain_id)?;
+    let example = chain.contract(ChainContract::Example, chain_id)?;
     let example_objects = example
         .objects
         .as_ref()
         .ok_or_else(|| eyre!("missing Example.objects for sui chain '{chain_id}'"))?;
-    let its = chain.contract("InterchainTokenService", chain_id)?;
+    let its = chain.contract(ChainContract::InterchainTokenService, chain_id)?;
     let its_objects = its.objects.as_ref().ok_or_else(|| {
         eyre!("missing InterchainTokenService.objects for sui chain '{chain_id}'")
     })?;
@@ -107,7 +107,7 @@ pub fn read_sui_its_config(
         )?,
         gateway_object: parse_sui_addr(
             chain
-                .contract("AxelarGateway", chain_id)?
+                .contract(ChainContract::AxelarGateway, chain_id)?
                 .objects
                 .as_ref()
                 .and_then(|objects| objects.gateway.as_deref())
@@ -117,7 +117,7 @@ pub fn read_sui_its_config(
         )?,
         gas_service_object: parse_sui_addr(
             chain
-                .contract("GasService", chain_id)?
+                .contract(ChainContract::GasService, chain_id)?
                 .objects
                 .as_ref()
                 .and_then(|objects| objects.gas_service.as_deref())

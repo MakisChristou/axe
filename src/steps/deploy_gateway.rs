@@ -1,5 +1,3 @@
-use std::fs;
-
 use alloy::{
     hex,
     network::TransactionBuilder,
@@ -28,7 +26,7 @@ struct GatewayDeploymentRecord {
     verifier_set_id: String,
 }
 
-fn write_gateway_config(ctx: &DeployContext, record: &GatewayDeploymentRecord) -> Result<()> {
+async fn write_gateway_config(ctx: &DeployContext, record: &GatewayDeploymentRecord) -> Result<()> {
     let mut data = serde_json::Map::new();
     data.insert("address".into(), json!(format!("{}", record.proxy)));
     data.insert(
@@ -57,6 +55,7 @@ fn write_gateway_config(ctx: &DeployContext, record: &GatewayDeploymentRecord) -
         "AxelarGateway",
         Value::Object(data),
     )
+    .await
 }
 
 async fn deploy_gateway_proxy<P: Provider>(
@@ -67,7 +66,7 @@ async fn deploy_gateway_proxy<P: Provider>(
     proxy_artifact: &str,
 ) -> Result<alloy::primitives::Address> {
     ui::info("deploying AxelarAmplifierGatewayProxy...");
-    let mut deploy_code = read_artifact_bytecode(proxy_artifact)?;
+    let mut deploy_code = read_artifact_bytecode(proxy_artifact).await?;
     deploy_code
         .extend_from_slice(&(implementation, owner, setup_params.clone()).abi_encode_params());
     let tx = TransactionRequest::default()
@@ -120,7 +119,7 @@ pub async fn run(
         .wallet(signer)
         .connect_http(ctx.rpc_url.parse()?);
 
-    let domain_separator = compute_domain_separator(&ctx.target_json, &ctx.axelar_id)?;
+    let domain_separator = compute_domain_separator(&ctx.target_json, &ctx.axelar_id).await?;
 
     // How many past verifier sets the gateway accepts proofs from after a
     // rotation. 15 means a rotation is reversible for 15 cycles before the
@@ -147,7 +146,7 @@ pub async fn run(
         (addr, keccak256(&code))
     } else {
         ui::info("deploying AxelarAmplifierGateway implementation...");
-        let impl_bytecode = read_artifact_bytecode(impl_artifact)?;
+        let impl_bytecode = read_artifact_bytecode(impl_artifact).await?;
         let mut impl_deploy_code = impl_bytecode.clone();
         impl_deploy_code.extend_from_slice(
             &(
@@ -174,14 +173,14 @@ pub async fn run(
 
         // Save implementation address to step so retries skip re-deployment
         ctx.state.steps[step_idx].set_implementation_address(addr)?;
-        save_state(&ctx.state)?;
+        save_state(&ctx.state).await?;
 
         (addr, codehash)
     };
 
     // --- Fetch verifier set from Axelar chain ---
     let chain_axelar_id = {
-        let content = fs::read_to_string(&ctx.target_json)?;
+        let content = tokio::fs::read_to_string(&ctx.target_json).await?;
         let root: Value = serde_json::from_str(&content)?;
         root.pointer(&format!("/chains/{}/axelarId", ctx.axelar_id))
             .and_then(|v| v.as_str())
@@ -218,4 +217,5 @@ pub async fn run(
             verifier_set_id,
         },
     )
+    .await
 }

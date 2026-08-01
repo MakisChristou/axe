@@ -3,8 +3,6 @@
 //! networks the message is wrapped in a governance proposal and the user
 //! has to vote it through.
 
-use std::fs;
-
 use base64::Engine;
 use eyre::Result;
 use serde_json::{Value, json};
@@ -43,37 +41,40 @@ struct InstantiatePlan {
     codes: ChainCodeIds,
 }
 
-fn read_chain_contract_addresses(ctx: &DeployContext) -> Result<ChainContractAddresses> {
-    read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Router/address")?;
+async fn read_chain_contract_addresses(ctx: &DeployContext) -> Result<ChainContractAddresses> {
+    read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Router/address").await?;
     Ok(ChainContractAddresses {
         coordinator: read_axelar_contract_field(
             &ctx.target_json,
             "/axelar/contracts/Coordinator/address",
-        )?,
-        rewards: read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Rewards/address")?,
+        )
+        .await?,
+        rewards: read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Rewards/address")
+            .await?,
         multisig: read_axelar_contract_field(
             &ctx.target_json,
             "/axelar/contracts/Multisig/address",
-        )?,
+        )
+        .await?,
         codec: read_axelar_contract_field(
             &ctx.target_json,
             "/axelar/contracts/ChainCodecEvm/address",
-        )?,
-        governance: read_axelar_contract_field(&ctx.target_json, "/axelar/governanceAddress")?,
+        )
+        .await?,
+        governance: read_axelar_contract_field(&ctx.target_json, "/axelar/governanceAddress")
+            .await?,
     })
 }
 
 async fn fetch_chain_code_ids(ctx: &DeployContext, lcd: &str) -> Result<ChainCodeIds> {
     ui::info("fetching code IDs...");
-    let hash = |contract| {
-        read_axelar_contract_field(
-            &ctx.target_json,
-            &format!("/axelar/contracts/{contract}/storeCodeProposalCodeHash"),
-        )
-    };
-    let gateway = lcd_fetch_code_id(lcd, &hash("Gateway")?).await?;
-    let verifier = lcd_fetch_code_id(lcd, &hash("VotingVerifier")?).await?;
-    let prover = lcd_fetch_code_id(lcd, &hash("MultisigProver")?).await?;
+    let gateway_hash = read_code_hash(ctx, "Gateway").await?;
+    let verifier_hash = read_code_hash(ctx, "VotingVerifier").await?;
+    let prover_hash = read_code_hash(ctx, "MultisigProver").await?;
+
+    let gateway = lcd_fetch_code_id(lcd, &gateway_hash).await?;
+    let verifier = lcd_fetch_code_id(lcd, &verifier_hash).await?;
+    let prover = lcd_fetch_code_id(lcd, &prover_hash).await?;
     ui::kv(
         "code IDs",
         &format!("gateway={gateway}, verifier={verifier}, prover={prover}"),
@@ -85,6 +86,12 @@ async fn fetch_chain_code_ids(ctx: &DeployContext, lcd: &str) -> Result<ChainCod
     })
 }
 
+async fn read_code_hash(ctx: &DeployContext, contract: &str) -> Result<String> {
+    let pointer = format!("/axelar/contracts/{contract}/storeCodeProposalCodeHash");
+
+    read_axelar_contract_field(&ctx.target_json, &pointer).await
+}
+
 fn contract_admin(env: &str) -> &'static str {
     match env {
         "devnet-amplifier" => "axelar1zlr7e5qf3sz7yf890rkh9tcnu87234k6k7ytd9",
@@ -94,13 +101,14 @@ fn contract_admin(env: &str) -> &'static str {
     }
 }
 
-fn build_instantiate_plan(
+async fn build_instantiate_plan(
     ctx: &DeployContext,
     tx: &StepTxContext<'_>,
     addresses: &ChainContractAddresses,
     codes: ChainCodeIds,
 ) -> Result<InstantiatePlan> {
-    let root: Value = serde_json::from_str(&fs::read_to_string(&ctx.target_json)?)?;
+    let content = tokio::fs::read_to_string(&ctx.target_json).await?;
+    let root: Value = serde_json::from_str(&content)?;
     let verifier = root
         .pointer(&format!(
             "/axelar/contracts/VotingVerifier/{}",
@@ -116,8 +124,11 @@ fn build_instantiate_plan(
     let salt_key = ctx.state.cosm_salt.clone();
     let salt =
         base64::engine::general_purpose::STANDARD.encode(get_salt_from_key(&salt_key).as_slice());
-    let domain_separator =
-        alloy::hex::encode(compute_domain_separator(&ctx.target_json, &ctx.axelar_id)?.as_slice());
+    let domain_separator = alloy::hex::encode(
+        compute_domain_separator(&ctx.target_json, &ctx.axelar_id)
+            .await?
+            .as_slice(),
+    );
     let admin = contract_admin(tx.env);
     let deployment_name = format!(
         "{}-{}-{}-{}",
@@ -194,12 +205,13 @@ fn build_instantiate_plan(
     })
 }
 
-fn save_instantiate_plan(
+async fn save_instantiate_plan(
     ctx: &DeployContext,
     chain_axelar_id: &str,
     plan: &InstantiatePlan,
 ) -> Result<()> {
-    let mut root: Value = serde_json::from_str(&fs::read_to_string(&ctx.target_json)?)?;
+    let content = tokio::fs::read_to_string(&ctx.target_json).await?;
+    let mut root: Value = serde_json::from_str(&content)?;
     let coordinator = root
         .pointer_mut("/axelar/contracts/Coordinator")
         .and_then(Value::as_object_mut)
@@ -246,10 +258,11 @@ fn save_instantiate_plan(
             }),
         );
     }
-    fs::write(
+    tokio::fs::write(
         &ctx.target_json,
         serde_json::to_string_pretty(&root)? + "\n",
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
@@ -258,9 +271,9 @@ pub(super) async fn run_instantiate(ctx: &mut DeployContext, tx: StepTxContext<'
         "instantiating chain contracts for {}...",
         tx.chain_axelar_id
     ));
-    let addresses = read_chain_contract_addresses(ctx)?;
+    let addresses = read_chain_contract_addresses(ctx).await?;
     let codes = fetch_chain_code_ids(ctx, tx.lcd).await?;
-    let plan = build_instantiate_plan(ctx, &tx, &addresses, codes)?;
+    let plan = build_instantiate_plan(ctx, &tx, &addresses, codes).await?;
     let json_str = serde_json::to_string_pretty(&plan.execute_msg)?;
     ui::info(&format!(
         "execute msg: {}",
@@ -277,6 +290,7 @@ pub(super) async fn run_instantiate(ctx: &mut DeployContext, tx: StepTxContext<'
             &ctx.target_json,
             "/axelar/govProposalExpeditedDepositAmount",
         )
+        .await
         .unwrap_or_else(|_| DEFAULT_PROPOSAL_DEPOSIT_UAXL.to_string());
         let title = format!("Instantiate chain contracts for {}", tx.chain_axelar_id);
         let summary = format!(
@@ -305,7 +319,7 @@ pub(super) async fn run_instantiate(ctx: &mut DeployContext, tx: StepTxContext<'
         messages,
     )
     .await?;
-    save_instantiate_plan(ctx, tx.chain_axelar_id, &plan)?;
+    save_instantiate_plan(ctx, tx.chain_axelar_id, &plan).await?;
     if tx.use_governance {
         let proposal_id = extract_proposal_id(&tx_resp)?;
         ui::kv("proposal submitted", &proposal_id.to_string());

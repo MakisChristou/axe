@@ -93,29 +93,29 @@ async fn resolve_in(
                 path.display()
             ));
         }
-        if path.exists() {
+        if tokio::fs::try_exists(&path).await? {
             return Ok(ConfigSource::Checkout(path));
         }
         return Err(eyre!("chains config '{}' does not exist", path.display()));
     }
 
     let sibling = sibling_info_dir.join(format!("{network}.json"));
-    if sibling.exists() {
+    if tokio::fs::try_exists(&sibling).await? {
         return Ok(ConfigSource::Checkout(sibling));
     }
 
     let cached = cache_dir.join(format!("{network}.json"));
-    if is_fresh(&cached) {
+    if is_fresh(&cached).await {
         return Ok(ConfigSource::Cached(cached));
     }
 
     let url = format!("{base_url}/{network}.json");
     match fetch_validated(&url).await {
         Ok(body) => {
-            write_atomic(&cached, &body)?;
+            write_atomic(&cached, &body).await?;
             Ok(ConfigSource::Cached(cached))
         }
-        Err(e) if cached.exists() => {
+        Err(e) if tokio::fs::try_exists(&cached).await? => {
             ui::warn(&format!(
                 "fetch of {url} failed ({e}); using cached config from {}; \
                  delete it or pass --config to refresh",
@@ -134,9 +134,10 @@ async fn resolve_in(
 }
 
 /// True when `path` exists and was written within [`CACHE_TTL`].
-fn is_fresh(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
+async fn is_fresh(path: &Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .and_then(|metadata| metadata.modified())
         .ok()
         .and_then(|mtime| mtime.elapsed().ok())
         .is_some_and(|age| age < CACHE_TTL)
@@ -153,18 +154,18 @@ async fn fetch_validated(url: &str) -> Result<String> {
 
 /// Write via a pid-suffixed temp file + rename so a concurrent axe process
 /// never observes a partially written cache entry.
-fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+async fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| eyre!("cache path {} has no parent directory", path.display()))?;
-    std::fs::create_dir_all(parent)?;
+    tokio::fs::create_dir_all(parent).await?;
     let tmp = parent.join(format!(
         "{}.tmp.{}",
         path.file_name().unwrap_or_default().to_string_lossy(),
         std::process::id()
     ));
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, path)?;
+    tokio::fs::write(&tmp, contents).await?;
+    tokio::fs::rename(&tmp, path).await?;
     Ok(())
 }
 
@@ -172,6 +173,7 @@ fn write_atomic(path: &Path, contents: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::future::Future;
     use std::time::SystemTime;
 
     /// A guaranteed-dead endpoint: connecting to port 1 on localhost is
@@ -219,94 +221,95 @@ mod tests {
             .expect("set mtime");
     }
 
-    async fn resolve_dead(dir: &TempDir, explicit: Option<PathBuf>) -> Result<ConfigSource> {
-        resolve_in(
+    fn block_on<F: Future>(future: F) -> F::Output {
+        tokio::runtime::Runtime::new().unwrap().block_on(future)
+    }
+
+    fn resolve_dead(dir: &TempDir, explicit: Option<PathBuf>) -> Result<ConfigSource> {
+        block_on(resolve_in(
             Network::Testnet,
             explicit,
             &dir.path.join("sibling"),
             &dir.path.join("cache"),
             DEAD_URL,
-        )
-        .await
+        ))
     }
 
-    #[tokio::test]
-    async fn explicit_path_naming_other_network_bails() {
+    #[test]
+    fn explicit_path_naming_other_network_bails() {
         let dir = TempDir::new("axe-cfg-mismatch");
         let other = dir.path.join("mainnet.json");
         std::fs::write(&other, "{}").unwrap();
-        let err = resolve_dead(&dir, Some(other)).await.unwrap_err();
+        let err = resolve_dead(&dir, Some(other)).unwrap_err();
         assert!(err.to_string().contains("targets mainnet"), "{err}");
     }
 
-    #[tokio::test]
-    async fn explicit_wins_over_sibling() {
+    #[test]
+    fn explicit_wins_over_sibling() {
         let dir = TempDir::new("explicit-wins");
         let explicit = dir.file("explicit.json", MINIMAL);
         dir.file("sibling/testnet.json", MINIMAL);
 
-        let src = resolve_dead(&dir, Some(explicit.clone())).await.unwrap();
+        let src = resolve_dead(&dir, Some(explicit.clone())).unwrap();
         match src {
             ConfigSource::Checkout(p) => assert_eq!(p, explicit),
             other => panic!("expected Checkout, got {other:?}"),
         }
     }
 
-    #[tokio::test]
-    async fn explicit_but_missing_errors() {
+    #[test]
+    fn explicit_but_missing_errors() {
         let dir = TempDir::new("explicit-missing");
         dir.file("sibling/testnet.json", MINIMAL);
 
-        let err = resolve_dead(&dir, Some(dir.path.join("nope.json")))
-            .await
-            .unwrap_err();
+        let err = resolve_dead(&dir, Some(dir.path.join("nope.json"))).unwrap_err();
         assert!(err.to_string().contains("does not exist"), "{err}");
     }
 
-    #[tokio::test]
-    async fn sibling_beats_fresh_cache_without_http() {
+    #[test]
+    fn sibling_beats_fresh_cache_without_http() {
         let dir = TempDir::new("sibling-wins");
         let sibling = dir.file("sibling/testnet.json", MINIMAL);
         dir.file("cache/testnet.json", MINIMAL);
 
         // DEAD_URL proves no HTTP is attempted on this path.
-        let src = resolve_dead(&dir, None).await.unwrap();
+        let src = resolve_dead(&dir, None).unwrap();
         match src {
             ConfigSource::Checkout(p) => assert_eq!(p, sibling),
             other => panic!("expected Checkout, got {other:?}"),
         }
     }
 
-    #[tokio::test]
-    async fn fresh_cache_hits_without_http() {
+    #[test]
+    fn fresh_cache_hits_without_http() {
         let dir = TempDir::new("fresh-cache");
         let cached = dir.file("cache/testnet.json", MINIMAL);
 
-        let src = resolve_dead(&dir, None).await.unwrap();
+        let src = resolve_dead(&dir, None).unwrap();
         match src {
             ConfigSource::Cached(p) => assert_eq!(p, cached),
             other => panic!("expected Cached, got {other:?}"),
         }
     }
 
-    #[tokio::test]
-    async fn stale_cache_survives_dead_fetch() {
+    #[test]
+    fn stale_cache_survives_dead_fetch() {
         let dir = TempDir::new("stale-cache");
         let cached = dir.file("cache/testnet.json", MINIMAL);
         backdate(&cached, 25 * 60 * 60);
 
-        let src = resolve_dead(&dir, None).await.unwrap();
+        let src = resolve_dead(&dir, None).unwrap();
         match src {
             ConfigSource::Cached(p) => assert_eq!(p, cached),
             other => panic!("expected Cached, got {other:?}"),
         }
     }
 
-    #[tokio::test]
-    async fn no_cache_dead_fetch_names_escape_hatches() {
+    #[test]
+    fn no_cache_dead_fetch_names_escape_hatches() {
         let dir = TempDir::new("all-fail");
 
-        let err = resolve_dead(&dir, None).await.unwrap_err();
+        let err = resolve_dead(&dir, None).unwrap_err();
         let msg = err.to_string();
         let sibling = dir.path.join("sibling/testnet.json");
         let cached = dir.path.join("cache/testnet.json");
@@ -320,8 +323,8 @@ mod tests {
         let dir = TempDir::new("atomic");
         let target = dir.path.join("cache/testnet.json");
 
-        write_atomic(&target, "first").unwrap();
-        write_atomic(&target, "second").unwrap();
+        block_on(write_atomic(&target, "first")).unwrap();
+        block_on(write_atomic(&target, "second")).unwrap();
 
         assert_eq!(fs::read_to_string(&target).unwrap(), "second");
         let names: Vec<_> = fs::read_dir(target.parent().unwrap())
@@ -346,21 +349,20 @@ mod tests {
     /// Live fetch of the real testnet config from GitHub. Replaces the old
     /// sibling-checkout-dependent `loads_real_testnet_json` in `config.rs`.
     /// Run manually after schema bumps with `cargo test -- --ignored`.
-    #[tokio::test]
+    #[test]
     #[ignore = "network"]
-    async fn fetches_and_parses_real_testnet_json() {
+    fn fetches_and_parses_real_testnet_json() {
         let dir = TempDir::new("live");
-        let src = resolve_in(
+        let src = block_on(resolve_in(
             Network::Testnet,
             None,
             &dir.path.join("sibling"),
             &dir.path.join("cache"),
             BASE_URL,
-        )
-        .await
+        ))
         .expect("live fetch resolves");
 
-        let cfg = ChainsConfig::load(src.path()).expect("testnet.json loads + parses");
+        let cfg = block_on(ChainsConfig::load(src.path())).expect("testnet.json loads + parses");
         assert!(cfg.chains.contains_key("hedera"), "hedera chain present");
         assert!(cfg.chains.contains_key("solana"), "solana chain present");
         assert!(cfg.axelar.lcd.is_some(), "axelar.lcd present");

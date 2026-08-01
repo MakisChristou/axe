@@ -10,12 +10,13 @@ use eyre::Result;
 use serde_json::{Value, json};
 
 use crate::commands::deploy::DeployContext;
+use crate::config::ChainContract;
 use crate::evm::{LegacyProxy, read_artifact_bytecode};
 use crate::state::{Step, save_state};
 use crate::ui;
 use crate::utils::{read_contract_address, update_target_json};
 
-fn write_contract_config(
+async fn write_contract_config(
     ctx: &DeployContext,
     step_name: &str,
     proxy_addr: alloy::primitives::Address,
@@ -35,6 +36,7 @@ fn write_contract_config(
         step_name,
         Value::Object(data),
     )
+    .await
 }
 
 async fn initialize_proxy<P: Provider>(
@@ -89,7 +91,8 @@ pub async fn run(
         .connect_http(ctx.rpc_url.parse()?);
 
     // Read the gas collector address (= Operators contract)
-    let gas_collector = read_contract_address(&ctx.target_json, &ctx.axelar_id, "Operators")?;
+    let gas_collector =
+        read_contract_address(&ctx.target_json, &ctx.axelar_id, ChainContract::Operators).await?;
     ui::address("gas collector (Operators)", &format!("{gas_collector}"));
 
     // --- Tx 1: Deploy implementation (skip if already deployed) ---
@@ -106,7 +109,7 @@ pub async fn run(
         addr
     } else {
         ui::info("deploying AxelarGasService implementation...");
-        let impl_bytecode = read_artifact_bytecode(impl_artifact)?;
+        let impl_bytecode = read_artifact_bytecode(impl_artifact).await?;
         let mut impl_deploy_code = impl_bytecode.clone();
         impl_deploy_code.extend_from_slice(&gas_collector.abi_encode());
 
@@ -131,7 +134,7 @@ pub async fn run(
 
         // Save to state so retries skip re-deployment
         ctx.state.steps[step_idx].set_implementation_address(addr)?;
-        save_state(&ctx.state)?;
+        save_state(&ctx.state).await?;
         addr
     };
 
@@ -145,7 +148,7 @@ pub async fn run(
         addr
     } else {
         ui::info("deploying AxelarGasServiceProxy...");
-        let proxy_bytecode = read_artifact_bytecode(proxy_artifact)?;
+        let proxy_bytecode = read_artifact_bytecode(proxy_artifact).await?;
 
         let tx = TransactionRequest::default().with_deploy_code(Bytes::from(proxy_bytecode));
         let receipt = provider.send_transaction(tx).await?.get_receipt().await?;
@@ -165,7 +168,7 @@ pub async fn run(
 
         // Save to state so retries skip re-deployment
         ctx.state.steps[step_idx].set_proxy_address(addr)?;
-        save_state(&ctx.state)?;
+        save_state(&ctx.state).await?;
         addr
     };
 
@@ -179,4 +182,5 @@ pub async fn run(
         deployer_addr,
         gas_collector,
     )
+    .await
 }

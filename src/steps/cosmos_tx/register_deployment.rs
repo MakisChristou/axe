@@ -33,14 +33,16 @@ pub(super) async fn run_register_deployment(
     ui::info(&format!("registering deployment for {chain_axelar_id}..."));
 
     let coordinator_addr =
-        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Coordinator/address")?;
+        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Coordinator/address")
+            .await?;
     let governance_address =
-        read_axelar_contract_field(&ctx.target_json, "/axelar/governanceAddress")?;
+        read_axelar_contract_field(&ctx.target_json, "/axelar/governanceAddress").await?;
 
     let deployment_name = read_axelar_contract_field(
         &ctx.target_json,
         &format!("/axelar/contracts/Coordinator/deployments/{chain_axelar_id}/deploymentName"),
-    )?;
+    )
+    .await?;
 
     let execute_msg = json!({
         "register_deployment": {
@@ -60,6 +62,7 @@ pub(super) async fn run_register_deployment(
             &ctx.target_json,
             "/axelar/govProposalExpeditedDepositAmount",
         )
+        .await
         .unwrap_or_else(|_| DEFAULT_PROPOSAL_DEPOSIT_UAXL.to_string());
         let title = format!("Register {chain_axelar_id} deployment on Coordinator");
         vec![build_submit_proposal_any(

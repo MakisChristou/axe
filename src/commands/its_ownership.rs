@@ -9,6 +9,7 @@ use eyre::{Result, WrapErr};
 use futures::stream::{self, StreamExt};
 use serde_json::{Value, json};
 use stellar_strkey::ed25519::PublicKey as StellarPublicKey;
+use tokio::task::spawn_blocking;
 
 use crate::config::{ChainConfig, ChainsConfig, ContractEntry};
 use crate::config_source;
@@ -300,7 +301,7 @@ struct OwnershipFields {
 
 pub async fn run(network: Network, json_output: bool) -> Result<()> {
     let config_path = config_source::resolve(network, None).await?.into_path();
-    let config = ChainsConfig::load(&config_path)?;
+    let config = ChainsConfig::load(&config_path).await?;
     let entries = collect_its_entries(&config, network);
 
     if entries.is_empty() {
@@ -331,7 +332,11 @@ pub async fn run(network: Network, json_output: bool) -> Result<()> {
     if json_output {
         render_json(network, &config_path, &rows)?;
     } else {
-        render_table(&rows);
+        let hyperlinks = spawn_blocking(terminal_hyperlinks_enabled)
+            .await
+            .unwrap_or(false);
+
+        render_table(&rows, hyperlinks);
         render_summary(&rows);
     }
 
@@ -791,11 +796,10 @@ impl OwnershipRow {
     }
 }
 
-fn render_table(rows: &[OwnershipRow]) {
+fn render_table(rows: &[OwnershipRow], hyperlinks: bool) {
     let mut table = Table::new();
     table.load_preset(comfy_table::presets::UTF8_FULL);
     table.set_content_arrangement(ContentArrangement::Dynamic);
-    let hyperlinks = terminal_hyperlinks_enabled();
     let mut links = Vec::new();
     table.set_header(vec![
         header_cell("#"),

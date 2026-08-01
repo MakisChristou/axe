@@ -6,7 +6,7 @@ use crate::commands::deploy::DeployContext;
 use crate::evm::Ownable;
 use crate::state::{Step, StepKind};
 use crate::ui;
-use crate::utils::{patch_target_json, read_contract_address};
+use crate::utils::{patch_target_json, read_contract_address_by_name};
 
 pub async fn run(ctx: &DeployContext, step: &Step, private_key: &str) -> Result<()> {
     let signer: PrivateKeySigner = private_key.parse()?;
@@ -26,7 +26,8 @@ pub async fn run(ctx: &DeployContext, step: &Step, private_key: &str) -> Result<
         }
     };
 
-    let contract_addr = read_contract_address(&ctx.target_json, &ctx.axelar_id, contract_name)?;
+    let contract_addr =
+        read_contract_address_by_name(&ctx.target_json, &ctx.axelar_id, contract_name).await?;
     let ownable = Ownable::new(contract_addr, &provider);
 
     ui::info(&format!(
@@ -45,7 +46,7 @@ pub async fn run(ctx: &DeployContext, step: &Step, private_key: &str) -> Result<
 
     let mut patches = Map::new();
     patches.insert("owner".into(), json!(format!("{new_owner}")));
-    patch_target_json(&ctx.target_json, &ctx.axelar_id, contract_name, &patches)?;
+    patch_target_json(&ctx.target_json, &ctx.axelar_id, contract_name, &patches).await?;
 
     Ok(())
 }

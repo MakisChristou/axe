@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::PathBuf;
 
 use alloy::{
@@ -11,6 +10,7 @@ use eyre::Result;
 use serde_json::{Value, json};
 
 use crate::commands::deploy::DeployContext;
+use crate::config::ChainContract;
 use crate::evm::{
     ConstAddressDeployer, Create3Deployer, broadcast_and_log, get_salt_from_key,
     read_artifact_bytecode,
@@ -66,7 +66,7 @@ struct ItsFactoryDeployment {
     proxy: Address,
 }
 
-fn record_its_deployer(
+async fn record_its_deployer(
     ctx: &mut DeployContext,
     step_idx: usize,
     step: &Step,
@@ -80,11 +80,11 @@ fn record_its_deployer(
             ui::info("clearing stale helper addresses from step state...");
             ctx.state.steps[step_idx].clear_its_helper_addresses()?;
             ctx.state.steps[step_idx].set_its_address("itsDeployer", deployer)?;
-            save_state(&ctx.state)?;
+            save_state(&ctx.state).await?;
         }
     } else {
         ctx.state.steps[step_idx].set_its_address("itsDeployer", deployer)?;
-        save_state(&ctx.state)?;
+        save_state(&ctx.state).await?;
     }
     Ok(ctx.state.steps[step_idx].clone())
 }
@@ -96,14 +96,33 @@ async fn prepare_its_plan<P: Provider>(
     deployer: Address,
     provider: &P,
 ) -> Result<ItsDeploymentPlan> {
-    let step = record_its_deployer(ctx, step_idx, step, deployer)?;
-    let const_deployer =
-        read_contract_address(&ctx.target_json, &ctx.axelar_id, "ConstAddressDeployer")?;
-    let create3_deployer =
-        read_contract_address(&ctx.target_json, &ctx.axelar_id, "Create3Deployer")?;
-    let gateway = read_contract_address(&ctx.target_json, &ctx.axelar_id, "AxelarGateway")?;
-    let gas_service = read_contract_address(&ctx.target_json, &ctx.axelar_id, "AxelarGasService")?;
-    let root: Value = serde_json::from_str(&fs::read_to_string(&ctx.target_json)?)?;
+    let step = record_its_deployer(ctx, step_idx, step, deployer).await?;
+    let const_deployer = read_contract_address(
+        &ctx.target_json,
+        &ctx.axelar_id,
+        ChainContract::ConstAddressDeployer,
+    )
+    .await?;
+    let create3_deployer = read_contract_address(
+        &ctx.target_json,
+        &ctx.axelar_id,
+        ChainContract::Create3Deployer,
+    )
+    .await?;
+    let gateway = read_contract_address(
+        &ctx.target_json,
+        &ctx.axelar_id,
+        ChainContract::AxelarGateway,
+    )
+    .await?;
+    let gas_service = read_contract_address(
+        &ctx.target_json,
+        &ctx.axelar_id,
+        ChainContract::AxelarGasService,
+    )
+    .await?;
+    let content = tokio::fs::read_to_string(&ctx.target_json).await?;
+    let root: Value = serde_json::from_str(&content)?;
     let chain_axelar_id = root
         .pointer(&format!("/chains/{}/axelarId", ctx.axelar_id))
         .and_then(Value::as_str)
@@ -184,14 +203,14 @@ async fn deploy_named_helper<P: Provider>(
         Create2Deployment {
             deployer: plan.deployer,
             name: deployment.name,
-            bytecode: read_artifact_bytecode(&plan.artifact(deployment.artifact))?,
+            bytecode: read_artifact_bytecode(&plan.artifact(deployment.artifact)).await?,
             constructor_args: deployment.constructor_args,
             salt: plan.helper_salt,
             step: &plan.step,
         },
     )
     .await?;
-    save_its_address(ctx, step_idx, deployment.name, address)?;
+    save_its_address(ctx, step_idx, deployment.name, address).await?;
     Ok(address)
 }
 
@@ -299,18 +318,20 @@ async fn deploy_its_service<P: Provider>(
             name: "InterchainTokenServiceImpl",
             bytecode: read_artifact_bytecode(
                 &plan.artifact("InterchainTokenService.sol/InterchainTokenService.json"),
-            )?,
+            )
+            .await?,
             constructor_args: Some(constructor_args),
             salt: plan.implementation_salt,
             step: &plan.step,
         },
     )
     .await?;
-    save_its_address(ctx, step_idx, "InterchainTokenServiceImpl", implementation)?;
+    save_its_address(ctx, step_idx, "InterchainTokenServiceImpl", implementation).await?;
 
     ui::section("deploying InterchainTokenService proxy");
     let proxy_bytecode =
-        read_artifact_bytecode(&plan.artifact("proxies/InterchainProxy.sol/InterchainProxy.json"))?;
+        read_artifact_bytecode(&plan.artifact("proxies/InterchainProxy.sol/InterchainProxy.json"))
+            .await?;
     let setup_params: Bytes = Bytes::from(
         (
             plan.deployer,
@@ -352,21 +373,23 @@ async fn deploy_its_factory<P: Provider>(
             name: "InterchainTokenFactoryImpl",
             bytecode: read_artifact_bytecode(
                 &plan.artifact("InterchainTokenFactory.sol/InterchainTokenFactory.json"),
-            )?,
+            )
+            .await?,
             constructor_args: Some(plan.its_proxy.abi_encode()),
             salt: plan.implementation_salt,
             step: &plan.step,
         },
     )
     .await?;
-    save_its_address(ctx, step_idx, "InterchainTokenFactoryImpl", implementation)?;
+    save_its_address(ctx, step_idx, "InterchainTokenFactoryImpl", implementation).await?;
 
     ui::section("deploying InterchainTokenFactory proxy");
     let proxy = deploy_via_create3(
         &Create3Deployer::new(plan.create3_deployer, provider),
         provider,
         "InterchainTokenFactoryProxy",
-        read_artifact_bytecode(&plan.artifact("proxies/InterchainProxy.sol/InterchainProxy.json"))?,
+        read_artifact_bytecode(&plan.artifact("proxies/InterchainProxy.sol/InterchainProxy.json"))
+            .await?,
         (implementation, plan.deployer, Bytes::new()).abi_encode_params(),
         plan.factory_salt,
         plan.factory_proxy,
@@ -379,7 +402,7 @@ async fn deploy_its_factory<P: Provider>(
     })
 }
 
-fn save_its_deployment(
+async fn save_its_deployment(
     ctx: &DeployContext,
     plan: &ItsDeploymentPlan,
     helpers: &ItsHelpers,
@@ -387,9 +410,12 @@ fn save_its_deployment(
     factory: &ItsFactoryDeployment,
 ) -> Result<()> {
     ui::section("saving ITS contract data to target JSON");
-    let predeploy_codehash = keccak256(read_artifact_bytecode(
-        &plan.artifact("InterchainTokenService.sol/InterchainTokenService.json"),
-    )?);
+    let predeploy_codehash = keccak256(
+        read_artifact_bytecode(
+            &plan.artifact("InterchainTokenService.sol/InterchainTokenService.json"),
+        )
+        .await?,
+    );
     update_target_json(
         &ctx.target_json,
         &ctx.axelar_id,
@@ -408,7 +434,8 @@ fn save_its_deployment(
             "predeployCodehash": format!("{predeploy_codehash}"),
             "owner": format!("{}", plan.deployer),
         }),
-    )?;
+    )
+    .await?;
     update_target_json(
         &ctx.target_json,
         &ctx.axelar_id,
@@ -419,7 +446,8 @@ fn save_its_deployment(
             "implementation": format!("{}", factory.implementation),
             "address": format!("{}", factory.proxy),
         }),
-    )?;
+    )
+    .await?;
     ui::success("ITS deployment complete!");
     ui::address("InterchainTokenService", &format!("{}", service.proxy));
     ui::address("InterchainTokenFactory", &format!("{}", factory.proxy));
@@ -444,7 +472,7 @@ pub async fn run(
     let service = deploy_its_service(ctx, step_idx, &plan, &helpers, &provider).await?;
 
     let factory = deploy_its_factory(ctx, step_idx, &plan, &provider).await?;
-    save_its_deployment(ctx, &plan, &helpers, &service, &factory)
+    save_its_deployment(ctx, &plan, &helpers, &service, &factory).await
 }
 
 /// Deploy a contract via CREATE2 using ConstAddressDeployer.
@@ -560,13 +588,13 @@ async fn deploy_via_create3<P: Provider>(
 }
 
 /// Save an intermediate address to the step state for idempotent retries.
-fn save_its_address(
+async fn save_its_address(
     ctx: &mut DeployContext,
     step_idx: usize,
     name: &str,
     addr: Address,
 ) -> Result<()> {
     ctx.state.steps[step_idx].set_its_address(name, addr)?;
-    save_state(&ctx.state)?;
+    save_state(&ctx.state).await?;
     Ok(())
 }

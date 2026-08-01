@@ -176,8 +176,8 @@ pub fn lookup_name(network: Network, addr: &str) -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 
-fn resolve_chain_axelar_id(config_path: &Path, chain_input: &str) -> Result<String> {
-    let content = std::fs::read_to_string(config_path)?;
+async fn resolve_chain_axelar_id(config_path: &Path, chain_input: &str) -> Result<String> {
+    let content = tokio::fs::read_to_string(config_path).await?;
     let root: Value = serde_json::from_str(&content)?;
     let chains = root
         .get("chains")
@@ -435,11 +435,12 @@ fn print_verifiers_table(
 pub async fn run(network: Network, chain: String, json_mode: bool) -> Result<()> {
     let known_verifiers = verifiers_for_network(network)?;
     let config_path = config_source::resolve(network, None).await?.into_path();
-    let chain_axelar_id = resolve_chain_axelar_id(&config_path, &chain)?;
+    let chain_axelar_id = resolve_chain_axelar_id(&config_path, &chain).await?;
 
-    let (lcd, _chain_id, _fee_denom, _gas_price) = read_axelar_config(&config_path)?;
+    let (lcd, _chain_id, _fee_denom, _gas_price) = read_axelar_config(&config_path).await?;
     let service_registry_addr =
-        read_axelar_contract_field(&config_path, "/axelar/contracts/ServiceRegistry/address")?;
+        read_axelar_contract_field(&config_path, "/axelar/contracts/ServiceRegistry/address")
+            .await?;
 
     if !json_mode {
         ui::section(&format!("Verifiers: {} / {}", network, chain_axelar_id));

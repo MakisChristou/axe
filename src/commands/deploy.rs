@@ -68,7 +68,7 @@ async fn check_deployment_balances(ctx: &DeployContext) -> Result<()> {
             wallets.push((label, signer.address()));
         }
     }
-    let config = crate::config::ChainsConfig::load(&ctx.target_json)?;
+    let config = crate::config::ChainsConfig::load(&ctx.target_json).await?;
     let token_symbol = config
         .chains
         .get(&ctx.axelar_id)
@@ -177,7 +177,7 @@ async fn execute_step(ctx: &mut DeployContext, execution: StepExecution<'_>) -> 
             .await
         }
         StepKind::PredictAddress => steps::predict_address::run(ctx).await,
-        StepKind::ConfigEdit => steps::config_edit::run(ctx),
+        StepKind::ConfigEdit => steps::config_edit::run(ctx).await,
         StepKind::CosmosTx { .. } => steps::cosmos_tx::run(ctx, execution.step, step_name).await,
         StepKind::CosmosPoll { .. } => steps::cosmos_poll::run(ctx, execution.step).await,
         StepKind::CosmosQuery => steps::cosmos_query::run(ctx).await,
@@ -226,13 +226,13 @@ pub async fn run(
         commands::init::run().await?;
     }
 
-    let mut state = read_state(&axelar_id)?;
+    let mut state = read_state(&axelar_id).await?;
 
     // Migrate: append any new steps added since this state was created
     migrate_steps(&mut state);
 
     load_its_environment(&mut state);
-    save_state(&state)?;
+    save_state(&state).await?;
 
     let rpc_url = state.rpc_url.clone();
     let target_json = state.target_json.clone();
@@ -295,7 +295,7 @@ pub async fn run(
         .await?;
 
         mark_step_completed(&mut ctx.state, step_idx);
-        save_state(&ctx.state)?;
+        save_state(&ctx.state).await?;
         ui::success(&format!(
             "{step_name} completed ({})",
             ui::format_elapsed(step_start)

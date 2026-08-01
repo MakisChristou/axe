@@ -64,15 +64,16 @@ pub(super) async fn run_create_reward_pools(
     ui::info(&format!("creating reward pools for {chain_axelar_id}..."));
 
     let rewards_addr =
-        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Rewards/address")?;
+        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Rewards/address").await?;
     let governance_address =
-        read_axelar_contract_field(&ctx.target_json, "/axelar/governanceAddress")?;
+        read_axelar_contract_field(&ctx.target_json, "/axelar/governanceAddress").await?;
     let multisig_addr =
-        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Multisig/address")?;
+        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Multisig/address").await?;
     let voting_verifier_addr = read_axelar_contract_field(
         &ctx.target_json,
         &format!("/axelar/contracts/VotingVerifier/{chain_axelar_id}/address"),
-    )?;
+    )
+    .await?;
 
     let [msg1, msg2] =
         reward_pool_messages(env, chain_axelar_id, &voting_verifier_addr, &multisig_addr);
@@ -90,6 +91,7 @@ pub(super) async fn run_create_reward_pools(
             &ctx.target_json,
             "/axelar/govProposalExpeditedDepositAmount",
         )
+        .await
         .unwrap_or_else(|_| DEFAULT_PROPOSAL_DEPOSIT_UAXL.to_string());
         let title = format!("Create reward pools for {chain_axelar_id}");
         let summary =
@@ -149,13 +151,14 @@ pub(super) async fn run_add_rewards(ctx: &DeployContext, tx: StepTxContext<'_>) 
     ui::info(&format!("adding rewards for {chain_axelar_id}..."));
 
     let rewards_addr =
-        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Rewards/address")?;
+        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Rewards/address").await?;
     let multisig_addr =
-        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Multisig/address")?;
+        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Multisig/address").await?;
     let voting_verifier_addr = read_axelar_contract_field(
         &ctx.target_json,
         &format!("/axelar/contracts/VotingVerifier/{chain_axelar_id}/address"),
-    )?;
+    )
+    .await?;
 
     let reward_amount = DEFAULT_REWARD_AMOUNT_UAXL;
     let funds = vec![ProtoCoin {

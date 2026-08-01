@@ -12,14 +12,19 @@ use alloy::{
     providers::Provider,
 };
 use eyre::Result;
+use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::Keypair;
+use tokio::task::spawn_blocking;
 
 use super::cache::{ItsTestCache, save_cache};
 use super::encoding::{encode_inner_deploy, encode_receive_from_hub, encode_send_to_hub_deploy};
 use super::relay::{DestinationRelayRequest, HubRelayRequest, relay_to_destination, relay_to_hub};
+use super::{DEST_CHAIN, TOTAL_STEPS};
 use crate::commands::event_extractors::generate_salt;
 use crate::commands::test_helpers::CosmosTxContext;
 use crate::evm::{ERC20, InterchainTokenService};
 use crate::timing::{DEST_CHAIN_POLL_ATTEMPTS, DEST_CHAIN_POLL_INTERVAL};
+use crate::types::Network;
 use crate::ui;
 
 const PHASE_A_STEPS: usize = 11;
@@ -63,11 +68,27 @@ struct SourceDeployment {
     payload_hash: FixedBytes<32>,
 }
 
-fn deploy_source_token<P: Provider>(
-    request: &PhaseADeployRequest<'_, P>,
-) -> Result<SourceDeployment> {
+struct SourceDeploymentRequest {
+    network: Network,
+    source_rpc: String,
+    keypair: Keypair,
+    public_key: Pubkey,
+    destination_chain: String,
+    gas_value: u64,
+}
+
+fn deploy_source_token(request: SourceDeploymentRequest) -> Result<SourceDeployment> {
+    let SourceDeploymentRequest {
+        network,
+        source_rpc,
+        keypair,
+        public_key,
+        destination_chain,
+        gas_value,
+    } = request;
+
     let salt = generate_salt().0;
-    let token_id = crate::solana::interchain_token_id(request.network, &request.sol_pubkey, &salt);
+    let token_id = crate::solana::interchain_token_id(network, &public_key, &salt);
     ui::step_header(1, PHASE_A_STEPS, "Generate salt + tokenId");
     ui::kv("salt", &format!("0x{}", alloy::hex::encode(salt)));
     ui::kv("tokenId", &format!("0x{}", alloy::hex::encode(token_id)));
@@ -76,9 +97,9 @@ fn deploy_source_token<P: Provider>(
     let spec = crate::types::ITS_CONFIG_SPEC;
     let local_signature = crate::solana::send_its_deploy_interchain_token(
         crate::solana::DeployInterchainTokenRequest {
-            rpc_url: request.src_rpc,
-            keypair: request.sol_keypair,
-            network: request.network,
+            rpc_url: &source_rpc,
+            keypair: &keypair,
+            network,
             salt: &salt,
             name: spec.name,
             symbol: spec.symbol,
@@ -98,19 +119,19 @@ fn deploy_source_token<P: Provider>(
         "Deploy remote interchain token (Solana → hub)",
     );
     let remote_signature = crate::solana::send_its_deploy_remote_interchain_token(
-        request.src_rpc,
-        request.sol_keypair,
-        request.network,
+        &source_rpc,
+        &keypair,
+        network,
         &salt,
-        request.dst_axelar_id.as_str(),
-        request.gas_value,
+        &destination_chain,
+        gas_value,
     )?;
     ui::tx_hash("solana tx", &remote_signature);
     let message_id =
-        crate::solana::extract_its_message_id(request.src_rpc, request.network, &remote_signature)?;
+        crate::solana::extract_its_message_id(&source_rpc, network, &remote_signature)?;
     ui::kv("first-leg message_id", &message_id);
     let gateway =
-        crate::solana::extract_gateway_call_contract_payload(request.src_rpc, &remote_signature)?;
+        crate::solana::extract_gateway_call_contract_payload(&source_rpc, &remote_signature)?;
     ui::kv("gateway sender", &gateway.sender);
     ui::kv("gateway destination_chain", &gateway.destination_chain);
     ui::kv("gateway destination_address", &gateway.destination_address);
@@ -123,7 +144,7 @@ fn deploy_source_token<P: Provider>(
         &format!("{} bytes", gateway.payload.len()),
     );
     let reconstructed = encode_send_to_hub_deploy(
-        request.dst_axelar_id.as_str(),
+        &destination_chain,
         &token_id,
         spec.name,
         spec.symbol,
@@ -178,7 +199,7 @@ async fn verify_and_cache_destination<P: Provider>(
         token_id_hex: format!("0x{}", alloy::hex::encode(deployment.token_id)),
         dest_token_address: format!("{dest_token_addr}"),
     };
-    if let Err(error) = save_cache(request.cache_file, &cache) {
+    if let Err(error) = save_cache(request.cache_file, &cache).await {
         ui::warn(&format!(
             "failed to write cache to {}: {error}",
             request.cache_file.display()
@@ -196,7 +217,17 @@ pub(super) async fn run_phase_a_deploy<P: Provider>(
     request: PhaseADeployRequest<'_, P>,
 ) -> Result<([u8; 32], Address)> {
     ui::section("Phase A: deploy local + remote (manual relay)");
-    let deployment = deploy_source_token(&request)?;
+
+    let deployment_request = SourceDeploymentRequest {
+        network: request.network,
+        source_rpc: request.src_rpc.to_string(),
+        keypair: crate::solana::clone_keypair(request.sol_keypair),
+        public_key: request.sol_pubkey,
+        destination_chain: request.dst_axelar_id.to_string(),
+        gas_value: request.gas_value,
+    };
+    let deployment = spawn_blocking(move || deploy_source_token(deployment_request)).await??;
+
     let spec = crate::types::ITS_CONFIG_SPEC;
 
     // Step A4: drive source → hub via existing relay_to_hub helper
@@ -267,9 +298,6 @@ pub(super) async fn poll_for_remote_token_deploy<P: Provider>(
     dest_its_addr: Address,
     token_id: FixedBytes<32>,
 ) -> Result<Address> {
-    use super::DEST_CHAIN;
-    use super::TOTAL_STEPS;
-
     let dest_its = InterchainTokenService::new(dest_its_addr, dest_provider);
 
     ui::step_header(

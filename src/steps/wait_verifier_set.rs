@@ -1,5 +1,3 @@
-use std::fs;
-
 use eyre::Result;
 use serde_json::{Value, json};
 
@@ -155,7 +153,7 @@ async fn update_or_wait_for_verifier_set(request: VerifierSetUpdate<'_>) -> Resu
 }
 
 pub async fn run(ctx: &DeployContext) -> Result<()> {
-    let content = fs::read_to_string(&ctx.target_json)?;
+    let content = tokio::fs::read_to_string(&ctx.target_json).await?;
     let root: Value = serde_json::from_str(&content)?;
     let chain_axelar_id = root
         .pointer(&format!("/chains/{}/axelarId", ctx.axelar_id))
@@ -167,18 +165,21 @@ pub async fn run(ctx: &DeployContext) -> Result<()> {
     let prover_addr = read_axelar_contract_field(
         &ctx.target_json,
         &format!("/axelar/contracts/MultisigProver/{chain_axelar_id}/address"),
-    )?;
+    )
+    .await?;
     let verifier_addr = read_axelar_contract_field(
         &ctx.target_json,
         &format!("/axelar/contracts/VotingVerifier/{chain_axelar_id}/address"),
-    )?;
+    )
+    .await?;
     let multisig_addr =
-        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Multisig/address")?;
+        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Multisig/address").await?;
     let service_registry_addr = read_axelar_contract_field(
         &ctx.target_json,
         "/axelar/contracts/ServiceRegistry/address",
-    )?;
-    let (lcd, chain_id, fee_denom, gas_price) = read_axelar_config(&ctx.target_json)?;
+    )
+    .await?;
+    let (lcd, chain_id, fee_denom, gas_price) = read_axelar_config(&ctx.target_json).await?;
     let env = ctx.state.env;
 
     // Check if verifier set already exists

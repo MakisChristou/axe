@@ -5,6 +5,7 @@ use alloy::{
 };
 use eyre::Result;
 use solana_sdk::{pubkey::Pubkey, signer::Signer};
+use tokio::task::spawn_blocking;
 
 use crate::commands::load_test::{make_executable_payload, memo_program_id};
 use crate::evm::{ContractCall, SenderReceiver};
@@ -98,7 +99,7 @@ pub async fn send_evm_call_contract<P: Provider>(
 /// The message id comes back from the gateway log via
 /// `extract_its_message_id`, falling back to `<sig>-1.1` if the log isn't
 /// indexable yet.
-pub fn send_svm_call_contract(
+pub async fn send_svm_call_contract(
     src_rpc: &str,
     network: crate::types::Network,
     destination_chain: &str,
@@ -106,7 +107,7 @@ pub fn send_svm_call_contract(
     step_idx: usize,
     total_steps: usize,
 ) -> Result<SentGmp> {
-    let keypair = load_keypair(None)?;
+    let keypair = load_keypair(None).await?;
 
     let (destination_address, payload_bytes) = match destination_address {
         None => {
@@ -128,18 +129,29 @@ pub fn send_svm_call_contract(
     ui::step_header(step_idx, total_steps, "Send callContract");
     ui::kv("destination address", &destination_address);
 
-    let (_sig, metrics) = send_call_contract(
-        src_rpc,
-        &keypair,
-        network,
-        destination_chain,
-        &destination_address,
-        &payload_bytes,
-    )?;
+    let source_address = keypair.pubkey().to_string();
+    let source_rpc = src_rpc.to_string();
+    let destination_chain = destination_chain.to_string();
+    let send_destination_chain = destination_chain.clone();
+    let send_destination = destination_address.clone();
+    let send_payload = payload_bytes.clone();
+    let (metrics, message_id) = spawn_blocking(move || {
+        let (_, metrics) = send_call_contract(
+            &source_rpc,
+            &keypair,
+            network,
+            &send_destination_chain,
+            &send_destination,
+            &send_payload,
+        )?;
+        let raw_sig = metrics.signature.clone();
+        let message_id = extract_its_message_id(&source_rpc, network, &raw_sig)
+            .unwrap_or_else(|_| format!("{raw_sig}-1.1"));
 
+        Ok::<_, eyre::Report>((metrics, message_id))
+    })
+    .await??;
     let raw_sig = metrics.signature.clone();
-    let message_id = extract_its_message_id(src_rpc, network, &raw_sig)
-        .unwrap_or_else(|_| format!("{raw_sig}-1.1"));
 
     ui::tx_hash("tx", &raw_sig);
     ui::kv("message_id", &message_id);
@@ -156,9 +168,9 @@ pub fn send_svm_call_contract(
     // see consistent state. No separate finality barrier needed.
 
     Ok(SentGmp {
-        destination_chain: destination_chain.to_string(),
+        destination_chain,
         destination_address,
-        source_address: keypair.pubkey().to_string(),
+        source_address,
         message_id,
         payload_bytes,
         payload_hash,

@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use chrono::{DateTime, Utc};
 use comfy_table::{Cell, ContentArrangement, Table};
 use eyre::Result;
 use serde_json::{Value, json};
@@ -14,8 +15,8 @@ const SUPPORTED_NETWORKS: &[crate::types::Network] = &[
     crate::types::Network::Mainnet,
 ];
 
-fn resolve_chain_axelar_id(config_path: &Path, chain_input: &str) -> Result<String> {
-    let content = std::fs::read_to_string(config_path)?;
+async fn resolve_chain_axelar_id(config_path: &Path, chain_input: &str) -> Result<String> {
+    let content = tokio::fs::read_to_string(config_path).await?;
     let root: Value = serde_json::from_str(&content)?;
     let chains = root
         .get("chains")
@@ -47,8 +48,8 @@ fn resolve_chain_axelar_id(config_path: &Path, chain_input: &str) -> Result<Stri
     ))
 }
 
-fn read_axelar_rpc_from(config_path: &Path) -> Result<String> {
-    let content = std::fs::read_to_string(config_path)?;
+async fn read_axelar_rpc_from(config_path: &Path) -> Result<String> {
+    let content = tokio::fs::read_to_string(config_path).await?;
     let root: Value = serde_json::from_str(&content)?;
     root.pointer("/axelar/rpc")
         .and_then(|v| v.as_str())
@@ -77,7 +78,6 @@ fn vote_label(v: &str) -> &'static str {
 /// Format an ISO-8601 timestamp as a compact "X ago" string relative to now.
 /// Returns "-" if the timestamp can't be parsed.
 fn relative_time(iso: &str) -> String {
-    use chrono::{DateTime, Utc};
     let parsed: Option<DateTime<Utc>> = iso.parse::<DateTime<Utc>>().ok().or_else(|| {
         DateTime::parse_from_rfc3339(iso)
             .ok()
@@ -345,11 +345,13 @@ pub async fn run(
     }
 
     let config_path = config_source::resolve(network, None).await?.into_path();
-    let chain_axelar_id = resolve_chain_axelar_id(&config_path, &chain)?;
-    let rpc = read_axelar_rpc_from(&config_path)?;
+    let chain_axelar_id = resolve_chain_axelar_id(&config_path, &chain).await?;
+    let rpc = read_axelar_rpc_from(&config_path).await?;
 
     let vv_pointer = format!("/axelar/contracts/VotingVerifier/{chain_axelar_id}/address");
-    let vv_addr = read_axelar_contract_field(&config_path, &vv_pointer).map_err(|_| {
+    let vv_addr = read_axelar_contract_field(&config_path, &vv_pointer)
+        .await
+        .map_err(|_| {
         eyre::eyre!(
             "no VotingVerifier address for chain '{chain_axelar_id}' on {network}. Is it Amplifier?"
         )

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+message_file=$1
+
+if grep -qi '^Co-Authored-By:.*Claude' "$message_file"; then
+    echo "Do not add a Claude co-author line."
+    exit 1
+fi
+
+if grep -n ';' "$message_file"; then
+    echo "Commit messages must not contain semicolons."
+    exit 1
+fi
+
+if LC_ALL=C grep -n '[^	 -~]' "$message_file"; then
+    echo "Commit messages must use plain ASCII text."
+    exit 1
+fi

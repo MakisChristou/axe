@@ -5,6 +5,7 @@ use alloy::rpc::types::Filter;
 use eyre::Result;
 use owo_colors::OwoColorize;
 use serde::Serialize;
+use serde_json::json;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -25,7 +26,7 @@ struct EvmContractEntry {
     address: Address,
 }
 
-fn discover_contracts(
+async fn discover_contracts(
     network: Network,
     config_path: &Path,
     chain: &str,
@@ -39,7 +40,7 @@ fn discover_contracts(
 
     let mut entries = Vec::new();
 
-    let Ok(config_content) = std::fs::read_to_string(config_path) else {
+    let Ok(config_content) = tokio::fs::read_to_string(config_path).await else {
         return entries;
     };
     let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_content) else {
@@ -169,7 +170,7 @@ pub async fn run(
     json_mode: bool,
 ) -> Result<()> {
     let config_path = config_source::resolve(network, None).await?.into_path();
-    let contracts = discover_contracts(network, &config_path, &chain, contract_filter);
+    let contracts = discover_contracts(network, &config_path, &chain, contract_filter).await;
 
     if contracts.is_empty() {
         return Err(eyre::eyre!(
@@ -367,8 +368,6 @@ fn params_to_json(params: &[(String, DynSolValue)]) -> serde_json::Value {
 }
 
 fn sol_value_to_json(value: &DynSolValue) -> serde_json::Value {
-    use serde_json::json;
-
     match value {
         DynSolValue::Bool(b) => json!(b),
         DynSolValue::Uint(u, _) => json!(format!("{u}")),

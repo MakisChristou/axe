@@ -5,6 +5,7 @@ use alloy::{
 };
 use eyre::Result;
 use solana_axelar_std::{CrossChainId, Message};
+use tokio::task::spawn_blocking;
 
 use crate::evm::{AxelarAmplifierGateway, SenderReceiver};
 use crate::solana::{
@@ -144,7 +145,7 @@ pub struct SvmExecutionRequest<'a> {
     pub total_steps: usize,
 }
 
-pub fn approve_and_execute_svm(request: SvmExecutionRequest<'_>) -> Result<()> {
+pub async fn approve_and_execute_svm(request: SvmExecutionRequest<'_>) -> Result<()> {
     let SvmExecutionRequest {
         dst_rpc,
         network,
@@ -161,23 +162,41 @@ pub fn approve_and_execute_svm(request: SvmExecutionRequest<'_>) -> Result<()> {
         total_steps,
     } = request;
     ui::step_header(step_idx_approve, total_steps, "Approve on Solana gateway");
-    let keypair = load_keypair(None)?;
+    let keypair = load_keypair(None).await?;
     let execute_data = decode_execute_data(execute_data_hex)?;
-    approve_messages_on_gateway(dst_rpc, &keypair, network, &execute_data)?;
 
-    ui::step_header(step_idx_execute, total_steps, "Execute on destination");
-    let gmp_message = Message {
-        cc_id: CrossChainId {
-            chain: source_chain.to_string(),
-            id: message_id.to_string(),
-        },
-        source_address: source_address.to_string(),
-        destination_chain: destination_chain.to_string(),
-        destination_address: destination_address.to_string(),
-        payload_hash: payload_hash.0,
-    };
+    let destination_rpc = dst_rpc.to_string();
+    let source_chain = source_chain.to_string();
+    let source_address = source_address.to_string();
+    let destination_chain = destination_chain.to_string();
+    let destination_address = destination_address.to_string();
+    let message_id = message_id.to_string();
+    let payload_bytes = payload_bytes.to_vec();
+    let memo_sig = spawn_blocking(move || {
+        approve_messages_on_gateway(&destination_rpc, &keypair, network, &execute_data)?;
 
-    let memo_sig = execute_on_memo(dst_rpc, &keypair, network, gmp_message, payload_bytes)?;
+        ui::step_header(step_idx_execute, total_steps, "Execute on destination");
+
+        let gmp_message = Message {
+            cc_id: CrossChainId {
+                chain: source_chain,
+                id: message_id,
+            },
+            source_address,
+            destination_chain,
+            destination_address,
+            payload_hash: payload_hash.0,
+        };
+
+        execute_on_memo(
+            &destination_rpc,
+            &keypair,
+            network,
+            gmp_message,
+            &payload_bytes,
+        )
+    })
+    .await??;
     ui::tx_hash("execute", &memo_sig.to_string());
 
     Ok(())
