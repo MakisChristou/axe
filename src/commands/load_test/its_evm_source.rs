@@ -479,15 +479,53 @@ pub(super) async fn distribute_tokens<P: Provider>(
             continue;
         }
 
-        let call = token.transfer(signer.address(), amount_per_key);
-        let pending = call
-            .send()
-            .await
-            .map_err(|e| eyre!("failed to transfer tokens to key {i}: {e}"))?;
-        pending
-            .get_receipt()
-            .await
-            .map_err(|e| eyre!("token transfer to key {i} failed: {e}"))?;
+        // Hedera 429s its JSON-RPC relay hard — even on a private RPC (a light
+        // burst reproduces ~25% rejections) — so both the send and the receipt
+        // poll must ride out transient rate-limits. A rejected send never
+        // submitted the tx (nonce not consumed), so retrying it can't
+        // double-transfer.
+        const DISTRIBUTE_MAX_SEND_ATTEMPTS: u32 = 5;
+        let mut attempt = 0u32;
+        let pending = loop {
+            match token
+                .transfer(signer.address(), amount_per_key)
+                .send()
+                .await
+            {
+                Ok(p) => break p,
+                Err(e)
+                    if attempt + 1 < DISTRIBUTE_MAX_SEND_ATTEMPTS
+                        && is_retryable_send_error(&e.to_string()) =>
+                {
+                    ui::warn(&format!(
+                        "distribute to key {i} rejected (transient) — retrying in {}ms: {e}",
+                        500u64 << attempt
+                    ));
+                    tokio::time::sleep(Duration::from_millis(500u64 << attempt)).await;
+                    attempt += 1;
+                }
+                Err(e) => return Err(eyre!("failed to transfer tokens to key {i}: {e}")),
+            }
+        };
+
+        // Poll the receipt ourselves so a 429 mid-poll is retried, not fatal.
+        let tx_hash = *pending.tx_hash();
+        let deadline = Instant::now() + EVM_RECEIPT_TIMEOUT;
+        loop {
+            match provider.get_transaction_receipt(tx_hash).await {
+                Ok(Some(receipt)) if receipt.status() => break,
+                Ok(Some(_)) => {
+                    return Err(eyre!("token transfer to key {i} reverted (status 0x0)"));
+                }
+                _ => {} // still pending, or a transient RPC error — keep polling
+            }
+            if Instant::now() >= deadline {
+                return Err(eyre!(
+                    "token transfer to key {i} receipt not seen in {EVM_RECEIPT_TIMEOUT:?}"
+                ));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
 
         spinner.set_message(format!(
             "distributing tokens ({}/{} done)...",
