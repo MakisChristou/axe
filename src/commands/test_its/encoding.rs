@@ -8,6 +8,7 @@ use alloy::{
     sol_types::SolValue,
 };
 use eyre::Result;
+use solana_axelar_its::encoding::{DeployInterchainToken, HubMessage, Message};
 
 /// Borsh-encode a HubMessage::SendToHub{ DeployInterchainToken } the way the
 /// Solana ITS program does in `gmp::send_to_hub_wrap` + `encoding::HubMessage`.
@@ -20,7 +21,6 @@ pub(super) fn encode_send_to_hub_deploy(
     decimals: u8,
     minter: Option<Vec<u8>>,
 ) -> Result<Vec<u8>> {
-    use solana_axelar_its::encoding::{DeployInterchainToken, HubMessage, Message};
     let inner = Message::DeployInterchainToken(DeployInterchainToken {
         token_id: *token_id,
         name: name.to_string(),

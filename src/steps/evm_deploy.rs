@@ -10,6 +10,7 @@ use eyre::Result;
 use serde_json::{Value, json};
 
 use crate::commands::deploy::DeployContext;
+use crate::config::ChainContract;
 use crate::evm::{ConstAddressDeployer, get_salt_from_key, read_artifact_bytecode};
 use crate::ui;
 use crate::utils::{read_contract_address, update_target_json};
@@ -22,7 +23,7 @@ pub async fn run(
     artifact_path: &str,
     salt: &Option<String>,
 ) -> Result<()> {
-    let bytecode_raw = read_artifact_bytecode(artifact_path)?;
+    let bytecode_raw = read_artifact_bytecode(artifact_path).await?;
 
     let signer: PrivateKeySigner = private_key.parse()?;
     let deployer_addr = signer.address();
@@ -40,8 +41,12 @@ pub async fn run(
         (addr, "create", None)
     } else {
         // deploy-create2
-        let const_deployer_addr =
-            read_contract_address(&ctx.target_json, &ctx.axelar_id, "ConstAddressDeployer")?;
+        let const_deployer_addr = read_contract_address(
+            &ctx.target_json,
+            &ctx.axelar_id,
+            ChainContract::ConstAddressDeployer,
+        )
+        .await?;
         let salt_string = salt.clone().unwrap_or_else(|| ctx.state.cosm_salt.clone());
         let salt_bytes = get_salt_from_key(&salt_string);
 
@@ -102,7 +107,8 @@ pub async fn run(
         &ctx.axelar_id,
         step_name,
         Value::Object(contract_data),
-    )?;
+    )
+    .await?;
 
     Ok(())
 }

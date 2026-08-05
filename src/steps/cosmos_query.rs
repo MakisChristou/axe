@@ -1,5 +1,3 @@
-use std::fs;
-
 use eyre::Result;
 use serde_json::{Value, json};
 
@@ -8,12 +6,13 @@ use crate::cosmos::{lcd_cosmwasm_smart_query, read_axelar_config, read_axelar_co
 use crate::ui;
 
 pub async fn run(ctx: &DeployContext) -> Result<()> {
-    let (lcd, _, _, _) = read_axelar_config(&ctx.target_json)?;
+    let (lcd, _, _, _) = read_axelar_config(&ctx.target_json).await?;
     let coordinator_addr =
-        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Coordinator/address")?;
+        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Coordinator/address")
+            .await?;
 
     let chain_axelar_id = {
-        let content = fs::read_to_string(&ctx.target_json)?;
+        let content = tokio::fs::read_to_string(&ctx.target_json).await?;
         let root: Value = serde_json::from_str(&content)?;
         root.pointer(&format!("/chains/{}/axelarId", ctx.axelar_id))
             .and_then(|v| v.as_str())
@@ -24,7 +23,8 @@ pub async fn run(ctx: &DeployContext) -> Result<()> {
     let deployment_name = read_axelar_contract_field(
         &ctx.target_json,
         &format!("/axelar/contracts/Coordinator/deployments/{chain_axelar_id}/deploymentName"),
-    )?;
+    )
+    .await?;
 
     ui::info(&format!(
         "querying deployed contracts for {chain_axelar_id} (deployment: {deployment_name})..."
@@ -51,7 +51,7 @@ pub async fn run(ctx: &DeployContext) -> Result<()> {
     ui::address("MultisigProver", prover_address);
     ui::address("Gateway", gateway_address);
 
-    let content = fs::read_to_string(&ctx.target_json)?;
+    let content = tokio::fs::read_to_string(&ctx.target_json).await?;
     let mut root: Value = serde_json::from_str(&content)?;
 
     if let Some(vv) = root.pointer_mut(&format!(
@@ -68,10 +68,11 @@ pub async fn run(ctx: &DeployContext) -> Result<()> {
         gw["address"] = json!(gateway_address);
     }
 
-    fs::write(
+    tokio::fs::write(
         &ctx.target_json,
         serde_json::to_string_pretty(&root)? + "\n",
-    )?;
+    )
+    .await?;
     ui::success(&format!("updated {}", ctx.target_json.display()));
 
     Ok(())

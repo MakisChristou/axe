@@ -10,10 +10,70 @@ use eyre::Result;
 use serde_json::{Value, json};
 
 use crate::commands::deploy::DeployContext;
+use crate::config::ChainContract;
 use crate::evm::{LegacyProxy, read_artifact_bytecode};
 use crate::state::{Step, save_state};
 use crate::ui;
 use crate::utils::{read_contract_address, update_target_json};
+
+async fn write_contract_config(
+    ctx: &DeployContext,
+    step_name: &str,
+    proxy_addr: alloy::primitives::Address,
+    impl_addr: alloy::primitives::Address,
+    deployer_addr: alloy::primitives::Address,
+    gas_collector: alloy::primitives::Address,
+) -> Result<()> {
+    let mut data = serde_json::Map::new();
+    data.insert("address".into(), json!(format!("{proxy_addr}")));
+    data.insert("implementation".into(), json!(format!("{impl_addr}")));
+    data.insert("deployer".into(), json!(format!("{deployer_addr}")));
+    data.insert("deploymentMethod".into(), json!("create"));
+    data.insert("collector".into(), json!(format!("{gas_collector}")));
+    update_target_json(
+        &ctx.target_json,
+        &ctx.axelar_id,
+        step_name,
+        Value::Object(data),
+    )
+    .await
+}
+
+async fn initialize_proxy<P: Provider>(
+    provider: &P,
+    proxy_addr: alloy::primitives::Address,
+    impl_addr: alloy::primitives::Address,
+    owner: alloy::primitives::Address,
+) -> Result<()> {
+    let implementation_slot: U256 =
+        "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc".parse()?;
+    let stored = provider
+        .get_storage_at(proxy_addr, implementation_slot)
+        .await?;
+    if stored != U256::ZERO {
+        let stored_impl = alloy::primitives::Address::from_word(stored.into());
+        ui::info(&format!(
+            "proxy already initialized with implementation: {stored_impl}"
+        ));
+        return Ok(());
+    }
+    ui::info(&format!("calling proxy.init({impl_addr}, {owner}, 0x)..."));
+    let receipt = LegacyProxy::new(proxy_addr, provider)
+        .init(impl_addr, owner, Bytes::new())
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    ui::tx_hash("init tx hash", &format!("{}", receipt.transaction_hash));
+    if !receipt.status() {
+        return Err(eyre::eyre!(
+            "proxy init tx {} reverted on-chain",
+            receipt.transaction_hash
+        ));
+    }
+    ui::success("proxy initialized successfully");
+    Ok(())
+}
 
 pub async fn run(
     ctx: &mut DeployContext,
@@ -31,7 +91,8 @@ pub async fn run(
         .connect_http(ctx.rpc_url.parse()?);
 
     // Read the gas collector address (= Operators contract)
-    let gas_collector = read_contract_address(&ctx.target_json, &ctx.axelar_id, "Operators")?;
+    let gas_collector =
+        read_contract_address(&ctx.target_json, &ctx.axelar_id, ChainContract::Operators).await?;
     ui::address("gas collector (Operators)", &format!("{gas_collector}"));
 
     // --- Tx 1: Deploy implementation (skip if already deployed) ---
@@ -48,7 +109,7 @@ pub async fn run(
         addr
     } else {
         ui::info("deploying AxelarGasService implementation...");
-        let impl_bytecode = read_artifact_bytecode(impl_artifact)?;
+        let impl_bytecode = read_artifact_bytecode(impl_artifact).await?;
         let mut impl_deploy_code = impl_bytecode.clone();
         impl_deploy_code.extend_from_slice(&gas_collector.abi_encode());
 
@@ -72,8 +133,8 @@ pub async fn run(
         ui::address("implementation deployed at", &format!("{addr}"));
 
         // Save to state so retries skip re-deployment
-        ctx.state.steps[step_idx].set_implementation_address(addr);
-        save_state(&ctx.state)?;
+        ctx.state.steps[step_idx].set_implementation_address(addr)?;
+        save_state(&ctx.state).await?;
         addr
     };
 
@@ -87,7 +148,7 @@ pub async fn run(
         addr
     } else {
         ui::info("deploying AxelarGasServiceProxy...");
-        let proxy_bytecode = read_artifact_bytecode(proxy_artifact)?;
+        let proxy_bytecode = read_artifact_bytecode(proxy_artifact).await?;
 
         let tx = TransactionRequest::default().with_deploy_code(Bytes::from(proxy_bytecode));
         let receipt = provider.send_transaction(tx).await?.get_receipt().await?;
@@ -106,56 +167,20 @@ pub async fn run(
         ui::address("proxy deployed at", &format!("{addr}"));
 
         // Save to state so retries skip re-deployment
-        ctx.state.steps[step_idx].set_proxy_address(addr);
-        save_state(&ctx.state)?;
+        ctx.state.steps[step_idx].set_proxy_address(addr)?;
+        save_state(&ctx.state).await?;
         addr
     };
 
-    // --- Tx 3: Call proxy.init(implementation, owner, setupParams) ---
-    let eip1967_impl_slot: U256 =
-        "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc".parse()?;
-    let impl_slot = provider
-        .get_storage_at(proxy_addr, eip1967_impl_slot)
-        .await?;
+    initialize_proxy(&provider, proxy_addr, impl_addr, deployer_addr).await?;
 
-    if impl_slot != U256::ZERO {
-        let stored_impl = alloy::primitives::Address::from_word(impl_slot.into());
-        ui::info(&format!(
-            "proxy already initialized with implementation: {stored_impl}"
-        ));
-    } else {
-        ui::info(&format!(
-            "calling proxy.init({impl_addr}, {deployer_addr}, 0x)..."
-        ));
-        let proxy = LegacyProxy::new(proxy_addr, &provider);
-        let init_tx = proxy.init(impl_addr, deployer_addr, Bytes::new());
-
-        let receipt = init_tx.send().await?.get_receipt().await?;
-        ui::tx_hash("init tx hash", &format!("{}", receipt.transaction_hash));
-
-        if !receipt.status() {
-            return Err(eyre::eyre!(
-                "proxy init tx {} reverted on-chain",
-                receipt.transaction_hash
-            ));
-        }
-        ui::success("proxy initialized successfully");
-    }
-
-    // --- Write to target JSON ---
-    let mut contract_data = serde_json::Map::new();
-    contract_data.insert("address".into(), json!(format!("{proxy_addr}")));
-    contract_data.insert("implementation".into(), json!(format!("{impl_addr}")));
-    contract_data.insert("deployer".into(), json!(format!("{deployer_addr}")));
-    contract_data.insert("deploymentMethod".into(), json!("create"));
-    contract_data.insert("collector".into(), json!(format!("{gas_collector}")));
-
-    update_target_json(
-        &ctx.target_json,
-        &ctx.axelar_id,
+    write_contract_config(
+        ctx,
         step_name,
-        Value::Object(contract_data),
-    )?;
-
-    Ok(())
+        proxy_addr,
+        impl_addr,
+        deployer_addr,
+        gas_collector,
+    )
+    .await
 }

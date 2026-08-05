@@ -5,6 +5,7 @@ use alloy::{
 };
 use eyre::Result;
 use solana_axelar_std::{CrossChainId, Message};
+use tokio::task::spawn_blocking;
 
 use crate::evm::{AxelarAmplifierGateway, SenderReceiver};
 use crate::solana::{
@@ -18,21 +19,38 @@ use crate::ui;
 /// address (a SenderReceiver address for the EVM-loopback flow, a Solana
 /// keypair pubkey for sol→evm) — the EVM gateway validates the approval
 /// against this value, so it must match what was emitted at the source.
-#[allow(clippy::too_many_arguments)]
+pub struct EvmExecutionRequest<'a, P> {
+    pub provider: &'a P,
+    pub gateway: Address,
+    pub sender_receiver: Address,
+    pub source_chain: &'a str,
+    pub source_address: &'a str,
+    pub message_id: &'a str,
+    pub execute_data_hex: &'a str,
+    pub payload_bytes: &'a [u8],
+    pub payload_hash: B256,
+    pub step_idx_approve: usize,
+    pub step_idx_execute: usize,
+    pub total_steps: usize,
+}
+
 pub async fn approve_and_execute_evm<P: Provider>(
-    provider: &P,
-    gateway: Address,
-    sender_receiver: Address,
-    source_chain: &str,
-    source_address: &str,
-    message_id: &str,
-    execute_data_hex: &str,
-    payload_bytes: &[u8],
-    payload_hash: B256,
-    step_idx_approve: usize,
-    step_idx_execute: usize,
-    total_steps: usize,
+    request: EvmExecutionRequest<'_, P>,
 ) -> Result<()> {
+    let EvmExecutionRequest {
+        provider,
+        gateway,
+        sender_receiver,
+        source_chain,
+        source_address,
+        message_id,
+        execute_data_hex,
+        payload_bytes,
+        payload_hash,
+        step_idx_approve,
+        step_idx_execute,
+        total_steps,
+    } = request;
     ui::step_header(step_idx_approve, total_steps, "Submit proof to EVM gateway");
     let execute_data = alloy::hex::decode(execute_data_hex)?;
 
@@ -110,40 +128,75 @@ pub async fn approve_and_execute_evm<P: Provider>(
 /// Submit the Amplifier-built `execute_data` to the Solana gateway, then
 /// call the destination program (memo) with the decoded GMP message and
 /// raw payload. Wraps Steps 7-8 of an SVM-destination flow.
-#[allow(clippy::too_many_arguments)]
-pub fn approve_and_execute_svm(
-    dst_rpc: &str,
-    network: crate::types::Network,
-    source_chain: &str,
-    destination_chain: &str,
-    source_address: &str,
-    destination_address: &str,
-    message_id: &str,
-    payload_bytes: &[u8],
-    payload_hash: B256,
-    execute_data_hex: &str,
-    step_idx_approve: usize,
-    step_idx_execute: usize,
-    total_steps: usize,
-) -> Result<()> {
+#[derive(Clone, Copy)]
+pub struct SvmExecutionRequest<'a> {
+    pub dst_rpc: &'a str,
+    pub network: crate::types::Network,
+    pub source_chain: &'a str,
+    pub destination_chain: &'a str,
+    pub source_address: &'a str,
+    pub destination_address: &'a str,
+    pub message_id: &'a str,
+    pub payload_bytes: &'a [u8],
+    pub payload_hash: B256,
+    pub execute_data_hex: &'a str,
+    pub step_idx_approve: usize,
+    pub step_idx_execute: usize,
+    pub total_steps: usize,
+}
+
+pub async fn approve_and_execute_svm(request: SvmExecutionRequest<'_>) -> Result<()> {
+    let SvmExecutionRequest {
+        dst_rpc,
+        network,
+        source_chain,
+        destination_chain,
+        source_address,
+        destination_address,
+        message_id,
+        payload_bytes,
+        payload_hash,
+        execute_data_hex,
+        step_idx_approve,
+        step_idx_execute,
+        total_steps,
+    } = request;
     ui::step_header(step_idx_approve, total_steps, "Approve on Solana gateway");
-    let keypair = load_keypair(None)?;
+    let keypair = load_keypair(None).await?;
     let execute_data = decode_execute_data(execute_data_hex)?;
-    approve_messages_on_gateway(dst_rpc, &keypair, network, &execute_data)?;
 
-    ui::step_header(step_idx_execute, total_steps, "Execute on destination");
-    let gmp_message = Message {
-        cc_id: CrossChainId {
-            chain: source_chain.to_string(),
-            id: message_id.to_string(),
-        },
-        source_address: source_address.to_string(),
-        destination_chain: destination_chain.to_string(),
-        destination_address: destination_address.to_string(),
-        payload_hash: payload_hash.0,
-    };
+    let destination_rpc = dst_rpc.to_string();
+    let source_chain = source_chain.to_string();
+    let source_address = source_address.to_string();
+    let destination_chain = destination_chain.to_string();
+    let destination_address = destination_address.to_string();
+    let message_id = message_id.to_string();
+    let payload_bytes = payload_bytes.to_vec();
+    let memo_sig = spawn_blocking(move || {
+        approve_messages_on_gateway(&destination_rpc, &keypair, network, &execute_data)?;
 
-    let memo_sig = execute_on_memo(dst_rpc, &keypair, network, gmp_message, payload_bytes)?;
+        ui::step_header(step_idx_execute, total_steps, "Execute on destination");
+
+        let gmp_message = Message {
+            cc_id: CrossChainId {
+                chain: source_chain,
+                id: message_id,
+            },
+            source_address,
+            destination_chain,
+            destination_address,
+            payload_hash: payload_hash.0,
+        };
+
+        execute_on_memo(
+            &destination_rpc,
+            &keypair,
+            network,
+            gmp_message,
+            &payload_bytes,
+        )
+    })
+    .await??;
     ui::tx_hash("execute", &memo_sig.to_string());
 
     Ok(())

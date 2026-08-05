@@ -2,6 +2,7 @@ use alloy::{providers::ProviderBuilder, signers::local::PrivateKeySigner};
 use eyre::Result;
 
 use crate::commands::deploy::DeployContext;
+use crate::config::ChainContract;
 use crate::evm::{Operators, broadcast_and_log};
 use crate::ui;
 use crate::utils::read_contract_address;
@@ -12,7 +13,8 @@ pub async fn run(ctx: &DeployContext, private_key: &str) -> Result<()> {
         .wallet(signer)
         .connect_http(ctx.rpc_url.parse()?);
 
-    let operators_addr = read_contract_address(&ctx.target_json, &ctx.axelar_id, "Operators")?;
+    let operators_addr =
+        read_contract_address(&ctx.target_json, &ctx.axelar_id, ChainContract::Operators).await?;
     let operators = Operators::new(operators_addr, &provider);
 
     let operator_addrs = ctx.state.env.axelar_operators();

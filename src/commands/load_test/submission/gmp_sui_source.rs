@@ -1,0 +1,116 @@
+//! Sui GMP transaction submission.
+
+use crate::ui;
+use std::time::Instant;
+
+use super::metrics::{TxMetrics, TxOutcome};
+use super::submitter::TransactionSubmitter;
+use super::units::Mist;
+use crate::sui::{SuiClient, SuiContractsConfig, SuiGmpCall, SuiWallet, send_gmp_call};
+
+/// Cross-chain gas attached to a Sui GMP send.
+pub(super) const DEFAULT_GAS_VALUE: Mist = Mist::new(100_000_000);
+/// On-chain Sui gas budget for executing the PTB itself.
+pub(super) const DEFAULT_GAS_BUDGET: Mist = Mist::new(50_000_000);
+
+pub(super) fn parse_gas_value(value: Option<&str>) -> eyre::Result<Mist> {
+    let gas_value = match value {
+        Some(value) => value
+            .parse()
+            .map_err(|error| eyre::eyre!("invalid --gas-value: {error}"))?,
+        None => DEFAULT_GAS_VALUE.get(),
+    };
+    ui::kv(
+        "cross-chain gas",
+        &format!("{gas_value} mist (paid via Sui GasService)"),
+    );
+    Ok(Mist::new(gas_value))
+}
+
+pub(super) fn parse_payload(value: Option<&str>) -> eyre::Result<Option<Vec<u8>>> {
+    value
+        .map(|value| {
+            hex::decode(value.strip_prefix("0x").unwrap_or(value))
+                .map_err(|error| eyre::eyre!("invalid --payload hex: {error}"))
+        })
+        .transpose()
+}
+
+#[derive(Clone)]
+pub(super) struct GmpSuiSubmitter {
+    pub client: SuiClient,
+    pub wallet: SuiWallet,
+    pub contracts: SuiContractsConfig,
+    pub destination_chain: String,
+    pub destination_address: String,
+    pub gas_value: Mist,
+    pub gas_budget: Mist,
+}
+
+pub(super) struct GmpSuiSubmitJob {
+    pub payload: Vec<u8>,
+}
+
+impl TransactionSubmitter for GmpSuiSubmitter {
+    type Job = GmpSuiSubmitJob;
+
+    async fn submit(&self, job: Self::Job) -> TxMetrics {
+        let send_start = Instant::now();
+        let result = send_gmp_call(
+            &self.client,
+            &self.wallet,
+            &self.contracts,
+            &SuiGmpCall {
+                destination_chain: self.destination_chain.clone(),
+                destination_address: self.destination_address.clone(),
+                payload: job.payload.clone(),
+                gas_value_mist: self.gas_value.get(),
+                gas_budget_mist: self.gas_budget.get(),
+            },
+        )
+        .await;
+
+        match result {
+            Ok(result) if result.success => {
+                let latency_ms = send_start
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
+                TxMetrics {
+                    confirm_time_ms: Some(latency_ms),
+                    latency_ms: Some(latency_ms),
+                    payload: job.payload,
+                    payload_hash: result.payload_hash_hex,
+                    source_address: format!("0x{}", result.source_address_hex),
+                    gmp_destination_chain: self.destination_chain.clone(),
+                    gmp_destination_address: self.destination_address.clone(),
+                    send_instant: Some(send_start),
+                    ..TxMetrics::succeeded(
+                        format!("{}-{}", result.digest, result.event_index),
+                        latency_ms,
+                    )
+                }
+            }
+            Ok(result) => failed_metrics(
+                job.payload,
+                TxOutcome::from_external(false, result.error, "Sui tx failed"),
+            ),
+            Err(error) => failed_metrics(job.payload, TxOutcome::failed(error.to_string())),
+        }
+    }
+}
+
+fn failed_metrics(payload: Vec<u8>, outcome: super::metrics::TxOutcome) -> TxMetrics {
+    TxMetrics {
+        payload,
+        ..TxMetrics::from_outcome("", 0, outcome)
+    }
+}
+
+pub(super) async fn run_sequential(
+    submitter: GmpSuiSubmitter,
+    jobs: Vec<GmpSuiSubmitJob>,
+) -> eyre::Result<super::submitter::BurstResult> {
+    super::submitter::run_serial(submitter, jobs, None).await
+}

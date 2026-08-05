@@ -67,7 +67,7 @@ pub async fn run(txid: &str, config: Option<&Path>, chain_filter: Option<&str>) 
     let mut rpcs = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for cfg in &configs {
-        for chain in load_evm_rpcs(cfg, chain_filter)? {
+        for chain in load_evm_rpcs(cfg, chain_filter).await? {
             if seen.insert(chain.rpc.clone()) {
                 rpcs.push(chain);
             }
@@ -219,8 +219,9 @@ fn alchemy_slug(chain_id: u64) -> Option<&'static str> {
     })
 }
 
-fn load_evm_rpcs(config: &Path, chain_filter: Option<&str>) -> Result<Vec<EvmChain>> {
-    let content = std::fs::read_to_string(config)
+async fn load_evm_rpcs(config: &Path, chain_filter: Option<&str>) -> Result<Vec<EvmChain>> {
+    let content = tokio::fs::read_to_string(config)
+        .await
         .map_err(|e| eyre::eyre!("failed to read config {}: {e}", config.display()))?;
     let root: serde_json::Value = serde_json::from_str(&content)?;
     let chains = root
@@ -342,7 +343,7 @@ async fn solana_rpcs_from_configs(
     };
     let mut rpcs = Vec::new();
     for (label, path) in configs {
-        let Ok(cfg) = crate::config::ChainsConfig::load(&path) else {
+        let Ok(cfg) = crate::config::ChainsConfig::load(&path).await else {
             continue;
         };
         for (key, chain) in &cfg.chains {

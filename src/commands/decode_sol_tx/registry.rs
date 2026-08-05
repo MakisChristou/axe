@@ -1,6 +1,7 @@
 //! Pure data lookups: program IDs, instruction discriminators, account-role
 //! labels, anchor event discriminators. No I/O, no formatting — just tables.
 
+use anchor_lang::Discriminator;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 
@@ -99,29 +100,28 @@ pub fn instruction_name(discriminator: &[u8]) -> Option<&'static str> {
     }
 }
 
-/// Return human-readable account role labels for known instructions.
-pub(super) fn account_labels(ix_name: &str) -> &'static [&'static str] {
+fn gateway_account_labels(ix_name: &str) -> Option<&'static [&'static str]> {
     match ix_name {
-        "CallContract" => &[
+        "CallContract" => Some(&[
             "sender",
             "sender",
             "gateway_root_pda",
             "event_authority",
             "gateway_program",
-        ],
-        "InitializePayloadVerificationSession" => &[
+        ]),
+        "InitializePayloadVerificationSession" => Some(&[
             "payer",
             "gateway_root_pda",
             "verification_session",
             "verifier_set_tracker",
             "system_program",
-        ],
-        "VerifySignature" => &[
+        ]),
+        "VerifySignature" => Some(&[
             "gateway_root_pda",
             "verification_session",
             "verifier_set_tracker",
-        ],
-        "ApproveMessage" => &[
+        ]),
+        "ApproveMessage" => Some(&[
             "gateway_root_pda",
             "funder",
             "verification_session",
@@ -129,15 +129,15 @@ pub(super) fn account_labels(ix_name: &str) -> &'static [&'static str] {
             "system_program",
             "event_authority",
             "gateway_program",
-        ],
-        "ValidateMessage" => &[
+        ]),
+        "ValidateMessage" => Some(&[
             "incoming_message_pda",
             "caller",
             "gateway_root_pda",
             "event_authority",
             "gateway_program",
-        ],
-        "RotateSigners" => &[
+        ]),
+        "RotateSigners" => Some(&[
             "payer",
             "gateway_root_pda",
             "verification_session",
@@ -145,22 +145,28 @@ pub(super) fn account_labels(ix_name: &str) -> &'static [&'static str] {
             "system_program",
             "event_authority",
             "gateway_program",
-        ],
-        "PayGas" => &[
+        ]),
+        "PayGas" => Some(&[
             "sender",
             "gas_config_pda",
             "system_program",
             "event_authority",
             "gas_service_program",
-        ],
-        "SendMemo" => &[
+        ]),
+        "SendMemo" => Some(&[
             "memo_program",
             "sender",
             "gateway_root_pda",
             "event_authority",
             "gateway_program",
-        ],
-        "InterchainTransfer" => &[
+        ]),
+        _ => None,
+    }
+}
+
+fn its_transfer_account_labels(ix_name: &str) -> Option<&'static [&'static str]> {
+    match ix_name {
+        "InterchainTransfer" => Some(&[
             "payer",
             "authority",
             "gateway_root_pda",
@@ -179,8 +185,8 @@ pub(super) fn account_labels(ix_name: &str) -> &'static [&'static str] {
             "system_program",
             "its_event_authority",
             "its_program",
-        ],
-        "Execute" => &[
+        ]),
+        "Execute" => Some(&[
             "incoming_message_pda",
             "signing_pda",
             "gateway_root_pda",
@@ -200,10 +206,10 @@ pub(super) fn account_labels(ix_name: &str) -> &'static [&'static str] {
             "sysvar_instructions",
             "mpl_token_metadata_program",
             "mpl_token_metadata_account",
-        ],
+        ]),
         // CPI accounts are reordered by Anchor's to_account_metas
         // (writable signers, readonly signers, writable, readonly)
-        "ExecuteDeployInterchainToken" => &[
+        "ExecuteDeployInterchainToken" => Some(&[
             "payer",
             "system_program",
             "its_root_pda",
@@ -219,8 +225,8 @@ pub(super) fn account_labels(ix_name: &str) -> &'static [&'static str] {
             "its_program",
             "minter",
             "minter_roles_pda",
-        ],
-        "ExecuteInterchainTransfer" => &[
+        ]),
+        "ExecuteInterchainTransfer" => Some(&[
             "payer",
             "its_root_pda",
             "destination",
@@ -234,7 +240,13 @@ pub(super) fn account_labels(ix_name: &str) -> &'static [&'static str] {
             "its_program",
             "its_event_authority",
             "its_program",
-        ],
+        ]),
+        _ => None,
+    }
+}
+
+fn its_deploy_account_labels(ix_name: &str) -> &'static [&'static str] {
+    match ix_name {
         "DeployInterchainToken" => &[
             "payer",
             "deployer",
@@ -272,6 +284,13 @@ pub(super) fn account_labels(ix_name: &str) -> &'static [&'static str] {
     }
 }
 
+/// Return human-readable account role labels for known instructions.
+pub(super) fn account_labels(ix_name: &str) -> &'static [&'static str] {
+    gateway_account_labels(ix_name)
+        .or_else(|| its_transfer_account_labels(ix_name))
+        .unwrap_or_else(|| its_deploy_account_labels(ix_name))
+}
+
 // ---------------------------------------------------------------------------
 // Anchor event discriminators
 //
@@ -285,7 +304,6 @@ pub(super) fn account_labels(ix_name: &str) -> &'static [&'static str] {
 pub use anchor_lang::event::EVENT_IX_TAG_LE;
 
 pub fn event_name(discriminator: &[u8]) -> Option<&'static str> {
-    use anchor_lang::Discriminator;
     if discriminator.len() < 8 {
         return None;
     }

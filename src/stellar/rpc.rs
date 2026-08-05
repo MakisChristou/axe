@@ -60,6 +60,49 @@ pub struct StellarClient {
     pub network_id: [u8; 32],
 }
 
+pub struct DeployInterchainTokenRequest<'a> {
+    pub wallet: &'a StellarWallet,
+    pub its_contract: &'a str,
+    pub salt: [u8; 32],
+    pub decimals: u32,
+    pub name: &'a str,
+    pub symbol: &'a str,
+    pub initial_supply: u128,
+}
+
+pub struct DeployRemoteInterchainTokenRequest<'a> {
+    pub wallet: &'a StellarWallet,
+    pub its_contract: &'a str,
+    pub gateway_contract: &'a str,
+    pub salt: [u8; 32],
+    pub destination_chain: &'a str,
+    pub gas_token: &'a str,
+    pub gas_amount: u64,
+}
+
+pub struct InterchainTransferRequest<'a> {
+    pub wallet: &'a StellarWallet,
+    pub its_contract: &'a str,
+    pub gateway_contract: &'a str,
+    pub token_id: [u8; 32],
+    pub destination_chain: &'a str,
+    pub destination_address_bytes: &'a [u8],
+    pub amount: u128,
+    pub data: Option<&'a [u8]>,
+    pub gas_token: &'a str,
+    pub gas_amount: u64,
+}
+
+pub struct MessageApprovalQuery<'a> {
+    pub signer_account_pk: &'a [u8; 32],
+    pub gateway_contract: &'a str,
+    pub source_chain: &'a str,
+    pub message_id: &'a str,
+    pub source_address: &'a str,
+    pub contract_address: &'a str,
+    pub payload_hash: [u8; 32],
+}
+
 impl StellarClient {
     pub fn new(rpc_url: &str, network_type: &str) -> Result<Self> {
         let rpc = RpcClient::new(rpc_url)
@@ -75,14 +118,10 @@ impl StellarClient {
         match self.rpc.get_account(address).await {
             Ok(entry) => Ok(Some(entry.seq_num.0)),
             Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("not found")
-                    || msg.contains("NotFound")
-                    || msg.contains("Account not found")
-                {
+                if matches!(e, stellar_rpc_client::Error::NotFound(_, _)) {
                     Ok(None)
                 } else {
-                    Err(eyre!("get_account({address}) failed: {msg}"))
+                    Err(eyre!("get_account({address}) failed: {e}"))
                 }
             }
         }
@@ -172,14 +211,10 @@ impl StellarClient {
         match self.rpc.get_account(address).await {
             Ok(entry) => Ok(Some(entry.balance)),
             Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("not found")
-                    || msg.contains("NotFound")
-                    || msg.contains("Account not found")
-                {
+                if matches!(e, stellar_rpc_client::Error::NotFound(_, _)) {
                     Ok(None)
                 } else {
-                    Err(eyre!("get_account({address}) balance: {msg}"))
+                    Err(eyre!("get_account({address}) balance: {e}"))
                 }
             }
         }
@@ -547,17 +582,19 @@ impl StellarClient {
     /// `InterchainTokenService.deploy_interchain_token(caller, salt, metadata,
     /// initial_supply, minter)` → returns the new `tokenId` (32 bytes).
     /// Initial supply is minted to `caller`.
-    #[allow(clippy::too_many_arguments)]
     pub async fn its_deploy_interchain_token(
         &self,
-        wallet: &StellarWallet,
-        its_contract: &str,
-        salt: [u8; 32],
-        decimals: u32,
-        name: &str,
-        symbol: &str,
-        initial_supply: u128,
+        request: DeployInterchainTokenRequest<'_>,
     ) -> Result<(InvokedTx, Option<[u8; 32]>)> {
+        let DeployInterchainTokenRequest {
+            wallet,
+            its_contract,
+            salt,
+            decimals,
+            name,
+            symbol,
+            initial_supply,
+        } = request;
         let caller = scval_address_account(&wallet.public_key_bytes);
         let metadata = scval_token_metadata(decimals, name, symbol)?;
         let supply = scval_i128_from_u128(initial_supply);
@@ -581,17 +618,19 @@ impl StellarClient {
     /// `InterchainTokenService.deploy_remote_interchain_token(caller, salt,
     /// destination_chain, gas_token)` — registers the same token on a
     /// destination chain via the ITS hub.
-    #[allow(clippy::too_many_arguments)]
     pub async fn its_deploy_remote_interchain_token(
         &self,
-        wallet: &StellarWallet,
-        its_contract: &str,
-        gateway_contract: &str,
-        salt: [u8; 32],
-        destination_chain: &str,
-        gas_token: &str,
-        gas_amount: u64,
+        request: DeployRemoteInterchainTokenRequest<'_>,
     ) -> Result<InvokedTx> {
+        let DeployRemoteInterchainTokenRequest {
+            wallet,
+            its_contract,
+            gateway_contract,
+            salt,
+            destination_chain,
+            gas_token,
+            gas_amount,
+        } = request;
         let caller = scval_address_account(&wallet.public_key_bytes);
         let dest_chain_v = scval_string(destination_chain)?;
         let gas_v = scval_token(gas_token, gas_amount)?;
@@ -612,20 +651,22 @@ impl StellarClient {
     /// `InterchainTokenService.interchain_transfer(caller, token_id,
     /// destination_chain, destination_address, amount, data, gas_token)`.
     /// `data` is `None` for plain transfers.
-    #[allow(clippy::too_many_arguments)]
     pub async fn its_interchain_transfer(
         &self,
-        wallet: &StellarWallet,
-        its_contract: &str,
-        gateway_contract: &str,
-        token_id: [u8; 32],
-        destination_chain: &str,
-        destination_address_bytes: &[u8],
-        amount: u128,
-        data: Option<&[u8]>,
-        gas_token: &str,
-        gas_amount: u64,
+        request: InterchainTransferRequest<'_>,
     ) -> Result<InvokedTx> {
+        let InterchainTransferRequest {
+            wallet,
+            its_contract,
+            gateway_contract,
+            token_id,
+            destination_chain,
+            destination_address_bytes,
+            amount,
+            data,
+            gas_token,
+            gas_amount,
+        } = request;
         let caller = scval_address_account(&wallet.public_key_bytes);
         let token_id_v = scval_bytes(&token_id)?;
         let dest_chain_v = scval_string(destination_chain)?;
@@ -873,17 +914,19 @@ impl StellarClient {
     /// source_address, contract_address, payload_hash) → bool`. Read-only.
     /// Returns `Some(true)` if approved, `Some(false)` if not (or already
     /// executed), `None` if the simulation could not be parsed.
-    #[allow(clippy::too_many_arguments)]
     pub async fn gateway_is_message_approved(
         &self,
-        signer_account_pk: &[u8; 32],
-        gateway_contract: &str,
-        source_chain: &str,
-        message_id: &str,
-        source_address: &str,
-        contract_address: &str,
-        payload_hash: [u8; 32],
+        query: MessageApprovalQuery<'_>,
     ) -> Result<Option<bool>> {
+        let MessageApprovalQuery {
+            signer_account_pk,
+            gateway_contract,
+            source_chain,
+            message_id,
+            source_address,
+            contract_address,
+            payload_hash,
+        } = query;
         let args = vec![
             scval_string(source_chain)?,
             scval_string(message_id)?,

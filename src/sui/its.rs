@@ -23,12 +23,15 @@
 use base64::Engine;
 use eyre::{Result, eyre};
 use serde_json::{Value, json};
-use sui_sdk_types::{Address as SuiAddress, Argument, GasPayment, ObjectReference, TypeTag};
+use sui_sdk_types::{
+    Address as SuiAddress, Argument, GasPayment, ObjectReference, Transaction, TypeTag,
+};
 
 use super::config::parse_sui_addr;
 use super::rpc::{SuiClient, object_ref_from_json, owner_addr_hex};
 use super::tx::{PtbBuilder, sign_and_submit};
 use super::wallet::SuiWallet;
+use crate::config::{ChainContract, ChainsConfig};
 
 /// Sui's well-known shared `Clock` object id (`0x6`).
 pub const SUI_CLOCK_ADDR_HEX: &str =
@@ -58,33 +61,70 @@ pub struct SuiItsContractsConfig {
 /// config. The Example contract bundles a separate ItsSingleton (vs.
 /// GmpSingleton) so we read both fresh here even though some are duplicated
 /// in `SuiContractsConfig`.
-pub fn read_sui_its_config(
+pub async fn read_sui_its_config(
     config: &std::path::Path,
     chain_id: &str,
 ) -> Result<SuiItsContractsConfig> {
-    let content =
-        std::fs::read_to_string(config).map_err(|e| eyre!("failed to read config: {e}"))?;
-    let root: Value = serde_json::from_str(&content)?;
-    let chain = root
-        .pointer(&format!("/chains/{chain_id}"))
-        .ok_or_else(|| eyre!("chain '{chain_id}' not found in config"))?;
-
-    let read = |ptr: &str| -> Result<&str> {
-        chain
-            .pointer(ptr)
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| eyre!("missing {ptr} for sui chain '{chain_id}'"))
-    };
+    let config = ChainsConfig::load(config).await?;
+    let chain = config.chain(chain_id)?;
+    let example = chain.contract(ChainContract::Example, chain_id)?;
+    let example_objects = example
+        .objects
+        .as_ref()
+        .ok_or_else(|| eyre!("missing Example.objects for sui chain '{chain_id}'"))?;
+    let its = chain.contract(ChainContract::InterchainTokenService, chain_id)?;
+    let its_objects = its.objects.as_ref().ok_or_else(|| {
+        eyre!("missing InterchainTokenService.objects for sui chain '{chain_id}'")
+    })?;
 
     Ok(SuiItsContractsConfig {
-        example_pkg: parse_sui_addr(read("/contracts/Example/address")?)?,
-        its_pkg: parse_sui_addr(read("/contracts/InterchainTokenService/address")?)?,
-        its_singleton: parse_sui_addr(read("/contracts/Example/objects/ItsSingleton")?)?,
-        its_object: parse_sui_addr(read(
-            "/contracts/InterchainTokenService/objects/InterchainTokenService",
-        )?)?,
-        gateway_object: parse_sui_addr(read("/contracts/AxelarGateway/objects/Gateway")?)?,
-        gas_service_object: parse_sui_addr(read("/contracts/GasService/objects/GasService")?)?,
+        example_pkg: parse_sui_addr(
+            example
+                .address
+                .as_deref()
+                .ok_or_else(|| eyre!("missing Example.address for sui chain '{chain_id}'"))?,
+        )?,
+        its_pkg: parse_sui_addr(its.address.as_deref().ok_or_else(|| {
+            eyre!("missing InterchainTokenService.address for sui chain '{chain_id}'")
+        })?)?,
+        its_singleton: parse_sui_addr(
+            example_objects
+                .its_singleton
+                .as_deref()
+                .ok_or_else(|| {
+                    eyre!("missing Example.objects.ItsSingleton for sui chain '{chain_id}'")
+                })?,
+        )?,
+        its_object: parse_sui_addr(
+            its_objects
+                .interchain_token_service
+                .as_deref()
+                .ok_or_else(|| {
+                    eyre!(
+                        "missing InterchainTokenService.objects.InterchainTokenService for sui chain '{chain_id}'"
+                    )
+                })?,
+        )?,
+        gateway_object: parse_sui_addr(
+            chain
+                .contract(ChainContract::AxelarGateway, chain_id)?
+                .objects
+                .as_ref()
+                .and_then(|objects| objects.gateway.as_deref())
+                .ok_or_else(|| {
+                    eyre!("missing AxelarGateway.objects.Gateway for sui chain '{chain_id}'")
+                })?,
+        )?,
+        gas_service_object: parse_sui_addr(
+            chain
+                .contract(ChainContract::GasService, chain_id)?
+                .objects
+                .as_ref()
+                .and_then(|objects| objects.gas_service.as_deref())
+                .ok_or_else(|| {
+                    eyre!("missing GasService.objects.GasService for sui chain '{chain_id}'")
+                })?,
+        )?,
     })
 }
 
@@ -224,146 +264,189 @@ pub struct ItsSendResult {
 /// `0x96b4…::token::TOKEN`); `transfer_amount` is in coin sub-units.
 /// `destination_address_bytes` is the raw address as the destination chain
 /// expects (20B for EVM, 32B for Solana/Stellar).
-#[allow(clippy::too_many_arguments)]
-pub async fn send_its_interchain_transfer(
-    client: &SuiClient,
-    wallet: &SuiWallet,
-    contracts: &SuiItsContractsConfig,
-    coin_type_tag: &str,
-    token_id: [u8; 32],
-    destination_chain: &str,
-    destination_address_bytes: &[u8],
-    transfer_amount: u64,
-    gas_value_mist: u64,
-    gas_budget_mist: u64,
-) -> Result<ItsSendResult> {
-    let coin_tt: TypeTag = coin_type_tag
-        .parse()
-        .map_err(|e| eyre!("invalid coin_type '{coin_type_tag}': {e}"))?;
+pub struct InterchainTransferRequest<'a> {
+    pub client: &'a SuiClient,
+    pub wallet: &'a SuiWallet,
+    pub contracts: &'a SuiItsContractsConfig,
+    pub coin_type_tag: &'a str,
+    pub token_id: [u8; 32],
+    pub destination_chain: &'a str,
+    pub destination_address_bytes: &'a [u8],
+    pub transfer_amount: u64,
+    pub gas_value_mist: u64,
+    pub gas_budget_mist: u64,
+}
 
-    let clock_addr = parse_sui_addr(SUI_CLOCK_ADDR_HEX)?;
+struct SharedVersions {
+    singleton: u64,
+    its: u64,
+    gateway: u64,
+    gas_service: u64,
+    clock: u64,
+}
 
-    // Resolve all shared-object versions in parallel.
-    let (singleton_v, its_v, gateway_v, gas_service_v, clock_v) = tokio::try_join!(
+async fn resolve_transfer_inputs(
+    request: &InterchainTransferRequest<'_>,
+    clock: &SuiAddress,
+) -> Result<(SharedVersions, ObjectReference, ObjectReference, u64)> {
+    let client = request.client;
+    let contracts = request.contracts;
+    let (singleton, its, gateway, gas_service, clock) = tokio::try_join!(
         client.get_shared_object_initial_version(&contracts.its_singleton),
         client.get_shared_object_initial_version(&contracts.its_object),
         client.get_shared_object_initial_version(&contracts.gateway_object),
         client.get_shared_object_initial_version(&contracts.gas_service_object),
-        client.get_shared_object_initial_version(&clock_addr),
+        client.get_shared_object_initial_version(clock),
     )?;
-
-    // Pick gas + Coin<T> in parallel.
-    let (gas_coin, coin_t_pick) = tokio::try_join!(
-        client.pick_gas_coin(&wallet.address),
-        client.pick_coin_of_type(&wallet.address, coin_type_tag),
+    let (gas_coin, coin_pick, gas_price) = tokio::try_join!(
+        client.pick_gas_coin(&request.wallet.address),
+        client.pick_coin_of_type(&request.wallet.address, request.coin_type_tag),
+        client.get_reference_gas_price(),
     )?;
-    let (coin_t_ref, coin_t_balance) = coin_t_pick;
-    if coin_t_balance < transfer_amount as u128 {
+    let (coin, balance) = coin_pick;
+    if balance < request.transfer_amount as u128 {
         return Err(eyre!(
-            "Coin<{coin_type_tag}> object balance {coin_t_balance} < transfer_amount {transfer_amount}"
+            "Coin<{}> object balance {balance} < transfer_amount {}",
+            request.coin_type_tag,
+            request.transfer_amount
         ));
     }
+    Ok((
+        SharedVersions {
+            singleton,
+            its,
+            gateway,
+            gas_service,
+            clock,
+        },
+        gas_coin,
+        coin,
+        gas_price,
+    ))
+}
 
-    let rgp = client.get_reference_gas_price().await?;
-
-    let mut b = PtbBuilder::new();
-
-    // 1. token_id::from_u256(<u256>) — encode token_id_u256 as 32B little-endian
-    //    BCS for u256.
-    let mut tid_le = [0u8; 32];
-    for (i, byte) in token_id.iter().enumerate() {
-        tid_le[31 - i] = *byte;
-    }
-    let tid_arg = b.pure_bytes(tid_le.to_vec());
-    let token_id_obj = b.move_call(
-        contracts.its_pkg,
+fn build_interchain_transfer(
+    request: &InterchainTransferRequest<'_>,
+    coin_type: TypeTag,
+    clock: SuiAddress,
+    versions: &SharedVersions,
+    gas_coin: ObjectReference,
+    transfer_coin: ObjectReference,
+    gas_price: u64,
+) -> Result<Transaction> {
+    let mut builder = PtbBuilder::new();
+    let mut token_id_le = request.token_id;
+    token_id_le.reverse();
+    let token_id_arg = builder.pure_bytes(token_id_le.to_vec());
+    let token_id = builder.move_call(
+        request.contracts.its_pkg,
         "token_id",
         "from_u256",
         vec![],
-        vec![tid_arg],
+        vec![token_id_arg],
     )?;
+    let transfer_coin = builder.owned_object(transfer_coin);
+    let transfer_amount = builder.pure_u64(request.transfer_amount)?;
+    let transfer_coin = builder.split_coin(transfer_coin, transfer_amount);
+    let gas_value = builder.pure_u64(request.gas_value_mist)?;
+    let cross_chain_gas = builder.split_coin(Argument::Gas, gas_value);
+    let destination_chain = builder.pure_string(request.destination_chain)?;
+    let destination_address = builder.pure_vec_u8(request.destination_address_bytes)?;
+    let metadata = builder.pure_vec_u8(&[])?;
+    let refund_address = builder.pure_address(request.wallet.address)?;
+    let gas_params = builder.pure_vec_u8(&[])?;
+    let singleton =
+        builder.shared_object(request.contracts.its_singleton, versions.singleton, false);
+    let its = builder.shared_object(request.contracts.its_object, versions.its, true);
+    let gateway = builder.shared_object(request.contracts.gateway_object, versions.gateway, true);
+    let gas_service = builder.shared_object(
+        request.contracts.gas_service_object,
+        versions.gas_service,
+        true,
+    );
+    let clock = builder.shared_object(clock, versions.clock, false);
 
-    // 2. Owned Coin<T> input -> SplitCoins(transfer_amount).
-    let coin_t_input = b.owned_object(coin_t_ref);
-    let amt_arg = b.pure_u64(transfer_amount)?;
-    let coin_split_arg = b.split_coin(coin_t_input, amt_arg);
-
-    // 3. SplitCoins from gas to fund cross-chain gas Coin<SUI>.
-    let gas_amt_arg = b.pure_u64(gas_value_mist)?;
-    let gas_coin_arg = b.split_coin(Argument::Gas, gas_amt_arg);
-
-    // 4. Pure args.
-    let dest_chain_arg = b.pure_string(destination_chain)?;
-    let dest_addr_arg = b.pure_vec_u8(destination_address_bytes)?;
-    let metadata_arg = b.pure_vec_u8(&[])?;
-    let refund_arg = b.pure_address(wallet.address)?;
-    let gas_params_arg = b.pure_vec_u8(&[])?;
-
-    // 5. Shared objects.
-    let singleton = b.shared_object(contracts.its_singleton, singleton_v, false);
-    let its = b.shared_object(contracts.its_object, its_v, true);
-    let gateway = b.shared_object(contracts.gateway_object, gateway_v, true);
-    let gas_svc = b.shared_object(contracts.gas_service_object, gas_service_v, true);
-    let clock = b.shared_object(clock_addr, clock_v, false);
-
-    // 6. example::its::send_interchain_transfer_call<T>(<13 args>)
-    b.move_call(
-        contracts.example_pkg,
+    builder.move_call(
+        request.contracts.example_pkg,
         "its",
         "send_interchain_transfer_call",
-        vec![coin_tt],
+        vec![coin_type],
         vec![
             singleton,
             its,
             gateway,
-            gas_svc,
-            token_id_obj,
-            coin_split_arg,
-            dest_chain_arg,
-            dest_addr_arg,
-            metadata_arg,
-            refund_arg,
-            gas_coin_arg,
-            gas_params_arg,
+            gas_service,
+            token_id,
+            transfer_coin,
+            destination_chain,
+            destination_address,
+            metadata,
+            refund_address,
+            cross_chain_gas,
+            gas_params,
             clock,
         ],
     )?;
-
-    let tx = b.build(
-        wallet.address,
+    Ok(builder.build(
+        request.wallet.address,
         GasPayment {
             objects: vec![gas_coin],
-            owner: wallet.address,
-            price: rgp,
-            budget: gas_budget_mist,
+            owner: request.wallet.address,
+            price: gas_price,
+            budget: request.gas_budget_mist,
         },
-    );
+    ))
+}
 
-    let submitted = sign_and_submit(client, wallet, tx).await?;
+fn extract_contract_call(events: &[Value]) -> (u32, String, String) {
+    events
+        .iter()
+        .enumerate()
+        .find(|(_, event)| {
+            event["type"]
+                .as_str()
+                .is_some_and(|event_type| event_type.ends_with("::events::ContractCall"))
+        })
+        .map(|(index, event)| {
+            let field = |pointer| {
+                event
+                    .pointer(pointer)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim_start_matches("0x")
+                    .to_string()
+            };
+            (
+                index as u32,
+                field("/parsedJson/source_id"),
+                field("/parsedJson/payload_hash"),
+            )
+        })
+        .unwrap_or_default()
+}
 
-    // Find the ContractCall event (emitted by AxelarGateway::events::ContractCall).
-    let mut event_index = 0u32;
-    let mut source_address_hex = String::new();
-    let mut payload_hash_hex = String::new();
-    for (i, ev) in submitted.events.iter().enumerate() {
-        let ty = ev["type"].as_str().unwrap_or("");
-        if ty.ends_with("::events::ContractCall") {
-            event_index = i as u32;
-            source_address_hex = ev
-                .pointer("/parsedJson/source_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim_start_matches("0x")
-                .to_string();
-            payload_hash_hex = ev
-                .pointer("/parsedJson/payload_hash")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim_start_matches("0x")
-                .to_string();
-            break;
-        }
-    }
+pub async fn send_its_interchain_transfer(
+    request: InterchainTransferRequest<'_>,
+) -> Result<ItsSendResult> {
+    let coin_type: TypeTag = request
+        .coin_type_tag
+        .parse()
+        .map_err(|e| eyre!("invalid coin_type '{}': {e}", request.coin_type_tag))?;
+    let clock = parse_sui_addr(SUI_CLOCK_ADDR_HEX)?;
+    let (versions, gas_coin, transfer_coin, gas_price) =
+        resolve_transfer_inputs(&request, &clock).await?;
+    let transaction = build_interchain_transfer(
+        &request,
+        coin_type,
+        clock,
+        &versions,
+        gas_coin,
+        transfer_coin,
+        gas_price,
+    )?;
+    let submitted = sign_and_submit(request.client, request.wallet, transaction).await?;
+    let (event_index, source_address_hex, payload_hash_hex) =
+        extract_contract_call(&submitted.events);
 
     Ok(ItsSendResult {
         digest: submitted.digest,

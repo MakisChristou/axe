@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if find src -type f -name mod.rs -print -quit | grep -q .; then
+    echo "Rust modules must use foo.rs with a foo directory."
+    exit 1
+fi
+
+if rg -n 'tracing::(trace|debug|info|warn|error)!' src --glob '*.rs'; then
+    echo "Import tracing macros before calling them."
+    exit 1
+fi
+
+if rg -n '#\[tokio::main\([^]]*current_thread' src --glob '*.rs'; then
+    echo "Use the default multithreaded Tokio runtime."
+    exit 1
+fi
+
+added_comments=$(
+    git diff --cached --find-renames --unified=0 -- '*.rs' |
+        awk '/^\+\+\+/{next} /^\+[[:space:]]*\/\/[\/!]?/ {print}'
+)
+
+if printf '%s\n' "$added_comments" | grep -n ';'; then
+    echo "Rust comments must not contain semicolons."
+    exit 1
+fi
+
+if printf '%s\n' "$added_comments" | LC_ALL=C grep -n '[^	 -~]'; then
+    echo "Rust comments must use plain ASCII text."
+    exit 1
+fi

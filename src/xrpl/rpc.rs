@@ -11,7 +11,6 @@ use xrpl_binary_codec::{serialize, sign::sign_transaction};
 use xrpl_types::{AccountId, Amount, PaymentTransaction};
 
 use super::helpers::signed_tx_hash_hex;
-use super::its::build_its_transfer_memos;
 use super::wallet::XrplWallet;
 
 /// Poll interval while waiting for a submitted tx to be validated on the
@@ -82,11 +81,13 @@ impl XrplClient {
                 })),
                 Err(e) => {
                     // `actNotFound` → account doesn't exist yet (not an error)
-                    let msg = e.to_string();
-                    if msg.contains("actNotFound") || msg.contains("Account not found") {
+                    if matches!(
+                        &e,
+                        xrpl_http_client::error::Error::Api(code) if code == "actNotFound"
+                    ) {
                         Ok(None)
                     } else {
-                        Err(eyre!("account_info({address}) failed: {msg}"))
+                        Err(eyre!("account_info({address}) failed: {e}"))
                     }
                 }
             }
@@ -115,66 +116,6 @@ impl XrplClient {
             ));
         }
         Ok(())
-    }
-
-    /// Build, sign, and submit an ITS interchain_transfer `Payment` from
-    /// `wallet` to the Axelar multisig at `destination_multisig`.
-    ///
-    /// `total_drops` must include the gas fee (which is deducted by the
-    /// relayer from the total).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn submit_its_interchain_transfer(
-        &self,
-        wallet: &XrplWallet,
-        destination_multisig: &AccountId,
-        total_drops: u64,
-        destination_chain: &str,
-        destination_address_hex: &str,
-        gas_fee_drops: u64,
-        payload: Option<&[u8]>,
-    ) -> Result<String> {
-        let amount = Amount::drops(total_drops)
-            .map_err(|e| eyre!("invalid Amount::drops({total_drops}): {e}"))?;
-
-        let mut tx = PaymentTransaction::new(wallet.account_id, amount, *destination_multisig);
-        tx.common.memos = build_its_transfer_memos(
-            destination_chain,
-            destination_address_hex,
-            gas_fee_drops,
-            payload,
-        );
-
-        // Auto-fill sequence, fee, last_ledger_sequence
-        self.inner
-            .prepare_transaction(&mut tx.common)
-            .await
-            .map_err(|e| eyre!("prepare_transaction failed: {e}"))?;
-
-        // Sign with secp256k1
-        sign_transaction(&mut tx, &wallet.public_key, &wallet.secret_key)
-            .map_err(|e| eyre!("sign_transaction failed: {e:?}"))?;
-
-        let tx_bytes = serialize::serialize(&tx).map_err(|e| eyre!("serialize failed: {e:?}"))?;
-        let tx_blob = hex::encode_upper(&tx_bytes);
-        let tx_hash = signed_tx_hash_hex(&tx_bytes);
-
-        let req = SubmitRequest::new(tx_blob).fail_hard(true);
-        let resp = self
-            .inner
-            .call(req)
-            .await
-            .map_err(|e| eyre!("submit failed: {e}"))?;
-
-        // `tesSUCCESS` means accepted into the mempool (not yet validated).
-        let engine = format!("{:?}", resp.engine_result);
-        if !engine.contains("tesSUCCESS") {
-            return Err(eyre!(
-                "submit rejected: {engine}: {}",
-                resp.engine_result_message
-            ));
-        }
-
-        Ok(tx_hash)
     }
 
     /// Send a simple XRP Payment with no memos. Used by the funding code to
@@ -330,13 +271,15 @@ impl XrplClient {
                 }))
             }
             Err(e) => {
-                let msg = e.to_string();
                 // `txnNotFound` means the tx is not yet on a validated ledger
                 // (or has been dropped). Treat as "not yet".
-                if msg.contains("txnNotFound") {
+                if matches!(
+                    &e,
+                    xrpl_http_client::error::Error::Api(code) if code == "txnNotFound"
+                ) {
                     Ok(None)
                 } else {
-                    Err(eyre!("tx({tx_hash}) failed: {msg}"))
+                    Err(eyre!("tx({tx_hash}) failed: {e}"))
                 }
             }
         }

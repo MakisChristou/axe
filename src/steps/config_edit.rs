@@ -1,5 +1,3 @@
-use std::fs;
-
 use eyre::Result;
 use serde_json::{Value, json};
 
@@ -7,7 +5,7 @@ use crate::commands::deploy::DeployContext;
 use crate::types::Network;
 use crate::ui;
 
-pub fn run(ctx: &DeployContext) -> Result<()> {
+pub async fn run(ctx: &DeployContext) -> Result<()> {
     let predicted_addr = ctx
         .state
         .predicted_gateway_address
@@ -17,7 +15,7 @@ pub fn run(ctx: &DeployContext) -> Result<()> {
         .to_string();
     let env = ctx.state.env;
 
-    let content = fs::read_to_string(&ctx.target_json)?;
+    let content = tokio::fs::read_to_string(&ctx.target_json).await?;
     let mut root: Value = serde_json::from_str(&content)?;
 
     let chain_axelar_id = root
@@ -97,10 +95,11 @@ pub fn run(ctx: &DeployContext) -> Result<()> {
     mp.insert(chain_axelar_id.clone(), multisig_prover_config);
     ui::success(&format!("added MultisigProver.{chain_axelar_id} config"));
 
-    fs::write(
+    tokio::fs::write(
         &ctx.target_json,
         serde_json::to_string_pretty(&root)? + "\n",
-    )?;
+    )
+    .await?;
     ui::success(&format!("updated {}", ctx.target_json.display()));
 
     Ok(())

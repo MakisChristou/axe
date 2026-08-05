@@ -5,6 +5,7 @@ use alloy::rpc::types::Filter;
 use eyre::Result;
 use owo_colors::OwoColorize;
 use serde::Serialize;
+use serde_json::json;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -25,7 +26,7 @@ struct EvmContractEntry {
     address: Address,
 }
 
-fn discover_contracts(
+async fn discover_contracts(
     network: Network,
     config_path: &Path,
     chain: &str,
@@ -39,7 +40,7 @@ fn discover_contracts(
 
     let mut entries = Vec::new();
 
-    let Ok(config_content) = std::fs::read_to_string(config_path) else {
+    let Ok(config_content) = tokio::fs::read_to_string(config_path).await else {
         return entries;
     };
     let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_content) else {
@@ -125,6 +126,38 @@ struct EvmActivityEntry {
     params: serde_json::Value,
 }
 
+fn print_contract_header(entry: &EvmContractEntry) {
+    let address = format!("{:x}", entry.address);
+    let short = format!("0x{}...{}", &address[..4], &address[36..]);
+    println!(
+        "\n{}",
+        format!(
+            "━━ {} ({}/{}) {} ━━",
+            entry.label, entry.network, entry.chain_name, short
+        )
+        .bold()
+    );
+}
+
+fn print_event_line(block: u64, event_name: &str, params: &str, transaction_hash: Option<&str>) {
+    let transaction = transaction_hash
+        .map(|hash| {
+            if hash.len() > 14 {
+                format!("{}...", &hash[..14])
+            } else {
+                hash.to_string()
+            }
+        })
+        .unwrap_or_default();
+    println!(
+        "  {} {:<42} {}  {}",
+        format!("blk {block}").dimmed(),
+        event_name.bold(),
+        params.dimmed(),
+        transaction.dimmed(),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
@@ -137,7 +170,7 @@ pub async fn run(
     json_mode: bool,
 ) -> Result<()> {
     let config_path = config_source::resolve(network, None).await?.into_path();
-    let contracts = discover_contracts(network, &config_path, &chain, contract_filter);
+    let contracts = discover_contracts(network, &config_path, &chain, contract_filter).await;
 
     if contracts.is_empty() {
         return Err(eyre::eyre!(
@@ -185,19 +218,7 @@ pub async fn run(
         };
 
         if !json_mode {
-            let addr_short = format!(
-                "0x{}...{}",
-                &format!("{:x}", entry.address)[..4],
-                &format!("{:x}", entry.address)[36..]
-            );
-            println!(
-                "\n{}",
-                format!(
-                    "━━ {} ({}/{}) {} ━━",
-                    entry.label, entry.network, entry.chain_name, addr_short
-                )
-                .bold()
-            );
+            print_contract_header(entry);
         }
 
         for log in &recent_logs {
@@ -229,24 +250,7 @@ pub async fn run(
             let params_json = params_to_json(&params);
 
             if !json_mode {
-                let tx_short = tx_hash
-                    .as_deref()
-                    .map(|h| {
-                        if h.len() > 14 {
-                            format!("{}...", &h[..14])
-                        } else {
-                            h.to_string()
-                        }
-                    })
-                    .unwrap_or_default();
-
-                println!(
-                    "  {} {:<42} {}  {}",
-                    format!("blk {block_num}").dimmed(),
-                    short_name.bold(),
-                    params_summary.dimmed(),
-                    tx_short.dimmed(),
-                );
+                print_event_line(block_num, short_name, &params_summary, tx_hash.as_deref());
             }
 
             all_entries.push(EvmActivityEntry {
@@ -364,8 +368,6 @@ fn params_to_json(params: &[(String, DynSolValue)]) -> serde_json::Value {
 }
 
 fn sol_value_to_json(value: &DynSolValue) -> serde_json::Value {
-    use serde_json::json;
-
     match value {
         DynSolValue::Bool(b) => json!(b),
         DynSolValue::Uint(u, _) => json!(format!("{u}")),

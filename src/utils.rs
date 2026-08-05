@@ -1,19 +1,19 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use alloy::primitives::{Address, FixedBytes, keccak256};
 use eyre::Result;
 use serde_json::{Map, Value};
 
+use crate::config::{AxelarGlobalContract, ChainContract, ChainsConfig};
 use crate::ui;
 
-pub fn update_target_json(
+pub async fn update_target_json(
     target_json: &Path,
     axelar_id: &str,
     contract_name: &str,
     contract_data: Value,
 ) -> Result<()> {
-    let content = fs::read_to_string(target_json)?;
+    let content = tokio::fs::read_to_string(target_json).await?;
     let mut root: Value = serde_json::from_str(&content)?;
 
     let contracts = root
@@ -27,7 +27,7 @@ pub fn update_target_json(
         })?;
 
     contracts.insert(contract_name.to_string(), contract_data);
-    fs::write(target_json, serde_json::to_string_pretty(&root)? + "\n")?;
+    tokio::fs::write(target_json, serde_json::to_string_pretty(&root)? + "\n").await?;
     ui::success(&format!(
         "updated {contract_name} in {}",
         target_json.display()
@@ -35,13 +35,13 @@ pub fn update_target_json(
     Ok(())
 }
 
-pub fn patch_target_json(
+pub async fn patch_target_json(
     target_json: &Path,
     axelar_id: &str,
     contract_name: &str,
     patches: &Map<String, Value>,
 ) -> Result<()> {
-    let content = fs::read_to_string(target_json)?;
+    let content = tokio::fs::read_to_string(target_json).await?;
     let mut root: Value = serde_json::from_str(&content)?;
 
     let contract = root
@@ -54,21 +54,32 @@ pub fn patch_target_json(
     for (k, v) in patches {
         contract.insert(k.clone(), v.clone());
     }
-    fs::write(target_json, serde_json::to_string_pretty(&root)? + "\n")?;
+    tokio::fs::write(target_json, serde_json::to_string_pretty(&root)? + "\n").await?;
     Ok(())
 }
 
-pub fn read_contract_address(
+pub async fn read_contract_address(
+    target_json: &Path,
+    axelar_id: &str,
+    contract: ChainContract,
+) -> Result<Address> {
+    let cfg = ChainsConfig::load(target_json).await?;
+    let chain = cfg.chain(axelar_id)?;
+
+    Ok(chain.contract_address(contract, axelar_id)?.parse()?)
+}
+
+pub async fn read_contract_address_by_name(
     target_json: &Path,
     axelar_id: &str,
     contract_name: &str,
 ) -> Result<Address> {
-    let cfg = crate::config::ChainsConfig::load(target_json)?;
-    let chain = cfg
-        .chains
-        .get(axelar_id)
-        .ok_or_else(|| eyre::eyre!("chain '{axelar_id}' not found in target json"))?;
-    Ok(chain.contract_address(contract_name, axelar_id)?.parse()?)
+    let cfg = ChainsConfig::load(target_json).await?;
+    let chain = cfg.chain(axelar_id)?;
+
+    Ok(chain
+        .contract_address_by_name(contract_name, axelar_id)?
+        .parse()?)
 }
 
 /// Derive the axelar-contract-deployments repo root from target_json path.
@@ -126,8 +137,11 @@ pub fn artifact_paths_for_step(step_name: &str, root: &Path) -> Option<(String, 
 }
 
 /// Compute domain separator: keccak256(chainAxelarId + routerAddress + axelarChainId)
-pub fn compute_domain_separator(target_json: &Path, axelar_id: &str) -> Result<FixedBytes<32>> {
-    let cfg = crate::config::ChainsConfig::load(target_json)?;
+pub async fn compute_domain_separator(
+    target_json: &Path,
+    axelar_id: &str,
+) -> Result<FixedBytes<32>> {
+    let cfg = ChainsConfig::load(target_json).await?;
 
     let chain_axelar_id = cfg
         .chains
@@ -135,7 +149,9 @@ pub fn compute_domain_separator(target_json: &Path, axelar_id: &str) -> Result<F
         .and_then(|c| c.axelar_id.as_deref())
         .ok_or_else(|| eyre::eyre!("no axelarId for chain {axelar_id}"))?;
 
-    let router_address = cfg.axelar.global_contract_address("Router")?;
+    let router_address = cfg
+        .axelar
+        .global_contract_address(AxelarGlobalContract::Router)?;
 
     let axelar_chain_id = cfg
         .axelar

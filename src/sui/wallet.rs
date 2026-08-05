@@ -21,21 +21,24 @@ const SECP256K1_PK_LEN: usize = 33; // compressed
 /// Sui supports several signature schemes. We support the two the Sui CLI
 /// emits for fresh keypairs: ed25519 (flag 0x00) and secp256k1 (flag 0x01).
 ///
-/// The variants are different sizes (ed25519 keypair ≈ 64 B vs secp256k1 ≈
-/// 128 B with uncompressed pubkey internals); a load-test holds at most a
-/// handful of these per run, so the indirection of `Box`-ing the larger
-/// variant isn't worth it.
+/// Both implementations keep their library-specific key material behind one
+/// pointer so every `SuiKeypair` has a small, uniform representation.
 #[derive(Clone)]
-#[allow(clippy::large_enum_variant)]
 pub enum SuiKeypair {
-    Ed25519 {
-        signing_key: EdSigningKey,
-        verifying_key: EdVerifyingKey,
-    },
-    Secp256k1 {
-        secret: SecpSecret,
-        public: SecpPub,
-    },
+    Ed25519(Box<Ed25519Keypair>),
+    Secp256k1(Box<Secp256k1Keypair>),
+}
+
+#[derive(Clone)]
+pub struct Ed25519Keypair {
+    signing_key: EdSigningKey,
+    verifying_key: EdVerifyingKey,
+}
+
+#[derive(Clone)]
+pub struct Secp256k1Keypair {
+    secret: SecpSecret,
+    public: SecpPub,
 }
 
 #[derive(Clone)]
@@ -55,10 +58,10 @@ impl SuiWallet {
         let address = SuiAddress::from_hex(format!("0x{}", hex::encode(blake2b256(&buf))))
             .map_err(|e| eyre!("address derivation failed: {e:?}"))?;
         Ok(Self {
-            keypair: SuiKeypair::Ed25519 {
+            keypair: SuiKeypair::Ed25519(Box::new(Ed25519Keypair {
                 signing_key,
                 verifying_key,
-            },
+            })),
             address,
         })
     }
@@ -74,7 +77,7 @@ impl SuiWallet {
         let address = SuiAddress::from_hex(format!("0x{}", hex::encode(blake2b256(&buf))))
             .map_err(|e| eyre!("address derivation failed: {e:?}"))?;
         Ok(Self {
-            keypair: SuiKeypair::Secp256k1 { secret, public },
+            keypair: SuiKeypair::Secp256k1(Box::new(Secp256k1Keypair { secret, public })),
             address,
         })
     }
@@ -147,26 +150,23 @@ impl SuiWallet {
     ///   secp256k1  signs sha256(blake2b256(intent_message)) (Sui spec).
     pub fn serialized_intent_signature(&self, intent_message: &[u8]) -> Vec<u8> {
         match &self.keypair {
-            SuiKeypair::Ed25519 {
-                signing_key,
-                verifying_key,
-            } => {
+            SuiKeypair::Ed25519(keypair) => {
                 let digest = blake2b256(intent_message);
-                let sig = signing_key.sign(&digest);
+                let sig = keypair.signing_key.sign(&digest);
                 let mut out = Vec::with_capacity(1 + SIG_LEN + ED25519_PK_LEN);
                 out.push(ED25519_FLAG);
                 out.extend_from_slice(&sig.to_bytes());
-                out.extend_from_slice(verifying_key.as_bytes());
+                out.extend_from_slice(keypair.verifying_key.as_bytes());
                 out
             }
-            SuiKeypair::Secp256k1 { secret, public } => {
+            SuiKeypair::Secp256k1(keypair) => {
                 let blake = blake2b256(intent_message);
                 let sha = Sha256::digest(blake);
                 let mut digest_arr = [0u8; 32];
                 digest_arr.copy_from_slice(&sha);
                 let msg = SecpMessage::parse(&digest_arr);
-                let (sig, _recovery) = libsecp256k1::sign(&msg, secret);
-                let pk_compressed = public.serialize_compressed();
+                let (sig, _recovery) = libsecp256k1::sign(&msg, &keypair.secret);
+                let pk_compressed = keypair.public.serialize_compressed();
                 let mut out = Vec::with_capacity(1 + SIG_LEN + SECP256K1_PK_LEN);
                 out.push(SECP256K1_FLAG);
                 out.extend_from_slice(&sig.serialize());

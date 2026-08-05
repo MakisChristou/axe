@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fs;
 
 use comfy_table::{Cell, ContentArrangement, Table};
 use eyre::Result;
@@ -28,20 +27,23 @@ struct TargetContract {
     address: Option<String>,
 }
 
-pub fn run(axelar_id: Option<String>) -> Result<()> {
+pub async fn run(axelar_id: Option<String>) -> Result<()> {
     let axelar_id = resolve_axelar_id(axelar_id)?;
-    let state = read_state(&axelar_id)?;
+    let state = read_state(&axelar_id).await?;
 
     ui::section(&format!("Status: {axelar_id}"));
     ui::kv("environment", state.env.as_str());
     ui::kv("rpc", &state.rpc_url);
 
-    // Try to read contract addresses from target json
     let target_json = &state.target_json;
+    let target = tokio::fs::read_to_string(target_json)
+        .await
+        .ok()
+        .and_then(|content| serde_json::from_str::<TargetChains>(&content).ok());
     let read_addr = |contract_name: &str| -> Option<String> {
-        let content = fs::read_to_string(target_json).ok()?;
-        let root: TargetChains = serde_json::from_str(&content).ok()?;
-        root.chains
+        target
+            .as_ref()?
+            .chains
             .get(&axelar_id)?
             .contracts
             .as_ref()?

@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
+use tokio::task::spawn_blocking;
 
 /// Print a step header: "[5/23] Deploying AxelarGateway..."
 pub fn step_header(current: usize, total: usize, name: &str) {
@@ -54,14 +55,20 @@ pub fn address(label: &str, addr: &str) {
 /// Call `.finish_and_clear()` or `.finish_with_message()` when done.
 pub fn wait_spinner(msg: &str) -> ProgressBar {
     let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::with_template("  {spinner:.cyan} {msg}")
-            .unwrap()
-            .tick_strings(&["|", "/", "-", "\\", ""]),
-    );
+    if let Ok(style) = ProgressStyle::with_template("  {spinner:.cyan} {msg}") {
+        pb.set_style(style.tick_strings(&["|", "/", "-", "\\", ""]));
+    }
     pb.set_message(msg.to_string());
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
     pb
+}
+
+pub fn progress_spinner_style(template: &str) -> ProgressStyle {
+    ProgressStyle::with_template(template).unwrap_or_else(|_| ProgressStyle::default_spinner())
+}
+
+pub fn progress_bar_style(template: &str) -> ProgressStyle {
+    ProgressStyle::with_template(template).unwrap_or_else(|_| ProgressStyle::default_bar())
 }
 
 /// Print a key-value pair: "  key: value" with key dimmed
@@ -84,19 +91,30 @@ pub fn action_required(lines: &[&str]) {
     println!();
 }
 
-/// Ask the user to confirm an action on stdin: "  {prompt} [y/N] ".
-/// Returns true only on an explicit yes. A non-interactive stdin (no TTY)
-/// returns false — callers should require an explicit bypass flag there.
-pub fn confirm(prompt: &str) -> bool {
+/// Ask the user to confirm an action on stdin.
+///
+/// Returns false when stdin is not interactive.
+pub async fn confirm(prompt: &str) -> bool {
+    let prompt = prompt.to_string();
+
+    spawn_blocking(move || confirm_blocking(&prompt))
+        .await
+        .unwrap_or(false)
+}
+
+fn confirm_blocking(prompt: &str) -> bool {
     if !io::stdin().is_terminal() {
         return false;
     }
+
     print!("  {} {} ", prompt.bold(), "[y/N]".dimmed());
     let _ = io::stdout().flush();
     let mut input = String::new();
+
     if io::stdin().read_line(&mut input).is_err() {
         return false;
     }
+
     matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 

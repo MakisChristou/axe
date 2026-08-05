@@ -191,7 +191,13 @@ where
     if !status.is_success() {
         eyre::bail!("Hyperliquid /exchange returned HTTP {status}: {text}");
     }
-    if !text.contains("\"status\":\"ok\"") {
+    #[derive(serde::Deserialize)]
+    struct ExchangeResponse {
+        status: String,
+    }
+    let exchange_response: ExchangeResponse = serde_json::from_str(&text)
+        .map_err(|error| eyre!("Hyperliquid returned malformed response: {error}: {text}"))?;
+    if exchange_response.status != "ok" {
         eyre::bail!("Hyperliquid rejected big-blocks toggle: {text}");
     }
     Ok(())

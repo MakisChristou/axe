@@ -2,7 +2,6 @@
 //! cosmos node — no signing, no broadcast. Config readers (`read_axelar_*`)
 //! live here too because they're "where do I point the LCD client" plumbing.
 
-use std::fs;
 use std::path::Path;
 
 use alloy::{
@@ -414,7 +413,7 @@ static LCD_FALLBACK_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new()
 /// in the candidate list — `0` is the primary (no warning), anything ≥ 1 is
 /// a fallback. The endpoint URL is intentionally NOT logged — it can be a
 /// private/paid endpoint from a repo secret.
-fn note_lcd_fallback_use(idx: usize, _used: &str, last_err: Option<&eyre::Report>) {
+fn note_lcd_fallback_use(idx: usize, last_err: Option<&CosmwasmQueryError>) {
     if idx == 0 {
         return;
     }
@@ -432,11 +431,96 @@ fn note_lcd_fallback_use(idx: usize, _used: &str, last_err: Option<&eyre::Report
     ));
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum CosmwasmQueryError {
+    #[error("failed to encode CosmWasm smart query: {0}")]
+    Encode(#[source] serde_json::Error),
+    #[error("{role} request failed: {source}")]
+    Transport {
+        role: &'static str,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("{role} body read failed: {source}")]
+    BodyRead {
+        role: &'static str,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("{role} returned HTTP {status}. First 200 chars of body: {body}")]
+    Http {
+        role: &'static str,
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    #[error("{role} returned non-JSON body. First 200 chars: {body}\nParse error: {source}")]
+    InvalidJson {
+        role: &'static str,
+        body: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("{role} response missing data field. First 200 chars: {body}")]
+    MissingData { role: &'static str, body: String },
+    #[error("LCD query exhausted all endpoints")]
+    Exhausted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CosmwasmQueryPending {
+    OutgoingMessage,
+    ExecutableMessage,
+}
+
+impl CosmwasmQueryError {
+    /// Contract-query error payload, if the server returned one. Verification
+    /// code may classify known contract-level "not ready yet" responses
+    /// without accidentally treating transport or malformed-data errors as
+    /// normal pending states.
+    pub fn contract_error_body(&self) -> Option<&str> {
+        match self {
+            Self::Http { body, .. } => Some(body),
+            _ => None,
+        }
+    }
+
+    pub fn is_pending(&self, query: CosmwasmQueryPending) -> bool {
+        let Some(body) = self.contract_error_body() else {
+            return false;
+        };
+        let body = body.to_lowercase();
+        match query {
+            CosmwasmQueryPending::OutgoingMessage => {
+                body.contains("failed to query outgoing messages")
+                    || body.contains("message with id") && body.contains("not found")
+            }
+            CosmwasmQueryPending::ExecutableMessage => {
+                body.contains("not approved")
+                    || body.contains("failed to query executable messages")
+            }
+        }
+    }
+}
+
 pub async fn lcd_cosmwasm_smart_query(
     lcd: &str,
     contract: &str,
     query_msg: &Value,
 ) -> Result<Value> {
+    lcd_cosmwasm_smart_query_typed(lcd, contract, query_msg)
+        .await
+        .map_err(eyre::Report::new)
+        .wrap_err(
+            "Tip: set AXELAR_LCD_URL to a working endpoint (e.g. \
+             `https://rest.lavenderfive.com/axelar` for mainnet).",
+        )
+}
+
+pub async fn lcd_cosmwasm_smart_query_typed(
+    lcd: &str,
+    contract: &str,
+    query_msg: &Value,
+) -> std::result::Result<Value, CosmwasmQueryError> {
     let user_override = std::env::var("AXELAR_LCD_URL").ok();
     let primary = user_override
         .clone()
@@ -457,9 +541,9 @@ pub async fn lcd_cosmwasm_smart_query(
         }
     }
 
-    let query_json = serde_json::to_string(query_msg)?;
+    let query_json = serde_json::to_string(query_msg).map_err(CosmwasmQueryError::Encode)?;
     let query_b64 = base64::engine::general_purpose::STANDARD.encode(query_json.as_bytes());
-    let mut last_err: Option<eyre::Report> = None;
+    let mut last_err: Option<CosmwasmQueryError> = None;
 
     for (idx, endpoint) in candidates.iter().enumerate() {
         // Role label keeps logs / report files free of endpoint URLs (which
@@ -476,21 +560,20 @@ pub async fn lcd_cosmwasm_smart_query(
                 match response.text().await {
                     Ok(body) => {
                         if !status.is_success() {
-                            last_err = Some(eyre::eyre!(
-                                "{role} returned HTTP {status}. \
-                                 First 200 chars of body: {}",
-                                body.chars().take(200).collect::<String>()
-                            ));
+                            last_err = Some(CosmwasmQueryError::Http {
+                                role,
+                                status,
+                                body: body.chars().take(200).collect(),
+                            });
                             continue;
                         }
                         match serde_json::from_str::<Value>(&body) {
                             Ok(resp) => {
                                 let data = resp.get("data").cloned().ok_or_else(|| {
-                                    eyre::eyre!(
-                                        "{role} response missing data field. \
-                                         First 200 chars: {}",
-                                        body.chars().take(200).collect::<String>()
-                                    )
+                                    CosmwasmQueryError::MissingData {
+                                        role,
+                                        body: body.chars().take(200).collect(),
+                                    }
                                 });
                                 let data = match data {
                                     Ok(data) => data,
@@ -499,38 +582,33 @@ pub async fn lcd_cosmwasm_smart_query(
                                         continue;
                                     }
                                 };
-                                note_lcd_fallback_use(idx, endpoint, last_err.as_ref());
+                                note_lcd_fallback_use(idx, last_err.as_ref());
                                 return Ok(data);
                             }
                             Err(e) => {
-                                last_err = Some(eyre::eyre!(
-                                    "{role} returned non-JSON body. \
-                                     First 200 chars: {}\nParse error: {e}",
-                                    body.chars().take(200).collect::<String>()
-                                ));
+                                last_err = Some(CosmwasmQueryError::InvalidJson {
+                                    role,
+                                    body: body.chars().take(200).collect(),
+                                    source: e,
+                                });
                                 continue;
                             }
                         }
                     }
                     Err(e) => {
-                        last_err = Some(eyre::eyre!("{role} body read failed: {e}"));
+                        last_err = Some(CosmwasmQueryError::BodyRead { role, source: e });
                         continue;
                     }
                 }
             }
             Err(e) => {
-                last_err = Some(eyre::eyre!("{role} request failed: {e}"));
+                last_err = Some(CosmwasmQueryError::Transport { role, source: e });
                 continue;
             }
         }
     }
 
-    Err(last_err.unwrap_or_else(|| eyre::eyre!("LCD query exhausted all endpoints"))).map_err(|e| {
-        eyre::eyre!(
-            "{e}\nTip: set AXELAR_LCD_URL to a working endpoint (e.g. \
-                 `https://rest.lavenderfive.com/axelar` for mainnet)."
-        )
-    })
+    Err(last_err.unwrap_or(CosmwasmQueryError::Exhausted))
 }
 
 /// Fetch code IDs by matching storeCodeProposalCodeHash against on-chain checksums.
@@ -571,15 +649,16 @@ pub async fn lcd_fetch_code_id(lcd: &str, expected_checksum: &str) -> Result<u64
 /// Errors if any of the fields are missing — silent defaults previously
 /// masked config drift (e.g. a missing `gasPrice` falling back to
 /// `0.007uaxl`), so callers should always hit a real on-disk config.
-pub fn read_axelar_config(target_json: &Path) -> Result<(String, String, String, f64)> {
-    crate::config::ChainsConfig::load(target_json)?
+pub async fn read_axelar_config(target_json: &Path) -> Result<(String, String, String, f64)> {
+    crate::config::ChainsConfig::load(target_json)
+        .await?
         .axelar
         .cosmos_tx_params()
 }
 
 /// Read a string field from axelar contracts config
-pub fn read_axelar_contract_field(target_json: &Path, pointer: &str) -> Result<String> {
-    let content = fs::read_to_string(target_json)?;
+pub async fn read_axelar_contract_field(target_json: &Path, pointer: &str) -> Result<String> {
+    let content = tokio::fs::read_to_string(target_json).await?;
     let root: Value = serde_json::from_str(&content)?;
     root.pointer(pointer)
         .and_then(|v| v.as_str())
@@ -588,8 +667,8 @@ pub fn read_axelar_contract_field(target_json: &Path, pointer: &str) -> Result<S
 }
 
 /// Read Axelar RPC url from target json (`/axelar/rpc`).
-pub fn read_axelar_rpc(target_json: &Path) -> Result<String> {
-    let content = fs::read_to_string(target_json)?;
+pub async fn read_axelar_rpc(target_json: &Path) -> Result<String> {
+    let content = tokio::fs::read_to_string(target_json).await?;
     // Parse to `Value` first so a malformed-JSON file surfaces serde's parse
     // error verbatim, matching the original `from_str::<Value>(&content)?`.
     let raw: Value = serde_json::from_str(&content)?;
@@ -631,7 +710,7 @@ fn rpc_fallbacks_for(primary: &str) -> &'static [&'static str] {
 /// flood the report log.
 static RPC_FALLBACK_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
-fn note_rpc_fallback_use(idx: usize, _used: &str, last_err: Option<&eyre::Report>) {
+fn note_rpc_fallback_use(idx: usize, last_err: Option<&eyre::Report>) {
     if idx == 0 {
         return;
     }
@@ -690,7 +769,7 @@ pub async fn rpc_tx_search_event(rpc: &str, event_key: &str, event_value: &str) 
                 }
                 match response.json::<Value>().await {
                     Ok(v) => {
-                        note_rpc_fallback_use(idx, endpoint, last_err.as_ref());
+                        note_rpc_fallback_use(idx, last_err.as_ref());
                         return Ok(v);
                     }
                     Err(e) => {
@@ -836,7 +915,7 @@ pub async fn rpc_block_info(rpc: &str, height: Option<u64>) -> Result<(u64, Stri
             continue;
         };
         let height: u64 = parse_required("block.header.height", Some(&height_str))?;
-        note_rpc_fallback_use(idx, endpoint, last_err.as_ref());
+        note_rpc_fallback_use(idx, last_err.as_ref());
         return Ok((height, time));
     }
 
@@ -856,7 +935,7 @@ pub async fn fetch_verifier_set(
     target_json: &Path,
     chain_axelar_id: &str,
 ) -> Result<(Vec<(Address, u128)>, u128, FixedBytes<32>, String)> {
-    let content = fs::read_to_string(target_json)?;
+    let content = tokio::fs::read_to_string(target_json).await?;
     // Parse to `Value` first so a malformed-JSON file surfaces serde's parse
     // error verbatim, matching the original `from_str::<Value>(&content)?`.
     let raw: Value = serde_json::from_str(&content)?;
@@ -900,19 +979,15 @@ pub async fn fetch_verifier_set(
         .signers
         .ok_or_else(|| eyre::eyre!("no signers object in verifier set"))?;
 
-    let threshold: u128 = verifier_set
-        .threshold
-        .as_str()
-        .or_else(|| verifier_set.threshold.as_u64().map(|_| ""))
-        .ok_or_else(|| eyre::eyre!("no threshold in verifier set"))
-        .and_then(|s| {
-            if s.is_empty() {
-                Ok(verifier_set.threshold.as_u64().unwrap() as u128)
-            } else {
-                s.parse::<u128>()
-                    .map_err(|e| eyre::eyre!("invalid threshold: {e}"))
-            }
-        })?;
+    let threshold = if let Some(value) = verifier_set.threshold.as_str() {
+        value
+            .parse::<u128>()
+            .map_err(|error| eyre::eyre!("invalid threshold: {error}"))?
+    } else if let Some(value) = verifier_set.threshold.as_u64() {
+        u128::from(value)
+    } else {
+        return Err(eyre::eyre!("no threshold in verifier set"));
+    };
 
     let created_at = verifier_set
         .created_at
@@ -960,4 +1035,44 @@ pub async fn fetch_verifier_set(
     }
 
     Ok((weighted_signers, threshold, nonce, verifier_set_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CosmwasmQueryError, CosmwasmQueryPending};
+
+    fn contract_error(body: &str) -> CosmwasmQueryError {
+        CosmwasmQueryError::Http {
+            role: "primary LCD",
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn classifies_only_matching_contract_responses_as_pending() {
+        assert!(
+            contract_error("failed to query outgoing messages: message with ID abc not found")
+                .is_pending(CosmwasmQueryPending::OutgoingMessage)
+        );
+        assert!(
+            contract_error("failed to query executable messages: message is not approved")
+                .is_pending(CosmwasmQueryPending::ExecutableMessage)
+        );
+        assert!(
+            !contract_error("failed to query executable messages")
+                .is_pending(CosmwasmQueryPending::OutgoingMessage)
+        );
+    }
+
+    #[test]
+    fn transport_and_malformed_failures_are_never_pending() {
+        let malformed = CosmwasmQueryError::MissingData {
+            role: "primary LCD",
+            body: "failed to query outgoing messages".to_string(),
+        };
+
+        assert!(!malformed.is_pending(CosmwasmQueryPending::OutgoingMessage));
+        assert!(!CosmwasmQueryError::Exhausted.is_pending(CosmwasmQueryPending::ExecutableMessage));
+    }
 }

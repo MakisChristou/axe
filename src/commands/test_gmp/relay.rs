@@ -3,7 +3,7 @@ use eyre::Result;
 use serde_json::{Value, json};
 
 use crate::commands::test_helpers::{
-    end_poll_with_retry, extract_event_attr, route_messages_with_retry,
+    CosmosTxContext, end_poll_with_retry, extract_event_attr, route_messages_with_retry,
     submit_verify_messages_amplifier, wait_for_poll_votes, wait_for_proof,
 };
 use crate::cosmos::{build_execute_msg_any, sign_and_broadcast_cosmos_tx};
@@ -37,18 +37,16 @@ pub async fn run_full_sequence(
     message_id: &str,
     total_steps: usize,
 ) -> Result<String> {
-    ui::step_header(2, total_steps, "verify_messages");
-    let poll_id = submit_verify_messages_amplifier(
-        gmp_msg,
+    let tx = CosmosTxContext {
         signing_key,
-        &ctx.axelar_address,
-        &ctx.lcd,
-        &ctx.chain_id,
-        &ctx.fee_denom,
-        ctx.gas_price,
-        &ctx.cosm_gateway,
-    )
-    .await?;
+        axelar_address: &ctx.axelar_address,
+        lcd: &ctx.lcd,
+        chain_id: &ctx.chain_id,
+        fee_denom: &ctx.fee_denom,
+        gas_price: ctx.gas_price,
+    };
+    ui::step_header(2, total_steps, "verify_messages");
+    let poll_id = submit_verify_messages_amplifier(gmp_msg, tx, &ctx.cosm_gateway).await?;
 
     if let Some(poll_id) = poll_id {
         ui::kv("poll_id", &poll_id);
@@ -59,17 +57,7 @@ pub async fn run_full_sequence(
             .as_deref()
             .ok_or_else(|| eyre::eyre!("voting verifier address required to end poll"))?;
         wait_for_poll_votes(&ctx.lcd, vv, &poll_id).await?;
-        end_poll_with_retry(
-            &poll_id,
-            signing_key,
-            &ctx.axelar_address,
-            &ctx.lcd,
-            &ctx.chain_id,
-            &ctx.fee_denom,
-            ctx.gas_price,
-            vv,
-        )
-        .await?;
+        end_poll_with_retry(&poll_id, tx, vv).await?;
     } else {
         ui::info("no new poll created — message already being verified by active verifiers");
         ui::step_header(3, total_steps, "Wait for poll votes + end poll");
@@ -77,17 +65,7 @@ pub async fn run_full_sequence(
     }
 
     ui::step_header(4, total_steps, "route_messages");
-    route_messages_with_retry(
-        gmp_msg,
-        signing_key,
-        &ctx.axelar_address,
-        &ctx.lcd,
-        &ctx.chain_id,
-        &ctx.fee_denom,
-        ctx.gas_price,
-        &ctx.cosm_gateway,
-    )
-    .await?;
+    route_messages_with_retry(gmp_msg, tx, &ctx.cosm_gateway).await?;
 
     ui::step_header(5, total_steps, "construct_proof");
     ui::address("multisig prover", &ctx.multisig_prover);

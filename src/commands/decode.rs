@@ -9,27 +9,35 @@ use std::sync::LazyLock;
 
 const ABI_JSON: &str = include_str!("../../abi-db.json");
 
-static FUNC_DB: LazyLock<HashMap<[u8; 4], alloy::json_abi::Function>> = LazyLock::new(|| {
-    let abi: JsonAbi = serde_json::from_str(ABI_JSON).expect("embedded ABI is invalid");
-    let mut map = HashMap::new();
-    for funcs in abi.functions.values() {
-        for func in funcs {
-            map.insert(func.selector().0, func.clone());
+static FUNC_DB: LazyLock<std::result::Result<HashMap<[u8; 4], alloy::json_abi::Function>, String>> =
+    LazyLock::new(|| {
+        let abi: JsonAbi = serde_json::from_str(ABI_JSON).map_err(|error| error.to_string())?;
+        let mut map = HashMap::new();
+        for funcs in abi.functions.values() {
+            for func in funcs {
+                map.insert(func.selector().0, func.clone());
+            }
         }
-    }
-    map
-});
+        Ok(map)
+    });
 
-pub(crate) static EVENT_DB: LazyLock<HashMap<B256, alloy::json_abi::Event>> = LazyLock::new(|| {
-    let abi: JsonAbi = serde_json::from_str(ABI_JSON).expect("embedded ABI is invalid");
-    let mut map = HashMap::new();
-    for events in abi.events.values() {
-        for event in events {
-            map.insert(event.selector(), event.clone());
+static EVENT_DB: LazyLock<std::result::Result<HashMap<B256, alloy::json_abi::Event>, String>> =
+    LazyLock::new(|| {
+        let abi: JsonAbi = serde_json::from_str(ABI_JSON).map_err(|error| error.to_string())?;
+        let mut map = HashMap::new();
+        for events in abi.events.values() {
+            for event in events {
+                map.insert(event.selector(), event.clone());
+            }
         }
-    }
-    map
-});
+        Ok(map)
+    });
+
+fn function_db() -> Result<&'static HashMap<[u8; 4], alloy::json_abi::Function>> {
+    FUNC_DB
+        .as_ref()
+        .map_err(|error| eyre::eyre!("embedded ABI is invalid: {error}"))
+}
 
 const MAX_DEPTH: usize = 5;
 
@@ -41,7 +49,7 @@ pub fn run(calldata_hex: &str) -> Result<()> {
 pub(crate) fn decode_bytes(data: &[u8], indent: &str) -> Result<()> {
     // Try as function call (4-byte selector lookup)
     if data.len() >= 4
-        && let Some(func) = FUNC_DB.get(&<[u8; 4]>::try_from(&data[..4])?)
+        && let Some(func) = function_db()?.get(&<[u8; 4]>::try_from(&data[..4])?)
     {
         let values = func.abi_decode_input(&data[4..])?;
         println!("{indent}{}", func.signature().bold());
@@ -78,7 +86,7 @@ pub(crate) fn decode_log(
     data: &[u8],
 ) -> Option<(String, Vec<(String, DynSolValue)>)> {
     let topic0 = topics.first()?;
-    let event = EVENT_DB.get(topic0)?;
+    let event = EVENT_DB.as_ref().ok()?.get(topic0)?;
 
     let non_indexed_params: Vec<_> = event.inputs.iter().filter(|p| !p.indexed).collect();
 
@@ -258,7 +266,7 @@ fn try_print_nested(data: &[u8], indent: &str, depth: usize) -> bool {
     // Try as function call
     if data.len() >= 4
         && let Ok(sel) = <[u8; 4]>::try_from(&data[..4])
-        && let Some(func) = FUNC_DB.get(&sel)
+        && let Some(func) = FUNC_DB.as_ref().ok().and_then(|db| db.get(&sel))
         && let Ok(values) = func.abi_decode_input(&data[4..])
     {
         println!("{indent}{}", func.signature().bold());

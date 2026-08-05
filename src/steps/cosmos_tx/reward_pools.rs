@@ -7,6 +7,7 @@ use cosmos_sdk_proto::cosmos::base::v1beta1::Coin as ProtoCoin;
 use eyre::Result;
 use serde_json::{Value, json};
 
+use super::StepTxContext;
 use super::defaults::{DEFAULT_PROPOSAL_DEPOSIT_UAXL, DEFAULT_REWARD_AMOUNT_UAXL};
 use crate::commands::deploy::DeployContext;
 use crate::cosmos::{
@@ -15,70 +16,67 @@ use crate::cosmos::{
 };
 use crate::ui;
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_create_reward_pools(
-    ctx: &mut DeployContext,
-    signing_key: &cosmrs::crypto::secp256k1::SigningKey,
-    axelar_address: &str,
-    lcd: &str,
-    chain_id: &str,
-    fee_denom: &str,
-    gas_price: f64,
-    use_governance: bool,
-    chain_axelar_id: &str,
+fn reward_pool_messages(
     env: &str,
-    proposal_key: &str,
-) -> Result<()> {
-    ui::info(&format!("creating reward pools for {chain_axelar_id}..."));
-
-    let rewards_addr =
-        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Rewards/address")?;
-    let governance_address =
-        read_axelar_contract_field(&ctx.target_json, "/axelar/governanceAddress")?;
-    let multisig_addr =
-        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Multisig/address")?;
-    let voting_verifier_addr = read_axelar_contract_field(
-        &ctx.target_json,
-        &format!("/axelar/contracts/VotingVerifier/{chain_axelar_id}/address"),
-    )?;
-
-    // Rewards-pool params per network. epoch_duration is in cosmos blocks
-    // (testnet/stagenet share the 600 default; mainnet's 14845 ≈ 24h at
-    // ~5.8s/block). participation_threshold is a ratio, rewards_per_epoch in
-    // uaxl. These match `axelar-contract-deployments` epoch params for the
-    // amplifier rewards pool.
+    chain: &str,
+    voting_verifier: &str,
+    multisig: &str,
+) -> [Value; 2] {
     let (epoch_duration, participation_threshold, rewards_per_epoch) = match env {
         "devnet-amplifier" => ("100", json!(["7", "10"]), "100"),
         "mainnet" => ("14845", json!(["8", "10"]), "3424660000"),
         _ => ("600", json!(["7", "10"]), "100"),
     };
+    let create = |contract: &str| {
+        json!({
+            "create_pool": {
+                "params": {
+                    "epoch_duration": epoch_duration,
+                    "participation_threshold": participation_threshold,
+                    "rewards_per_epoch": rewards_per_epoch
+                },
+                "pool_id": {
+                    "chain_name": chain,
+                    "contract": contract
+                }
+            }
+        })
+    };
+    [create(voting_verifier), create(multisig)]
+}
 
-    let msg1 = json!({
-        "create_pool": {
-            "params": {
-                "epoch_duration": epoch_duration,
-                "participation_threshold": participation_threshold,
-                "rewards_per_epoch": rewards_per_epoch
-            },
-            "pool_id": {
-                "chain_name": chain_axelar_id,
-                "contract": voting_verifier_addr
-            }
-        }
-    });
-    let msg2 = json!({
-        "create_pool": {
-            "params": {
-                "epoch_duration": epoch_duration,
-                "participation_threshold": participation_threshold,
-                "rewards_per_epoch": rewards_per_epoch
-            },
-            "pool_id": {
-                "chain_name": chain_axelar_id,
-                "contract": multisig_addr
-            }
-        }
-    });
+pub(super) async fn run_create_reward_pools(
+    ctx: &mut DeployContext,
+    tx: StepTxContext<'_>,
+) -> Result<()> {
+    let StepTxContext {
+        signing_key,
+        axelar_address,
+        lcd,
+        chain_id,
+        fee_denom,
+        gas_price,
+        use_governance,
+        chain_axelar_id,
+        env,
+        proposal_key,
+    } = tx;
+    ui::info(&format!("creating reward pools for {chain_axelar_id}..."));
+
+    let rewards_addr =
+        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Rewards/address").await?;
+    let governance_address =
+        read_axelar_contract_field(&ctx.target_json, "/axelar/governanceAddress").await?;
+    let multisig_addr =
+        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Multisig/address").await?;
+    let voting_verifier_addr = read_axelar_contract_field(
+        &ctx.target_json,
+        &format!("/axelar/contracts/VotingVerifier/{chain_axelar_id}/address"),
+    )
+    .await?;
+
+    let [msg1, msg2] =
+        reward_pool_messages(env, chain_axelar_id, &voting_verifier_addr, &multisig_addr);
 
     let sender = if use_governance {
         &governance_address
@@ -93,6 +91,7 @@ pub(super) async fn run_create_reward_pools(
             &ctx.target_json,
             "/axelar/govProposalExpeditedDepositAmount",
         )
+        .await
         .unwrap_or_else(|_| DEFAULT_PROPOSAL_DEPOSIT_UAXL.to_string());
         let title = format!("Create reward pools for {chain_axelar_id}");
         let summary =
@@ -138,27 +137,28 @@ pub(super) async fn run_create_reward_pools(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_add_rewards(
-    ctx: &DeployContext,
-    signing_key: &cosmrs::crypto::secp256k1::SigningKey,
-    axelar_address: &str,
-    lcd: &str,
-    chain_id: &str,
-    fee_denom: &str,
-    gas_price: f64,
-    chain_axelar_id: &str,
-) -> Result<()> {
+pub(super) async fn run_add_rewards(ctx: &DeployContext, tx: StepTxContext<'_>) -> Result<()> {
+    let StepTxContext {
+        signing_key,
+        axelar_address,
+        lcd,
+        chain_id,
+        fee_denom,
+        gas_price,
+        chain_axelar_id,
+        ..
+    } = tx;
     ui::info(&format!("adding rewards for {chain_axelar_id}..."));
 
     let rewards_addr =
-        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Rewards/address")?;
+        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Rewards/address").await?;
     let multisig_addr =
-        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Multisig/address")?;
+        read_axelar_contract_field(&ctx.target_json, "/axelar/contracts/Multisig/address").await?;
     let voting_verifier_addr = read_axelar_contract_field(
         &ctx.target_json,
         &format!("/axelar/contracts/VotingVerifier/{chain_axelar_id}/address"),
-    )?;
+    )
+    .await?;
 
     let reward_amount = DEFAULT_REWARD_AMOUNT_UAXL;
     let funds = vec![ProtoCoin {

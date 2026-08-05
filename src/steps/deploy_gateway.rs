@@ -1,5 +1,3 @@
-use std::fs;
-
 use alloy::{
     hex,
     network::TransactionBuilder,
@@ -19,6 +17,94 @@ use crate::state::{Step, save_state};
 use crate::ui;
 use crate::utils::{compute_domain_separator, update_target_json};
 
+struct GatewayDeploymentRecord {
+    proxy: alloy::primitives::Address,
+    implementation: alloy::primitives::Address,
+    deployer: alloy::primitives::Address,
+    implementation_codehash: alloy::primitives::B256,
+    domain_separator: alloy::primitives::B256,
+    verifier_set_id: String,
+}
+
+async fn write_gateway_config(ctx: &DeployContext, record: &GatewayDeploymentRecord) -> Result<()> {
+    let mut data = serde_json::Map::new();
+    data.insert("address".into(), json!(format!("{}", record.proxy)));
+    data.insert(
+        "implementation".into(),
+        json!(format!("{}", record.implementation)),
+    );
+    data.insert("deployer".into(), json!(format!("{}", record.deployer)));
+    data.insert("deploymentMethod".into(), json!("create"));
+    data.insert(
+        "implementationCodehash".into(),
+        json!(format!("{}", record.implementation_codehash)),
+    );
+    data.insert("previousSignersRetention".into(), json!(15));
+    data.insert(
+        "domainSeparator".into(),
+        json!(format!("{}", record.domain_separator)),
+    );
+    data.insert("minimumRotationDelay".into(), json!(3600));
+    data.insert("operator".into(), json!(format!("{}", record.deployer)));
+    data.insert("owner".into(), json!(format!("{}", record.deployer)));
+    data.insert("connectionType".into(), json!("amplifier"));
+    data.insert("initialVerifierSetId".into(), json!(record.verifier_set_id));
+    update_target_json(
+        &ctx.target_json,
+        &ctx.axelar_id,
+        "AxelarGateway",
+        Value::Object(data),
+    )
+    .await
+}
+
+async fn deploy_gateway_proxy<P: Provider>(
+    provider: &P,
+    implementation: alloy::primitives::Address,
+    owner: alloy::primitives::Address,
+    setup_params: &Bytes,
+    proxy_artifact: &str,
+) -> Result<alloy::primitives::Address> {
+    ui::info("deploying AxelarAmplifierGatewayProxy...");
+    let mut deploy_code = read_artifact_bytecode(proxy_artifact).await?;
+    deploy_code
+        .extend_from_slice(&(implementation, owner, setup_params.clone()).abi_encode_params());
+    let tx = TransactionRequest::default()
+        .with_deploy_code(Bytes::from(deploy_code))
+        .with_gas_limit(5_000_000);
+    match provider.call(tx.clone()).await {
+        Ok(_) => ui::success("eth_call simulation passed"),
+        Err(error) => {
+            ui::warn(&format!(
+                "eth_call simulation failed: {}",
+                decode_evm_error(&error)
+            ));
+            ui::warn("proceeding with send_transaction anyway...");
+        }
+    }
+    let receipt = match provider.send_transaction(tx).await {
+        Ok(pending) => pending.get_receipt().await?,
+        Err(error) => {
+            return Err(eyre::eyre!(
+                "proxy deployment failed: {}",
+                decode_evm_error(&error)
+            ));
+        }
+    };
+    ui::tx_hash("proxy tx hash", &format!("{}", receipt.transaction_hash));
+    if !receipt.status() {
+        return Err(eyre::eyre!(
+            "proxy deployment tx {} reverted on-chain (status=0)",
+            receipt.transaction_hash
+        ));
+    }
+    let address = receipt
+        .contract_address
+        .ok_or_else(|| eyre::eyre!("no contract address in proxy receipt"))?;
+    ui::address("proxy deployed at", &format!("{address}"));
+    Ok(address)
+}
+
 pub async fn run(
     ctx: &mut DeployContext,
     step_idx: usize,
@@ -33,7 +119,7 @@ pub async fn run(
         .wallet(signer)
         .connect_http(ctx.rpc_url.parse()?);
 
-    let domain_separator = compute_domain_separator(&ctx.target_json, &ctx.axelar_id)?;
+    let domain_separator = compute_domain_separator(&ctx.target_json, &ctx.axelar_id).await?;
 
     // How many past verifier sets the gateway accepts proofs from after a
     // rotation. 15 means a rotation is reversible for 15 cycles before the
@@ -60,7 +146,7 @@ pub async fn run(
         (addr, keccak256(&code))
     } else {
         ui::info("deploying AxelarAmplifierGateway implementation...");
-        let impl_bytecode = read_artifact_bytecode(impl_artifact)?;
+        let impl_bytecode = read_artifact_bytecode(impl_artifact).await?;
         let mut impl_deploy_code = impl_bytecode.clone();
         impl_deploy_code.extend_from_slice(
             &(
@@ -86,15 +172,15 @@ pub async fn run(
         let codehash = keccak256(&code);
 
         // Save implementation address to step so retries skip re-deployment
-        ctx.state.steps[step_idx].set_implementation_address(addr);
-        save_state(&ctx.state)?;
+        ctx.state.steps[step_idx].set_implementation_address(addr)?;
+        save_state(&ctx.state).await?;
 
         (addr, codehash)
     };
 
     // --- Fetch verifier set from Axelar chain ---
     let chain_axelar_id = {
-        let content = fs::read_to_string(&ctx.target_json)?;
+        let content = tokio::fs::read_to_string(&ctx.target_json).await?;
         let root: Value = serde_json::from_str(&content)?;
         root.pointer(&format!("/chains/{}/axelarId", ctx.axelar_id))
             .and_then(|v| v.as_str())
@@ -117,75 +203,19 @@ pub async fn run(
         ),
     );
 
-    // --- Tx 2: Deploy proxy ---
-    ui::info("deploying AxelarAmplifierGatewayProxy...");
-    let proxy_bytecode = read_artifact_bytecode(proxy_artifact)?;
-    let mut proxy_deploy_code = proxy_bytecode.clone();
-    proxy_deploy_code
-        .extend_from_slice(&(impl_addr, owner, setup_params.clone()).abi_encode_params());
+    let proxy_addr =
+        deploy_gateway_proxy(&provider, impl_addr, owner, &setup_params, proxy_artifact).await?;
 
-    let proxy_deploy_bytes = Bytes::from(proxy_deploy_code);
-    let tx = TransactionRequest::default()
-        .with_deploy_code(proxy_deploy_bytes.clone())
-        .with_gas_limit(5_000_000);
-
-    match provider.call(tx.clone()).await {
-        Ok(_) => ui::success("eth_call simulation passed"),
-        Err(e) => {
-            let reason = decode_evm_error(&e);
-            ui::warn(&format!("eth_call simulation failed: {reason}"));
-            ui::warn("proceeding with send_transaction anyway...");
-        }
-    }
-
-    let receipt = match provider.send_transaction(tx).await {
-        Ok(pending) => pending.get_receipt().await?,
-        Err(e) => {
-            let reason = decode_evm_error(&e);
-            return Err(eyre::eyre!("proxy deployment failed: {reason}"));
-        }
-    };
-    ui::tx_hash("proxy tx hash", &format!("{}", receipt.transaction_hash));
-
-    if !receipt.status() {
-        return Err(eyre::eyre!(
-            "proxy deployment tx {} reverted on-chain (status=0)",
-            receipt.transaction_hash
-        ));
-    }
-
-    let proxy_addr = receipt
-        .contract_address
-        .ok_or_else(|| eyre::eyre!("no contract address in proxy receipt"))?;
-    ui::address("proxy deployed at", &format!("{proxy_addr}"));
-
-    // --- Write to target JSON ---
-    let mut contract_data = serde_json::Map::new();
-    contract_data.insert("address".into(), json!(format!("{proxy_addr}")));
-    contract_data.insert("implementation".into(), json!(format!("{impl_addr}")));
-    contract_data.insert("deployer".into(), json!(format!("{deployer_addr}")));
-    contract_data.insert("deploymentMethod".into(), json!("create"));
-    contract_data.insert(
-        "implementationCodehash".into(),
-        json!(format!("{impl_codehash}")),
-    );
-    contract_data.insert("previousSignersRetention".into(), json!(15));
-    contract_data.insert(
-        "domainSeparator".into(),
-        json!(format!("{domain_separator}")),
-    );
-    contract_data.insert("minimumRotationDelay".into(), json!(3600));
-    contract_data.insert("operator".into(), json!(format!("{operator}")));
-    contract_data.insert("owner".into(), json!(format!("{owner}")));
-    contract_data.insert("connectionType".into(), json!("amplifier"));
-    contract_data.insert("initialVerifierSetId".into(), json!(verifier_set_id));
-
-    update_target_json(
-        &ctx.target_json,
-        &ctx.axelar_id,
-        "AxelarGateway",
-        Value::Object(contract_data),
-    )?;
-
-    Ok(())
+    write_gateway_config(
+        ctx,
+        &GatewayDeploymentRecord {
+            proxy: proxy_addr,
+            implementation: impl_addr,
+            deployer: deployer_addr,
+            implementation_codehash: impl_codehash,
+            domain_separator,
+            verifier_set_id,
+        },
+    )
+    .await
 }

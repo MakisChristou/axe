@@ -15,8 +15,8 @@ use crate::ui;
 /// without going so far back that consensus parameter changes skew the rate.
 const RATE_SAMPLE_WINDOW: u64 = 1000;
 
-fn read_axelar_rpc_from(config_path: &Path) -> Result<String> {
-    let content = std::fs::read_to_string(config_path)?;
+async fn read_axelar_rpc_from(config_path: &Path) -> Result<String> {
+    let content = tokio::fs::read_to_string(config_path).await?;
     let root: Value = serde_json::from_str(&content)?;
     root.pointer("/axelar/rpc")
         .and_then(|v| v.as_str())
@@ -58,7 +58,7 @@ fn print_times(time: DateTime<Utc>) {
 
 pub async fn run(network: Network, number: Option<u64>, at_time: Option<String>) -> Result<()> {
     let config_path = config_source::resolve(network, None).await?.into_path();
-    let rpc = read_axelar_rpc_from(&config_path)?;
+    let rpc = read_axelar_rpc_from(&config_path).await?;
 
     ui::section(&format!("Info: block ({network})"));
 
@@ -114,7 +114,11 @@ pub async fn run(network: Network, number: Option<u64>, at_time: Option<String>)
             return Ok(());
         }
 
-        let target = parse_at_time(&at_time.unwrap())?;
+        let target = parse_at_time(
+            at_time
+                .as_deref()
+                .ok_or_else(|| eyre::eyre!("missing --at-time value"))?,
+        )?;
         let delta_secs = (target - head_time).num_milliseconds() as f64 / 1000.0;
         let delta_blocks = delta_secs / rate_secs_per_block;
         let predicted_height = head_height as f64 + delta_blocks;

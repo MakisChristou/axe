@@ -38,7 +38,7 @@ pub async fn ensure_sender_receiver_deployed<P: Provider>(
     };
 
     state.sender_receiver_address = Some(addr);
-    save_state(state)?;
+    save_state(state).await?;
     ui::address("SenderReceiver", &format!("{addr}"));
     Ok(addr)
 }
@@ -48,7 +48,7 @@ async fn deploy_sender_receiver<P: Provider>(
     gateway: Address,
     gas_service: Address,
 ) -> Result<Address> {
-    let bytecode = read_artifact_bytecode("artifacts/SenderReceiver.json")?;
+    let bytecode = read_artifact_bytecode("artifacts/SenderReceiver.json").await?;
     let mut deploy_code = bytecode;
     deploy_code.extend_from_slice(&(gateway, gas_service).abi_encode_params());
 

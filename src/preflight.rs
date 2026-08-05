@@ -64,7 +64,7 @@ pub async fn check_deployer_balance(
     target_json: &Path,
     axelar_id: &str,
 ) -> Result<()> {
-    let cfg = crate::config::ChainsConfig::load(target_json)?;
+    let cfg = crate::config::ChainsConfig::load(target_json).await?;
     let token_symbol = cfg
         .chains
         .get(axelar_id)

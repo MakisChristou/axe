@@ -1,5 +1,3 @@
-use std::fs;
-
 use eyre::Result;
 use serde_json::Value;
 
@@ -7,18 +5,16 @@ use crate::cli::resolve_axelar_id;
 use crate::state::{read_state, state_path};
 use crate::ui;
 
-pub fn run(axelar_id: Option<String>) -> Result<()> {
+pub async fn run(axelar_id: Option<String>) -> Result<()> {
     let axelar_id = resolve_axelar_id(axelar_id)?;
-    let state = read_state(&axelar_id)?;
+    let state = read_state(&axelar_id).await?;
     let target_json = state.target_json;
 
-    // --- Delete state file ---
     let sf = state_path(&axelar_id)?;
-    fs::remove_file(&sf)?;
+    tokio::fs::remove_file(&sf).await?;
     ui::success(&format!("deleted {}", sf.display()));
 
-    // --- Clean up target JSON ---
-    if !target_json.exists() {
+    if !tokio::fs::try_exists(&target_json).await? {
         ui::warn(&format!(
             "target json {} does not exist, skipping",
             target_json.display()
@@ -26,7 +22,7 @@ pub fn run(axelar_id: Option<String>) -> Result<()> {
         return Ok(());
     }
 
-    let content = fs::read_to_string(&target_json)?;
+    let content = tokio::fs::read_to_string(&target_json).await?;
     let mut root: Value = serde_json::from_str(&content)?;
 
     if let Some(chains) = root.get_mut("chains").and_then(|v| v.as_object_mut())
@@ -67,7 +63,7 @@ pub fn run(axelar_id: Option<String>) -> Result<()> {
         ui::info(&format!("removed Coordinator.deployments.{axelar_id}"));
     }
 
-    fs::write(&target_json, serde_json::to_string_pretty(&root)? + "\n")?;
+    tokio::fs::write(&target_json, serde_json::to_string_pretty(&root)? + "\n").await?;
     ui::success(&format!("cleaned up {}", target_json.display()));
 
     Ok(())

@@ -97,10 +97,6 @@ manual_let_else        = "deny"
 redundant_clone        = "deny"
 useless_conversion     = "deny"
 
-# `too_many_lines` stays at warn: the load-test pipeline orchestrators
-# (`poll_pipeline`, `poll_pipeline_its_hub`, `poll_pipeline_its_hub_evm`,
-# and the burst/sustained helpers) are state machines whose body length
-# matches the inherent state count. Decomposing them further would create
-# artificial seams. The warning still surfaces in `cargo clippy` so future
-# contributors see it, but it's not gate-enforced.
-too_many_lines         = "warn"
+# Large state machines and command handlers are split behind typed phase
+# helpers, so new oversized functions are architectural regressions.
+too_many_lines         = "deny"

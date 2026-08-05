@@ -1,6 +1,8 @@
-use std::fs;
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 
+use alloy::signers::k256::PublicKey;
+use alloy::signers::k256::elliptic_curve::sec1::ToEncodedPoint;
 use alloy::{
     hex,
     network::{Network, ReceiptResponse},
@@ -23,8 +25,8 @@ use crate::ui;
 /// (primary first, then the public fallback).
 ///
 /// alloy's [`FallbackLayer`] ranks the transports by success-rate + latency, so
-/// a persistently-failing endpoint — Hedera 429s, Avalanche "state not
-/// available for pending block" — is routed around automatically. Combined with
+/// a persistently-failing endpoint - Hedera 429s, Avalanche "state not
+/// available for pending block" - is routed around automatically. Combined with
 /// the axe-level retries that re-issue each call, this is the "retry, then fall
 /// back to the public RPC" behaviour: a retried call whose primary keeps
 /// erroring lands on the healthy public transport. Identical URLs are
@@ -49,17 +51,17 @@ pub fn connect_evm_signed(urls: &[String], signer: PrivateKeySigner) -> Result<D
 /// single-active fallback (`active_transport_count = 1` so writes are never
 /// broadcast to two endpoints in parallel).
 fn fallback_client(urls: &[String]) -> Result<RpcClient> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     let transports: Vec<Http<reqwest::Client>> = urls
         .iter()
-        .filter(|u| seen.insert((*u).clone()))
-        .map(|u| Ok::<_, eyre::Report>(Http::new(u.parse()?)))
+        .filter(|url| seen.insert((*url).clone()))
+        .map(|url| Ok::<_, eyre::Report>(Http::new(url.parse()?)))
         .collect::<Result<_>>()?;
     if transports.is_empty() {
         eyre::bail!("connect_evm: no RPC URLs provided");
     }
-    let fallback = FallbackLayer::default()
-        .with_active_transport_count(NonZeroUsize::new(1).expect("nonzero"));
+    // `NonZeroUsize::MIN` is 1 - one active transport at a time.
+    let fallback = FallbackLayer::default().with_active_transport_count(NonZeroUsize::MIN);
     Ok(RpcClient::new(fallback.layer(transports), false))
 }
 
@@ -327,8 +329,9 @@ pub fn get_salt_from_key(key: &str) -> FixedBytes<32> {
     keccak256(&encoded)
 }
 
-pub fn read_artifact_bytecode(artifact_path: &str) -> Result<Vec<u8>> {
-    let artifact: Value = serde_json::from_str(&fs::read_to_string(artifact_path)?)?;
+pub async fn read_artifact_bytecode(artifact_path: &str) -> Result<Vec<u8>> {
+    let content = tokio::fs::read_to_string(artifact_path).await?;
+    let artifact: Value = serde_json::from_str(&content)?;
     let bytecode_hex = artifact["bytecode"]
         .as_str()
         .ok_or_else(|| eyre::eyre!("no bytecode field in artifact"))?;
@@ -339,9 +342,6 @@ pub fn read_artifact_bytecode(artifact_path: &str) -> Result<Vec<u8>> {
 
 /// Convert an ECDSA public key (compressed or uncompressed) to an EVM address.
 pub fn pubkey_to_address(pubkey_bytes: &[u8]) -> Result<Address> {
-    use alloy::signers::k256::PublicKey;
-    use alloy::signers::k256::elliptic_curve::sec1::ToEncodedPoint;
-
     let pubkey =
         PublicKey::from_sec1_bytes(pubkey_bytes).map_err(|e| eyre::eyre!("invalid pubkey: {e}"))?;
 

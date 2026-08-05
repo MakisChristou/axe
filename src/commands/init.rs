@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::PathBuf;
 
 use alloy::signers::local::PrivateKeySigner;
@@ -11,6 +10,86 @@ use crate::cosmos::{derive_axelar_wallet, read_axelar_config};
 use crate::state::{State, data_dir, default_steps, save_state, state_path};
 use crate::types::{ChainKey, Network};
 use crate::ui;
+
+fn apply_optional_state_environment(state: &mut State) -> Result<()> {
+    ui::section("Deployer Addresses");
+    let (_, axelar_address) = derive_axelar_wallet(&state.mnemonic)?;
+    ui::address("axelar deployer", &axelar_address);
+
+    if let Ok(mnemonic) = std::env::var("MULTISIG_PROVER_MNEMONIC") {
+        let (_, address) = derive_axelar_wallet(&mnemonic)?;
+        ui::address("prover admin", &address);
+        state.admin_mnemonic = Some(mnemonic);
+    }
+    for (variable, label, destination) in [
+        (
+            "DEPLOYER_PRIVATE_KEY",
+            "deployer",
+            &mut state.deployer_private_key,
+        ),
+        (
+            "GAS_SERVICE_DEPLOYER_PRIVATE_KEY",
+            "gas service deployer",
+            &mut state.gas_service_deployer_private_key,
+        ),
+        (
+            "ITS_DEPLOYER_PRIVATE_KEY",
+            "ITS deployer",
+            &mut state.its_deployer_private_key,
+        ),
+    ] {
+        if let Ok(private_key) = std::env::var(variable) {
+            let signer: PrivateKeySigner = private_key
+                .parse()
+                .map_err(|error| eyre::eyre!("invalid {label} private key: {error}"))?;
+            ui::address(label, &format!("{}", signer.address()));
+            *destination = Some(private_key);
+        }
+    }
+    if let Ok(private_key) = std::env::var("GATEWAY_DEPLOYER_PRIVATE_KEY") {
+        let signer: PrivateKeySigner = private_key
+            .parse()
+            .map_err(|error| eyre::eyre!("invalid gateway deployer private key: {error}"))?;
+        let address = signer.address();
+        ui::address("gateway deployer", &format!("{address}"));
+        state.gateway_deployer_private_key = Some(private_key);
+        state.gateway_deployer = Some(address);
+    }
+    if let Ok(salt) = std::env::var("ITS_SALT") {
+        ui::kv("ITS salt", &salt);
+        state.its_salt = Some(salt);
+    }
+    if let Ok(salt) = std::env::var("ITS_PROXY_SALT") {
+        ui::kv("ITS proxy salt", &salt);
+        state.its_proxy_salt = Some(salt);
+    }
+    Ok(())
+}
+
+async fn print_axelar_balance(target_json: &std::path::Path, axelar_address: &str) -> Result<()> {
+    if !target_json.exists() {
+        return Ok(());
+    }
+    let (lcd, _, fee_denom, _) = read_axelar_config(target_json).await?;
+    let url = format!("{lcd}/cosmos/bank/v1beta1/balances/{axelar_address}");
+    match reqwest::get(&url).await {
+        Ok(response) => {
+            let data: Value = response.json().await?;
+            if let Some(balances) = data["balances"].as_array() {
+                let balance = balances
+                    .iter()
+                    .find(|entry| entry["denom"].as_str() == Some(&fee_denom))
+                    .and_then(|entry| entry["amount"].as_str())
+                    .unwrap_or("0");
+                let display_denom = fee_denom.strip_prefix('u').unwrap_or(&fee_denom);
+                let major = balance.parse::<f64>().unwrap_or(0.0) / 1_000_000.0;
+                ui::kv("balance", &format!("{major:.6} {display_denom}"));
+            }
+        }
+        Err(error) => ui::warn(&format!("could not query balance: {error}")),
+    }
+    Ok(())
+}
 
 pub async fn run() -> Result<()> {
     let require = |name: &str| -> Result<String> {
@@ -45,16 +124,8 @@ pub async fn run() -> Result<()> {
             .require_checkout()?,
     };
 
-    // Optional env vars
     let explorer_name = std::env::var("EXPLORER_NAME").ok();
     let explorer_url = std::env::var("EXPLORER_URL").ok();
-    let admin_mnemonic = std::env::var("MULTISIG_PROVER_MNEMONIC").ok();
-    let deployer_private_key = std::env::var("DEPLOYER_PRIVATE_KEY").ok();
-    let gateway_deployer_private_key = std::env::var("GATEWAY_DEPLOYER_PRIVATE_KEY").ok();
-    let gas_service_deployer_private_key = std::env::var("GAS_SERVICE_DEPLOYER_PRIVATE_KEY").ok();
-    let its_deployer_private_key = std::env::var("ITS_DEPLOYER_PRIVATE_KEY").ok();
-    let its_salt = std::env::var("ITS_SALT").ok();
-    let its_proxy_salt = std::env::var("ITS_PROXY_SALT").ok();
 
     // --- Chain config → target json ---
     let mut chain_entry = json!({
@@ -75,7 +146,7 @@ pub async fn run() -> Result<()> {
         chain_entry["explorer"] = json!({ "name": name, "url": url });
     }
 
-    let content = fs::read_to_string(&target_json)?;
+    let content = tokio::fs::read_to_string(&target_json).await?;
     let mut root: Value = serde_json::from_str(&content)?;
     let chains = root
         .get_mut("chains")
@@ -89,7 +160,7 @@ pub async fn run() -> Result<()> {
         ));
     } else {
         chains.insert(axelar_id.clone(), chain_entry);
-        fs::write(&target_json, serde_json::to_string_pretty(&root)? + "\n")?;
+        tokio::fs::write(&target_json, serde_json::to_string_pretty(&root)? + "\n").await?;
         ui::success(&format!(
             "added chain '{axelar_id}' to {}",
             target_json.display()
@@ -98,7 +169,7 @@ pub async fn run() -> Result<()> {
 
     // --- State file ---
     let dir = data_dir()?;
-    fs::create_dir_all(&dir)?;
+    tokio::fs::create_dir_all(&dir).await?;
 
     let mut state = State {
         axelar_id: ChainKey::new(axelar_id.clone()),
@@ -121,83 +192,14 @@ pub async fn run() -> Result<()> {
         steps: default_steps(),
     };
 
-    ui::section("Deployer Addresses");
-
     let (_, axelar_address) = derive_axelar_wallet(&mnemonic)?;
-    ui::address("axelar deployer", &axelar_address);
-
-    if let Some(admin_mn) = admin_mnemonic {
-        let (_, admin_address) = derive_axelar_wallet(&admin_mn)?;
-        ui::address("prover admin", &admin_address);
-        state.admin_mnemonic = Some(admin_mn);
-    }
-
-    if let Some(pk) = deployer_private_key {
-        let signer: PrivateKeySigner = pk
-            .parse()
-            .map_err(|e| eyre::eyre!("invalid deployer private key: {e}"))?;
-        ui::address("deployer", &format!("{}", signer.address()));
-        state.deployer_private_key = Some(pk);
-    }
-    if let Some(pk) = gateway_deployer_private_key {
-        let signer: PrivateKeySigner = pk
-            .parse()
-            .map_err(|e| eyre::eyre!("invalid gateway deployer private key: {e}"))?;
-        let gw_addr = signer.address();
-        ui::address("gateway deployer", &format!("{gw_addr}"));
-        state.gateway_deployer_private_key = Some(pk);
-        state.gateway_deployer = Some(gw_addr);
-    }
-    if let Some(pk) = gas_service_deployer_private_key {
-        let signer: PrivateKeySigner = pk
-            .parse()
-            .map_err(|e| eyre::eyre!("invalid gas service deployer private key: {e}"))?;
-        ui::address("gas service deployer", &format!("{}", signer.address()));
-        state.gas_service_deployer_private_key = Some(pk);
-    }
-    if let Some(pk) = its_deployer_private_key {
-        let signer: PrivateKeySigner = pk
-            .parse()
-            .map_err(|e| eyre::eyre!("invalid ITS deployer private key: {e}"))?;
-        ui::address("ITS deployer", &format!("{}", signer.address()));
-        state.its_deployer_private_key = Some(pk);
-    }
-    if let Some(s) = its_salt {
-        ui::kv("ITS salt", &s);
-        state.its_salt = Some(s);
-    }
-    if let Some(s) = its_proxy_salt {
-        ui::kv("ITS proxy salt", &s);
-        state.its_proxy_salt = Some(s);
-    }
+    apply_optional_state_environment(&mut state)?;
 
     ui::section("State");
     let state_file = state_path(&axelar_id)?;
-    save_state(&state)?;
+    save_state(&state).await?;
     ui::kv("state file", &state_file.display().to_string());
     ui::success(&format!("init complete for '{axelar_id}' (env={env})"));
 
-    // Query and display the deployer balance
-    if target_json.exists() {
-        let (lcd, _, fee_denom, _) = read_axelar_config(&target_json)?;
-        let url = format!("{lcd}/cosmos/bank/v1beta1/balances/{axelar_address}");
-        match reqwest::get(&url).await {
-            Ok(resp) => {
-                let data: Value = resp.json().await?;
-                if let Some(balances) = data["balances"].as_array() {
-                    let bal = balances
-                        .iter()
-                        .find(|b| b["denom"].as_str() == Some(&fee_denom))
-                        .and_then(|b| b["amount"].as_str())
-                        .unwrap_or("0");
-                    let display_denom = fee_denom.strip_prefix('u').unwrap_or(&fee_denom);
-                    let bal_major: f64 = bal.parse::<f64>().unwrap_or(0.0) / 1_000_000.0;
-                    ui::kv("balance", &format!("{bal_major:.6} {display_denom}"));
-                }
-            }
-            Err(e) => ui::warn(&format!("could not query balance: {e}")),
-        }
-    }
-
-    Ok(())
+    print_axelar_balance(&target_json, &axelar_address).await
 }

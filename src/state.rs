@@ -11,7 +11,6 @@
 //! `axe deploy reset` and re-init.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use alloy::primitives::Address;
@@ -20,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{ChainKey, Network};
 use crate::ui;
+use StepKind as K;
 
 // ---------------------------------------------------------------------------
 // Top-level State
@@ -206,127 +206,126 @@ pub enum StepKind {
 /// `migrate_steps` appends any new entries here onto an existing state file
 /// so partial deployments pick up newly-added stages without manual surgery.
 pub fn default_steps() -> Vec<Step> {
-    use StepKind as K;
-    let make = |name: &str, kind: K| Step {
-        name: name.to_string(),
-        status: StepStatus::Pending,
-        kind,
-    };
-    let new_owner: Address = "0x49845e5d9985d8dc941462293ed38EEfF18B0eAE"
-        .parse()
-        .expect("hard-coded admin address parses");
-    vec![
-        make("EvmCompatibilityCheck", K::EvmCompat),
-        make("ConstAddressDeployer", K::DeployCreate),
-        make("Create3Deployer", K::DeployCreate2),
-        make("PredictGatewayAddress", K::PredictAddress),
-        make("AddCosmWasmConfig", K::ConfigEdit),
-        make(
+    let new_owner = alloy::primitives::address!("49845e5d9985d8dc941462293ed38EEfF18B0eAE");
+    let mut steps = vec![
+        pending_step("EvmCompatibilityCheck", K::EvmCompat),
+        pending_step("ConstAddressDeployer", K::DeployCreate),
+        pending_step("Create3Deployer", K::DeployCreate2),
+        pending_step("PredictGatewayAddress", K::PredictAddress),
+        pending_step("AddCosmWasmConfig", K::ConfigEdit),
+        pending_step(
             "InstantiateChainContracts",
             K::CosmosTx {
                 proposal_key: "instantiate".into(),
             },
         ),
-        make(
+        pending_step(
             "WaitInstantiateProposal",
             K::CosmosPoll {
                 proposal_key: "instantiate".into(),
             },
         ),
-        make("SaveDeployedContracts", K::CosmosQuery),
-        make(
+        pending_step("SaveDeployedContracts", K::CosmosQuery),
+        pending_step(
             "RegisterDeployment",
             K::CosmosTx {
                 proposal_key: "register".into(),
             },
         ),
-        make(
+        pending_step(
             "WaitRegisterProposal",
             K::CosmosPoll {
                 proposal_key: "register".into(),
             },
         ),
-        make(
+        pending_step(
             "CreateRewardPools",
             K::CosmosTx {
                 proposal_key: "rewardPools".into(),
             },
         ),
-        make(
+        pending_step(
             "WaitRewardPoolsProposal",
             K::CosmosPoll {
                 proposal_key: "rewardPools".into(),
             },
         ),
-        make(
+        pending_step(
             "AddRewards",
             K::CosmosTx {
                 proposal_key: "addRewards".into(),
             },
         ),
-        make("WaitForVerifierSet", K::WaitVerifierSet),
-        make(
+        pending_step("WaitForVerifierSet", K::WaitVerifierSet),
+        pending_step(
             "AxelarGateway",
             K::DeployGateway {
                 implementation_address: None,
             },
         ),
-        make("Operators", K::DeployCreate2),
-        make("RegisterOperators", K::RegisterOperators),
-        make(
+        pending_step("Operators", K::DeployCreate2),
+        pending_step("RegisterOperators", K::RegisterOperators),
+        pending_step(
             "AxelarGasService",
             K::DeployUpgradable {
                 implementation_address: None,
                 proxy_address: None,
             },
         ),
-        make(
-            "TransferOperatorsOwnership",
-            K::TransferOwnership {
-                contract: "Operators".into(),
-                new_owner,
-            },
-        ),
-        make(
-            "TransferGatewayOwnership",
-            K::TransferOwnership {
-                contract: "AxelarGateway".into(),
-                new_owner,
-            },
-        ),
-        make(
-            "TransferGasServiceOwnership",
-            K::TransferOwnership {
-                contract: "AxelarGasService".into(),
-                new_owner,
-            },
-        ),
-        make(
-            "DeployInterchainTokenService",
-            K::DeployIts {
-                its_deployer_address: None,
-                token_manager_deployer_address: None,
-                interchain_token_address: None,
-                interchain_token_deployer_address: None,
-                token_manager_address: None,
-                token_handler_address: None,
-                interchain_token_service_impl_address: None,
-                interchain_token_factory_impl_address: None,
-            },
-        ),
-        make(
+    ];
+    steps.extend([
+        ownership_step("TransferOperatorsOwnership", "Operators", new_owner),
+        ownership_step("TransferGatewayOwnership", "AxelarGateway", new_owner),
+        ownership_step("TransferGasServiceOwnership", "AxelarGasService", new_owner),
+        deploy_its_step(),
+        pending_step(
             "RegisterItsOnHub",
             K::CosmosTx {
                 proposal_key: "itsHubRegister".into(),
             },
         ),
-        make(
+        pending_step(
             "WaitItsHubRegistration",
             K::CosmosPoll {
                 proposal_key: "itsHubRegister".into(),
             },
         ),
-    ]
+    ]);
+    steps
+}
+
+fn pending_step(name: &str, kind: StepKind) -> Step {
+    Step {
+        name: name.to_string(),
+        status: StepStatus::Pending,
+        kind,
+    }
+}
+
+fn ownership_step(name: &str, contract: &str, new_owner: Address) -> Step {
+    pending_step(
+        name,
+        StepKind::TransferOwnership {
+            contract: contract.into(),
+            new_owner,
+        },
+    )
+}
+
+fn deploy_its_step() -> Step {
+    pending_step(
+        "DeployInterchainTokenService",
+        StepKind::DeployIts {
+            its_deployer_address: None,
+            token_manager_deployer_address: None,
+            interchain_token_address: None,
+            interchain_token_deployer_address: None,
+            token_manager_address: None,
+            token_handler_address: None,
+            interchain_token_service_impl_address: None,
+            interchain_token_factory_impl_address: None,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -345,13 +344,13 @@ pub fn state_path(axelar_id: &str) -> Result<PathBuf> {
 }
 
 /// Read and deserialize the state file into a typed `State`.
-pub fn read_state(axelar_id: &str) -> Result<State> {
+pub async fn read_state(axelar_id: &str) -> Result<State> {
     let path = state_path(axelar_id)?;
-    read_state_at(&path)
+    read_state_at(&path).await
 }
 
-pub fn read_state_at(path: &Path) -> Result<State> {
-    let content = fs::read_to_string(path).map_err(|e| {
+pub async fn read_state_at(path: &Path) -> Result<State> {
+    let content = tokio::fs::read_to_string(path).await.map_err(|e| {
         eyre::eyre!(
             "failed to read state file {}: {e}. Run `init` first.",
             path.display()
@@ -362,16 +361,16 @@ pub fn read_state_at(path: &Path) -> Result<State> {
 
 /// Serialize and write the state file. The path is derived from
 /// `state.axelar_id` so callers don't need to track it.
-pub fn save_state(state: &State) -> Result<()> {
+pub async fn save_state(state: &State) -> Result<()> {
     let path = state_path(state.axelar_id.as_str())?;
-    save_state_at(state, &path)
+    save_state_at(state, &path).await
 }
 
-pub fn save_state_at(state: &State, path: &Path) -> Result<()> {
+pub async fn save_state_at(state: &State, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        tokio::fs::create_dir_all(parent).await?;
     }
-    fs::write(path, serde_json::to_string_pretty(state)? + "\n")?;
+    tokio::fs::write(path, serde_json::to_string_pretty(state)? + "\n").await?;
     Ok(())
 }
 
@@ -449,11 +448,8 @@ impl Step {
         }
     }
 
-    /// Set the implementation address on a `DeployGateway` or
-    /// `DeployUpgradable` step. Panics on a wrong-variant call — callers
-    /// should already know the step's kind from dispatch.
-    #[track_caller]
-    pub fn set_implementation_address(&mut self, addr: Address) {
+    /// Set the implementation address on a compatible deployment step.
+    pub fn set_implementation_address(&mut self, addr: Address) -> Result<()> {
         match &mut self.kind {
             StepKind::DeployGateway {
                 implementation_address,
@@ -463,18 +459,25 @@ impl Step {
                 ..
             } => *implementation_address = Some(addr),
             other => {
-                panic!("set_implementation_address called on incompatible step kind: {other:?}")
+                return Err(eyre::eyre!(
+                    "cannot set an implementation address on step kind {other:?}"
+                ));
             }
         }
+        Ok(())
     }
 
     /// Set the proxy address on a `DeployUpgradable` step.
-    #[track_caller]
-    pub fn set_proxy_address(&mut self, addr: Address) {
+    pub fn set_proxy_address(&mut self, addr: Address) -> Result<()> {
         match &mut self.kind {
             StepKind::DeployUpgradable { proxy_address, .. } => *proxy_address = Some(addr),
-            other => panic!("set_proxy_address called on incompatible step kind: {other:?}"),
+            other => {
+                return Err(eyre::eyre!(
+                    "cannot set a proxy address on step kind {other:?}"
+                ));
+            }
         }
+        Ok(())
     }
 
     /// Read one of the eight ITS sub-deploy addresses by name. Used by
@@ -508,10 +511,8 @@ impl Step {
         }
     }
 
-    /// Set one of the eight ITS sub-deploy addresses by name. Panics if the
-    /// step isn't a `DeployIts` or the name is unknown.
-    #[track_caller]
-    pub fn set_its_address(&mut self, name: &str, addr: Address) {
+    /// Set one of the eight ITS sub-deploy addresses by name.
+    pub fn set_its_address(&mut self, name: &str, addr: Address) -> Result<()> {
         let StepKind::DeployIts {
             its_deployer_address,
             token_manager_deployer_address,
@@ -523,10 +524,9 @@ impl Step {
             interchain_token_factory_impl_address,
         } = &mut self.kind
         else {
-            panic!(
-                "set_its_address called on non-DeployIts step: {:?}",
-                self.kind
-            );
+            return Err(eyre::eyre!(
+                "cannot set ITS address '{name}' on a non-DeployIts step"
+            ));
         };
         let slot = match name {
             "itsDeployer" => its_deployer_address,
@@ -537,15 +537,15 @@ impl Step {
             "TokenHandler" => token_handler_address,
             "InterchainTokenServiceImpl" => interchain_token_service_impl_address,
             "InterchainTokenFactoryImpl" => interchain_token_factory_impl_address,
-            other => panic!("unknown ITS sub-deploy name '{other}'"),
+            other => return Err(eyre::eyre!("unknown ITS sub-deploy name '{other}'")),
         };
         *slot = Some(addr);
+        Ok(())
     }
 
     /// Clear all ITS sub-deploy addresses on this step (used when the
     /// deployer key changes and stale predictions need to be discarded).
-    #[track_caller]
-    pub fn clear_its_helper_addresses(&mut self) {
+    pub fn clear_its_helper_addresses(&mut self) -> Result<()> {
         let StepKind::DeployIts {
             token_manager_deployer_address,
             interchain_token_address,
@@ -557,10 +557,9 @@ impl Step {
             ..
         } = &mut self.kind
         else {
-            panic!(
-                "clear_its_helper_addresses called on non-DeployIts step: {:?}",
-                self.kind
-            );
+            return Err(eyre::eyre!(
+                "cannot clear ITS helper addresses on a non-DeployIts step"
+            ));
         };
         *token_manager_deployer_address = None;
         *interchain_token_address = None;
@@ -569,6 +568,7 @@ impl Step {
         *token_handler_address = None;
         *interchain_token_service_impl_address = None;
         *interchain_token_factory_impl_address = None;
+        Ok(())
     }
 }
 
@@ -631,7 +631,7 @@ mod tests {
         let addr: Address = "0x49845e5d9985d8dc941462293ed38EEfF18B0eAE"
             .parse()
             .unwrap();
-        step.set_implementation_address(addr);
+        step.set_implementation_address(addr).unwrap();
         assert_eq!(step.implementation_address(), Some(addr));
     }
 

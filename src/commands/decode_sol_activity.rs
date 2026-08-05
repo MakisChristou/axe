@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::str::FromStr;
+
 use eyre::Result;
 use owo_colors::OwoColorize;
 use serde::Serialize;
@@ -7,8 +11,7 @@ use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_transaction_status::UiTransactionEncoding;
-use std::path::PathBuf;
-use std::str::FromStr;
+use tokio::task::spawn_blocking;
 
 use super::decode_sol_tx;
 use crate::cli::SolProgram;
@@ -27,7 +30,7 @@ struct DiscoveredProgram {
     address: String,
 }
 
-fn discover_programs(
+async fn discover_programs(
     configs: &[(Network, PathBuf)],
     program_filter: Option<SolProgram>,
 ) -> Vec<DiscoveredProgram> {
@@ -41,7 +44,7 @@ fn discover_programs(
     let mut programs = Vec::new();
 
     for (network, config_path) in configs {
-        let Ok(config_content) = std::fs::read_to_string(config_path) else {
+        let Ok(config_content) = tokio::fs::read_to_string(config_path).await else {
             continue;
         };
         let config: serde_json::Value = match serde_json::from_str(&config_content) {
@@ -131,6 +134,52 @@ struct ActivityEntry {
     events: Vec<String>,
 }
 
+fn print_program_header(entry: &DiscoveredProgram) {
+    println!(
+        "\n{}",
+        format!(
+            "━━ {} ({}/{}) {} ━━",
+            entry.label, entry.network, entry.chain_name, entry.address
+        )
+        .bold()
+    );
+}
+
+fn print_activity_line(
+    signature: &str,
+    block_time: Option<i64>,
+    succeeded: bool,
+    instruction: Option<&str>,
+    events: &[String],
+) {
+    let time = block_time
+        .map(format_timestamp)
+        .unwrap_or_else(|| "?".to_string());
+    let status = if succeeded {
+        format!("{}", "OK".green())
+    } else {
+        format!("{}", "FAIL".red())
+    };
+    let signature = if signature.len() > 20 {
+        format!("{}...", &signature[..20])
+    } else {
+        signature.to_string()
+    };
+    let events = if events.is_empty() {
+        String::new()
+    } else {
+        format!(" → {}", events.join(", ").dimmed())
+    };
+    println!(
+        "  {} [{}] {:<45} {}{}",
+        time.dimmed(),
+        status,
+        instruction.unwrap_or("?").bold(),
+        signature.dimmed(),
+        events,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
@@ -157,16 +206,32 @@ pub async fn run(
         ));
     }
 
-    let programs = discover_programs(&configs, program_filter);
+    let programs = discover_programs(&configs, program_filter).await;
 
     if programs.is_empty() {
         return Err(eyre::eyre!("no Solana programs found in chains config(s)"));
     }
 
     let known = decode_sol_tx::known_programs();
-    let mut all_entries: Vec<ActivityEntry> = Vec::new();
+    let all_entries =
+        spawn_blocking(move || scan_program_activity(&programs, &known, limit, json_mode)).await?;
 
-    for entry in &programs {
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(&all_entries)?);
+    }
+
+    Ok(())
+}
+
+fn scan_program_activity(
+    programs: &[DiscoveredProgram],
+    known: &HashMap<Pubkey, &'static str>,
+    limit: usize,
+    json_mode: bool,
+) -> Vec<ActivityEntry> {
+    let mut all_entries = Vec::new();
+
+    for entry in programs {
         let Ok(pubkey) = Pubkey::from_str(&entry.address) else {
             continue;
         };
@@ -188,14 +253,7 @@ pub async fn run(
         }
 
         if !json_mode {
-            println!(
-                "\n{}",
-                format!(
-                    "━━ {} ({}/{}) {} ━━",
-                    entry.label, entry.network, entry.chain_name, entry.address
-                )
-                .bold()
-            );
+            print_program_header(entry);
         }
 
         for sig_info in &sigs {
@@ -209,40 +267,15 @@ pub async fn run(
             let slot = sig_info.slot;
             let block_time = sig_info.block_time;
 
-            let (ix_name, args_json, events) = fetch_and_decode(&rpc, sig, &known);
+            let (ix_name, args_json, events) = fetch_and_decode(&rpc, sig, known);
 
             if !json_mode {
-                let time_str = block_time
-                    .map(format_timestamp)
-                    .unwrap_or_else(|| "?".to_string());
-
-                let status_colored = if status == "Success" {
-                    format!("{}", "OK".green())
-                } else {
-                    format!("{}", "FAIL".red())
-                };
-
-                let ix_display = ix_name.as_deref().unwrap_or("?");
-
-                let sig_short = if sig.len() > 20 {
-                    format!("{}...", &sig[..20])
-                } else {
-                    sig.clone()
-                };
-
-                let events_str = if events.is_empty() {
-                    String::new()
-                } else {
-                    format!(" → {}", events.join(", ").dimmed())
-                };
-
-                println!(
-                    "  {} [{}] {:<45} {}{}",
-                    time_str.dimmed(),
-                    status_colored,
-                    ix_display.bold(),
-                    sig_short.dimmed(),
-                    events_str,
+                print_activity_line(
+                    sig,
+                    block_time,
+                    sig_info.err.is_none(),
+                    ix_name.as_deref(),
+                    &events,
                 );
             }
 
@@ -262,11 +295,7 @@ pub async fn run(
         }
     }
 
-    if json_mode {
-        println!("{}", serde_json::to_string_pretty(&all_entries)?);
-    }
-
-    Ok(())
+    all_entries
 }
 
 // ---------------------------------------------------------------------------
@@ -276,7 +305,7 @@ pub async fn run(
 fn fetch_and_decode(
     rpc: &RpcClient,
     sig_str: &str,
-    known: &std::collections::HashMap<Pubkey, &'static str>,
+    known: &HashMap<Pubkey, &'static str>,
 ) -> (Option<String>, Option<serde_json::Value>, Vec<String>) {
     let Ok(sig) = Signature::from_str(sig_str) else {
         return (None, None, vec![]);

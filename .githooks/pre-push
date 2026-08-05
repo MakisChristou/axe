@@ -13,14 +13,23 @@ set -euo pipefail
 ROOT=$(git rev-parse --show-toplevel)
 cd "$ROOT"
 
+echo "==> repository style checks"
+.githooks/check-style
+
 echo "==> cargo fmt --all --check"
 cargo fmt --all --check
 
-echo "==> cargo clippy --all-targets -- -D warnings (too_many_lines suppressed)"
-cargo clippy --all-targets -- -D warnings \
-    -A clippy::too_many_lines
+echo "==> cargo clippy --locked --all-targets -- -D warnings"
+cargo clippy --locked --all-targets -- -D warnings
 
-echo "==> cargo test --all-targets"
-cargo test --all-targets --quiet
+echo "==> production panic-safety lints"
+cargo clippy --locked --bin axe -- \
+    -D warnings \
+    -D clippy::unwrap_used \
+    -D clippy::expect_used \
+    -D clippy::panic
+
+echo "==> cargo test --locked --all-targets"
+cargo test --locked --all-targets --quiet
 
 echo "pre-push OK"

@@ -21,33 +21,38 @@ use crate::ui;
 /// generous buffer.
 const GAS_MULTIPLIER: f64 = 3.0;
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn build_and_sign_cosmos_tx(
-    signing_key: &SigningKey,
-    chain_id: &str,
+struct CosmosTxSignInput<'a> {
+    chain_id: &'a str,
     account_number: u64,
     sequence: u64,
     gas_limit: u64,
     fee_amount: u128,
-    fee_denom: &str,
+    fee_denom: &'a str,
     messages: Vec<cosmrs::Any>,
+}
+
+fn build_and_sign_cosmos_tx(
+    signing_key: &SigningKey,
+    input: CosmosTxSignInput<'_>,
 ) -> Result<Vec<u8>> {
-    let tx_body = tx::Body::new(messages, "", 0u32);
-    let signer_info = SignerInfo::single_direct(Some(signing_key.public_key()), sequence);
+    let tx_body = tx::Body::new(input.messages, "", 0u32);
+    let signer_info = SignerInfo::single_direct(Some(signing_key.public_key()), input.sequence);
     let fee = Fee::from_amount_and_gas(
         cosmrs::Coin {
-            denom: fee_denom
+            denom: input
+                .fee_denom
                 .parse()
                 .map_err(|e| eyre::eyre!("invalid denom: {e}"))?,
-            amount: fee_amount,
+            amount: input.fee_amount,
         },
-        gas_limit,
+        input.gas_limit,
     );
     let auth_info = signer_info.auth_info(fee);
-    let cosmos_chain_id: cosmrs::tendermint::chain::Id = chain_id
+    let cosmos_chain_id: cosmrs::tendermint::chain::Id = input
+        .chain_id
         .parse()
         .map_err(|e| eyre::eyre!("invalid chain id: {e}"))?;
-    let sign_doc = SignDoc::new(&tx_body, &auth_info, &cosmos_chain_id, account_number)
+    let sign_doc = SignDoc::new(&tx_body, &auth_info, &cosmos_chain_id, input.account_number)
         .map_err(|e| eyre::eyre!("sign doc error: {e}"))?;
     let tx_signed = sign_doc
         .sign(signing_key)
@@ -144,13 +149,15 @@ pub async fn sign_and_broadcast_cosmos_tx(
 
     let sim_tx = build_and_sign_cosmos_tx(
         signing_key,
-        chain_id,
-        account_number,
-        sequence,
-        10_000_000,
-        0,
-        fee_denom,
-        messages.clone(),
+        CosmosTxSignInput {
+            chain_id,
+            account_number,
+            sequence,
+            gas_limit: 10_000_000,
+            fee_amount: 0,
+            fee_denom,
+            messages: messages.clone(),
+        },
     )?;
 
     let gas_used = lcd_simulate_tx(lcd, &sim_tx).await?;
@@ -163,13 +170,15 @@ pub async fn sign_and_broadcast_cosmos_tx(
 
     let tx_bytes = build_and_sign_cosmos_tx(
         signing_key,
-        chain_id,
-        account_number,
-        sequence,
-        gas_limit,
-        fee_amount,
-        fee_denom,
-        messages,
+        CosmosTxSignInput {
+            chain_id,
+            account_number,
+            sequence,
+            gas_limit,
+            fee_amount,
+            fee_denom,
+            messages,
+        },
     )?;
 
     let broadcast_resp = lcd_broadcast_tx(lcd, &tx_bytes).await?;
