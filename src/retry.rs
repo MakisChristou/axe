@@ -83,6 +83,28 @@ where
     retry_async(label, DEFAULT_ATTEMPTS, |_| true, op).await
 }
 
+/// Default predicate: classify common error-string signatures as
+/// transient. Matches HTTP 5xx, 429, "timeout", "connection", "network",
+/// and JSON-RPC server-error messages. Use this for state-changing calls
+/// (`send_transaction`, `submit`) where you want to retry network
+/// flakiness but NOT contract reverts.
+pub fn is_transient_default<E: std::fmt::Display>(err: &E) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("timeout")
+        || msg.contains("timed out")
+        || msg.contains("connection")
+        || msg.contains("network")
+        || msg.contains("502")
+        || msg.contains("503")
+        || msg.contains("504")
+        || msg.contains("429")
+        || msg.contains("too many requests")
+        || msg.contains("bad gateway")
+        || msg.contains("service unavailable")
+        || msg.contains("gateway timeout")
+        || msg.contains("server error")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +155,27 @@ mod tests {
         .await;
         assert_eq!(result, Err("permanent"));
         assert_eq!(counter.load(Ordering::SeqCst), 1, "should not retry");
+    }
+
+    #[test]
+    fn is_transient_classifies_common_strings() {
+        for s in [
+            "request timeout",
+            "connection reset",
+            "HTTP 502 bad gateway",
+            "503 service unavailable",
+            "429 Too Many Requests",
+            "network error",
+        ] {
+            assert!(is_transient_default(&s), "expected transient: {s}");
+        }
+        for s in [
+            "execution reverted: InsufficientBalance",
+            "account not found",
+            "invalid signature",
+            "Wrong tokenManager type",
+        ] {
+            assert!(!is_transient_default(&s), "expected NOT transient: {s}");
+        }
     }
 }

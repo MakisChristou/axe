@@ -1439,7 +1439,22 @@ async fn check_evm_its_amplifier<P: Provider>(
         });
     }
     let results: Vec<Result<_>> = stream::iter(futures).buffer_unordered(20).collect().await;
-    results.into_iter().collect()
+    // Same defense as the GMP EVM branch: a persistent second-leg dest-RPC
+    // error (e.g. Hedera 429 rate-limiting, transient retries already
+    // exhausted) must NOT abort the run - drop the observation so the tx stays
+    // in-flight and `finalize_timed_out_txs`'s GMP-API recheck can recover it if
+    // it actually executed on-chain.
+    let mut observations = Vec::with_capacity(results.len());
+    for result in results {
+        match result {
+            Ok(observation) => observations.push(observation),
+            Err(error) => ui::warn(&format!(
+                "second-leg destination check RPC error (keeping in-flight for GMP-API recheck): \
+                 {error}"
+            )),
+        }
+    }
+    Ok(observations)
 }
 
 async fn check_evm_its_legacy<P: Provider>(

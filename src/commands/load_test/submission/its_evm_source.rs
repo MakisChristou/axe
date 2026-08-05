@@ -53,6 +53,7 @@ use crate::commands::test_its::{
 use crate::config::ChainContract;
 use crate::config::ChainsConfig;
 use crate::evm::{ERC20, InterchainTokenFactory, InterchainTokenService};
+use crate::retry::{is_transient_default, retry_all};
 use crate::types::Network;
 use crate::ui;
 
@@ -66,6 +67,10 @@ use crate::ui;
 /// matches the deploy-tx receipt waits in this file, while still catching
 /// silently-dropped txs on other chains.
 const EVM_RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How many times `execute_interchain_transfer` may send the transfer. See the
+/// same-nonce resubmit rationale on that function's submit loop.
+const MAX_SUBMIT_ATTEMPTS: u32 = 3;
 
 const TOKEN_NAME: &str = "AXE";
 const TOKEN_SYMBOL: &str = "AXE";
@@ -599,15 +604,53 @@ pub(super) async fn distribute_tokens<P: Provider>(
             continue;
         }
 
-        let call = token.transfer(signer.address(), amount_per_key);
-        let pending = call
-            .send()
-            .await
-            .map_err(|e| eyre!("failed to transfer tokens to key {i}: {e}"))?;
-        pending
-            .get_receipt()
-            .await
-            .map_err(|e| eyre!("token transfer to key {i} failed: {e}"))?;
+        // Hedera 429s its JSON-RPC relay hard - even on a private RPC (a light
+        // burst reproduces ~25% rejections) - so both the send and the receipt
+        // poll must ride out transient rate-limits. A rejected send never
+        // submitted the tx (nonce not consumed), so retrying it can't
+        // double-transfer.
+        const DISTRIBUTE_MAX_SEND_ATTEMPTS: u32 = 5;
+        let mut attempt = 0u32;
+        let pending = loop {
+            match token
+                .transfer(signer.address(), amount_per_key)
+                .send()
+                .await
+            {
+                Ok(p) => break p,
+                Err(e)
+                    if attempt + 1 < DISTRIBUTE_MAX_SEND_ATTEMPTS
+                        && is_retryable_send_error(&e.to_string()) =>
+                {
+                    ui::warn(&format!(
+                        "distribute to key {i} rejected (transient) — retrying in {}ms: {e}",
+                        500u64 << attempt
+                    ));
+                    time::sleep(Duration::from_millis(500u64 << attempt)).await;
+                    attempt += 1;
+                }
+                Err(e) => return Err(eyre!("failed to transfer tokens to key {i}: {e}")),
+            }
+        };
+
+        // Poll the receipt ourselves so a 429 mid-poll is retried, not fatal.
+        let tx_hash = *pending.tx_hash();
+        let deadline = Instant::now() + EVM_RECEIPT_TIMEOUT;
+        loop {
+            match provider.get_transaction_receipt(tx_hash).await {
+                Ok(Some(receipt)) if receipt.status() => break,
+                Ok(Some(_)) => {
+                    return Err(eyre!("token transfer to key {i} reverted (status 0x0)"));
+                }
+                _ => {} // still pending, or a transient RPC error — keep polling
+            }
+            if Instant::now() >= deadline {
+                return Err(eyre!(
+                    "token transfer to key {i} receipt not seen in {EVM_RECEIPT_TIMEOUT:?}"
+                ));
+            }
+            time::sleep(Duration::from_secs(2)).await;
+        }
 
         spinner.set_message(format!(
             "distributing tokens ({}/{} done)...",
@@ -770,7 +813,6 @@ pub(super) async fn execute_interchain_transfer<P: Provider>(
     // nonce (learned from the first send) so at most one tx can land: a dropped
     // tx's nonce is free and the resubmit fills it; a still-pending tx makes the
     // resubmit a same-nonce replacement, never a second transfer.
-    const MAX_SUBMIT_ATTEMPTS: u32 = 3;
     let mut pinned_nonce = explicit_nonce;
     let mut last_hash: Option<TxHash> = None;
     for attempt in 0..MAX_SUBMIT_ATTEMPTS {
@@ -800,7 +842,24 @@ pub(super) async fn execute_interchain_transfer<P: Provider>(
                 {
                     return receipt_to_metrics(&receipt, h, its_proxy, submit_start);
                 }
-                return make_failure(submit_start, &e.to_string());
+                match classify_send_rejection(&e.to_string(), attempt, pinned_nonce) {
+                    SendRejection::RetryAtNonce(expected) => {
+                        ui::warn(&format!(
+                            "source tx nonce too low — retrying at node-reported nonce {expected}"
+                        ));
+                        pinned_nonce = Some(expected);
+                        continue;
+                    }
+                    SendRejection::RetryAfterBackoff(delay) => {
+                        ui::warn(&format!(
+                            "source send rejected (transient) — retrying in {}ms: {e}",
+                            delay.as_millis()
+                        ));
+                        time::sleep(delay).await;
+                        continue;
+                    }
+                    SendRejection::Fatal => return make_failure(submit_start, &e.to_string()),
+                }
             }
         };
 
@@ -818,29 +877,16 @@ pub(super) async fn execute_interchain_transfer<P: Provider>(
                 return make_failure_with_hash(submit_start, &e.to_string(), Some(tx_hash));
             }
             Err(_) => {
-                // Deadline hit — did it land just after?
-                if let Ok(Some(receipt)) = provider.get_transaction_receipt(tx_hash).await {
-                    return receipt_to_metrics(&receipt, tx_hash, its_proxy, submit_start);
+                let timed_out = ReceiptTimeout {
+                    tx_hash,
+                    its_proxy,
+                    submit_start,
+                    pinned_nonce,
+                    attempt,
+                };
+                if let Some(metrics) = resolve_receipt_timeout(provider, timed_out).await {
+                    return metrics;
                 }
-                // Not mined. Resubmit only if the nonce is pinned (else a
-                // resubmit could double-send) and attempts remain.
-                if pinned_nonce.is_none() || attempt + 1 == MAX_SUBMIT_ATTEMPTS {
-                    return make_failure_with_hash(
-                        submit_start,
-                        &format!(
-                            "tx timed out (no receipt in {}s)",
-                            EVM_RECEIPT_TIMEOUT.as_secs()
-                        ),
-                        Some(tx_hash),
-                    );
-                }
-                ui::warn(&format!(
-                    "source tx {tx_hash:#x} not mined in {}s — resubmitting at nonce {} \
-                     (attempt {}/{MAX_SUBMIT_ATTEMPTS})",
-                    EVM_RECEIPT_TIMEOUT.as_secs(),
-                    pinned_nonce.unwrap_or_default(),
-                    attempt + 2,
-                ));
             }
         }
     }
@@ -905,6 +951,117 @@ async fn learn_nonce<P: Provider>(provider: &P, tx_hash: TxHash) -> Option<u64> 
     }
 }
 
+/// Whether a *rejected send* (no tx submitted) is worth re-sending. Covers the
+/// generic transient RPC signatures plus Avalanche's "state not available for
+/// pending block" (a node that can't serve pending state for the gas/nonce
+/// fill). Safe to retry because a rejected send never consumed the nonce.
+fn is_retryable_send_error(err: &str) -> bool {
+    err.contains("state not available for pending block") || is_transient_default(&err)
+}
+
+/// A submitted transfer whose receipt did not arrive within
+/// `EVM_RECEIPT_TIMEOUT`.
+struct ReceiptTimeout {
+    tx_hash: TxHash,
+    its_proxy: Address,
+    submit_start: Instant,
+    pinned_nonce: Option<u64>,
+    attempt: u32,
+}
+
+/// Resolve a receipt-wait timeout: `Some(metrics)` is terminal, `None` means the
+/// submit loop should resubmit at the pinned nonce.
+async fn resolve_receipt_timeout<P: Provider>(
+    provider: &P,
+    timed_out: ReceiptTimeout,
+) -> Option<TxMetrics> {
+    let ReceiptTimeout {
+        tx_hash,
+        its_proxy,
+        submit_start,
+        pinned_nonce,
+        attempt,
+    } = timed_out;
+    // Deadline hit - did it land just after?
+    if let Ok(Some(receipt)) = provider.get_transaction_receipt(tx_hash).await {
+        return Some(receipt_to_metrics(
+            &receipt,
+            tx_hash,
+            its_proxy,
+            submit_start,
+        ));
+    }
+    // Not mined. Resubmit only if the nonce is pinned (else a resubmit could
+    // double-send) and attempts remain.
+    let Some(nonce) = pinned_nonce.filter(|_| attempt + 1 < MAX_SUBMIT_ATTEMPTS) else {
+        return Some(make_failure_with_hash(
+            submit_start,
+            &format!(
+                "tx timed out (no receipt in {}s)",
+                EVM_RECEIPT_TIMEOUT.as_secs()
+            ),
+            Some(tx_hash),
+        ));
+    };
+    ui::warn(&format!(
+        "source tx {tx_hash:#x} not mined in {}s — resubmitting at nonce {nonce} \
+         (attempt {}/{MAX_SUBMIT_ATTEMPTS})",
+        EVM_RECEIPT_TIMEOUT.as_secs(),
+        attempt + 2,
+    ));
+    None
+}
+
+/// Recovery the submit loop should take after a rejected send.
+enum SendRejection {
+    /// The node reported the nonce it actually wants - pin it and re-send.
+    RetryAtNonce(u64),
+    /// Transient RPC rejection - back off for this long, then re-send.
+    RetryAfterBackoff(Duration),
+    /// Deterministic rejection (or attempts exhausted) - record the failure.
+    Fatal,
+}
+
+/// Classify a rejected `interchainTransfer` send. Both retry paths are safe:
+/// a rejected send never entered the mempool, so its nonce was not consumed
+/// and re-sending cannot double-transfer.
+///
+/// - Stale nonce: the RPC handed alloy an already-consumed nonce (observed on
+///   Avalanche via QuikNode: "nonce too low: next nonce N, tx nonce N-1"). The
+///   node reports the nonce it wants, so pin it rather than fail the route.
+///   Guarded by `!= pinned_nonce` + the attempt bound so a persistent mismatch
+///   can't loop.
+/// - Transient rejection: source-side 429s, and Avalanche's "state not
+///   available for pending block" (a coreth node that can't serve pending state
+///   for the gas/nonce fill - recurs on the testnet Avalanche RPC).
+fn classify_send_rejection(error: &str, attempt: u32, pinned_nonce: Option<u64>) -> SendRejection {
+    if attempt + 1 >= MAX_SUBMIT_ATTEMPTS {
+        return SendRejection::Fatal;
+    }
+    if error.contains("nonce too low")
+        && let Some(expected) = parse_expected_nonce(error)
+        && Some(expected) != pinned_nonce
+    {
+        return SendRejection::RetryAtNonce(expected);
+    }
+    if is_retryable_send_error(error) {
+        return SendRejection::RetryAfterBackoff(Duration::from_millis(500u64 << attempt));
+    }
+    SendRejection::Fatal
+}
+
+/// Parse the node-expected nonce out of a geth-style "nonce too low: next nonce
+/// N, tx nonce M" error so a stale-nonce send can be retried at the right value.
+fn parse_expected_nonce(err: &str) -> Option<u64> {
+    let after = err.split("next nonce").nth(1)?;
+    let digits: String = after
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
 fn make_failure(submit_start: Instant, error: &str) -> TxMetrics {
     make_failure_with_hash(submit_start, error, None)
 }
@@ -943,11 +1100,14 @@ pub(super) async fn rescale_sizing_for_decimals<P: Provider>(
     provider: &P,
     token_addr: Address,
 ) -> eyre::Result<u8> {
-    let decimals = ERC20::new(token_addr, provider)
-        .decimals()
-        .call()
-        .await
-        .map_err(|e| eyre!("failed to read source token decimals at {token_addr}: {e}"))?;
+    // Retry: this read runs on the source RPC (Hedera hard-429s its JSON-RPC
+    // relay), and a transient rate-limit blip on a setup read shouldn't fail
+    // the whole route.
+    let decimals = retry_all("read_source_token_decimals", || async {
+        ERC20::new(token_addr, provider).decimals().call().await
+    })
+    .await
+    .map_err(|e| eyre!("failed to read source token decimals at {token_addr}: {e}"))?;
     if decimals < 18 {
         let divisor = U256::from(10).pow(U256::from(18 - u32::from(decimals)));
         *amount_per_tx /= divisor;
@@ -969,4 +1129,39 @@ fn make_failure_with_hash(
         elapsed_ms,
         error,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_expected_nonce;
+
+    #[test]
+    fn parses_geth_nonce_too_low() {
+        // The exact Avalanche/QuikNode wording that failed the cron.
+        let err = "server returned an error response: error code -32000: nonce too low: \
+                   next nonce 246, tx nonce 245";
+        assert_eq!(parse_expected_nonce(err), Some(246));
+    }
+
+    #[test]
+    fn none_when_no_next_nonce_phrase() {
+        assert_eq!(parse_expected_nonce("nonce too low"), None);
+        assert_eq!(parse_expected_nonce("some unrelated error"), None);
+    }
+
+    #[test]
+    fn retryable_send_errors() {
+        use super::is_retryable_send_error;
+        // Avalanche coreth pending-state rejection (the recurring testnet one).
+        assert!(is_retryable_send_error(
+            "error code -32000: state not available for pending block"
+        ));
+        // Generic transient signatures still count.
+        assert!(is_retryable_send_error("HTTP error 429 too many requests"));
+        assert!(is_retryable_send_error("connection reset by peer"));
+        // A deterministic revert must NOT be retried.
+        assert!(!is_retryable_send_error(
+            "execution reverted: TakeTokenFailed"
+        ));
+    }
 }
