@@ -21,6 +21,7 @@ cosmos-sdk-proto = { version = "0.27", features = ["cosmwasm"] }
 prost = "0.13"
 tendermint-proto = "0.40"
 reqwest = { version = "0.12", features = ["json"] }
+tower = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"

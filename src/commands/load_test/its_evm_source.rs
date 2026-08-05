@@ -73,6 +73,25 @@ pub(super) struct ItsContracts {
     pub its_proxy_addr: Address,
 }
 
+/// Source-chain RPC candidates for a fallback provider: the configured
+/// (private, from `--source-rpc`/secret) endpoint first, then the chains-config
+/// public RPC. `connect_evm` dedups, so when the secret is unset (both resolve
+/// to the public RPC) this is a harmless single transport. Passing the pair to
+/// `connect_evm[_signed]` is what lets a persistently-failing private endpoint
+/// (Hedera 429s, Avalanche pending-state) fail over to the public RPC.
+pub(super) fn source_rpc_candidates(args: &LoadTestArgs) -> Vec<String> {
+    let mut urls = vec![args.source_rpc.clone()];
+    if let Ok(cfg) = ChainsConfig::load(&args.config)
+        && let Some(public) = cfg
+            .chains
+            .get(&args.source_chain)
+            .and_then(|c| c.rpc.clone())
+    {
+        urls.push(public);
+    }
+    urls
+}
+
 /// Default gas value for ITS cross-chain transfers.
 ///
 /// Tries the Axelarscan `estimateGasFee` quote for this route (× 1.5);

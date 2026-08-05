@@ -1,18 +1,67 @@
 use std::fs;
+use std::num::NonZeroUsize;
 
 use alloy::{
     hex,
     network::{Network, ReceiptResponse},
     primitives::{Address, Bytes, FixedBytes, keccak256},
-    providers::PendingTransactionBuilder,
+    providers::{DynProvider, PendingTransactionBuilder, Provider as _, ProviderBuilder},
+    rpc::client::RpcClient,
+    signers::local::PrivateKeySigner,
     sol,
     sol_types::{SolCall, SolValue},
+    transports::{http::Http, layers::FallbackLayer},
 };
 use eyre::Result;
 use serde_json::Value;
+use tower::Layer;
 
 use crate::timing::EVM_TX_RECEIPT_TIMEOUT;
 use crate::ui;
+
+/// Build a read-only EVM provider that transparently fails over across `urls`
+/// (primary first, then the public fallback).
+///
+/// alloy's [`FallbackLayer`] ranks the transports by success-rate + latency, so
+/// a persistently-failing endpoint — Hedera 429s, Avalanche "state not
+/// available for pending block" — is routed around automatically. Combined with
+/// the axe-level retries that re-issue each call, this is the "retry, then fall
+/// back to the public RPC" behaviour: a retried call whose primary keeps
+/// erroring lands on the healthy public transport. Identical URLs are
+/// deduplicated, so passing `[private, public]` where the secret is unset (both
+/// resolve to the public RPC) is a harmless single-transport provider.
+pub fn connect_evm(urls: &[String]) -> Result<DynProvider> {
+    Ok(ProviderBuilder::new()
+        .connect_client(fallback_client(urls)?)
+        .erased())
+}
+
+/// Signed variant for state-changing calls: same failover, plus the wallet
+/// filler so the provider can sign + send.
+pub fn connect_evm_signed(urls: &[String], signer: PrivateKeySigner) -> Result<DynProvider> {
+    Ok(ProviderBuilder::new()
+        .wallet(signer)
+        .connect_client(fallback_client(urls)?)
+        .erased())
+}
+
+/// Assemble an [`RpcClient`] over one-or-more HTTP transports behind a
+/// single-active fallback (`active_transport_count = 1` so writes are never
+/// broadcast to two endpoints in parallel).
+fn fallback_client(urls: &[String]) -> Result<RpcClient> {
+    let mut seen = std::collections::HashSet::new();
+    let transports: Vec<Http<reqwest::Client>> = urls
+        .iter()
+        .filter(|u| seen.insert((*u).clone()))
+        .map(|u| Ok::<_, eyre::Report>(Http::new(u.parse()?)))
+        .collect::<Result<_>>()?;
+    if transports.is_empty() {
+        eyre::bail!("connect_evm: no RPC URLs provided");
+    }
+    let fallback = FallbackLayer::default()
+        .with_active_transport_count(NonZeroUsize::new(1).expect("nonzero"));
+    Ok(RpcClient::new(fallback.layer(transports), false))
+}
 
 sol! {
     #[sol(rpc)]

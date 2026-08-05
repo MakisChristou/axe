@@ -30,13 +30,13 @@ use tokio::sync::{Mutex, Semaphore};
 
 use super::its_evm_source::{
     self, EvmSource, ItsContracts, deploy_its_token, derive_and_fund_keys, distribute_tokens,
-    execute_interchain_transfer, init_evm_source, resolve_its_contracts,
+    execute_interchain_transfer, init_evm_source, resolve_its_contracts, source_rpc_candidates,
     verify_axelar_prerequisites,
 };
 use super::metrics::{LoadTestReport, TxMetrics};
 use super::{LoadTestArgs, finish_report, read_its_cache, validate_evm_rpc};
 use crate::config::ChainsConfig;
-use crate::evm::{ERC20, InterchainTokenService};
+use crate::evm::{ERC20, InterchainTokenService, connect_evm, connect_evm_signed};
 use crate::ui;
 
 const MAX_CONCURRENT_SENDS: usize = 100;
@@ -91,7 +91,7 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
     // there is 10^10 AXE, way over wallet balance and rejected by the source
     // burn. Rescale after we know the real on-chain decimals.
     {
-        let read_provider = ProviderBuilder::new().connect_http(source_rpc_url.parse()?);
+        let read_provider = connect_evm(&source_rpc_candidates(&args))?;
         super::its_evm_source::rescale_sizing_for_decimals(
             &mut sizing.amount_per_tx,
             &mut sizing.amount_per_key,
@@ -128,9 +128,8 @@ pub async fn run(args: LoadTestArgs, _run_start: Instant) -> eyre::Result<()> {
     )
     .await?;
 
-    let token_provider = ProviderBuilder::new()
-        .wallet(evm_source.signer.clone())
-        .connect_http(source_rpc_url.parse()?);
+    let token_provider =
+        connect_evm_signed(&source_rpc_candidates(&args), evm_source.signer.clone())?;
     distribute_tokens(
         &token_provider,
         token.token_addr,
@@ -289,7 +288,7 @@ async fn resolve_or_deploy_token(
     args: &LoadTestArgs,
     evm_source: &EvmSource,
     its: &ItsContracts,
-    evm_rpc_url: &str,
+    _evm_rpc_url: &str,
     dest_rpc_url: &str,
     sizing: &RunSizing,
     gas_value: U256,
@@ -302,9 +301,8 @@ async fn resolve_or_deploy_token(
     // revert with `UntrustedChain()`, so the on-chain destination name must be
     // the axelarId. (`dest` stays the key for cache/config lookups.)
     let dest_its = args.destination_axelar_id.as_str();
-    let write_provider = ProviderBuilder::new()
-        .wallet(evm_source.signer.clone())
-        .connect_http(evm_rpc_url.parse()?);
+    let write_provider =
+        connect_evm_signed(&source_rpc_candidates(args), evm_source.signer.clone())?;
 
     let its_service = InterchainTokenService::new(its.its_proxy_addr, &write_provider);
 
@@ -446,7 +444,7 @@ fn hub_gas_extra_per_key(args: &LoadTestArgs, sizing: &RunSizing, gas_value_wei:
 async fn run_sustained_pipeline(
     args: &LoadTestArgs,
     cfg: &ChainsConfig,
-    source_rpc_url: &str,
+    _source_rpc_url: &str,
     dest_rpc_url: &str,
     dest_gateway_addr: Address,
     derived: &[PrivateKeySigner],
@@ -458,9 +456,9 @@ async fn run_sustained_pipeline(
     let tps = sizing.sustained_params.expect("burst_mode is false").0 as usize;
     let duration_secs = sizing.sustained_params.expect("burst_mode is false").1;
     let key_cycle = args.key_cycle as usize;
-    let rpc_url_str = source_rpc_url.to_string();
+    let source_rpc_urls = source_rpc_candidates(args);
 
-    let nonce_provider = ProviderBuilder::new().connect_http(source_rpc_url.parse()?);
+    let nonce_provider = connect_evm(&source_rpc_urls)?;
     let mut nonces: Vec<u64> = Vec::with_capacity(sizing.num_keys);
     for signer in derived {
         let n = nonce_provider
@@ -526,13 +524,12 @@ async fn run_sustained_pipeline(
             let amt = amount_per_tx;
             let its_proxy = its_proxy_addr;
             let tid = token_id;
-            let url = rpc_url_str.clone();
+            let urls = source_rpc_urls.clone();
             let vtx = verify_tx.clone();
             let has_vv = has_voting_verifier;
 
-            let provider = ProviderBuilder::new()
-                .wallet(derived_owned[key_idx].clone())
-                .connect_http(url.parse().expect("invalid RPC URL"));
+            let provider = connect_evm_signed(&urls, derived_owned[key_idx].clone())
+                .expect("build source fallback provider");
 
             Box::pin(async move {
                 let mut result = execute_interchain_transfer(
@@ -592,7 +589,7 @@ async fn run_sustained_pipeline(
 #[allow(clippy::too_many_arguments)]
 async fn run_burst_pipeline(
     args: &LoadTestArgs,
-    source_rpc_url: &str,
+    _source_rpc_url: &str,
     dest_rpc_url: &str,
     dest_gateway_addr: Address,
     derived: &[PrivateKeySigner],
@@ -612,6 +609,7 @@ async fn run_burst_pipeline(
     let mut tasks = Vec::with_capacity(num_txs);
     // ITS routes by axelarId (key != axelarId for consensus chains).
     let dest_chain = args.destination_axelar_id.clone();
+    let source_rpc_urls = source_rpc_candidates(args);
 
     for derived_signer in derived {
         let metrics_clone = Arc::clone(&metrics_list);
@@ -627,9 +625,7 @@ async fn run_burst_pipeline(
         let its_proxy = targets.its_proxy_addr;
         let tid = targets.token_id;
 
-        let provider = ProviderBuilder::new()
-            .wallet(derived_signer.clone())
-            .connect_http(source_rpc_url.parse()?);
+        let provider = connect_evm_signed(&source_rpc_urls, derived_signer.clone())?;
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
