@@ -16,9 +16,23 @@ on:
   workflow_dispatch:
     inputs:
       chains:
-        description: Express-supported chains to monitor (space- or comma-separated axelar ids, e.g. "avalanche linea")
-        type: string
+        description: 'Express-supported chain(s) to monitor. "all" scans every express chain for the chosen network; or pick one for a focused run.'
+        type: choice
         required: true
+        default: all
+        options:
+          - all
+          - ethereum
+          - ethereum-sepolia
+          - avalanche
+          - base
+          - binance
+          - optimism
+          - polygon
+          - arbitrum
+          - mantle
+          - celo
+          - linea
       network:
         description: Axelar network (testnet + mainnet have express data)
         type: choice
@@ -72,7 +86,17 @@ jobs:
           NETWORK: ${{ inputs.network }}
         run: |
           set -euo pipefail
-          # Inputs are space- or comma-separated; normalise commas to spaces and
-          # forward each chain as a positional arg.
-          read -ra CHAIN_ARGS <<< "${CHAINS//,/ }"
+          # "all" expands to the network's express-supported chains; any other
+          # choice scans just that chain. (The GMP-API destinationChain filter is
+          # case-insensitive, so lowercase axelar ids are fine.) The per-network
+          # lists come from live express activity on the Axelarscan GMP API.
+          if [ "$CHAINS" = all ]; then
+            if [ "$NETWORK" = mainnet ]; then
+              CHAIN_ARGS=(ethereum base binance optimism polygon arbitrum mantle celo avalanche)
+            else
+              CHAIN_ARGS=(avalanche ethereum-sepolia linea binance)
+            fi
+          else
+            CHAIN_ARGS=("$CHAINS")
+          fi
           ./target/release/axe test express-execution "${CHAIN_ARGS[@]}" --network "$NETWORK"

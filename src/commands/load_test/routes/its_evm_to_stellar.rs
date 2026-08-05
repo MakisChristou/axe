@@ -545,7 +545,7 @@ async fn run_sustained_pipeline(
         ..
     } = transfer;
     let submitter = super::its_evm_source::ItsEvmSubmitter {
-        rpc_url: rpc_url.parse()?,
+        rpc_urls: vec![rpc_url.to_string()],
         its_proxy: its_proxy_addr,
         token_id: token_id.into(),
         destination_chain: args.destination_axelar_id.to_string(),
@@ -605,7 +605,7 @@ async fn run_burst_pipeline(
     let test_start = Instant::now();
     let burst = super::its_evm_source::run_its_burst(
         super::its_evm_source::ItsEvmSubmitter {
-            rpc_url: transfer.rpc_url.parse()?,
+            rpc_urls: vec![transfer.rpc_url.to_string()],
             its_proxy: transfer.its_proxy_addr,
             token_id: transfer.token_id.into(),
             destination_chain: args.destination_axelar_id.to_string(),

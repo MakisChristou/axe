@@ -1444,6 +1444,7 @@ dependencies = [
  "tendermint-proto",
  "thiserror 2.0.18",
  "tokio",
+ "tower 0.5.3",
  "xrpl_api",
  "xrpl_binary_codec",
  "xrpl_http_client",

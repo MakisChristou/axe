@@ -247,7 +247,7 @@ async fn run_burst_pipeline(
             .await;
     let burst = super::its_evm_source::run_its_burst(
         super::its_evm_source::ItsEvmSubmitter {
-            rpc_url: evm.rpc_url.parse()?,
+            rpc_urls: vec![evm.rpc_url.to_string()],
             its_proxy: evm.its_proxy_addr,
             token_id: evm.token_id.into(),
             destination_chain: args.destination_axelar_id.to_string(),
@@ -309,7 +309,7 @@ async fn run_sustained_pipeline(
             .await;
     let make_task = super::its_evm_source::its_sustained_tasks(
         super::its_evm_source::ItsEvmSubmitter {
-            rpc_url: evm.rpc_url.parse()?,
+            rpc_urls: vec![evm.rpc_url.to_string()],
             its_proxy: evm.its_proxy_addr,
             token_id: evm.token_id.into(),
             destination_chain: args.destination_axelar_id.to_string(),

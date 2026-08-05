@@ -21,7 +21,7 @@ use std::time::Instant;
 use super::its_evm_source::{
     self, EvmSource, EvmTokenRunSizing as RunSizing, ItsContracts, deploy_its_token,
     derive_and_fund_keys, distribute_tokens, hub_gas_extra_per_key, init_evm_source,
-    resolve_its_contracts,
+    resolve_its_contracts, source_rpc_candidates,
 };
 use super::its_prerequisites::{self, GatewayRequirement};
 use super::its_verification;
@@ -32,7 +32,7 @@ use super::{LoadTestArgs, validate_evm_rpc};
 use crate::config::AxelarChainContract;
 use crate::config::ChainContract;
 use crate::config::ChainsConfig;
-use crate::evm::InterchainTokenService;
+use crate::evm::{InterchainTokenService, connect_evm, connect_evm_signed};
 use crate::ui;
 use alloy::{
     primitives::{Address, Bytes, FixedBytes, U256},
@@ -46,6 +46,8 @@ pub async fn run(args: LoadTestArgs, validated_sizing: ValidatedRunSizing) -> ey
     let dest = &args.destination_chain;
 
     let source_rpc_url = args.source_rpc.to_string();
+    // Private endpoint first, chains-config public RPC as failover.
+    let source_rpc_urls = source_rpc_candidates(&args).await;
     let dest_rpc_url = args.destination_rpc.to_string();
     validate_evm_rpc(&source_rpc_url).await?;
     validate_evm_rpc(&dest_rpc_url).await?;
@@ -75,14 +77,14 @@ pub async fn run(args: LoadTestArgs, validated_sizing: ValidatedRunSizing) -> ey
         &args,
         &evm_source,
         &its,
-        &source_rpc_url,
+        &source_rpc_urls,
         &dest_rpc_url,
         &sizing,
         gas_value,
     )
     .await?;
 
-    rescale_token_sizing(&mut sizing, &source_rpc_url, token.token_addr).await?;
+    rescale_token_sizing(&mut sizing, &source_rpc_urls, token.token_addr).await?;
 
     if let Some(ref deploy_msg_id) = token.deploy_message_id {
         // Use axelar IDs (not the config keys) — the ITS Hub records messages
@@ -110,9 +112,7 @@ pub async fn run(args: LoadTestArgs, validated_sizing: ValidatedRunSizing) -> ey
     )
     .await?;
 
-    let token_provider = ProviderBuilder::new()
-        .wallet(evm_source.signer.clone())
-        .connect_http(source_rpc_url.parse()?);
+    let token_provider = connect_evm_signed(&source_rpc_urls, evm_source.signer.clone())?;
     distribute_tokens(
         &token_provider,
         token.token_addr,
@@ -139,7 +139,7 @@ pub async fn run(args: LoadTestArgs, validated_sizing: ValidatedRunSizing) -> ey
     let pipeline = PipelineContext {
         args,
         cfg,
-        source_rpc_url,
+        source_rpc_urls,
         destination_rpc_url: dest_rpc_url,
         destination_gateway: dest_gateway_addr,
         derived,
@@ -154,10 +154,10 @@ pub async fn run(args: LoadTestArgs, validated_sizing: ValidatedRunSizing) -> ey
 
 async fn rescale_token_sizing(
     sizing: &mut RunSizing,
-    source_rpc_url: &str,
+    source_rpc_urls: &[String],
     token: Address,
 ) -> eyre::Result<()> {
-    let provider = ProviderBuilder::new().connect_http(source_rpc_url.parse()?);
+    let provider = connect_evm(source_rpc_urls)?;
     super::its_evm_source::rescale_sizing_for_decimals(
         &mut sizing.amount_per_tx,
         &mut sizing.amount_per_key,
@@ -229,15 +229,13 @@ async fn resolve_or_deploy_token(
     args: &LoadTestArgs,
     evm_source: &EvmSource,
     its: &ItsContracts,
-    evm_rpc_url: &str,
+    source_rpc_urls: &[String],
     dest_rpc_url: &str,
     sizing: &RunSizing,
     gas_value: U256,
 ) -> eyre::Result<TokenIdentity> {
     let src = &args.source_chain;
-    let write_provider = ProviderBuilder::new()
-        .wallet(evm_source.signer.clone())
-        .connect_http(evm_rpc_url.parse()?);
+    let write_provider = connect_evm_signed(source_rpc_urls, evm_source.signer.clone())?;
     let needed = sizing.amount_per_tx * U256::from(sizing.num_keys);
     let config_axe = super::helpers::reusable_config_axe(
         &args.config,
@@ -361,7 +359,7 @@ async fn resolve_cached_or_deploy<P: Provider>(
 struct PipelineContext {
     args: LoadTestArgs,
     cfg: ChainsConfig,
-    source_rpc_url: String,
+    source_rpc_urls: Vec<String>,
     destination_rpc_url: String,
     destination_gateway: Address,
     derived: Vec<PrivateKeySigner>,
@@ -376,7 +374,7 @@ async fn run_sustained_pipeline(
     let PipelineContext {
         args,
         cfg,
-        source_rpc_url,
+        source_rpc_urls,
         destination_rpc_url: dest_rpc_url,
         destination_gateway: dest_gateway_addr,
         derived,
@@ -389,7 +387,7 @@ async fn run_sustained_pipeline(
         key_cycle,
     } = plan;
 
-    let nonce_provider = ProviderBuilder::new().connect_http(source_rpc_url.parse()?);
+    let nonce_provider = connect_evm(&source_rpc_urls)?;
     let mut nonces: Vec<u64> = Vec::with_capacity(sizing.num_keys);
     for signer in &derived {
         let n = nonce_provider
@@ -403,7 +401,7 @@ async fn run_sustained_pipeline(
         .contract_address(AxelarChainContract::VotingVerifier, &args.source_chain)
         .is_ok();
     let submitter = its_evm_source::ItsEvmSubmitter {
-        rpc_url: source_rpc_url.parse()?,
+        rpc_urls: source_rpc_urls,
         its_proxy: targets.its_proxy_addr,
         token_id: targets.token_id.into(),
         destination_chain: args.destination_axelar_id.to_string(),
@@ -450,7 +448,7 @@ async fn run_sustained_pipeline(
 async fn run_burst_pipeline(pipeline: PipelineContext) -> eyre::Result<()> {
     let PipelineContext {
         args,
-        source_rpc_url,
+        source_rpc_urls,
         destination_rpc_url: dest_rpc_url,
         destination_gateway: dest_gateway_addr,
         derived,
@@ -463,7 +461,7 @@ async fn run_burst_pipeline(pipeline: PipelineContext) -> eyre::Result<()> {
     let test_start = Instant::now();
     let burst = its_evm_source::run_its_burst(
         its_evm_source::ItsEvmSubmitter {
-            rpc_url: source_rpc_url.parse()?,
+            rpc_urls: source_rpc_urls,
             its_proxy: targets.its_proxy_addr,
             token_id: targets.token_id.into(),
             destination_chain: args.destination_axelar_id.to_string(),

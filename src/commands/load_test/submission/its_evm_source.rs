@@ -52,7 +52,7 @@ use crate::commands::test_its::{
 };
 use crate::config::ChainContract;
 use crate::config::ChainsConfig;
-use crate::evm::{ERC20, InterchainTokenFactory, InterchainTokenService};
+use crate::evm::{ERC20, InterchainTokenFactory, InterchainTokenService, connect_evm_signed};
 use crate::retry::{is_transient_default, retry_all};
 use crate::types::Network;
 use crate::ui;
@@ -134,6 +134,25 @@ pub(super) struct EvmSource {
 pub(super) struct ItsContracts {
     pub its_factory_addr: Address,
     pub its_proxy_addr: Address,
+}
+
+/// Source-chain RPC candidates for a fallback provider: the configured
+/// (private, from `--source-rpc`/secret) endpoint first, then the chains-config
+/// public RPC. `connect_evm` dedups, so when the secret is unset (both resolve
+/// to the public RPC) this is a harmless single transport. Passing the pair to
+/// `connect_evm[_signed]` is what lets a persistently-failing private endpoint
+/// (Hedera 429s, Avalanche pending-state) fail over to the public RPC.
+pub(super) async fn source_rpc_candidates(args: &LoadTestArgs) -> Vec<String> {
+    let mut urls = vec![args.source_rpc.to_string()];
+    if let Ok(cfg) = ChainsConfig::load(&args.config).await
+        && let Some(public) = cfg
+            .chains
+            .get(args.source_chain.as_ref())
+            .and_then(|chain| chain.rpc.clone())
+    {
+        urls.push(public);
+    }
+    urls
 }
 
 /// Default gas value for ITS cross-chain transfers.
@@ -697,7 +716,10 @@ pub(super) struct InterchainTransferRequest {
 /// Chain-specific ITS submission capability shared by every EVM-source route.
 #[derive(Clone)]
 pub(super) struct ItsEvmSubmitter {
-    pub rpc_url: reqwest::Url,
+    /// Source RPCs in preference order, passed straight to `connect_evm_signed`
+    /// so a persistently-failing primary fails over. Routes that have not wired
+    /// `source_rpc_candidates` pass a single URL, which is a plain provider.
+    pub rpc_urls: Vec<String>,
     pub its_proxy: Address,
     pub token_id: TokenId,
     pub destination_chain: String,
@@ -718,9 +740,11 @@ impl TransactionSubmitter for ItsEvmSubmitter {
     type Job = ItsEvmSubmitJob;
 
     async fn submit(&self, job: Self::Job) -> TxMetrics {
-        let provider = ProviderBuilder::new()
-            .wallet(job.signer)
-            .connect_http(self.rpc_url.clone());
+        let submit_start = Instant::now();
+        let provider = match connect_evm_signed(&self.rpc_urls, job.signer) {
+            Ok(provider) => provider,
+            Err(error) => return make_failure(submit_start, &error.to_string()),
+        };
         let submit = || {
             execute_interchain_transfer(
                 &provider,

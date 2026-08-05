@@ -320,7 +320,7 @@ async fn run_sustained_pipeline(
         .contract_address(AxelarChainContract::VotingVerifier, &args.source_chain)
         .is_ok();
     let submitter = its_evm_source::ItsEvmSubmitter {
-        rpc_url: evm_rpc_url.parse()?,
+        rpc_urls: vec![evm_rpc_url.to_string()],
         its_proxy: targets.its_proxy_addr,
         token_id: targets.token_id.into(),
         destination_chain: dest.to_string(),
@@ -379,7 +379,7 @@ async fn run_burst_pipeline(
     let test_start = Instant::now();
     let burst = its_evm_source::run_its_burst(
         its_evm_source::ItsEvmSubmitter {
-            rpc_url: evm_rpc_url.parse()?,
+            rpc_urls: vec![evm_rpc_url.to_string()],
             its_proxy: targets.its_proxy_addr,
             token_id: targets.token_id.into(),
             destination_chain: dest.to_string(),
