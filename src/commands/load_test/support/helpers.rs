@@ -28,7 +28,7 @@ use tokio::{fs, time};
 use super::metrics::{AmplifierTiming, LoadTestReport, VerificationReport};
 use super::verify;
 use super::{GmpCache, LoadTestArgs, read_cache, save_cache};
-use crate::config::{ChainContract, ChainsConfig};
+use crate::config::{ChainContract, ChainsConfig, ContractEntry};
 use crate::evm::{ERC20, InterchainTokenService, SenderReceiver, read_artifact_bytecode};
 use crate::retry::{FALLBACK_ATTEMPTS, retry_all, retry_async};
 use crate::stellar::StellarWallet;
@@ -854,20 +854,53 @@ pub(crate) async fn read_pre_registered_axe_token(
     config: &Path,
     chain_axelar_id: &str,
 ) -> Result<Option<FixedBytes<32>>> {
-    let config = ChainsConfig::load(config).await?;
-    let tid_str = config
-        .chains
-        .get(chain_axelar_id)
-        .and_then(|chain| chain.contracts.as_ref())
-        .and_then(|contracts| contracts.get("AXE"))
-        .and_then(|axe| axe.token_id.as_deref());
+    let tid_str =
+        match axe_config_field(config, chain_axelar_id, |axe| axe.token_id.clone()).await? {
+            Some(value) => Some(value),
+            None => axe_overlay_field(config, chain_axelar_id, |axe| axe.token_id.clone()).await,
+        };
     match tid_str {
         Some(value) => Ok(Some(FixedBytes::from(parse_token_id_hex(
-            value,
+            &value,
             &format!("AXE.tokenId for chain {chain_axelar_id}"),
         )?))),
         None => Ok(None),
     }
+}
+
+/// Read one `chains.<chain>.contracts.AXE.<field>` value from a chains-config
+/// file.
+async fn axe_config_field(
+    config: &Path,
+    chain_axelar_id: &str,
+    pick: fn(&ContractEntry) -> Option<String>,
+) -> Result<Option<String>> {
+    let config = ChainsConfig::load(config).await?;
+    Ok(config
+        .chains
+        .get(chain_axelar_id)
+        .and_then(|chain| chain.contracts.as_ref())
+        .and_then(|contracts| contracts.get("AXE"))
+        .and_then(pick))
+}
+
+/// Same lookup against this repo's AXE-token overlay,
+/// `axe-tokens/<network>.json` (network = the chains-config file stem). The
+/// upstream chains-config for stagenet / devnet-amplifier records no
+/// `contracts.AXE` entries and axe cannot push there, so tokens deployed on
+/// those networks persist HERE — the CI checkout and local runs both see the
+/// file. Missing/unreadable overlay is simply "no entry".
+async fn axe_overlay_field(
+    config: &Path,
+    chain_axelar_id: &str,
+    pick: fn(&ContractEntry) -> Option<String>,
+) -> Option<String> {
+    let stem = config.file_stem()?.to_str()?;
+    let overlay = Path::new("axe-tokens").join(format!("{stem}.json"));
+    axe_config_field(&overlay, chain_axelar_id, pick)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Companion to `read_pre_registered_axe_token`: returns the AXE
@@ -894,13 +927,11 @@ pub(crate) async fn read_pre_registered_axe_token_address(
     // the caller fell back to ITS.interchainTokenAddress(tokenId), which
     // reverts on the Hedera HTS-fork (its `registeredTokenAddress` view
     // replaces it).
-    let config = ChainsConfig::load(config).await?;
-    let addr_str = config
-        .chains
-        .get(chain_axelar_id)
-        .and_then(|chain| chain.contracts.as_ref())
-        .and_then(|contracts| contracts.get("AXE"))
-        .and_then(|axe| axe.address.as_deref());
+    let addr_str =
+        match axe_config_field(config, chain_axelar_id, |axe| axe.address.clone()).await? {
+            Some(value) => Some(value),
+            None => axe_overlay_field(config, chain_axelar_id, |axe| axe.address.clone()).await,
+        };
     match addr_str {
         Some(s) => Ok(Some(s.parse().map_err(|e| {
             eyre::eyre!("invalid AXE.address for chain {chain_axelar_id}: {e}")
@@ -986,7 +1017,9 @@ pub(crate) async fn reusable_config_axe<P: Provider>(
 /// per-chain deploy helpers right after the source-side deploy succeeds.
 pub(crate) fn hint_persist_axe_token(chain_axelar_id: &str, token_id: &FixedBytes<32>) {
     ui::info(&format!(
-        "💡 To skip the deploy on future runs, add to chains-config:\n  \
+        "💡 To skip the deploy on future runs, add to chains-config (or, for \
+         networks whose upstream config axe can't edit, to this repo's \
+         axe-tokens/<network>.json overlay):\n  \
          chains.{chain_axelar_id}.contracts.AXE.tokenId = \"{token_id}\"\n  \
          (assumes the destination chains you care about already have the remote registered)"
     ));

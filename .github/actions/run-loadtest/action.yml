@@ -107,28 +107,33 @@ runs:
         CHAIN_MAP=$(cat <<'EOF'
         {
           "Arbitrum":    {"mainnet": "arbitrum",   "testnet": "arbitrum-sepolia", "stagenet": "arbitrum-sepolia"},
-          "Avalanche":   {"mainnet": "avalanche",  "testnet": "avalanche",        "stagenet": "avalanche"},
+          "Arc":         {"devnet-amplifier": "arc-2"},
+          "Avalanche":   {"mainnet": "avalanche",  "testnet": "avalanche",        "stagenet": "avalanche", "devnet-amplifier": "avalanche-fuji"},
           "Base":        {"mainnet": "base",       "testnet": "base-sepolia",     "stagenet": "base-sepolia"},
+          "Berachain":   {"stagenet": "berachain", "devnet-amplifier": "berachain"},
           "Binance":     {"mainnet": "binance",    "testnet": "binance"},
-          "Blast":       {"mainnet": "blast",      "testnet": "blast-sepolia"},
-          "Ethereum":    {"mainnet": "ethereum",   "testnet": "ethereum-sepolia", "stagenet": "ethereum-sepolia"},
+          "Blast":       {"mainnet": "blast",      "testnet": "blast-sepolia",    "stagenet": "blast-sepolia"},
+          "Celo":        {"stagenet": "celo-sepolia"},
+          "Ethereum":    {"mainnet": "ethereum",   "testnet": "ethereum-sepolia", "stagenet": "ethereum-sepolia", "devnet-amplifier": "eth-sepolia"},
           "Filecoin":    {"mainnet": "filecoin",   "testnet": "filecoin-2"},
-          "Hedera":      {"mainnet": "hedera",   "testnet": "hedera"},
+          "Flow":        {"stagenet": "flow",      "devnet-amplifier": "flow"},
+          "Hedera":      {"mainnet": "hedera",   "testnet": "hedera",             "stagenet": "hedera"},
           "Hyperliquid": {"mainnet": "hyperliquid","testnet": "hyperliquid",      "stagenet": "hyperliquid"},
           "Immutable":   {"mainnet": "immutable",  "testnet": "immutable"},
-          "Kava":        {"mainnet": "kava",       "testnet": "kava"},
-          "Linea":       {"mainnet": "linea",      "testnet": "linea-sepolia"},
-          "Mantle":      {"mainnet": "mantle",     "testnet": "mantle-sepolia"},
+          "Kava":        {"mainnet": "kava",       "testnet": "kava",             "stagenet": "kava"},
+          "Linea":       {"mainnet": "linea",      "testnet": "linea-sepolia",    "stagenet": "linea-sepolia"},
+          "Mantle":      {"mainnet": "mantle",     "testnet": "mantle-sepolia",   "stagenet": "mantle-sepolia"},
           "Monad":       {"mainnet": "monad",     "testnet": "monad-3",          "stagenet": "monad"},
-          "Moonbeam":    {"mainnet": "moonbeam",   "testnet": "moonbeam"},
-          "Optimism":    {"mainnet": "optimism",   "testnet": "optimism-sepolia", "stagenet": "optimism-sepolia"},
-          "Polygon":     {"mainnet": "polygon",    "testnet": "polygon-sepolia"},
+          "Moonbeam":    {"mainnet": "moonbeam",   "testnet": "moonbeam",         "stagenet": "moonbeam"},
+          "Optimism":    {"mainnet": "optimism",   "testnet": "optimism-sepolia", "stagenet": "optimism-sepolia", "devnet-amplifier": "optimism-sepolia"},
+          "Plume":       {"stagenet": "plume",     "devnet-amplifier": "plume-2"},
+          "Polygon":     {"mainnet": "polygon",    "testnet": "polygon-sepolia",  "stagenet": "polygon-sepolia"},
           "Scroll":      {"mainnet": "scroll",     "testnet": "scroll"},
           "Solana":      {"mainnet": "solana",     "testnet": "solana",           "stagenet": "solana-stagenet-3", "devnet-amplifier": "solana-18"},
           "Stellar":     {"mainnet": "stellar",    "testnet": "stellar-2026-q1-2"},
           "Sui":         {"mainnet": "sui",        "testnet": "sui",              "stagenet": "sui", "devnet-amplifier": "sui-2"},
-          "XRPL":        {"mainnet": "xrpl",       "testnet": "xrpl",             "stagenet": "xrpl", "devnet-amplifier": "xrpl-dev"},
-          "XRPL EVM":    {"mainnet": "xrpl-evm",   "testnet": "xrpl-evm",         "stagenet": "xrpl-evm"}
+          "XRPL":        {"mainnet": "xrpl",       "testnet": "xrpl",             "stagenet": "xrpl"},
+          "XRPL EVM":    {"mainnet": "xrpl-evm",   "testnet": "xrpl-evm",         "stagenet": "xrpl-evm", "devnet-amplifier": "xrpl-evm-devnet"}
         }
         EOF
         )
@@ -137,12 +142,16 @@ runs:
         CHAIN_TYPES=$(cat <<'EOF'
         {
           "Arbitrum":    "evm",
+          "Arc":         "evm",
           "Avalanche":   "evm",
           "Base":        "evm",
+          "Berachain":   "evm",
           "Binance":     "evm",
           "Blast":       "evm",
+          "Celo":        "evm",
           "Ethereum":    "evm",
           "Filecoin":    "evm",
+          "Flow":        "evm",
           "Hedera":      "evm",
           "Hyperliquid": "evm",
           "Immutable":   "evm",
@@ -152,6 +161,7 @@ runs:
           "Monad":       "evm",
           "Moonbeam":    "evm",
           "Optimism":    "evm",
+          "Plume":       "evm",
           "Polygon":     "evm",
           "Scroll":      "evm",
           "Solana":      "sol",
@@ -172,7 +182,7 @@ runs:
             "evm":     ["evm", "sol", "sui", "stellar"],
             "sol":     ["evm", "sol", "sui", "stellar"],
             "stellar": ["evm", "sol", "sui"],
-            "sui":     ["evm"]
+            "sui":     ["evm", "sol"]
           },
           "its": {
             "evm":     ["evm", "sol", "stellar", "sui", "xrpl"],

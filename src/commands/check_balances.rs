@@ -124,16 +124,79 @@ impl BalanceRow {
 /// Solana (not present in the JS) is set to 0.3 SOL — large enough to cover
 /// many GMP-fleet transactions including PDA-creating rent-exempt deposits.
 fn chain_targets(network: Network) -> Vec<ChainTarget> {
-    let stellar_key = match network {
-        Network::Mainnet => "stellar",
-        Network::Testnet | Network::Stagenet | Network::DevnetAmplifier => "stellar-2026-q1-2",
+    match network {
+        Network::Mainnet | Network::Testnet => production_chain_targets(network),
+        Network::Stagenet => stagenet_chain_targets(),
+        Network::DevnetAmplifier => devnet_chain_targets(),
+    }
+}
+
+/// Stagenet wallet targets. Chain ids come from stagenet.json: Monad is plain
+/// `monad`, Solana is `solana-stagenet-3`, and there is NO Stellar deployment.
+fn stagenet_chain_targets() -> Vec<ChainTarget> {
+    let evm = |chain_key: &str, threshold_units: f64| ChainTarget {
+        chain_key: chain_key.to_string(),
+        kind: ChainKind::Evm,
+        threshold_units,
     };
+    vec![
+        evm("hyperliquid", 0.01),
+        evm("xrpl-evm", 2.0),
+        evm("hedera", 5.0),
+        evm("monad", 50.0),
+        evm("avalanche", 0.5),
+        evm("flow", 1.0),
+        ChainTarget {
+            chain_key: "xrpl".to_string(),
+            kind: ChainKind::Xrpl,
+            threshold_units: 3.0,
+        },
+        ChainTarget {
+            chain_key: "sui".to_string(),
+            kind: ChainKind::Sui,
+            threshold_units: 0.05,
+        },
+        ChainTarget {
+            chain_key: "solana-stagenet-3".to_string(),
+            kind: ChainKind::Solana,
+            threshold_units: 0.3,
+        },
+    ]
+}
+
+/// Devnet-amplifier wallet targets. Chain ids come from devnet-amplifier.json.
+/// Absent by design: Stellar (no deployment), XRPL (`xrpl-dev` only exposes a
+/// wss:// RPC the HTTP client can't probe), Hyperliquid/Hedera/Monad (not
+/// deployed on this network).
+fn devnet_chain_targets() -> Vec<ChainTarget> {
+    let evm = |chain_key: &str, threshold_units: f64| ChainTarget {
+        chain_key: chain_key.to_string(),
+        kind: ChainKind::Evm,
+        threshold_units,
+    };
+    vec![
+        evm("avalanche-fuji", 0.5),
+        evm("eth-sepolia", 0.5),
+        evm("xrpl-evm-devnet", 2.0),
+        evm("flow", 1.0),
+        ChainTarget {
+            chain_key: "sui-2".to_string(),
+            kind: ChainKind::Sui,
+            threshold_units: 0.05,
+        },
+        ChainTarget {
+            chain_key: "solana-18".to_string(),
+            kind: ChainKind::Solana,
+            threshold_units: 0.3,
+        },
+    ]
+}
+
+fn production_chain_targets(network: Network) -> Vec<ChainTarget> {
+    let stellar_key = stellar_chain_key(network);
     // The Monad amplifier chain id differs by network: `monad` on mainnet,
     // `monad-3` on testnet (the active testnet deployment).
-    let monad_key = match network {
-        Network::Mainnet => "monad",
-        Network::Testnet | Network::Stagenet | Network::DevnetAmplifier => "monad-3",
-    };
+    let monad_key = monad_chain_key(network);
     vec![
         ChainTarget {
             chain_key: "hyperliquid".to_string(),
@@ -201,15 +264,18 @@ fn chain_targets(network: Network) -> Vec<ChainTarget> {
     ]
 }
 
-/// The Monad amplifier chain id differs by network: `monad` on mainnet,
-/// `monad-3` on testnet.
+/// The Monad amplifier chain id differs by network: `monad` on mainnet and
+/// stagenet, `monad-3` on testnet. (Devnet-amplifier has no Monad.)
 fn monad_chain_key(network: Network) -> &'static str {
     match network {
-        Network::Mainnet => "monad",
-        Network::Testnet | Network::Stagenet | Network::DevnetAmplifier => "monad-3",
+        Network::Mainnet | Network::Stagenet | Network::DevnetAmplifier => "monad",
+        Network::Testnet => "monad-3",
     }
 }
 
+/// Stellar chain id per network. Only mainnet and testnet have a Stellar
+/// deployment; the other arms exist for totality and are never reached by the
+/// per-network target builders.
 fn stellar_chain_key(network: Network) -> &'static str {
     match network {
         Network::Mainnet => "stellar",
@@ -232,21 +298,38 @@ fn axe_targets(network: Network) -> Vec<ChainTarget> {
         kind,
         threshold_units: AXE_MIN_WHOLE_TOKENS,
     };
-    let mut targets = vec![
-        axe("hyperliquid", ChainKind::Evm),
-        axe(monad_chain_key(network), ChainKind::Evm),
-        axe("hedera", ChainKind::Evm),
-        // Avalanche is the legacy (consensus-EVM) ITS source in the fleet
-        // (Avalanche→Monad, Avalanche→Ethereum) — it holds the canonical AXE
-        // seeded from xrpl-evm. Same key on both networks.
-        axe("avalanche", ChainKind::Evm),
-    ];
-    // Stellar is a mainnet ITS AXE source (Stellar ↔ Hyperliquid); it was
-    // removed from the testnet ITS cron, so only check it on mainnet.
-    if network == Network::Mainnet {
-        targets.push(axe(stellar_chain_key(network), ChainKind::Stellar));
+    match network {
+        Network::Mainnet | Network::Testnet => {
+            let mut targets = vec![
+                axe("hyperliquid", ChainKind::Evm),
+                axe(monad_chain_key(network), ChainKind::Evm),
+                axe("hedera", ChainKind::Evm),
+                // Avalanche is the legacy (consensus-EVM) ITS source in the
+                // fleet (Avalanche→Monad, Avalanche→Ethereum) — it holds the
+                // canonical AXE seeded from xrpl-evm. Same key on both.
+                axe("avalanche", ChainKind::Evm),
+            ];
+            // Stellar is a mainnet ITS AXE source (Stellar ↔ Hyperliquid); it
+            // was removed from the testnet ITS cron, so only check on mainnet.
+            if network == Network::Mainnet {
+                targets.push(axe(stellar_chain_key(network), ChainKind::Stellar));
+            }
+            targets
+        }
+        // Plausible ITS AXE sources on the non-production networks. All rows
+        // are advisory until `contracts.AXE` entries land in their configs.
+        Network::Stagenet => vec![
+            axe("monad", ChainKind::Evm),
+            axe("hedera", ChainKind::Evm),
+            axe("avalanche", ChainKind::Evm),
+            axe("flow", ChainKind::Evm),
+        ],
+        Network::DevnetAmplifier => vec![
+            axe("avalanche-fuji", ChainKind::Evm),
+            axe("eth-sepolia", ChainKind::Evm),
+            axe("flow", ChainKind::Evm),
+        ],
     }
-    targets
 }
 
 pub async fn run(network: Network) -> Result<()> {
@@ -679,17 +762,33 @@ mod tests {
 
     #[test]
     fn testnet_uses_quarterly_stellar_key() {
-        for net in [
-            Network::Testnet,
-            Network::Stagenet,
-            Network::DevnetAmplifier,
-        ] {
-            let targets = chain_targets(net);
-            let stellar = targets
-                .iter()
-                .find(|t| t.kind == ChainKind::Stellar)
-                .unwrap();
-            assert_eq!(stellar.chain_key, "stellar-2026-q1-2", "for {net:?}");
+        let targets = chain_targets(Network::Testnet);
+        let stellar = targets
+            .iter()
+            .find(|t| t.kind == ChainKind::Stellar)
+            .unwrap();
+        assert_eq!(stellar.chain_key, "stellar-2026-q1-2");
+    }
+
+    #[test]
+    fn stagenet_and_devnet_use_their_own_chain_ids() {
+        // Stagenet: no Stellar deployment; Monad is plain `monad`; Solana is
+        // the `solana-stagenet-3` deployment.
+        let stagenet = chain_targets(Network::Stagenet);
+        assert!(!stagenet.iter().any(|t| t.kind == ChainKind::Stellar));
+        assert!(stagenet.iter().any(|t| t.chain_key == "monad"));
+        assert!(stagenet.iter().any(|t| t.chain_key == "solana-stagenet-3"));
+
+        // Devnet-amplifier: its own suffixed ids; no Stellar, no XRPL (wss-only
+        // RPC), no Hyperliquid/Hedera/Monad.
+        let devnet = chain_targets(Network::DevnetAmplifier);
+        assert!(!devnet.iter().any(|t| t.kind == ChainKind::Stellar));
+        assert!(!devnet.iter().any(|t| t.kind == ChainKind::Xrpl));
+        for key in ["avalanche-fuji", "eth-sepolia", "sui-2", "solana-18"] {
+            assert!(
+                devnet.iter().any(|t| t.chain_key == key),
+                "missing devnet target {key}"
+            );
         }
     }
 

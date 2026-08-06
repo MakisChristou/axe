@@ -234,7 +234,11 @@ const GMP_API_RECHECK_BACKOFF: Duration = Duration::from_secs(10);
 /// fixes. Retries so a transient API error or a message still transitioning to
 /// executed does not become a permanent failed verdict.
 async fn gmp_api_reports_executed(network: Network, message_id: &str) -> bool {
-    let base = gmp_api::base_url(network);
+    let Some(base) = gmp_api::base_url(network) else {
+        // devnet-amplifier has no Axelarscan — no recheck possible; the
+        // on-chain poll verdict stands.
+        return false;
+    };
     for attempt in 0..GMP_API_RECHECK_ATTEMPTS {
         let lookup = async {
             // Prefer the exact `message_id` Axelarscan keys on. If it isn't

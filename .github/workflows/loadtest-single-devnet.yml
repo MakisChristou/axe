@@ -1,0 +1,109 @@
+name: Single Test (devnet-amplifier)
+
+run-name: "Devnet-amplifier: ${{ inputs.protocol }} ${{ inputs.source_chain }} → ${{ inputs.destination_chain }}"
+
+# Devnet-amplifier variant of Single Test — dropdowns list exactly the chains
+# wired in devnet-amplifier.json + the composite action's CHAIN_MAP. Absent by
+# design: Stellar (no deployment), XRPL (config only exposes a wss:// RPC axe's
+# HTTP client can't use), and the core-* legacy clones. Note devnet-amplifier
+# has NO Axelarscan API: gas quotes fall back to constants and the GMP-API
+# recheck is unavailable.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_chain:
+        description: Source chain (devnet-amplifier-wired chains only)
+        type: choice
+        required: true
+        options:
+          - Arc
+          - Avalanche
+          - Berachain
+          - Ethereum
+          - Flow
+          - Optimism
+          - Plume
+          - Solana
+          - Sui
+          - XRPL EVM
+      destination_chain:
+        description: Destination chain (devnet-amplifier-wired chains only)
+        type: choice
+        required: true
+        options:
+          - Arc
+          - Avalanche
+          - Berachain
+          - Ethereum
+          - Flow
+          - Optimism
+          - Plume
+          - Solana
+          - Sui
+          - XRPL EVM
+      protocol:
+        description: Protocol
+        type: choice
+        required: true
+        default: gmp
+        options:
+          - gmp
+          - its
+          - its-with-data
+      source_rpc:
+        description: Optional - override the source RPC URL (blank = secret/config default)
+        type: string
+        required: false
+        default: ""
+      destination_rpc:
+        description: Optional - override the destination RPC URL
+        type: string
+        required: false
+        default: ""
+      gas_value:
+        description: Optional - cross-chain gas value override
+        type: string
+        required: false
+        default: ""
+      token_id:
+        description: Optional - reuse an existing ITS token (hex) instead of deploying
+        type: string
+        required: false
+        default: ""
+
+jobs:
+  loadtest:
+    runs-on: ubuntu-latest
+    # Private RPC secrets for devnet-amplifier chains (see loadtest-single.yml
+    # for the naming convention). Chains without a secret fall through to the
+    # public chains-config RPC.
+    env:
+      ARC_DEVNET_AMPLIFIER_RPC:       ${{ secrets.ARC_DEVNET_AMPLIFIER_RPC }}
+      AVALANCHE_DEVNET_AMPLIFIER_RPC: ${{ secrets.AVALANCHE_DEVNET_AMPLIFIER_RPC }}
+      BERACHAIN_DEVNET_AMPLIFIER_RPC: ${{ secrets.BERACHAIN_DEVNET_AMPLIFIER_RPC }}
+      ETHEREUM_DEVNET_AMPLIFIER_RPC:  ${{ secrets.ETHEREUM_DEVNET_AMPLIFIER_RPC }}
+      FLOW_DEVNET_AMPLIFIER_RPC:      ${{ secrets.FLOW_DEVNET_AMPLIFIER_RPC }}
+      OPTIMISM_DEVNET_AMPLIFIER_RPC:  ${{ secrets.OPTIMISM_DEVNET_AMPLIFIER_RPC }}
+      PLUME_DEVNET_AMPLIFIER_RPC:     ${{ secrets.PLUME_DEVNET_AMPLIFIER_RPC }}
+      SOLANA_DEVNET_AMPLIFIER_RPC:    ${{ secrets.SOLANA_DEVNET_AMPLIFIER_RPC }}
+      SUI_DEVNET_AMPLIFIER_RPC:       ${{ secrets.SUI_DEVNET_AMPLIFIER_RPC }}
+      XRPL_EVM_DEVNET_AMPLIFIER_RPC:  ${{ secrets.XRPL_EVM_DEVNET_AMPLIFIER_RPC }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/run-loadtest
+        with:
+          network: devnet-amplifier
+          source_chain: ${{ inputs.source_chain }}
+          destination_chain: ${{ inputs.destination_chain }}
+          protocol: ${{ inputs.protocol }}
+          source_rpc: ${{ inputs.source_rpc }}
+          destination_rpc: ${{ inputs.destination_rpc }}
+          num_txs: "1"
+          gas_value: ${{ inputs.gas_value }}
+          token_id: ${{ inputs.token_id }}
+          evm_private_key: ${{ secrets.EVM_PRIVATE_KEY }}
+          solana_private_key: ${{ secrets.SOLANA_PRIVATE_KEY }}
+          sui_private_key: ${{ secrets.SUI_PRIVATE_KEY }}
+          xrpl_private_key: ${{ secrets.XRPL_PRIVATE_KEY }}
+          stellar_private_key: ${{ secrets.STELLAR_PRIVATE_KEY }}

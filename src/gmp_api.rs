@@ -17,12 +17,16 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
 
-/// GMP API base URL for the given network. Testnet/stagenet/devnet share the
-/// testnet Axelarscan deployment; mainnet has its own.
-pub fn base_url(network: crate::types::Network) -> &'static str {
+/// GMP API base URL for the given network. Mainnet, testnet, and stagenet
+/// each have their own Axelarscan deployment; devnet-amplifier has none
+/// (`None` — callers must skip the query rather than hit a wrong network's
+/// index).
+pub fn base_url(network: crate::types::Network) -> Option<&'static str> {
     match network {
-        crate::types::Network::Mainnet => "https://api.axelarscan.io",
-        _ => "https://testnet.api.axelarscan.io",
+        crate::types::Network::Mainnet => Some("https://api.axelarscan.io"),
+        crate::types::Network::Testnet => Some("https://testnet.api.axelarscan.io"),
+        crate::types::Network::Stagenet => Some("https://stagenet.api.axelarscan.io"),
+        crate::types::Network::DevnetAmplifier => None,
     }
 }
 
