@@ -21,6 +21,7 @@ use alloy::sol_types::SolEvent;
 use eyre::{Result, eyre};
 
 use crate::evm::ContractCallApproved;
+use crate::retry::retry_all;
 
 /// Max blocks per `eth_getLogs` window. Public RPCs cap the range (polygon Amoy
 /// rejects > ~128 blocks); we scan newest→oldest in windows of this size so a
@@ -107,7 +108,11 @@ async fn find_approval<P: Provider>(
     source_tx_hash: Option<FixedBytes<32>>,
     from_block: u64,
 ) -> Result<Option<[u8; 32]>> {
-    let latest = provider.get_block_number().await?;
+    // Retried: these run against the destination RPC every poll cycle, and a
+    // transient blip must not surface as a scan failure (the callers treat a
+    // failed scan as "still pending" — see the tolerant poll loops — so an
+    // unretried error would silently delay detection by a full cycle).
+    let latest = retry_all("legacy get_block_number", || provider.get_block_number()).await?;
     let mut to = latest;
     while to >= from_block {
         let from = to.saturating_sub(LOG_WINDOW_BLOCKS - 1).max(from_block);
@@ -117,7 +122,7 @@ async fn find_approval<P: Provider>(
             .topic3(payload_hash)
             .from_block(from)
             .to_block(to);
-        let logs = provider.get_logs(&filter).await?;
+        let logs = retry_all("legacy get_logs", || provider.get_logs(&filter)).await?;
         for log in logs {
             let Ok(decoded) = ContractCallApproved::decode_log(&log.inner) else {
                 continue;

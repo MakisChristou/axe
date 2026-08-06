@@ -1466,59 +1466,80 @@ async fn check_evm_its_legacy<P: Provider>(
     let mut observations = Vec::with_capacity(indices.len());
     for &index in indices {
         let tx = &txs[index];
-        let second_leg = required_second_leg(tx)?;
-        let destination_address: Address =
-            second_leg.destination_address.parse().wrap_err_with(|| {
-                format!(
-                    "invalid second-leg EVM destination address {}",
-                    second_leg.destination_address
-                )
-            })?;
-        let status = match tx.phase() {
-            Some(Phase::Approved) => {
-                let found = legacy::find_contract_call_approved_by_payload(
-                    verifier.gw_contract.provider(),
-                    *verifier.gw_contract.address(),
-                    destination_address,
-                    required_second_leg_payload_hash(tx)?,
-                    from_block,
-                )
-                .await?;
-                match found {
-                    Some(command_id)
-                        if check_evm_command_executed(verifier.gw_contract, command_id.into())
-                            .await? =>
-                    {
-                        DestinationStatus::Executed {
-                            command_id: Some(command_id),
-                        }
-                    }
-                    Some(command_id) => DestinationStatus::Approved {
-                        command_id: Some(command_id),
-                    },
-                    None => DestinationStatus::Pending,
-                }
+        // Per-tx tolerance: a destination-RPC failure on one poll cycle must
+        // not abort the whole run — report Pending and let the next cycle (or
+        // the GMP-API recheck after the inactivity timeout) resolve it.
+        let status = match its_legacy_tx_status(verifier, from_block, tx).await {
+            Ok(status) => status,
+            Err(error) => {
+                ui::warn(&format!(
+                    "legacy ITS destination check failed for {} (keeping in-flight): {error}",
+                    tx.message_id
+                ));
+                DestinationStatus::Pending
             }
-            Some(Phase::Executed) => {
-                let command_id = tx.command_id().ok_or_else(|| {
-                    eyre::eyre!(
-                        "legacy ITS tx {} in Executed phase without a commandId",
-                        tx.message_id
-                    )
-                })?;
-                if check_evm_command_executed(verifier.gw_contract, command_id.into()).await? {
-                    DestinationStatus::Executed {
-                        command_id: Some(command_id),
-                    }
-                } else {
-                    DestinationStatus::Pending
-                }
-            }
-            _ => DestinationStatus::Pending,
         };
         observations.push(DestinationObservation { index, status });
     }
     Ok(observations)
+}
+
+/// Status of one legacy-destination ITS tx for this poll cycle.
+async fn its_legacy_tx_status<P: Provider>(
+    verifier: &EvmItsDestinationVerifier<'_, P>,
+    from_block: u64,
+    tx: &PendingTx,
+) -> Result<DestinationStatus> {
+    let second_leg = required_second_leg(tx)?;
+    let destination_address: Address =
+        second_leg.destination_address.parse().wrap_err_with(|| {
+            format!(
+                "invalid second-leg EVM destination address {}",
+                second_leg.destination_address
+            )
+        })?;
+    Ok(match tx.phase() {
+        Some(Phase::Approved) => {
+            let found = legacy::find_contract_call_approved_by_payload(
+                verifier.gw_contract.provider(),
+                *verifier.gw_contract.address(),
+                destination_address,
+                required_second_leg_payload_hash(tx)?,
+                from_block,
+            )
+            .await?;
+            match found {
+                Some(command_id)
+                    if check_evm_command_executed(verifier.gw_contract, command_id.into())
+                        .await? =>
+                {
+                    DestinationStatus::Executed {
+                        command_id: Some(command_id),
+                    }
+                }
+                Some(command_id) => DestinationStatus::Approved {
+                    command_id: Some(command_id),
+                },
+                None => DestinationStatus::Pending,
+            }
+        }
+        Some(Phase::Executed) => {
+            let command_id = tx.command_id().ok_or_else(|| {
+                eyre::eyre!(
+                    "legacy ITS tx {} in Executed phase without a commandId",
+                    tx.message_id
+                )
+            })?;
+            if check_evm_command_executed(verifier.gw_contract, command_id.into()).await? {
+                DestinationStatus::Executed {
+                    command_id: Some(command_id),
+                }
+            } else {
+                DestinationStatus::Pending
+            }
+        }
+        _ => DestinationStatus::Pending,
+    })
 }
 
 impl<P: Provider> DestinationVerifier for EvmItsDestinationVerifier<'_, P> {

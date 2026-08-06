@@ -244,11 +244,18 @@ async fn check_amplifier_evm_deploy<P: Provider>(
         (RemoteDeployPhase::Executed, Ok(true)) => {
             spinner.set_message("remote deploy: waiting for EVM execution...");
         }
+        // A destination-RPC blip on one poll cycle must not abort the wait —
+        // warn, keep the phase, and let the next cycle (or the wait's own
+        // timeout) resolve it.
         (RemoteDeployPhase::Approved, Err(error)) => {
-            return Err(error.wrap_err("remote deploy EVM approval check failed"));
+            ui::warn(&format!(
+                "remote deploy EVM approval check failed (retrying next poll): {error}"
+            ));
         }
         (RemoteDeployPhase::Executed, Err(error)) => {
-            return Err(error.wrap_err("remote deploy EVM execution check failed"));
+            ui::warn(&format!(
+                "remote deploy EVM execution check failed (retrying next poll): {error}"
+            ));
         }
         _ => {}
     }

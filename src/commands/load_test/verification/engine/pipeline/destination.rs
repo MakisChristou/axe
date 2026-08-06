@@ -198,30 +198,52 @@ async fn check_evm_legacy_destination<P: Provider>(
     let mut observations = Vec::with_capacity(indices.len());
     for &index in indices {
         let tx = &txs[index];
-        let status = match tx.phase() {
-            Some(Phase::Approved) => {
-                legacy_approval_status(gw_contract, tx, from_block, match_by_payload).await?
+        // Per-tx tolerance: a destination-RPC failure on one poll cycle must
+        // not abort the whole run — report Pending and let the next cycle (or
+        // the GMP-API recheck after the inactivity timeout) resolve it.
+        let status = match legacy_tx_status(gw_contract, tx, from_block, match_by_payload).await {
+            Ok(status) => status,
+            Err(error) => {
+                ui::warn(&format!(
+                    "legacy destination check failed for {} (keeping in-flight): {error}",
+                    tx.message_id
+                ));
+                DestinationStatus::Pending
             }
-            Some(Phase::Executed) => {
-                let command_id = tx.command_id().ok_or_else(|| {
-                    eyre::eyre!(
-                        "legacy tx {} in Executed phase without a commandId",
-                        tx.message_id
-                    )
-                })?;
-                if check_evm_command_executed(gw_contract, command_id.into()).await? {
-                    DestinationStatus::Executed {
-                        command_id: Some(command_id),
-                    }
-                } else {
-                    DestinationStatus::Pending
-                }
-            }
-            _ => DestinationStatus::Pending,
         };
         observations.push(DestinationObservation { index, status });
     }
     Ok(observations)
+}
+
+/// Status of one legacy-destination tx for this poll cycle.
+async fn legacy_tx_status<P: Provider>(
+    gw_contract: &AxelarAmplifierGateway::AxelarAmplifierGatewayInstance<&P>,
+    tx: &PendingTx,
+    from_block: u64,
+    match_by_payload: bool,
+) -> Result<DestinationStatus> {
+    Ok(match tx.phase() {
+        Some(Phase::Approved) => {
+            legacy_approval_status(gw_contract, tx, from_block, match_by_payload).await?
+        }
+        Some(Phase::Executed) => {
+            let command_id = tx.command_id().ok_or_else(|| {
+                eyre::eyre!(
+                    "legacy tx {} in Executed phase without a commandId",
+                    tx.message_id
+                )
+            })?;
+            if check_evm_command_executed(gw_contract, command_id.into()).await? {
+                DestinationStatus::Executed {
+                    command_id: Some(command_id),
+                }
+            } else {
+                DestinationStatus::Pending
+            }
+        }
+        _ => DestinationStatus::Pending,
+    })
 }
 
 impl<P: Provider> DestinationVerifier for EvmDestinationVerifier<'_, P> {
