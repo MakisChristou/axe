@@ -8,7 +8,7 @@
 use eyre::Result;
 use solana_sdk::pubkey::Pubkey;
 
-use super::rpc::rpc_client;
+use super::rpc::{retry_blocking, rpc_client};
 use crate::ui;
 
 /// Default minimum balance for a Solana wallet to send a single GMP-style
@@ -35,9 +35,12 @@ pub fn check_solana_balance(
     min_lamports: u64,
 ) -> Result<()> {
     let rpc_client = rpc_client(rpc_url);
-    let balance = rpc_client
-        .get_balance(pubkey)
-        .map_err(|e| eyre::eyre!("failed to query Solana balance for {pubkey}: {e}"))?;
+    let balance = retry_blocking(
+        "solana get_balance",
+        |_| true,
+        || rpc_client.get_balance(pubkey),
+    )
+    .map_err(|e| eyre::eyre!("failed to query Solana balance for {pubkey}: {e}"))?;
 
     let display = balance as f64 / 1_000_000_000.0;
     let min_display = min_lamports as f64 / 1_000_000_000.0;

@@ -28,13 +28,10 @@ use std::ops::Deref;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio::time;
 
 use alloy::{
-    consensus::Transaction as _,
-    contract::Error as ContractError,
     primitives::{Address, Bytes, FixedBytes, TxHash, U256},
-    providers::{Provider, ProviderBuilder},
+    providers::Provider,
     rpc::types::TransactionReceipt,
     signers::local::PrivateKeySigner,
 };
@@ -46,14 +43,17 @@ use super::metrics::TxMetrics;
 use super::run_sizing::RunSizing;
 use super::submitter::TransactionSubmitter;
 use super::units::Wei;
-use super::{ItsCache, LoadTestArgs, check_evm_balance, read_its_cache, save_its_cache};
+use super::{ItsCache, LoadTestArgs, read_its_cache, save_its_cache};
 use crate::commands::test_its::{
     extract_contract_call_event, extract_token_deployed_event, generate_salt,
 };
 use crate::config::ChainContract;
 use crate::config::ChainsConfig;
-use crate::evm::{ERC20, InterchainTokenFactory, InterchainTokenService, connect_evm_signed};
-use crate::retry::{is_transient_default, retry_all};
+use crate::evm::{
+    ERC20, EvmEndpoints, InterchainTokenFactory, InterchainTokenService, connect_evm_signed,
+    send_tx_robust,
+};
+use crate::retry::retry_with_fallback_all;
 use crate::types::Network;
 use crate::ui;
 
@@ -68,30 +68,9 @@ use crate::ui;
 /// silently-dropped txs on other chains.
 const EVM_RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// How many times `execute_interchain_transfer` may send the transfer. See the
-/// same-nonce resubmit rationale on that function's submit loop.
-const MAX_SUBMIT_ATTEMPTS: u32 = 3;
-
 const TOKEN_NAME: &str = "AXE";
 const TOKEN_SYMBOL: &str = "AXE";
 const TOKEN_DECIMALS: u8 = 18;
-
-fn prior_attempt_may_have_landed(error: &ContractError) -> bool {
-    let ContractError::TransportError(transport) = error else {
-        return false;
-    };
-    let Some(response) = transport.as_error_resp() else {
-        return false;
-    };
-    let message = response.message.to_lowercase();
-    [
-        "nonce too low",
-        "already known",
-        "replacement transaction underpriced",
-    ]
-    .iter()
-    .any(|signature| message.contains(signature))
-}
 
 /// Validated run shape plus the shared token economics used by EVM-source
 /// ITS routes.
@@ -229,22 +208,33 @@ async fn quote_route_gas(args: &LoadTestArgs) -> Option<u128> {
 /// state used by every downstream phase.
 pub(super) async fn init_evm_source(
     args: &LoadTestArgs,
-    evm_rpc_url: &str,
+    rpc_urls: &[String],
 ) -> eyre::Result<EvmSource> {
     let private_key = args.private_key.as_ref().ok_or_else(|| {
         eyre!("EVM private key required. Set EVM_PRIVATE_KEY env var or use --private-key")
     })?;
     let signer: PrivateKeySigner = private_key.parse()?;
     let deployer_address = signer.address();
-    let read_provider = ProviderBuilder::new().connect_http(evm_rpc_url.parse()?);
-    check_evm_balance(&read_provider, deployer_address).await?;
+
+    // One retried, fallback-capable read; the zero-check itself is
+    // deterministic and must not burn retries.
+    let endpoints = EvmEndpoints::connect(rpc_urls)?;
+    let balance: u128 =
+        retry_with_fallback_all("wallet balance", endpoints.providers(), |p| async move {
+            p.get_balance(deployer_address).await
+        })
+        .await?
+        .to();
+    if balance == 0 {
+        eyre::bail!(
+            "EVM wallet {deployer_address} has no funds. Fund it first:\n  \
+             Use a faucet or transfer native tokens to {deployer_address}"
+        );
+    }
 
     let main_key: [u8; 32] = signer.to_bytes().into();
-    {
-        let balance: u128 = read_provider.get_balance(deployer_address).await?.to();
-        let eth = balance as f64 / 1e18;
-        ui::kv("wallet", &format!("{deployer_address} ({eth:.6} ETH)"));
-    }
+    let eth = balance as f64 / 1e18;
+    ui::kv("wallet", &format!("{deployer_address} ({eth:.6} ETH)"));
 
     Ok(EvmSource {
         signer,
@@ -285,7 +275,7 @@ pub(super) fn resolve_its_contracts(cfg: &ChainsConfig, src: &str) -> eyre::Resu
 pub(super) async fn derive_and_fund_keys(
     main_signer: &PrivateKeySigner,
     main_key: &[u8; 32],
-    evm_rpc_url: &str,
+    rpc_urls: &[String],
     num_keys: usize,
     hub_gas_extra_per_key: Wei,
     source_axelar_id: &str,
@@ -305,9 +295,9 @@ pub(super) async fn derive_and_fund_keys(
     let derived = keypairs::derive_evm_signers(main_key, num_keys)?;
     ui::info(&format!("derived {} EVM signing keys", derived.len()));
 
-    let funding_provider = ProviderBuilder::new()
-        .wallet(main_signer.clone())
-        .connect_http(evm_rpc_url.parse()?);
+    // Multi-transport provider: funding reads/sends fail over to the public
+    // RPC on transport-level errors.
+    let funding_provider = connect_evm_signed(rpc_urls, main_signer.clone())?;
     keypairs::ensure_funded_evm_with_extra(
         &funding_provider,
         main_signer,
@@ -381,15 +371,17 @@ pub(super) async fn token_balance<P: Provider>(
 /// `salt` — so a token deployed for, say, an EVM→EVM run is reusable on an
 /// EVM→Solana run with the same source/destination pair if the destination
 /// chain string matches.
-pub(super) async fn deploy_its_token<P: Provider>(
-    provider: &P,
+pub(super) async fn deploy_its_token(
+    endpoints: &EvmEndpoints,
+    signer: &PrivateKeySigner,
     factory_addr: Address,
-    deployer: Address,
     dest_chain: &str,
     total_supply: U256,
     source_chain: &str,
     gas_value: U256,
 ) -> eyre::Result<(FixedBytes<32>, Address, Option<String>)> {
+    // The token minter is the deploying wallet itself.
+    let deployer = signer.address();
     let salt = generate_salt();
 
     ui::info("deploying new ITS token...");
@@ -398,9 +390,9 @@ pub(super) async fn deploy_its_token<P: Provider>(
     ui::kv("decimals", &TOKEN_DECIMALS.to_string());
     ui::kv("supply", &format!("{total_supply}"));
 
-    let factory = InterchainTokenFactory::new(factory_addr, provider);
+    let factory = InterchainTokenFactory::new(factory_addr, endpoints.primary().clone());
 
-    let deploy_call = factory
+    let mut deploy_tx = factory
         .deployInterchainToken(
             salt,
             TOKEN_NAME.to_string(),
@@ -409,15 +401,20 @@ pub(super) async fn deploy_its_token<P: Provider>(
             total_supply,
             deployer,
         )
-        .value(U256::ZERO);
+        .value(U256::ZERO)
+        .into_transaction_request();
+    deploy_tx.from = Some(signer.address());
 
-    let pending = deploy_call.send().await?;
-    let tx_hash = *pending.tx_hash();
-    ui::tx_hash("deploy tx", &format!("{tx_hash}"));
-
-    let receipt = time::timeout(Duration::from_secs(120), pending.get_receipt())
-        .await
-        .map_err(|_| eyre!("deploy tx timed out after 120s"))??;
+    let receipt = send_tx_robust(
+        endpoints,
+        signer,
+        deploy_tx,
+        "deploy tx",
+        EVM_RECEIPT_TIMEOUT,
+    )
+    .await
+    .map_err(|error| eyre!("deploy tx failed: {error}"))?;
+    ui::tx_hash("deploy tx", &format!("{}", receipt.transaction_hash));
 
     let (token_id, token_addr) = extract_token_deployed_event(&receipt)?;
     ui::kv("token ID", &format!("{token_id}"));
@@ -432,17 +429,23 @@ pub(super) async fn deploy_its_token<P: Provider>(
     // token creation needed ~10×); the relayer refunds the unused remainder.
     // Mirrors `DEPLOY_GAS_MULTIPLIER` in the Solana-source ITS module.
     let hub_gas = gas_value * U256::from(10);
-    let remote_call = factory
+    let mut remote_tx = factory
         .deployRemoteInterchainToken(salt, dest_chain.to_string(), hub_gas)
-        .value(hub_gas);
+        .value(hub_gas)
+        .into_transaction_request();
+    remote_tx.from = Some(signer.address());
 
-    let pending = remote_call.send().await?;
-    let tx_hash = *pending.tx_hash();
+    let receipt = send_tx_robust(
+        endpoints,
+        signer,
+        remote_tx,
+        "remote deploy tx",
+        EVM_RECEIPT_TIMEOUT,
+    )
+    .await
+    .map_err(|error| eyre!("remote deploy tx failed: {error}"))?;
+    let tx_hash = receipt.transaction_hash;
     ui::tx_hash("remote deploy tx", &format!("{tx_hash}"));
-
-    let receipt = time::timeout(Duration::from_secs(120), pending.get_receipt())
-        .await
-        .map_err(|_| eyre!("remote deploy tx timed out after 120s"))??;
 
     ui::success(&format!(
         "remote deploy confirmed in block {}",
@@ -474,27 +477,35 @@ pub(super) async fn deploy_its_token<P: Provider>(
 /// existing AXE be registered on a chain it isn't on yet (e.g. a legacy chain),
 /// reusing the same `tokenId`. Returns the remote-deploy message id for the
 /// hub-propagation wait. `dest_chain` is the destination axelarId.
-pub(super) async fn remote_deploy_existing_token<P: Provider>(
-    provider: &P,
+pub(super) async fn remote_deploy_existing_token(
+    endpoints: &EvmEndpoints,
+    signer: &PrivateKeySigner,
     factory_addr: Address,
     salt: FixedBytes<32>,
     dest_chain: &str,
     gas_value: U256,
 ) -> eyre::Result<String> {
-    let factory = InterchainTokenFactory::new(factory_addr, provider);
+    let factory = InterchainTokenFactory::new(factory_addr, endpoints.primary().clone());
     // Same 10× headroom as a fresh remote deploy — the destination still
     // CREATE2s the token contract; the relayer refunds the remainder.
     let hub_gas = gas_value * U256::from(10);
     ui::info(&format!("registering existing token on {dest_chain}..."));
-    let remote_call = factory
+    let mut remote_tx = factory
         .deployRemoteInterchainToken(salt, dest_chain.to_string(), hub_gas)
-        .value(hub_gas);
-    let pending = remote_call.send().await?;
-    let tx_hash = *pending.tx_hash();
+        .value(hub_gas)
+        .into_transaction_request();
+    remote_tx.from = Some(signer.address());
+    let receipt = send_tx_robust(
+        endpoints,
+        signer,
+        remote_tx,
+        "remote deploy tx",
+        EVM_RECEIPT_TIMEOUT,
+    )
+    .await
+    .map_err(|error| eyre!("remote deploy tx failed: {error}"))?;
+    let tx_hash = receipt.transaction_hash;
     ui::tx_hash("remote deploy tx", &format!("{tx_hash}"));
-    let receipt = time::timeout(Duration::from_secs(120), pending.get_receipt())
-        .await
-        .map_err(|_| eyre!("remote deploy tx timed out after 120s"))??;
     let (event_index, _, _, _, _) = extract_contract_call_event(&receipt)
         .map_err(|e| eyre!("remote deploy emitted no ContractCall event: {e}"))?;
     let msg_id = format!("{tx_hash:#x}-{event_index}");
@@ -525,27 +536,32 @@ pub(super) async fn remote_deploy_existing_token<P: Provider>(
 /// `amount_per_key * 2`, so re-runs against the same derived keys reuse the
 /// prior approval.
 pub(super) async fn approve_its_for_keys(
-    rpc_url: &str,
+    rpc_urls: &[String],
     token_addr: Address,
     its_proxy: Address,
     token_id: FixedBytes<32>,
     derived: &[PrivateKeySigner],
     amount_per_key: U256,
 ) -> eyre::Result<()> {
-    let read_provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let its = InterchainTokenService::new(its_proxy, &read_provider);
-    let token_manager: Address = its
-        .tokenManagerAddress(token_id)
-        .call()
-        .await
-        .map_err(|e| {
-            eyre!(
-                "ITS.tokenManagerAddress({}) failed — token may not be registered yet: {e}",
-                hex::encode(token_id)
-            )
-        })?;
+    let endpoints = EvmEndpoints::connect(rpc_urls)?;
+    let token_manager: Address = retry_with_fallback_all(
+        "ITS.tokenManagerAddress",
+        endpoints.providers(),
+        |p| async move {
+            InterchainTokenService::new(its_proxy, p)
+                .tokenManagerAddress(token_id)
+                .call()
+                .await
+        },
+    )
+    .await
+    .map_err(|e| {
+        eyre!(
+            "ITS.tokenManagerAddress({}) failed — token may not be registered yet: {e}",
+            hex::encode(token_id)
+        )
+    })?;
 
-    let read_token = ERC20::new(token_addr, &read_provider);
     let approve_threshold = amount_per_key.saturating_mul(U256::from(2));
 
     let spinner = ui::wait_spinner(&format!(
@@ -555,27 +571,32 @@ pub(super) async fn approve_its_for_keys(
 
     let mut approved = 0usize;
     for (i, signer) in derived.iter().enumerate() {
-        let allowance = read_token
-            .allowance(signer.address(), token_manager)
-            .call()
+        let holder = signer.address();
+        let allowance =
+            retry_with_fallback_all("token allowance", endpoints.providers(), |p| async move {
+                ERC20::new(token_addr, p)
+                    .allowance(holder, token_manager)
+                    .call()
+                    .await
+            })
             .await
             .unwrap_or_default();
         if allowance >= approve_threshold {
             continue;
         }
-        let write_provider = ProviderBuilder::new()
-            .wallet(signer.clone())
-            .connect_http(rpc_url.parse()?);
-        let token = ERC20::new(token_addr, &write_provider);
-        let pending = token
+        let mut approve_tx = ERC20::new(token_addr, endpoints.primary().clone())
             .approve(token_manager, U256::MAX)
-            .send()
-            .await
-            .map_err(|e| eyre!("failed to approve token manager for key {i}: {e}"))?;
-        pending
-            .get_receipt()
-            .await
-            .map_err(|e| eyre!("approve receipt for key {i} failed: {e}"))?;
+            .into_transaction_request();
+        approve_tx.from = Some(holder);
+        send_tx_robust(
+            &endpoints,
+            signer,
+            approve_tx,
+            "token-manager approve",
+            EVM_RECEIPT_TIMEOUT,
+        )
+        .await
+        .map_err(|e| eyre!("failed to approve token manager for key {i}: {e}"))?;
         approved += 1;
         spinner.set_message(format!(
             "approving token manager ({}/{} new approvals)...",
@@ -603,20 +624,21 @@ pub(super) async fn approve_its_for_keys(
 /// Per-key sends are skipped when the existing balance already meets
 /// `amount_per_key`, so re-runs against the same derived keys reuse prior
 /// distribution.
-pub(super) async fn distribute_tokens<P: Provider>(
-    provider: &P,
+pub(super) async fn distribute_tokens(
+    endpoints: &EvmEndpoints,
+    deployer: &PrivateKeySigner,
     token_addr: Address,
     derived: &[PrivateKeySigner],
     amount_per_key: U256,
 ) -> eyre::Result<()> {
-    let token = ERC20::new(token_addr, provider);
-
     let spinner = ui::wait_spinner(&format!("distributing tokens to {} keys...", derived.len()));
 
     for (i, signer) in derived.iter().enumerate() {
-        let balance = token
-            .balanceOf(signer.address())
-            .call()
+        let holder = signer.address();
+        let balance =
+            retry_with_fallback_all("token balance", endpoints.providers(), |p| async move {
+                ERC20::new(token_addr, p).balanceOf(holder).call().await
+            })
             .await
             .unwrap_or_default();
         if balance >= amount_per_key {
@@ -624,51 +646,25 @@ pub(super) async fn distribute_tokens<P: Provider>(
         }
 
         // Hedera 429s its JSON-RPC relay hard - even on a private RPC (a light
-        // burst reproduces ~25% rejections) - so both the send and the receipt
-        // poll must ride out transient rate-limits. A rejected send never
-        // submitted the tx (nonce not consumed), so retrying it can't
-        // double-transfer.
-        const DISTRIBUTE_MAX_SEND_ATTEMPTS: u32 = 5;
-        let mut attempt = 0u32;
-        let pending = loop {
-            match token
-                .transfer(signer.address(), amount_per_key)
-                .send()
-                .await
-            {
-                Ok(p) => break p,
-                Err(e)
-                    if attempt + 1 < DISTRIBUTE_MAX_SEND_ATTEMPTS
-                        && is_retryable_send_error(&e.to_string()) =>
-                {
-                    ui::warn(&format!(
-                        "distribute to key {i} rejected (transient) — retrying in {}ms: {e}",
-                        500u64 << attempt
-                    ));
-                    time::sleep(Duration::from_millis(500u64 << attempt)).await;
-                    attempt += 1;
-                }
-                Err(e) => return Err(eyre!("failed to transfer tokens to key {i}: {e}")),
-            }
-        };
-
-        // Poll the receipt ourselves so a 429 mid-poll is retried, not fatal.
-        let tx_hash = *pending.tx_hash();
-        let deadline = Instant::now() + EVM_RECEIPT_TIMEOUT;
-        loop {
-            match provider.get_transaction_receipt(tx_hash).await {
-                Ok(Some(receipt)) if receipt.status() => break,
-                Ok(Some(_)) => {
-                    return Err(eyre!("token transfer to key {i} reverted (status 0x0)"));
-                }
-                _ => {} // still pending, or a transient RPC error — keep polling
-            }
-            if Instant::now() >= deadline {
-                return Err(eyre!(
-                    "token transfer to key {i} receipt not seen in {EVM_RECEIPT_TIMEOUT:?}"
-                ));
-            }
-            time::sleep(Duration::from_secs(2)).await;
+        // burst reproduces ~25% rejections). `send_tx_robust` rides out the
+        // rate-limits (retry + public fallback), re-broadcasts the same signed
+        // bytes (never a double-transfer), and recovers lost-response landings
+        // by hash.
+        let mut transfer_tx = ERC20::new(token_addr, endpoints.primary().clone())
+            .transfer(holder, amount_per_key)
+            .into_transaction_request();
+        transfer_tx.from = Some(deployer.address());
+        let receipt = send_tx_robust(
+            endpoints,
+            deployer,
+            transfer_tx,
+            "token distribution",
+            EVM_RECEIPT_TIMEOUT,
+        )
+        .await
+        .map_err(|e| eyre!("failed to transfer tokens to key {i}: {e}"))?;
+        if !receipt.status() {
+            return Err(eyre!("token transfer to key {i} reverted (status 0x0)"));
         }
 
         spinner.set_message(format!(
@@ -741,13 +737,14 @@ impl TransactionSubmitter for ItsEvmSubmitter {
 
     async fn submit(&self, job: Self::Job) -> TxMetrics {
         let submit_start = Instant::now();
-        let provider = match connect_evm_signed(&self.rpc_urls, job.signer) {
-            Ok(provider) => provider,
+        let endpoints = match EvmEndpoints::connect(&self.rpc_urls) {
+            Ok(endpoints) => endpoints,
             Err(error) => return make_failure(submit_start, &error.to_string()),
         };
         let submit = || {
             execute_interchain_transfer(
-                &provider,
+                &endpoints,
+                &job.signer,
                 InterchainTransferRequest {
                     its_proxy: self.its_proxy,
                     token_id: self.token_id,
@@ -806,8 +803,9 @@ pub(super) fn its_sustained_tasks(
     )
 }
 
-pub(super) async fn execute_interchain_transfer<P: Provider>(
-    provider: &P,
+pub(super) async fn execute_interchain_transfer(
+    endpoints: &EvmEndpoints,
+    signer: &PrivateKeySigner,
     request: InterchainTransferRequest,
 ) -> TxMetrics {
     let InterchainTransferRequest {
@@ -828,97 +826,41 @@ pub(super) async fn execute_interchain_transfer<P: Provider>(
     } else {
         hub_gas / U256::from(10).pow(U256::from(gas_arg_scaling_factor))
     };
-    let its = InterchainTokenService::new(its_proxy, provider);
 
-    // A receipt timeout on an EVM chain (all mine within seconds) almost always
-    // means the tx was dropped from the mempool — not that it is slow — e.g. an
-    // RPC that accepted `eth_sendRawTransaction` but never broadcast it
-    // (observed on Avalanche via QuikNode). Resubmit, but only ever at the SAME
-    // nonce (learned from the first send) so at most one tx can land: a dropped
-    // tx's nonce is free and the resubmit fills it; a still-pending tx makes the
-    // resubmit a same-nonce replacement, never a second transfer.
-    let mut pinned_nonce = explicit_nonce;
-    let mut last_hash: Option<TxHash> = None;
-    for attempt in 0..MAX_SUBMIT_ATTEMPTS {
-        let base_call = its
-            .interchainTransfer(
-                token_id.into_fixed_bytes(),
-                dest_chain.clone(),
-                receiver_bytes.clone(),
-                amount,
-                Bytes::new(),
-                gas_value_arg,
-            )
-            .value(hub_gas);
-        let call = match pinned_nonce {
-            Some(n) => base_call.nonce(n),
-            None => base_call,
-        };
+    // Build the calldata once, then hand the whole fill→sign→broadcast→confirm
+    // sequence to `send_tx_robust`: retry + private→public fallback at every
+    // phase, idempotent same-bytes re-broadcast, and lost-response landings
+    // recovered by the pre-known tx hash (Hedera's "timeout exceeded" →
+    // "nonce too low" pattern).
+    let its = InterchainTokenService::new(its_proxy, endpoints.primary().clone());
+    let mut tx = its
+        .interchainTransfer(
+            token_id.into_fixed_bytes(),
+            dest_chain,
+            receiver_bytes,
+            amount,
+            Bytes::new(),
+            gas_value_arg,
+        )
+        .value(hub_gas)
+        .into_transaction_request();
+    tx.from = Some(signer.address());
+    tx.nonce = explicit_nonce;
 
-        let pending = match call.send().await {
-            Ok(p) => p,
-            Err(e) => {
-                // "nonce too low" / "already known" ⇒ a prior attempt actually
-                // landed; return its receipt instead of a spurious failure.
-                if let Some(h) = last_hash
-                    && prior_attempt_may_have_landed(&e)
-                    && let Ok(Some(receipt)) = provider.get_transaction_receipt(h).await
-                {
-                    return receipt_to_metrics(&receipt, h, its_proxy, submit_start);
-                }
-                match classify_send_rejection(&e.to_string(), attempt, pinned_nonce) {
-                    SendRejection::RetryAtNonce(expected) => {
-                        ui::warn(&format!(
-                            "source tx nonce too low — retrying at node-reported nonce {expected}"
-                        ));
-                        pinned_nonce = Some(expected);
-                        continue;
-                    }
-                    SendRejection::RetryAfterBackoff(delay) => {
-                        ui::warn(&format!(
-                            "source send rejected (transient) — retrying in {}ms: {e}",
-                            delay.as_millis()
-                        ));
-                        time::sleep(delay).await;
-                        continue;
-                    }
-                    SendRejection::Fatal => return make_failure(submit_start, &e.to_string()),
-                }
-            }
-        };
-
-        let tx_hash = *pending.tx_hash();
-        last_hash = Some(tx_hash);
-        if pinned_nonce.is_none() {
-            pinned_nonce = learn_nonce(provider, tx_hash).await;
-        }
-
-        match time::timeout(EVM_RECEIPT_TIMEOUT, pending.get_receipt()).await {
-            Ok(Ok(receipt)) => {
-                return receipt_to_metrics(&receipt, tx_hash, its_proxy, submit_start);
-            }
-            Ok(Err(e)) => {
-                return make_failure_with_hash(submit_start, &e.to_string(), Some(tx_hash));
-            }
-            Err(_) => {
-                let timed_out = ReceiptTimeout {
-                    tx_hash,
-                    its_proxy,
-                    submit_start,
-                    pinned_nonce,
-                    attempt,
-                };
-                if let Some(metrics) = resolve_receipt_timeout(provider, timed_out).await {
-                    return metrics;
-                }
-            }
-        }
-    }
-    make_failure_with_hash(
-        submit_start,
-        &format!("tx timed out after {MAX_SUBMIT_ATTEMPTS} submit attempts"),
-        last_hash,
+    match send_tx_robust(
+        endpoints,
+        signer,
+        tx,
+        "source interchainTransfer",
+        EVM_RECEIPT_TIMEOUT,
     )
+    .await
+    {
+        Ok(receipt) => {
+            receipt_to_metrics(&receipt, receipt.transaction_hash, its_proxy, submit_start)
+        }
+        Err(error) => make_failure(submit_start, &error.to_string()),
+    }
 }
 
 /// Build success (or revert) metrics from a mined receipt. Shared by the
@@ -964,128 +906,6 @@ fn receipt_to_metrics(
     }
 }
 
-/// Best-effort read of a just-submitted tx's nonce so resubmits reuse it
-/// (a replacement, never a duplicate). Returns `None` if the RPC can't return
-/// the tx yet — the caller then declines to resubmit rather than risk a
-/// double-send.
-async fn learn_nonce<P: Provider>(provider: &P, tx_hash: TxHash) -> Option<u64> {
-    match provider.get_transaction_by_hash(tx_hash).await {
-        Ok(Some(tx)) => Some(tx.inner.nonce()),
-        _ => None,
-    }
-}
-
-/// Whether a *rejected send* (no tx submitted) is worth re-sending. Covers the
-/// generic transient RPC signatures plus Avalanche's "state not available for
-/// pending block" (a node that can't serve pending state for the gas/nonce
-/// fill). Safe to retry because a rejected send never consumed the nonce.
-fn is_retryable_send_error(err: &str) -> bool {
-    err.contains("state not available for pending block") || is_transient_default(&err)
-}
-
-/// A submitted transfer whose receipt did not arrive within
-/// `EVM_RECEIPT_TIMEOUT`.
-struct ReceiptTimeout {
-    tx_hash: TxHash,
-    its_proxy: Address,
-    submit_start: Instant,
-    pinned_nonce: Option<u64>,
-    attempt: u32,
-}
-
-/// Resolve a receipt-wait timeout: `Some(metrics)` is terminal, `None` means the
-/// submit loop should resubmit at the pinned nonce.
-async fn resolve_receipt_timeout<P: Provider>(
-    provider: &P,
-    timed_out: ReceiptTimeout,
-) -> Option<TxMetrics> {
-    let ReceiptTimeout {
-        tx_hash,
-        its_proxy,
-        submit_start,
-        pinned_nonce,
-        attempt,
-    } = timed_out;
-    // Deadline hit - did it land just after?
-    if let Ok(Some(receipt)) = provider.get_transaction_receipt(tx_hash).await {
-        return Some(receipt_to_metrics(
-            &receipt,
-            tx_hash,
-            its_proxy,
-            submit_start,
-        ));
-    }
-    // Not mined. Resubmit only if the nonce is pinned (else a resubmit could
-    // double-send) and attempts remain.
-    let Some(nonce) = pinned_nonce.filter(|_| attempt + 1 < MAX_SUBMIT_ATTEMPTS) else {
-        return Some(make_failure_with_hash(
-            submit_start,
-            &format!(
-                "tx timed out (no receipt in {}s)",
-                EVM_RECEIPT_TIMEOUT.as_secs()
-            ),
-            Some(tx_hash),
-        ));
-    };
-    ui::warn(&format!(
-        "source tx {tx_hash:#x} not mined in {}s — resubmitting at nonce {nonce} \
-         (attempt {}/{MAX_SUBMIT_ATTEMPTS})",
-        EVM_RECEIPT_TIMEOUT.as_secs(),
-        attempt + 2,
-    ));
-    None
-}
-
-/// Recovery the submit loop should take after a rejected send.
-enum SendRejection {
-    /// The node reported the nonce it actually wants - pin it and re-send.
-    RetryAtNonce(u64),
-    /// Transient RPC rejection - back off for this long, then re-send.
-    RetryAfterBackoff(Duration),
-    /// Deterministic rejection (or attempts exhausted) - record the failure.
-    Fatal,
-}
-
-/// Classify a rejected `interchainTransfer` send. Both retry paths are safe:
-/// a rejected send never entered the mempool, so its nonce was not consumed
-/// and re-sending cannot double-transfer.
-///
-/// - Stale nonce: the RPC handed alloy an already-consumed nonce (observed on
-///   Avalanche via QuikNode: "nonce too low: next nonce N, tx nonce N-1"). The
-///   node reports the nonce it wants, so pin it rather than fail the route.
-///   Guarded by `!= pinned_nonce` + the attempt bound so a persistent mismatch
-///   can't loop.
-/// - Transient rejection: source-side 429s, and Avalanche's "state not
-///   available for pending block" (a coreth node that can't serve pending state
-///   for the gas/nonce fill - recurs on the testnet Avalanche RPC).
-fn classify_send_rejection(error: &str, attempt: u32, pinned_nonce: Option<u64>) -> SendRejection {
-    if attempt + 1 >= MAX_SUBMIT_ATTEMPTS {
-        return SendRejection::Fatal;
-    }
-    if error.contains("nonce too low")
-        && let Some(expected) = parse_expected_nonce(error)
-        && Some(expected) != pinned_nonce
-    {
-        return SendRejection::RetryAtNonce(expected);
-    }
-    if is_retryable_send_error(error) {
-        return SendRejection::RetryAfterBackoff(Duration::from_millis(500u64 << attempt));
-    }
-    SendRejection::Fatal
-}
-
-/// Parse the node-expected nonce out of a geth-style "nonce too low: next nonce
-/// N, tx nonce M" error so a stale-nonce send can be retried at the right value.
-fn parse_expected_nonce(err: &str) -> Option<u64> {
-    let after = err.split("next nonce").nth(1)?;
-    let digits: String = after
-        .trim_start()
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    digits.parse().ok()
-}
-
 fn make_failure(submit_start: Instant, error: &str) -> TxMetrics {
     make_failure_with_hash(submit_start, error, None)
 }
@@ -1117,19 +937,21 @@ pub(super) async fn read_gas_arg_scaling_factor(config_path: &Path, source_chain
 /// decimals — 1e16 sub-units there is 1e10 AXE, exceeds wallet balance, and
 /// the source burn reverts. Dividing by `10^(18 − decimals)` keeps the
 /// intended 0.01 AXE meaning regardless of chain.
-pub(super) async fn rescale_sizing_for_decimals<P: Provider>(
+pub(super) async fn rescale_sizing_for_decimals(
     amount_per_tx: &mut U256,
     amount_per_key: &mut U256,
     total_supply: &mut U256,
-    provider: &P,
+    endpoints: &EvmEndpoints,
     token_addr: Address,
 ) -> eyre::Result<u8> {
-    // Retry: this read runs on the source RPC (Hedera hard-429s its JSON-RPC
-    // relay), and a transient rate-limit blip on a setup read shouldn't fail
-    // the whole route.
-    let decimals = retry_all("read_source_token_decimals", || async {
-        ERC20::new(token_addr, provider).decimals().call().await
-    })
+    // Retry + fallback: this read runs on the source RPC (Hedera hard-429s its
+    // JSON-RPC relay), and a transient rate-limit blip on a setup read
+    // shouldn't fail the whole route.
+    let decimals = retry_with_fallback_all(
+        "read_source_token_decimals",
+        endpoints.providers(),
+        |p| async move { ERC20::new(token_addr, p).decimals().call().await },
+    )
     .await
     .map_err(|e| eyre!("failed to read source token decimals at {token_addr}: {e}"))?;
     if decimals < 18 {
@@ -1153,39 +975,4 @@ fn make_failure_with_hash(
         elapsed_ms,
         error,
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_expected_nonce;
-
-    #[test]
-    fn parses_geth_nonce_too_low() {
-        // The exact Avalanche/QuikNode wording that failed the cron.
-        let err = "server returned an error response: error code -32000: nonce too low: \
-                   next nonce 246, tx nonce 245";
-        assert_eq!(parse_expected_nonce(err), Some(246));
-    }
-
-    #[test]
-    fn none_when_no_next_nonce_phrase() {
-        assert_eq!(parse_expected_nonce("nonce too low"), None);
-        assert_eq!(parse_expected_nonce("some unrelated error"), None);
-    }
-
-    #[test]
-    fn retryable_send_errors() {
-        use super::is_retryable_send_error;
-        // Avalanche coreth pending-state rejection (the recurring testnet one).
-        assert!(is_retryable_send_error(
-            "error code -32000: state not available for pending block"
-        ));
-        // Generic transient signatures still count.
-        assert!(is_retryable_send_error("HTTP error 429 too many requests"));
-        assert!(is_retryable_send_error("connection reset by peer"));
-        // A deterministic revert must NOT be retried.
-        assert!(!is_retryable_send_error(
-            "execution reverted: TakeTokenFailed"
-        ));
-    }
 }

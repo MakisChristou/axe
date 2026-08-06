@@ -115,7 +115,20 @@ impl StellarClient {
     /// Fetch the current account sequence number. Returns `None` if the
     /// account is unfunded / missing.
     pub async fn account_sequence(&self, address: &str) -> Result<Option<i64>> {
-        match self.rpc.get_account(address).await {
+        // This read gates every submit (and the `invoke_contract` resubmit
+        // guard), so a transient RPC blip here used to kill a run. Retry
+        // transient errors only: `NotFound` (unfunded account) is
+        // deterministic and falls straight through to the `Ok(None)` mapping.
+        // An exhausted retry still surfaces as `Err`, which the resubmit
+        // guard keeps interpreting as "don't resubmit".
+        let fetched = crate::retry::retry_async(
+            "stellar.get_account",
+            crate::retry::FALLBACK_ATTEMPTS,
+            crate::retry::is_transient_default,
+            || async { self.rpc.get_account(address).await },
+        )
+        .await;
+        match fetched {
             Ok(entry) => Ok(Some(entry.seq_num.0)),
             Err(e) => {
                 if matches!(e, stellar_rpc_client::Error::NotFound(_, _)) {
@@ -175,11 +188,17 @@ impl StellarClient {
             ext: TransactionExt::V0,
         };
         let signed = self.sign(funder, tx)?;
-        let hash = self
-            .rpc
-            .send_transaction(&signed)
-            .await
-            .map_err(|e| eyre!("send_transaction: {e}"))?;
+        // Rebroadcasting the identical signed envelope is idempotent (fixed
+        // sequence — at most one copy lands), so transient transport errors
+        // safely retry the same envelope. Never re-sign inside the retry.
+        let hash = crate::retry::retry_async(
+            "stellar.send_transaction",
+            crate::retry::FALLBACK_ATTEMPTS,
+            crate::retry::is_transient_default,
+            || async { self.rpc.send_transaction(&signed).await },
+        )
+        .await
+        .map_err(|e| eyre!("send_transaction: {e}"))?;
         let tx_hash_hex = hex::encode(hash.0);
 
         let start = Instant::now();
@@ -208,7 +227,16 @@ impl StellarClient {
     /// Native-XLM balance of `address` in stroops. Returns `None` if the
     /// account does not exist yet.
     pub async fn native_balance_stroops(&self, address: &str) -> Result<Option<i64>> {
-        match self.rpc.get_account(address).await {
+        // Same retry/NotFound split as `account_sequence`: retry transient
+        // RPC errors, map a deterministic `NotFound` to `Ok(None)`.
+        let fetched = crate::retry::retry_async(
+            "stellar.get_account",
+            crate::retry::FALLBACK_ATTEMPTS,
+            crate::retry::is_transient_default,
+            || async { self.rpc.get_account(address).await },
+        )
+        .await;
+        match fetched {
             Ok(entry) => Ok(Some(entry.balance)),
             Err(e) => {
                 if matches!(e, stellar_rpc_client::Error::NotFound(_, _)) {
@@ -268,7 +296,18 @@ impl StellarClient {
                 ext: TransactionExt::V0,
             };
             let signed = self.sign(funder, tx)?;
-            match self.rpc.send_transaction(&signed).await {
+            // Transient transport errors rebroadcast the identical signed
+            // envelope (idempotent: fixed sequence, at most one copy lands).
+            // TxBadSeq is not transient, so it bails out of the retry and
+            // falls through to the re-fetch recovery below.
+            let sent = crate::retry::retry_async(
+                "stellar.send_transaction",
+                crate::retry::FALLBACK_ATTEMPTS,
+                crate::retry::is_transient_default,
+                || async { self.rpc.send_transaction(&signed).await },
+            )
+            .await;
+            match sent {
                 Ok(hash) => break hash,
                 Err(e) if attempt + 1 < MAX_SEQ_RETRIES && format!("{e}").contains("TxBadSeq") => {
                     crate::ui::warn(&format!(
@@ -379,11 +418,22 @@ impl StellarClient {
             tx: tx.clone(),
             signatures: VecM::default(),
         });
-        let sim = self
-            .rpc
-            .simulate_transaction_envelope(&envelope, None)
-            .await
-            .map_err(|e| eyre!("simulate_transaction_envelope: {e}"))?;
+        // Simulation is a pure read, so transient RPC errors retry safely.
+        // Deterministic failures bail immediately: contract errors arrive in
+        // `sim.error` on the Ok path, and non-transient transport errors are
+        // filtered out by the predicate.
+        let sim = crate::retry::retry_async(
+            "stellar.simulate_invoke",
+            crate::retry::FALLBACK_ATTEMPTS,
+            crate::retry::is_transient_default,
+            || async {
+                self.rpc
+                    .simulate_transaction_envelope(&envelope, None)
+                    .await
+            },
+        )
+        .await
+        .map_err(|e| eyre!("simulate_transaction_envelope: {e}"))?;
         if let Some(err) = &sim.error {
             return Err(eyre!("Stellar simulation failed: {err}"));
         }
@@ -419,11 +469,20 @@ impl StellarClient {
         // 4. Sign.
         let signed = self.sign(wallet, tx)?;
 
-        // 5. Submit.
-        self.rpc
-            .send_transaction(&signed)
-            .await
-            .map_err(|e| eyre!("send_transaction: {e}"))
+        // 5. Submit. Transient transport errors rebroadcast the identical
+        // signed envelope — idempotent (fixed sequence: at most one copy
+        // lands; a rebroadcast after the tx already landed surfaces TxBadSeq,
+        // which is not transient and bails out to the caller's TxBadSeq
+        // loop). Never re-sign inside the retry: a fresh envelope with a
+        // re-read sequence would be a real double-send.
+        crate::retry::retry_async(
+            "stellar.send_transaction",
+            crate::retry::FALLBACK_ATTEMPTS,
+            crate::retry::is_transient_default,
+            || async { self.rpc.send_transaction(&signed).await },
+        )
+        .await
+        .map_err(|e| eyre!("send_transaction: {e}"))
     }
 
     /// Build + simulate + sign + submit an InvokeContract call, then poll.

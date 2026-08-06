@@ -26,13 +26,14 @@ use crate::config::AxelarChainContract;
 use crate::config::ChainContract;
 use crate::config::ChainsConfig;
 use crate::cosmos::lcd_cosmwasm_smart_query;
-use crate::evm::InterchainTokenService;
+use crate::evm::{EvmEndpoints, InterchainTokenService, connect_evm_signed};
+use crate::retry::retry_with_fallback_all;
 use crate::types::Network;
 use crate::ui;
 use crate::xrpl::{XrplClient, faucet_url_for_network, parse_address};
 use alloy::{
     primitives::{Bytes, FixedBytes, U256},
-    providers::{Provider, ProviderBuilder},
+    providers::Provider,
     signers::local::PrivateKeySigner,
 };
 use eyre::eyre;
@@ -61,6 +62,8 @@ pub async fn run(args: LoadTestArgs, sizing: RunSizing) -> eyre::Result<()> {
     let dest = &args.destination_chain;
 
     let evm_rpc_url = args.source_rpc.to_string();
+    // Private endpoint first, chains-config public RPC as failover.
+    let source_rpc_urls = super::its_evm_source::source_rpc_candidates(&args).await;
     validate_evm_rpc(&evm_rpc_url).await?;
 
     let cfg = ChainsConfig::load(&args.config).await?;
@@ -79,20 +82,20 @@ pub async fn run(args: LoadTestArgs, sizing: RunSizing) -> eyre::Result<()> {
     let token_id =
         resolve_token_id(&cfg, args.token_id.as_deref(), &args.destination_axelar_id).await?;
 
-    let evm_src = init_evm_source(&cfg, src, &evm_rpc_url, args.private_key.as_deref()).await?;
+    let evm_src = init_evm_source(&cfg, src, &source_rpc_urls, args.private_key.as_deref()).await?;
 
-    let token_addr = verify_token_on_its(&evm_src, &evm_rpc_url, token_id).await?;
+    let token_addr = verify_token_on_its(&evm_src, &source_rpc_urls, token_id).await?;
 
     let xrpl = setup_xrpl_recipient(&args.config, dest, args.network).await?;
 
     let (gas_value_wei, gas_value) = super::its_evm_source::standard_gas_value(&args).await?;
 
     let derived =
-        derive_and_fund_evm_signers(&evm_src, &evm_rpc_url, gas_value_wei, &sizing).await?;
+        derive_and_fund_evm_signers(&evm_src, &source_rpc_urls, gas_value_wei, &sizing).await?;
 
     distribute_and_approve_tokens(
         &evm_src,
-        &evm_rpc_url,
+        &source_rpc_urls,
         token_addr,
         token_id,
         &derived,
@@ -124,7 +127,7 @@ pub async fn run(args: LoadTestArgs, sizing: RunSizing) -> eyre::Result<()> {
             run_sustained_pipeline(SustainedPipeline {
                 args,
                 cfg,
-                evm_rpc_url,
+                source_rpc_urls,
                 xrpl,
                 derived,
                 its_ctx,
@@ -134,7 +137,7 @@ pub async fn run(args: LoadTestArgs, sizing: RunSizing) -> eyre::Result<()> {
             .await
         }
         RunMode::Burst { .. } => {
-            run_burst_pipeline(&args, &evm_rpc_url, &xrpl, &derived, &its_ctx, &sizing).await
+            run_burst_pipeline(&args, &source_rpc_urls, &xrpl, &derived, &its_ctx, &sizing).await
         }
     }
 }
@@ -209,7 +212,7 @@ async fn resolve_token_id(
 async fn init_evm_source(
     cfg: &ChainsConfig,
     src: &str,
-    evm_rpc_url: &str,
+    rpc_urls: &[String],
     private_key: Option<&str>,
 ) -> eyre::Result<EvmSource> {
     let private_key = private_key.ok_or_else(|| {
@@ -217,8 +220,8 @@ async fn init_evm_source(
     })?;
     let signer: PrivateKeySigner = private_key.parse()?;
     let deployer_address = signer.address();
-    let read_provider = ProviderBuilder::new().connect_http(evm_rpc_url.parse()?);
-    check_evm_balance(&read_provider, deployer_address).await?;
+    let endpoints = EvmEndpoints::connect(rpc_urls)?;
+    check_evm_balance(endpoints.primary(), deployer_address).await?;
     let main_key: [u8; 32] = signer.to_bytes().into();
 
     let its_proxy_addr: Address = cfg
@@ -247,23 +250,29 @@ async fn init_evm_source(
 /// id. That's a runtime failure mode the load-test treats as a 0/N report.
 async fn verify_token_on_its(
     evm_src: &EvmSource,
-    evm_rpc_url: &str,
+    rpc_urls: &[String],
     token_id: FixedBytes<32>,
 ) -> eyre::Result<Address> {
-    let write_provider = ProviderBuilder::new()
-        .wallet(evm_src.signer.clone())
-        .connect_http(evm_rpc_url.parse()?);
-    let its_service = InterchainTokenService::new(evm_src.its_proxy_addr, &write_provider);
-    let token_addr = its_service
-        .interchainTokenAddress(token_id)
-        .call()
-        .await
-        .map_err(|e| {
-            eyre!(
-                "token id 0x{} not registered on EVM ITS: {e}",
-                hex::encode(token_id)
-            )
-        })?;
+    let endpoints = EvmEndpoints::connect(rpc_urls)?;
+    let its_proxy = evm_src.its_proxy_addr;
+    let token_addr = retry_with_fallback_all(
+        "token address lookup",
+        endpoints.providers(),
+        |p| async move {
+            InterchainTokenService::new(its_proxy, p)
+                .interchainTokenAddress(token_id)
+                .call()
+                .await
+        },
+    )
+    .await
+    .map_err(|e| {
+        eyre!(
+            "token id 0x{} not registered on EVM ITS: {e}",
+            hex::encode(token_id)
+        )
+    })?;
+    let its_service = InterchainTokenService::new(its_proxy, endpoints.primary());
     // Best-effort: report the manager type if the ITS deployment exposes the
     // getter (modern ITS does). Older deployments revert here for
     // unregistered token ids — which is itself diagnostic, so we surface the
@@ -344,15 +353,15 @@ async fn setup_xrpl_recipient(
 /// safety multiplier).
 async fn derive_and_fund_evm_signers(
     evm_src: &EvmSource,
-    evm_rpc_url: &str,
+    rpc_urls: &[String],
     gas_value_wei: u128,
     sizing: &RunSizing,
 ) -> eyre::Result<Vec<PrivateKeySigner>> {
     let derived = keypairs::derive_evm_signers(&evm_src.main_key, sizing.num_keys)?;
     ui::info(&format!("derived {} EVM signing keys", derived.len()));
-    let funding_provider = ProviderBuilder::new()
-        .wallet(evm_src.signer.clone())
-        .connect_http(evm_rpc_url.parse()?);
+    // Multi-transport provider: funding reads/sends fail over to the public
+    // RPC on transport-level errors.
+    let funding_provider = connect_evm_signed(rpc_urls, evm_src.signer.clone())?;
     // Compute funding dynamically: each interchainTransfer costs roughly
     // GAS_LIMIT × gas_price for the call plus `gas_value` (msg.value to gas
     // service). xrpl-evm runs at ~137 gwei vs ~1 gwei on most EVM testnets,
@@ -407,7 +416,7 @@ async fn derive_and_fund_evm_signers(
 /// `TakeTokenFailed(bytes)` (selector 0x1a59c9bd).
 async fn distribute_and_approve_tokens(
     evm_src: &EvmSource,
-    evm_rpc_url: &str,
+    rpc_urls: &[String],
     token_addr: Address,
     token_id: FixedBytes<32>,
     derived: &[PrivateKeySigner],
@@ -420,14 +429,18 @@ async fn distribute_and_approve_tokens(
         let txs_per_key = sizing.transactions_per_key() + 1;
         amount_per_tx * U256::from(txs_per_key)
     };
-    let token_provider = ProviderBuilder::new()
-        .wallet(evm_src.signer.clone())
-        .connect_http(evm_rpc_url.parse()?);
-    super::its_evm_source::distribute_tokens(&token_provider, token_addr, derived, amount_per_key)
-        .await?;
+    let endpoints = EvmEndpoints::connect(rpc_urls)?;
+    super::its_evm_source::distribute_tokens(
+        &endpoints,
+        &evm_src.signer,
+        token_addr,
+        derived,
+        amount_per_key,
+    )
+    .await?;
 
     super::its_evm_source::approve_its_for_keys(
-        evm_rpc_url,
+        rpc_urls,
         token_addr,
         evm_src.its_proxy_addr,
         token_id,
@@ -444,7 +457,7 @@ async fn distribute_and_approve_tokens(
 struct SustainedPipeline {
     args: LoadTestArgs,
     cfg: ChainsConfig,
-    evm_rpc_url: String,
+    source_rpc_urls: Vec<String>,
     xrpl: XrplDest,
     derived: Vec<PrivateKeySigner>,
     its_ctx: ItsCallCtx,
@@ -456,7 +469,7 @@ async fn run_sustained_pipeline(pipeline: SustainedPipeline) -> eyre::Result<()>
     let SustainedPipeline {
         args,
         cfg,
-        evm_rpc_url,
+        source_rpc_urls,
         xrpl,
         derived,
         its_ctx,
@@ -469,10 +482,16 @@ async fn run_sustained_pipeline(pipeline: SustainedPipeline) -> eyre::Result<()>
         key_cycle,
     } = plan;
 
-    let nonce_provider = ProviderBuilder::new().connect_http(evm_rpc_url.parse()?);
+    let nonce_endpoints = EvmEndpoints::connect(&source_rpc_urls)?;
     let mut nonces: Vec<u64> = Vec::with_capacity(sizing.num_keys);
     for s in &derived {
-        let n = nonce_provider.get_transaction_count(s.address()).await?;
+        let address = s.address();
+        let n = retry_with_fallback_all(
+            "starting nonce",
+            nonce_endpoints.providers(),
+            |p| async move { p.get_transaction_count(address).await },
+        )
+        .await?;
         nonces.push(n);
     }
 
@@ -481,7 +500,7 @@ async fn run_sustained_pipeline(pipeline: SustainedPipeline) -> eyre::Result<()>
         .contract_address(AxelarChainContract::VotingVerifier, &args.source_axelar_id)
         .is_ok();
     let submitter = super::its_evm_source::ItsEvmSubmitter {
-        rpc_urls: vec![evm_rpc_url.to_string()],
+        rpc_urls: source_rpc_urls,
         its_proxy: its_ctx.its_proxy_addr,
         token_id: its_ctx.token_id.into(),
         destination_chain: args.destination_axelar_id.to_string(),
@@ -529,7 +548,7 @@ async fn run_sustained_pipeline(pipeline: SustainedPipeline) -> eyre::Result<()>
 /// hand off to `finish_report`.
 async fn run_burst_pipeline(
     args: &LoadTestArgs,
-    evm_rpc_url: &str,
+    source_rpc_urls: &[String],
     xrpl: &XrplDest,
     derived: &[PrivateKeySigner],
     its_ctx: &ItsCallCtx,
@@ -540,7 +559,7 @@ async fn run_burst_pipeline(
     let test_start = Instant::now();
     let burst = super::its_evm_source::run_its_burst(
         super::its_evm_source::ItsEvmSubmitter {
-            rpc_urls: vec![evm_rpc_url.to_string()],
+            rpc_urls: source_rpc_urls.to_vec(),
             its_proxy: its_ctx.its_proxy_addr,
             token_id: its_ctx.token_id.into(),
             destination_chain: args.destination_axelar_id.to_string(),

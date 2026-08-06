@@ -9,7 +9,6 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use tokio::time;
 
 /// How long to wait for an EVM tx receipt before giving up.
 /// Fast chains confirm in ~8s; others typically <20s. 60s gives congested
@@ -24,12 +23,13 @@ use super::run_sizing::SustainedPlan;
 use super::submitter::TransactionSubmitter;
 use super::units::Wei;
 use crate::config::AxelarChainContract;
-use crate::evm::{ContractCall, SenderReceiver};
+use crate::evm::{ContractCall, EvmEndpoints, SenderReceiver, connect_evm_signed, send_tx_robust};
+use crate::retry::retry_with_fallback_all;
 use crate::types::Network;
 use crate::ui;
 use alloy::{
     primitives::{Address, Bytes, keccak256},
-    providers::{Provider, ProviderBuilder},
+    providers::Provider,
     signers::local::PrivateKeySigner,
     sol_types::SolEvent,
 };
@@ -75,7 +75,9 @@ fn fallback_gas_value_wei(network: Network) -> u128 {
 }
 
 struct EvmSubmitter {
-    rpc_url: reqwest::Url,
+    /// Source RPCs in preference order, `[private, public]` — each submit
+    /// builds an `EvmEndpoints` pool so a failing primary fails over.
+    rpc_urls: Vec<String>,
     sender_receiver: Address,
     destination_chain: String,
     destination_address: String,
@@ -92,18 +94,21 @@ impl TransactionSubmitter for EvmSubmitter {
     type Job = EvmSubmitJob;
 
     async fn submit(&self, job: Self::Job) -> TxMetrics {
-        let provider = ProviderBuilder::new()
-            .wallet(job.signer)
-            .connect_http(self.rpc_url.clone());
+        let submit_start = Instant::now();
+        let endpoints = match EvmEndpoints::connect(&self.rpc_urls) {
+            Ok(endpoints) => endpoints,
+            Err(error) => return make_failure(submit_start, &error.to_string()),
+        };
         super::retry::rate_limited(|| {
             execute_and_record_evm(
-                &provider,
-                self.sender_receiver,
-                &self.destination_chain,
-                &self.destination_address,
-                &job.payload,
-                self.gas_value,
-                EvmTxOpts {
+                &endpoints,
+                &job.signer,
+                SendPayloadRequest {
+                    sender_receiver: self.sender_receiver,
+                    destination_chain: self.destination_chain.clone(),
+                    destination_address: self.destination_address.clone(),
+                    payload: job.payload.clone(),
+                    gas_value: self.gas_value,
                     nonce: None,
                     fee_mode: self.fee_mode,
                 },
@@ -114,7 +119,9 @@ impl TransactionSubmitter for EvmSubmitter {
 }
 
 struct EvmSustainedSubmitter {
-    rpc_url: reqwest::Url,
+    /// Source RPCs in preference order, `[private, public]` — each submit
+    /// builds an `EvmEndpoints` pool so a failing primary fails over.
+    rpc_urls: Vec<String>,
     sender_receiver: Address,
     destination_chain: String,
     destination_address: String,
@@ -132,17 +139,20 @@ impl TransactionSubmitter for EvmSustainedSubmitter {
     type Job = EvmSustainedSubmitJob;
 
     async fn submit(&self, job: Self::Job) -> TxMetrics {
-        let provider = ProviderBuilder::new()
-            .wallet(job.signer)
-            .connect_http(self.rpc_url.clone());
+        let submit_start = Instant::now();
+        let endpoints = match EvmEndpoints::connect(&self.rpc_urls) {
+            Ok(endpoints) => endpoints,
+            Err(error) => return make_failure(submit_start, &error.to_string()),
+        };
         execute_and_record_evm(
-            &provider,
-            self.sender_receiver,
-            &self.destination_chain,
-            &self.destination_address,
-            &job.payload,
-            self.gas_value,
-            EvmTxOpts {
+            &endpoints,
+            &job.signer,
+            SendPayloadRequest {
+                sender_receiver: self.sender_receiver,
+                destination_chain: self.destination_chain.clone(),
+                destination_address: self.destination_address.clone(),
+                payload: job.payload,
+                gas_value: self.gas_value,
                 nonce: job.nonce,
                 fee_mode: self.fee_mode,
             },
@@ -161,7 +171,7 @@ pub async fn run_load_test_with_metrics(
     num_txs: u64,
     sender_receiver_addr: Address,
     main_key: &[u8; 32],
-    evm_rpc_url: &str,
+    rpc_urls: &[String],
     destination_address: &str,
     payload_encoding: GmpPayloadEncoding,
 ) -> eyre::Result<LoadTestReport> {
@@ -175,9 +185,9 @@ pub async fn run_load_test_with_metrics(
 
     let main_signer = PrivateKeySigner::from_bytes(&(*main_key).into())
         .map_err(|e| eyre!("invalid main EVM key: {e}"))?;
-    let funding_provider = ProviderBuilder::new()
-        .wallet(main_signer.clone())
-        .connect_http(evm_rpc_url.parse()?);
+    // Multi-transport provider: funding reads/sends fail over to the public
+    // RPC on transport-level errors.
+    let funding_provider = connect_evm_signed(rpc_urls, main_signer.clone())?;
     let gas_value_wei: u128 = match &args.gas_value {
         Some(v) => v.parse().map_err(|e| eyre!("invalid --gas-value: {e}"))?,
         None => default_gas_value_wei(args).await,
@@ -232,7 +242,7 @@ pub async fn run_load_test_with_metrics(
         .collect();
     let burst = super::submitter::run_burst(
         EvmSubmitter {
-            rpc_url: evm_rpc_url.parse()?,
+            rpc_urls: rpc_urls.to_vec(),
             sender_receiver: sender_receiver_addr,
             destination_chain: dest_chain.to_string(),
             destination_address: dest_addr.clone(),
@@ -279,91 +289,98 @@ pub async fn run_load_test_with_metrics(
     Ok(report)
 }
 
-/// Send a single callContract tx via SenderReceiver.sendPayload() and return metrics.
+/// Per-tx request for a single callContract via SenderReceiver.sendPayload().
 /// Gas payment + callContract happen atomically in the SenderReceiver contract.
-///
-/// `explicit_nonce`: when `Some`, sets the nonce directly on the tx instead of letting
-/// alloy fetch it from the RPC. Required for sustained mode because many RPC nodes
-/// (including QuikNode) do not reliably return pending-mempool txs in
-/// `eth_getTransactionCount(addr, "pending")`, causing nonce collisions when the same
-/// key fires again within 3s before its previous tx confirms.
-/// Per-tx options for an EVM GMP send.
-#[derive(Clone, Copy)]
-struct EvmTxOpts {
-    /// When `Some`, sets the nonce directly (sustained mode — see below).
+struct SendPayloadRequest {
+    sender_receiver: Address,
+    destination_chain: String,
+    destination_address: String,
+    payload: Vec<u8>,
+    gas_value: Wei,
+    /// When `Some`, sets the nonce directly on the tx instead of letting the
+    /// fill fetch it from the RPC. Required for sustained mode because many RPC
+    /// nodes (including QuikNode) do not reliably return pending-mempool txs in
+    /// `eth_getTransactionCount(addr, "pending")`, causing nonce collisions when
+    /// the same key fires again within 3s before its previous tx confirms.
     nonce: Option<u64>,
     /// Legacy vs 1559 fee mode for the source chain.
     fee_mode: super::gas_mode::EvmFeeMode,
 }
 
-async fn execute_and_record_evm<P: Provider>(
-    provider: &P,
-    sender_receiver_addr: Address,
-    dest_chain: &str,
-    dest_addr: &str,
-    payload: &[u8],
-    gas_value: Wei,
-    opts: EvmTxOpts,
+async fn execute_and_record_evm(
+    endpoints: &EvmEndpoints,
+    signer: &PrivateKeySigner,
+    request: SendPayloadRequest,
 ) -> TxMetrics {
+    let SendPayloadRequest {
+        sender_receiver: sender_receiver_addr,
+        destination_chain: dest_chain,
+        destination_address: dest_addr,
+        payload,
+        gas_value,
+        nonce,
+        fee_mode,
+    } = request;
     let submit_start = Instant::now();
-    let payload_hash = hex::encode(keccak256(payload));
+    let payload_hash = hex::encode(keccak256(&payload));
 
-    let sr = SenderReceiver::new(sender_receiver_addr, provider);
-    let mut base_call = sr
-        .sendPayload(
-            dest_chain.to_string(),
-            dest_addr.to_string(),
-            Bytes::from(payload.to_vec()),
-        )
-        .value(gas_value.as_u256());
+    // Build the calldata once, then hand the whole fill→sign→broadcast→confirm
+    // sequence to `send_tx_robust`: retry + private→public fallback at every
+    // phase, idempotent same-bytes re-broadcast, and lost-response landings
+    // recovered by the pre-known tx hash.
+    let sr = SenderReceiver::new(sender_receiver_addr, endpoints.primary().clone());
+    let mut tx = sr
+        .sendPayload(dest_chain, dest_addr, Bytes::from(payload.clone()))
+        .value(gas_value.as_u256())
+        .into_transaction_request();
+    tx.from = Some(signer.address());
+    tx.nonce = nonce;
     // Legacy (pre-1559) chains: send a type-0 tx with an explicit gas_price.
-    if let Some(gp) = opts.fee_mode.legacy_gas_price() {
-        base_call = base_call.gas_price(gp);
+    if let Some(gp) = fee_mode.legacy_gas_price() {
+        tx.gas_price = Some(gp);
     }
-    let call = match opts.nonce {
-        Some(n) => base_call.nonce(n),
-        None => base_call,
-    };
 
-    match call.send().await {
-        Ok(pending) => {
-            let tx_hash = *pending.tx_hash();
-            match time::timeout(EVM_RECEIPT_TIMEOUT, pending.get_receipt()).await {
-                Ok(Ok(receipt)) => {
-                    let latency_ms = submit_start.elapsed().as_millis() as u64;
+    match send_tx_robust(
+        endpoints,
+        signer,
+        tx,
+        "source sendPayload",
+        EVM_RECEIPT_TIMEOUT,
+    )
+    .await
+    {
+        Ok(receipt) => {
+            let tx_hash = receipt.transaction_hash;
+            let latency_ms = submit_start.elapsed().as_millis() as u64;
 
-                    // Extract ContractCall event index
-                    let event_index = receipt
-                        .inner
-                        .logs()
-                        .iter()
-                        .enumerate()
-                        .find_map(|(i, log)| {
-                            if log.topics().first() == Some(&ContractCall::SIGNATURE_HASH) {
-                                Some(i)
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or(0);
-
-                    // message_id format matching Axelar convention
-                    let message_id = format!("{tx_hash:#x}-{event_index}");
-
-                    TxMetrics {
-                        confirm_time_ms: Some(latency_ms),
-                        latency_ms: Some(latency_ms),
-                        compute_units: Some(receipt.gas_used),
-                        slot: receipt.block_number,
-                        payload: payload.to_vec(),
-                        payload_hash,
-                        source_address: format!("{sender_receiver_addr}"),
-                        send_instant: Some(submit_start),
-                        ..TxMetrics::succeeded(message_id, 0)
+            // Extract ContractCall event index
+            let event_index = receipt
+                .inner
+                .logs()
+                .iter()
+                .enumerate()
+                .find_map(|(i, log)| {
+                    if log.topics().first() == Some(&ContractCall::SIGNATURE_HASH) {
+                        Some(i)
+                    } else {
+                        None
                     }
-                }
-                Ok(Err(e)) => make_failure_with_hash(submit_start, &e.to_string(), Some(tx_hash)),
-                Err(_) => make_failure_with_hash(submit_start, "tx timed out", Some(tx_hash)),
+                })
+                .unwrap_or(0);
+
+            // message_id format matching Axelar convention
+            let message_id = format!("{tx_hash:#x}-{event_index}");
+
+            TxMetrics {
+                confirm_time_ms: Some(latency_ms),
+                latency_ms: Some(latency_ms),
+                compute_units: Some(receipt.gas_used),
+                slot: receipt.block_number,
+                payload,
+                payload_hash,
+                source_address: format!("{sender_receiver_addr}"),
+                send_instant: Some(submit_start),
+                ..TxMetrics::succeeded(message_id, 0)
             }
         }
         Err(e) => make_failure(submit_start, &e.to_string()),
@@ -379,7 +396,8 @@ pub(super) struct SustainedLoadRequest {
     pub plan: SustainedPlan,
     pub sender_receiver: Address,
     pub main_key: [u8; 32],
-    pub evm_rpc_url: String,
+    /// Source RPCs in preference order, `[private, public]`.
+    pub rpc_urls: Vec<String>,
     pub destination_address: String,
     pub verify_tx: Option<mpsc::UnboundedSender<super::verify::PendingTx>>,
     pub send_done: Option<Arc<AtomicBool>>,
@@ -399,7 +417,7 @@ async fn prepare_evm_sustained(
     args: &LoadTestArgs,
     plan: SustainedPlan,
     main_key: [u8; 32],
-    evm_rpc_url: &str,
+    rpc_urls: &[String],
 ) -> eyre::Result<EvmSustainedSetup> {
     let payload = args
         .payload
@@ -421,9 +439,9 @@ async fn prepare_evm_sustained(
     ));
     let main_signer = PrivateKeySigner::from_bytes(&main_key.into())
         .map_err(|error| eyre!("invalid main EVM key: {error}"))?;
-    let funding_provider = ProviderBuilder::new()
-        .wallet(main_signer.clone())
-        .connect_http(evm_rpc_url.parse()?);
+    // Multi-transport provider: funding reads/sends fail over to the public
+    // RPC on transport-level errors.
+    let funding_provider = connect_evm_signed(rpc_urls, main_signer.clone())?;
     let rounds = plan.duration_secs.div_ceil(plan.key_cycle as u64);
     let buffered_rounds = rounds + rounds / 5 + 1;
     keypairs::ensure_funded_evm_with_extra(
@@ -434,14 +452,17 @@ async fn prepare_evm_sustained(
     )
     .await?;
     let fee_mode = super::gas_mode::EvmFeeMode::detect(&funding_provider).await?;
-    let nonce_provider = ProviderBuilder::new().connect_http(evm_rpc_url.parse()?);
+    let nonce_endpoints = EvmEndpoints::connect(rpc_urls)?;
     let mut nonces = Vec::with_capacity(pool_size);
     for signer in &derived {
-        nonces.push(
-            nonce_provider
-                .get_transaction_count(signer.address())
-                .await?,
-        );
+        let address = signer.address();
+        let n = retry_with_fallback_all(
+            "starting nonce",
+            nonce_endpoints.providers(),
+            |p| async move { p.get_transaction_count(address).await },
+        )
+        .await?;
+        nonces.push(n);
     }
     Ok(EvmSustainedSetup {
         payload,
@@ -484,7 +505,7 @@ pub(super) async fn run_sustained_load_test_with_metrics(
             },
         sender_receiver: sender_receiver_addr,
         main_key,
-        evm_rpc_url,
+        rpc_urls,
         destination_address,
         verify_tx,
         send_done,
@@ -494,7 +515,7 @@ pub(super) async fn run_sustained_load_test_with_metrics(
     let pool_size = tps * key_cycle;
     let total_expected = plan.total_transactions();
 
-    let setup = prepare_evm_sustained(&args, plan, main_key, &evm_rpc_url).await?;
+    let setup = prepare_evm_sustained(&args, plan, main_key, &rpc_urls).await?;
     let EvmSustainedSetup {
         payload,
         gas_value,
@@ -509,7 +530,6 @@ pub(super) async fn run_sustained_load_test_with_metrics(
 
     let dest_chain = args.destination_chain.clone();
     let dest_addr = destination_address.to_string();
-    let rpc_url_str = evm_rpc_url.to_string();
     let cfg = ChainsConfig::load(&args.config).await?;
     let has_voting_verifier = cfg
         .axelar
@@ -521,10 +541,9 @@ pub(super) async fn run_sustained_load_test_with_metrics(
         super::verify::classify_route(&cfg, &args.source_axelar_id, &args.destination_axelar_id);
     let legacy_route = src_legacy || dst_legacy;
 
-    let rpc_url = rpc_url_str.parse()?;
     let make_task = super::sustained::submission_tasks(
         EvmSustainedSubmitter {
-            rpc_url,
+            rpc_urls,
             sender_receiver: sender_receiver_addr,
             destination_chain: dest_chain.to_string(),
             destination_address: dest_addr,

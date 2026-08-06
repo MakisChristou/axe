@@ -81,6 +81,11 @@ bech32 = "0.11"
 bcs = "0.1"
 blake2 = "0.10"
 
+[dev-dependencies]
+# `test-util` enables `#[tokio::test(start_paused = true)]` so retry/backoff
+# tests auto-advance their sleeps instead of really waiting them out.
+tokio = { version = "1", features = ["full", "test-util"] }
+
 [lints.clippy]
 # Catch new functions whose cognitive complexity grows past clippy's default
 # threshold (25). The pre-commit hook runs clippy with `-D warnings` so this

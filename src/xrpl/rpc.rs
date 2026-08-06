@@ -130,10 +130,22 @@ impl XrplClient {
             .map_err(|e| eyre!("invalid Amount::drops({amount_drops}): {e}"))?;
         let mut tx = PaymentTransaction::new(wallet.account_id, amount, *destination);
 
-        self.inner
-            .prepare_transaction(&mut tx.common)
-            .await
-            .map_err(|e| eyre!("prepare_transaction failed: {e}"))?;
+        // `prepare_transaction` autofills Sequence/Fee/LastLedgerSequence via
+        // read-only RPCs, so it's safe to retry: run each attempt on a clone
+        // and commit the prepared copy only on success.
+        let prepared = crate::retry::retry_all("xrpl.prepare_transaction", || {
+            let mut common = tx.common.clone();
+            let inner = &self.inner;
+            async move {
+                inner
+                    .prepare_transaction(&mut common)
+                    .await
+                    .map(|()| common)
+            }
+        })
+        .await
+        .map_err(|e| eyre!("prepare_transaction failed: {e}"))?;
+        tx.common = prepared;
         if let Some(lls) = tx.common.last_ledger_sequence {
             tx.common.last_ledger_sequence = Some(lls.saturating_add(LAST_LEDGER_SEQUENCE_BUMP));
         }
@@ -145,19 +157,60 @@ impl XrplClient {
         let tx_hash = signed_tx_hash_hex(&tx_bytes);
 
         let req = SubmitRequest::new(tx_blob).fail_hard(true);
-        let resp = self
-            .inner
-            .call(req)
-            .await
-            .map_err(|e| eyre!("submit failed: {e}"))?;
-        let engine = format!("{:?}", resp.engine_result);
-        if !engine.contains("tesSUCCESS") {
-            return Err(eyre!(
-                "submit rejected: {engine}: {}",
-                resp.engine_result_message
-            ));
-        }
+        self.submit_signed_blob(&req, &tx_hash).await?;
         Ok(tx_hash)
+    }
+
+    /// Submit an already-signed transaction blob, retrying transient
+    /// transport errors. Re-POSTing the same blob is idempotent — XRPL
+    /// dedups on Sequence — so retrying here can never double-send; a
+    /// fresh prepare→sign per attempt would mint a new Sequence and could.
+    ///
+    /// A lost submit response does not mean the tx failed: on transport
+    /// exhaustion, or a `tefPAST_SEQ`/`tefALREADY` engine result (this
+    /// exact Sequence already consumed), an earlier attempt may have
+    /// landed — confirm via the precomputed hash before failing.
+    pub async fn submit_signed_blob(&self, req: &SubmitRequest, tx_hash: &str) -> Result<()> {
+        let submit_result = crate::retry::retry_async(
+            "xrpl.submit",
+            crate::retry::FALLBACK_ATTEMPTS,
+            crate::retry::is_transient_default,
+            || {
+                let req = req.clone();
+                let inner = &self.inner;
+                async move { inner.call(req).await }
+            },
+        )
+        .await;
+        match submit_result {
+            Ok(resp) => {
+                let engine = format!("{:?}", resp.engine_result);
+                if engine.contains("tesSUCCESS") {
+                    return Ok(());
+                }
+                let maybe_landed = engine.contains("tefPAST_SEQ") || engine.contains("tefALREADY");
+                if maybe_landed && self.landed_by_hash(tx_hash).await {
+                    return Ok(());
+                }
+                Err(eyre!(
+                    "submit rejected: {engine}: {}",
+                    resp.engine_result_message
+                ))
+            }
+            Err(e) => {
+                if self.landed_by_hash(tx_hash).await {
+                    Ok(())
+                } else {
+                    Err(eyre!("submit failed: {e}"))
+                }
+            }
+        }
+    }
+
+    /// Bounded check (via [`Self::wait_for_validated`]) that `tx_hash`
+    /// validated with `tesSUCCESS` — resolves lost submit responses.
+    async fn landed_by_hash(&self, tx_hash: &str) -> bool {
+        matches!(self.wait_for_validated(tx_hash).await, Ok(v) if v.success)
     }
 
     /// Search the recipient account's recent transactions for an incoming
@@ -190,11 +243,13 @@ impl XrplClient {
             },
             ..Default::default()
         };
-        let resp = self
-            .inner
-            .call(req)
-            .await
-            .map_err(|e| eyre!("account_tx({recipient}): {e}"))?;
+        let resp = crate::retry::retry_all("xrpl.account_tx", || {
+            let req = req.clone();
+            let inner = &self.inner;
+            async move { inner.call(req).await }
+        })
+        .await
+        .map_err(|e| eyre!("account_tx({recipient}): {e}"))?;
 
         for at in resp.transactions {
             if !at.validated {
@@ -253,36 +308,41 @@ impl XrplClient {
     /// otherwise return `None`. Non-`tesSUCCESS` validated txs still return
     /// `Some` with `success=false` so the caller can decide what to do.
     pub async fn get_validated_tx(&self, tx_hash: &str) -> Result<Option<ValidatedTx>> {
-        let req = TxRequest::new(tx_hash);
-        match self.inner.call(req).await {
-            Ok(resp) => {
-                let common = resp.tx.common();
-                if common.validated != Some(true) {
-                    return Ok(None);
+        crate::retry::retry_all("xrpl.tx", || async {
+            let req = TxRequest::new(tx_hash);
+            match self.inner.call(req).await {
+                Ok(resp) => {
+                    let common = resp.tx.common();
+                    if common.validated != Some(true) {
+                        return Ok(None);
+                    }
+                    let success = common
+                        .meta
+                        .as_ref()
+                        .map(|m| m.transaction_result == xrpl_api::TransactionResult::tesSUCCESS)
+                        .unwrap_or(false);
+                    Ok(Some(ValidatedTx {
+                        ledger_index: common.ledger_index,
+                        success,
+                    }))
                 }
-                let success = common
-                    .meta
-                    .as_ref()
-                    .map(|m| m.transaction_result == xrpl_api::TransactionResult::tesSUCCESS)
-                    .unwrap_or(false);
-                Ok(Some(ValidatedTx {
-                    ledger_index: common.ledger_index,
-                    success,
-                }))
-            }
-            Err(e) => {
-                // `txnNotFound` means the tx is not yet on a validated ledger
-                // (or has been dropped). Treat as "not yet".
-                if matches!(
-                    &e,
-                    xrpl_http_client::error::Error::Api(code) if code == "txnNotFound"
-                ) {
-                    Ok(None)
-                } else {
-                    Err(eyre!("tx({tx_hash}) failed: {e}"))
+                Err(e) => {
+                    // `txnNotFound` means the tx is not yet on a validated
+                    // ledger (or has been dropped). Mapped to `Ok(None)`
+                    // *before* the retry layer sees it, so poll loops don't
+                    // burn the retry budget on "not yet".
+                    if matches!(
+                        &e,
+                        xrpl_http_client::error::Error::Api(code) if code == "txnNotFound"
+                    ) {
+                        Ok(None)
+                    } else {
+                        Err(eyre!("tx({tx_hash}) failed: {e}"))
+                    }
                 }
             }
-        }
+        })
+        .await
     }
 }
 

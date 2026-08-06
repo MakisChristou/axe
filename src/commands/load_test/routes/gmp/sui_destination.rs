@@ -6,6 +6,7 @@ use alloy::{providers::ProviderBuilder, signers::local::PrivateKeySigner};
 use eyre::Result;
 
 use super::super::gmp_payload::GmpPayloadEncoding;
+use super::super::its_evm_source::source_rpc_candidates;
 use super::super::metrics::RunIdentity;
 use super::super::run_sizing::RunSizing;
 use super::super::{
@@ -34,6 +35,8 @@ pub(in crate::commands::load_test) async fn run_evm_to_sui(
     ui::kv("protocol", "GMP (EVM SenderReceiver → Sui memo)");
 
     let evm_rpc_url = args.source_rpc.to_string();
+    // Private endpoint first, chains-config public RPC as failover.
+    let source_rpc_urls = source_rpc_candidates(&args).await;
     validate_evm_rpc(&evm_rpc_url).await?;
 
     let signer = args
@@ -88,7 +91,7 @@ pub(in crate::commands::load_test) async fn run_evm_to_sui(
         sizing.require_burst("GMP evm-to-sui")?,
         sender_receiver_addr,
         &main_key,
-        &evm_rpc_url,
+        &source_rpc_urls,
         &sui_channel,
         GmpPayloadEncoding::AbiString,
     )

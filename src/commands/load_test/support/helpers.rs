@@ -30,7 +30,7 @@ use super::verify;
 use super::{GmpCache, LoadTestArgs, read_cache, save_cache};
 use crate::config::{ChainContract, ChainsConfig};
 use crate::evm::{ERC20, InterchainTokenService, SenderReceiver, read_artifact_bytecode};
-use crate::retry::{DEFAULT_ATTEMPTS, retry_async};
+use crate::retry::{DEFAULT_ATTEMPTS, retry_all, retry_async};
 use crate::stellar::StellarWallet;
 use crate::sui::{SuiWallet, read_sui_chain_config};
 use crate::ui;
@@ -259,12 +259,16 @@ pub(crate) async fn validate_evm_rpc(rpc_url: &str) -> Result<()> {
             .parse()
             .map_err(|e| eyre::eyre!("invalid EVM RPC URL: {e}"))?,
     );
-    provider.get_chain_id().await.map_err(|_| {
-        eyre::eyre!(
-            "configured EVM RPC does not appear to be a valid endpoint \
-             (eth_chainId failed). Check the chain-config or RPC override."
-        )
-    })?;
+    // Retried: a transient blip on the pre-flight probe must not kill a run
+    // whose actual sends carry full retry + fallback.
+    retry_all("validate_evm_rpc", || provider.get_chain_id())
+        .await
+        .map_err(|_| {
+            eyre::eyre!(
+                "configured EVM RPC does not appear to be a valid endpoint \
+                 (eth_chainId failed). Check the chain-config or RPC override."
+            )
+        })?;
     Ok(())
 }
 
@@ -937,13 +941,23 @@ pub(crate) async fn reusable_config_axe<P: Provider>(
     // that then reverts with InitialSupplyUnsupported. Scale `needed` by the
     // source token's actual decimals so the comparison is apples-to-apples.
     let token = ERC20::new(addr, provider);
-    let decimals: u8 = token.decimals().call().await.unwrap_or(18);
+    let decimals: u8 = retry_all("config AXE decimals", || async {
+        token.decimals().call().await
+    })
+    .await
+    .unwrap_or(18);
     let scaled_needed = if decimals < 18 {
         needed / U256::from(10).pow(U256::from(18 - u32::from(decimals)))
     } else {
         needed
     };
-    let balance = token.balanceOf(holder).call().await.unwrap_or_default();
+    // Retried: a transient error that silently reads as balance 0 would
+    // trigger a spurious fresh deploy of the config AXE token.
+    let balance = retry_all("config AXE balance", || async {
+        token.balanceOf(holder).call().await
+    })
+    .await
+    .unwrap_or_default();
     if balance >= scaled_needed {
         Ok(Some((tid, addr)))
     } else {

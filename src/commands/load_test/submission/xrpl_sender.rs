@@ -11,6 +11,7 @@ use super::run_sizing::SustainedPlan;
 use super::submitter::TransactionSubmitter;
 use super::sustained;
 use super::units::Drops;
+use crate::retry::retry_all;
 use crate::xrpl::{LAST_LEDGER_SEQUENCE_BUMP, XrplClient, XrplWallet, build_its_transfer_memos};
 use eyre::{Result, eyre};
 use indicatif::ProgressBar;
@@ -88,8 +89,23 @@ async fn submit_single(submission: TransferSubmission) -> TxMetrics {
     })
     .collect();
 
-    if let Err(e) = client.inner().prepare_transaction(&mut tx.common).await {
-        return fail_metrics(submit_start, &source_addr, &format!("prepare: {e}"));
+    // `prepare_transaction` autofills Sequence + LastLedgerSequence via
+    // read-only RPCs, so it's safe to retry: run each attempt on a clone and
+    // commit the prepared copy only on success.
+    let prepared = retry_all("xrpl.prepare", || {
+        let mut common = tx.common.clone();
+        let inner = client.inner();
+        async move {
+            inner
+                .prepare_transaction(&mut common)
+                .await
+                .map(|()| common)
+        }
+    })
+    .await;
+    match prepared {
+        Ok(common) => tx.common = common,
+        Err(e) => return fail_metrics(submit_start, &source_addr, &format!("prepare: {e}")),
     }
 
     // The SDK's `prepare_transaction` sets `LastLedgerSequence = validated + 4`,
@@ -115,19 +131,12 @@ async fn submit_single(submission: TransferSubmission) -> TxMetrics {
         h.to_hex()
     };
 
+    // Retry stays strictly on the already-signed blob (idempotent — see
+    // `submit_signed_blob`); a lost response or tefPAST_SEQ/tefALREADY is
+    // resolved there by checking the precomputed hash on-ledger.
     let req = SubmitRequest::new(tx_blob).fail_hard(true);
-    match client.inner().call(req).await {
-        Ok(resp) => {
-            let engine = format!("{:?}", resp.engine_result);
-            if !engine.contains("tesSUCCESS") {
-                return fail_metrics(
-                    submit_start,
-                    &source_addr,
-                    &format!("submit rejected: {engine}: {}", resp.engine_result_message),
-                );
-            }
-        }
-        Err(e) => return fail_metrics(submit_start, &source_addr, &format!("submit: {e}")),
+    if let Err(e) = client.submit_signed_blob(&req, &tx_hash).await {
+        return fail_metrics(submit_start, &source_addr, &e.to_string());
     }
 
     let submit_time_ms = submit_start.elapsed().as_millis() as u64;

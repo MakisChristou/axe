@@ -4,11 +4,15 @@ use std::num::NonZeroUsize;
 use alloy::signers::k256::PublicKey;
 use alloy::signers::k256::elliptic_curve::sec1::ToEncodedPoint;
 use alloy::{
+    consensus::TxEnvelope,
+    eips::eip2718::Encodable2718,
     hex,
     network::{Network, ReceiptResponse},
-    primitives::{Address, Bytes, FixedBytes, keccak256},
-    providers::{DynProvider, PendingTransactionBuilder, Provider as _, ProviderBuilder},
-    rpc::client::RpcClient,
+    primitives::{Address, Bytes, FixedBytes, TxHash, keccak256},
+    providers::{
+        DynProvider, PendingTransactionBuilder, Provider as _, ProviderBuilder, SendableTx,
+    },
+    rpc::{client::RpcClient, types::TransactionRequest},
     signers::local::PrivateKeySigner,
     sol,
     sol_types::{SolCall, SolValue},
@@ -63,6 +67,275 @@ fn fallback_client(urls: &[String]) -> Result<RpcClient> {
     // `NonZeroUsize::MIN` is 1 - one active transport at a time.
     let fallback = FallbackLayer::default().with_active_transport_count(NonZeroUsize::MIN);
     Ok(RpcClient::new(fallback.layer(transports), false))
+}
+
+/// An ordered pool of independent EVM providers — one per unique RPC URL,
+/// `[private, public]` — for application-level retry + failover via
+/// [`crate::retry::retry_with_fallback`].
+///
+/// This complements the transport-level [`FallbackLayer`] in [`connect_evm`]:
+/// that layer only rotates on *transport* failures (connection refused, 5xx,
+/// socket timeout). A JSON-RPC **error body** — Hedera 429s, Avalanche's
+/// "state not available for pending block", consensus-node timeouts — arrives
+/// as a healthy HTTP 200, so the layer keeps routing to the broken endpoint.
+/// Only the application, which sees the decoded error, can decide to move to
+/// the public RPC. Iterating this pool with `retry_with_fallback` is that
+/// decision.
+#[derive(Clone)]
+pub struct EvmEndpoints {
+    urls: Vec<String>,
+    providers: Vec<DynProvider>,
+}
+
+impl EvmEndpoints {
+    /// Build one single-transport provider per unique URL, order preserved.
+    pub fn connect(urls: &[String]) -> Result<Self> {
+        let mut seen = HashSet::new();
+        let unique: Vec<String> = urls
+            .iter()
+            .filter(|url| seen.insert((*url).clone()))
+            .cloned()
+            .collect();
+        if unique.is_empty() {
+            eyre::bail!("EvmEndpoints::connect: no RPC URLs provided");
+        }
+        let providers = unique
+            .iter()
+            .map(|url| {
+                Ok(ProviderBuilder::new()
+                    .connect_client(RpcClient::new(Http::new(url.parse()?), false))
+                    .erased())
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            urls: unique,
+            providers,
+        })
+    }
+
+    /// The read-only providers, `[private, public]` order — pass to
+    /// `retry_with_fallback` and issue the call on the provider it hands you.
+    pub fn providers(&self) -> &[DynProvider] {
+        &self.providers
+    }
+
+    /// The first (preferred) provider, for call sites that need a single
+    /// provider handle and carry their own retry logic.
+    pub fn primary(&self) -> &DynProvider {
+        &self.providers[0]
+    }
+
+    /// Fill (nonce, gas, fees, chain id) and sign `tx` WITHOUT broadcasting,
+    /// retrying the fill across endpoints — the fill is pure reads, so it can
+    /// fail over freely. Returns the signed envelope: its hash is known before
+    /// any broadcast, and its raw bytes can be re-broadcast on any endpoint
+    /// idempotently (same bytes ⇒ same tx ⇒ at most one can land).
+    pub async fn fill_and_sign(
+        &self,
+        signer: &PrivateKeySigner,
+        tx: TransactionRequest,
+    ) -> Result<TxEnvelope> {
+        let signer = signer.clone();
+        crate::retry::retry_with_fallback(
+            "fill+sign evm tx",
+            &self.urls,
+            |e: &eyre::Report| crate::retry::is_transient_default(e) || is_pending_state_error(e),
+            move |url| {
+                let signer = signer.clone();
+                let tx = tx.clone();
+                async move {
+                    let provider = ProviderBuilder::new()
+                        .wallet(signer)
+                        .connect_client(RpcClient::new(Http::new(url.parse()?), false));
+                    match provider.fill(tx).await? {
+                        SendableTx::Envelope(envelope) => Ok(envelope),
+                        SendableTx::Builder(_) => {
+                            eyre::bail!("wallet filler did not produce a signed envelope")
+                        }
+                    }
+                }
+            },
+        )
+        .await
+    }
+
+    /// Broadcast a signed envelope's raw bytes, retrying across endpoints.
+    /// Safe to call repeatedly with the same envelope: identical bytes hash to
+    /// the same transaction, so re-broadcast can never double-send.
+    pub async fn broadcast_raw(&self, envelope: &TxEnvelope) -> Result<TxHash> {
+        let raw = envelope.encoded_2718();
+        crate::retry::retry_with_fallback(
+            "broadcast evm tx",
+            &self.providers,
+            |e: &eyre::Report| crate::retry::is_transient_default(e) || is_pending_state_error(e),
+            move |provider| {
+                let raw = raw.clone();
+                async move {
+                    let pending = provider.send_raw_transaction(&raw).await?;
+                    Ok(*pending.tx_hash())
+                }
+            },
+        )
+        .await
+    }
+}
+
+/// Avalanche's coreth rejection when a node cannot serve pending-block state
+/// for the gas/nonce fill. Endpoint-specific — the public RPC serves it fine —
+/// so it must count as transient for retry/fallback purposes.
+pub fn is_pending_state_error<E: std::fmt::Display>(err: &E) -> bool {
+    err.to_string()
+        .contains("state not available for pending block")
+}
+
+/// Broadcast rejections that mean the transaction (or its nonce) is already
+/// on-chain or in the mempool — i.e. an earlier attempt may have landed even
+/// though its RPC response was lost (Hedera's consensus-node "timeout
+/// exceeded" landing pattern surfaces as "nonce too low" on the re-send).
+/// The pre-known envelope hash then settles the question definitively.
+pub fn send_error_may_mean_landed<E: std::fmt::Display>(err: &E) -> bool {
+    let message = err.to_string().to_lowercase();
+    [
+        "nonce too low",
+        "already known",
+        "already exists",
+        "already imported",
+        "replacement transaction underpriced",
+    ]
+    .iter()
+    .any(|signature| message.contains(signature))
+}
+
+/// Parse the node-expected nonce out of a geth-style "nonce too low: next
+/// nonce N, tx nonce M" error so a stale-nonce send can be retried at the
+/// value the node actually wants.
+pub fn parse_expected_nonce(err: &str) -> Option<u64> {
+    let idx = err.find("next nonce ")?;
+    let rest = &err[idx + "next nonce ".len()..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// Rounds of fill→broadcast→confirm in [`send_tx_robust`]. Each round already
+/// carries full per-phase retry + endpoint fallback, so rounds only replay for
+/// nonce re-resolution or an unmined-after-timeout re-broadcast.
+const SEND_ROUNDS: u32 = 3;
+
+/// Send an EVM transaction with retry + private→public fallback at every
+/// phase, and at-most-once semantics end to end:
+///
+/// 1. **Fill + sign** (nonce, gas, fees) — pure reads, retried across
+///    endpoints. Signing locally fixes the tx hash *before* any broadcast.
+/// 2. **Broadcast raw bytes** — retried across endpoints; identical bytes
+///    hash to the same tx, so re-broadcast can never double-send. A
+///    "nonce too low"/"already known" rejection is checked against our own
+///    pre-known hash: if the tx is on-chain or in the pool the send *already
+///    succeeded* (the classic lost-response landing); otherwise the nonce was
+///    stale — re-resolve it and re-sign.
+/// 3. **Confirm by hash** — receipt polled across endpoints (tolerant of
+///    per-endpoint errors) up to `receipt_timeout`; an unmined tx is
+///    re-broadcast (same bytes) for another round.
+///
+/// Returns the mined receipt — reverted (status 0x0) receipts are returned,
+/// not errors, so callers keep their own status handling.
+pub async fn send_tx_robust(
+    endpoints: &EvmEndpoints,
+    signer: &PrivateKeySigner,
+    tx: TransactionRequest,
+    label: &str,
+    receipt_timeout: std::time::Duration,
+) -> Result<alloy::rpc::types::TransactionReceipt> {
+    let mut envelope: Option<TxEnvelope> = None;
+    let mut nonce_override: Option<u64> = tx.nonce;
+    let mut last_hash: Option<TxHash> = None;
+    for round in 0..SEND_ROUNDS {
+        let env = match envelope.clone() {
+            Some(env) => env,
+            None => {
+                let mut request = tx.clone();
+                request.nonce = nonce_override;
+                let env = endpoints.fill_and_sign(signer, request).await?;
+                envelope = Some(env.clone());
+                env
+            }
+        };
+        let tx_hash = *env.tx_hash();
+        last_hash = Some(tx_hash);
+
+        match endpoints.broadcast_raw(&env).await {
+            Ok(_) => {}
+            Err(error) if send_error_may_mean_landed(&error) => {
+                if !tx_known_by_hash(endpoints, tx_hash).await {
+                    // Not ours: the fill used a stale nonce. Re-resolve (from
+                    // the node's own report when present) and re-sign.
+                    nonce_override = parse_expected_nonce(&error.to_string());
+                    envelope = None;
+                    ui::warn(&format!(
+                        "{label}: nonce conflict ({error}); re-signing at {}",
+                        match nonce_override {
+                            Some(nonce) => format!("node-reported nonce {nonce}"),
+                            None => "freshly-fetched nonce".to_string(),
+                        }
+                    ));
+                    continue;
+                }
+                // Ours: an earlier broadcast landed despite its lost response.
+                // Fall through to confirmation.
+            }
+            Err(error) => return Err(error),
+        }
+
+        match wait_receipt_by_hash(endpoints, tx_hash, receipt_timeout).await {
+            Some(receipt) => return Ok(receipt),
+            None => ui::warn(&format!(
+                "{label}: tx {tx_hash:#x} not mined in {}s — re-broadcasting same bytes \
+                 (round {}/{SEND_ROUNDS})",
+                receipt_timeout.as_secs(),
+                round + 2,
+            )),
+        }
+    }
+    Err(eyre::eyre!(
+        "{label}: no receipt after {SEND_ROUNDS} broadcast rounds{}",
+        match last_hash {
+            Some(hash) => format!(" (last tx {hash:#x})"),
+            None => String::new(),
+        }
+    ))
+}
+
+/// Whether the transaction is visible on any endpoint — mined or pending in
+/// the mempool. Used to distinguish "our lost-response broadcast landed" from
+/// "the nonce was consumed by something else".
+async fn tx_known_by_hash(endpoints: &EvmEndpoints, tx_hash: TxHash) -> bool {
+    for provider in endpoints.providers() {
+        if let Ok(Some(_)) = provider.get_transaction_by_hash(tx_hash).await {
+            return true;
+        }
+    }
+    false
+}
+
+/// Poll every endpoint for the receipt until `timeout`. Per-endpoint errors
+/// (429s, flaky nodes) are tolerated by construction — the next endpoint or
+/// the next tick retries.
+pub async fn wait_receipt_by_hash(
+    endpoints: &EvmEndpoints,
+    tx_hash: TxHash,
+    timeout: std::time::Duration,
+) -> Option<alloy::rpc::types::TransactionReceipt> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        for provider in endpoints.providers() {
+            if let Ok(Some(receipt)) = provider.get_transaction_receipt(tx_hash).await {
+                return Some(receipt);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
 }
 
 sol! {
@@ -517,4 +790,47 @@ where
         receipt.block_number().unwrap_or(0)
     ));
     Ok(receipt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_pending_state_error, parse_expected_nonce, send_error_may_mean_landed};
+
+    #[test]
+    fn parses_geth_nonce_too_low() {
+        // The exact Avalanche/QuikNode wording that failed the cron.
+        let err = "server returned an error response: error code -32000: nonce too low: \
+                   next nonce 246, tx nonce 245";
+        assert_eq!(parse_expected_nonce(err), Some(246));
+    }
+
+    #[test]
+    fn none_when_no_next_nonce_phrase() {
+        assert_eq!(parse_expected_nonce("nonce too low"), None);
+        assert_eq!(parse_expected_nonce("some unrelated error"), None);
+    }
+
+    #[test]
+    fn pending_state_error_is_detected() {
+        // Avalanche coreth pending-state rejection (the recurring testnet one).
+        assert!(is_pending_state_error(
+            &"error code -32000: state not available for pending block"
+        ));
+        assert!(!is_pending_state_error(
+            &"execution reverted: TakeTokenFailed"
+        ));
+    }
+
+    #[test]
+    fn landed_signatures_are_detected() {
+        // Hedera lost-response landing surfaces as "Nonce too low" on re-send.
+        assert!(send_error_may_mean_landed(
+            &"HTTP error 400: [Request ID: x] Nonce too low. Provided nonce: 5, current nonce: 6"
+        ));
+        assert!(send_error_may_mean_landed(&"already known"));
+        assert!(!send_error_may_mean_landed(&"429 too many requests"));
+        assert!(!send_error_may_mean_landed(
+            &"execution reverted: TakeTokenFailed"
+        ));
+    }
 }

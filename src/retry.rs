@@ -22,10 +22,20 @@ use std::time::Duration;
 /// (500ms, 1s, 2s) ≈ 3.5s worst-case wall-clock if every attempt fails.
 pub const DEFAULT_ATTEMPTS: u32 = 3;
 
+/// Attempts against EACH endpoint in `retry_with_fallback` before advancing
+/// to the next one. 5 attempts × geometric backoff (500ms, 1s, 2s, 4s)
+/// ≈ 7.5s worst-case per endpoint, ≈ 15s across a [private, public] pair.
+pub const FALLBACK_ATTEMPTS: u32 = 5;
+
 /// Base backoff between attempts. Doubles each subsequent retry:
 /// 500ms → 1s → 2s → 4s. Capped at 8s for any single sleep.
 const BASE_BACKOFF_MS: u64 = 500;
 const MAX_BACKOFF_MS: u64 = 8_000;
+
+/// Compute the geometric backoff for a zero-based attempt index.
+pub(crate) fn backoff_for_attempt(attempt: u32) -> Duration {
+    Duration::from_millis((BASE_BACKOFF_MS << attempt.min(31)).min(MAX_BACKOFF_MS))
+}
 
 /// Retry an async fallible operation with geometric backoff. `op` must be
 /// re-callable — it'll be invoked once per attempt, so any per-call state
@@ -57,17 +67,106 @@ where
         match op().await {
             Ok(t) => return Ok(t),
             Err(e) if attempt + 1 < attempts && is_transient(&e) => {
-                let backoff_ms = (BASE_BACKOFF_MS << attempt).min(MAX_BACKOFF_MS);
+                let backoff = backoff_for_attempt(attempt);
                 crate::ui::warn(&format!(
-                    "{label}: attempt {} failed: {e}; retrying in {backoff_ms}ms",
+                    "{label}: attempt {} failed: {e}; retrying in {}ms",
                     attempt + 1,
+                    backoff.as_millis(),
                 ));
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                tokio::time::sleep(backoff).await;
                 attempt += 1;
             }
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Retry an operation against an ordered list of endpoints — typically
+/// `[private RPC, public RPC]` — trying each endpoint up to
+/// [`FALLBACK_ATTEMPTS`] times with geometric backoff before falling over to
+/// the next. This is the application-level fallback that transport-level
+/// failover cannot provide: a JSON-RPC *error body* (429, "state not
+/// available for pending block", Hedera consensus timeouts) arrives as a
+/// perfectly healthy HTTP 200, so only a layer that sees the decoded error
+/// can decide to move to the next endpoint.
+///
+/// `op` receives one endpoint (cloned per attempt) and must be re-callable.
+/// `is_transient` gates every retry AND the fallback itself: a deterministic
+/// error (revert, "insufficient balance") returns immediately — the same
+/// contract state answers on every endpoint, so retrying elsewhere just
+/// delays the real error.
+///
+/// Returns the last endpoint's last error if every endpoint exhausts.
+pub async fn retry_with_fallback<C, F, Fut, T, E, P>(
+    label: &str,
+    endpoints: &[C],
+    is_transient: P,
+    mut op: F,
+) -> Result<T, E>
+where
+    C: Clone,
+    F: FnMut(C) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+    P: Fn(&E) -> bool,
+{
+    debug_assert!(!endpoints.is_empty(), "retry_with_fallback: no endpoints");
+    let last = endpoints.len().saturating_sub(1);
+    let mut final_err: Option<E> = None;
+    for (endpoint_idx, endpoint) in endpoints.iter().enumerate() {
+        for attempt in 0..FALLBACK_ATTEMPTS {
+            match op(endpoint.clone()).await {
+                Ok(t) => return Ok(t),
+                Err(e) if !is_transient(&e) => return Err(e),
+                Err(e) if attempt + 1 < FALLBACK_ATTEMPTS => {
+                    let backoff = backoff_for_attempt(attempt);
+                    crate::ui::warn(&format!(
+                        "{label}: endpoint {}/{} attempt {}/{FALLBACK_ATTEMPTS} failed: {e}; \
+                         retrying in {}ms",
+                        endpoint_idx + 1,
+                        endpoints.len(),
+                        attempt + 1,
+                        backoff.as_millis(),
+                    ));
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(e) => {
+                    if endpoint_idx < last {
+                        crate::ui::warn(&format!(
+                            "{label}: endpoint {}/{} exhausted ({FALLBACK_ATTEMPTS} attempts): \
+                             {e}; falling back to next endpoint",
+                            endpoint_idx + 1,
+                            endpoints.len(),
+                        ));
+                    }
+                    final_err = Some(e);
+                }
+            }
+        }
+    }
+    // Unreachable while callers pass ≥1 endpoint (debug_assert above); the
+    // loop structure guarantees `final_err` is set on every exhausted path.
+    match final_err {
+        Some(e) => Err(e),
+        None => unreachable!("retry_with_fallback called with no endpoints"),
+    }
+}
+
+/// Convenience: `retry_with_fallback` treating ALL errors as transient.
+/// Appropriate for read-only / idempotent calls (`get_balance`, view calls,
+/// receipt polls) where any error is plausibly endpoint-specific.
+pub async fn retry_with_fallback_all<C, F, Fut, T, E>(
+    label: &str,
+    endpoints: &[C],
+    op: F,
+) -> Result<T, E>
+where
+    C: Clone,
+    F: FnMut(C) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    retry_with_fallback(label, endpoints, |_| true, op).await
 }
 
 /// Convenience: retry treating ALL errors as transient. Appropriate for
@@ -155,6 +254,57 @@ mod tests {
         .await;
         assert_eq!(result, Err("permanent"));
         assert_eq!(counter.load(Ordering::SeqCst), 1, "should not retry");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fallback_advances_to_second_endpoint_after_exhausting_first() {
+        let counter = AtomicU32::new(0);
+        let result: Result<u32, String> =
+            retry_with_fallback_all("test", &["private", "public"], |endpoint| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if endpoint == "private" {
+                        Err("429 too many requests".to_string())
+                    } else {
+                        Ok(42)
+                    }
+                }
+            })
+            .await;
+        assert_eq!(result, Ok(42));
+        // All FALLBACK_ATTEMPTS burned on the private endpoint, then the
+        // public endpoint succeeds on its first attempt.
+        assert_eq!(counter.load(Ordering::SeqCst), FALLBACK_ATTEMPTS + 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fallback_returns_last_error_when_all_endpoints_exhaust() {
+        let counter = AtomicU32::new(0);
+        let result: Result<(), String> =
+            retry_with_fallback_all("test", &["private", "public"], |endpoint| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async move { Err(format!("{endpoint} down")) }
+            })
+            .await;
+        assert_eq!(result, Err("public down".to_string()));
+        assert_eq!(counter.load(Ordering::SeqCst), FALLBACK_ATTEMPTS * 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fallback_bails_immediately_on_deterministic_error() {
+        let counter = AtomicU32::new(0);
+        let result: Result<(), &'static str> = retry_with_fallback(
+            "test",
+            &["private", "public"],
+            |_| false,
+            |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async { Err("execution reverted") }
+            },
+        )
+        .await;
+        assert_eq!(result, Err("execution reverted"));
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "no retry, no fallback");
     }
 
     #[test]

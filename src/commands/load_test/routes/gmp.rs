@@ -29,6 +29,7 @@ use super::evm_sender;
 use super::gmp_payload::{GmpPayloadEncoding, make_executable_payload, memo_program_id};
 use super::gmp_verification;
 use super::helpers::list_gateway_chains;
+use super::its_evm_source::source_rpc_candidates;
 use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentity};
 use super::run_sizing::{RunSizing, SustainedPlan};
 use super::sol_sender;
@@ -43,7 +44,8 @@ use super::{
     read_stellar_token_address, save_cache, validate_evm_rpc, validate_solana_rpc,
 };
 use crate::config::{AxelarChainContract, ChainContract, ChainsConfig};
-use crate::evm::SenderReceiver;
+use crate::evm::{EvmEndpoints, SenderReceiver, connect_evm, connect_evm_signed};
+use crate::retry::retry_with_fallback_all;
 use crate::stellar::{StellarClient, StellarWallet};
 use crate::sui::{SuiClient, SuiContractsConfig, SuiWallet, read_sui_chain_config};
 use crate::ui;
@@ -69,16 +71,28 @@ pub(super) use self::sui_destination::{run_evm_to_sui, run_sol_to_sui, run_stell
 
 async fn load_evm_signer(
     args: &LoadTestArgs,
-    rpc_url: &str,
+    rpc_urls: &[String],
 ) -> Result<(PrivateKeySigner, [u8; 32])> {
     let private_key = args.private_key.as_ref().ok_or_else(|| {
         eyre::eyre!("EVM private key required. Set EVM_PRIVATE_KEY env var or use --private-key")
     })?;
     let signer: PrivateKeySigner = private_key.parse()?;
     let signer_address = signer.address();
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    check_evm_balance(&provider, signer_address).await?;
-    let balance: u128 = provider.get_balance(signer_address).await?.to();
+    // One retried, fallback-capable read; the zero-check itself is
+    // deterministic and must not burn retries.
+    let endpoints = EvmEndpoints::connect(rpc_urls)?;
+    let balance: u128 =
+        retry_with_fallback_all("wallet balance", endpoints.providers(), |p| async move {
+            p.get_balance(signer_address).await
+        })
+        .await?
+        .to();
+    if balance == 0 {
+        eyre::bail!(
+            "EVM wallet {signer_address} has no funds. Fund it first:\n  \
+             Use a faucet or transfer native tokens to {signer_address}"
+        );
+    }
     let eth = balance as f64 / 1e18;
     ui::kv("wallet", &format!("{signer_address} ({eth:.6} ETH)"));
     let main_key = signer.to_bytes().into();
@@ -275,6 +289,8 @@ pub(super) async fn run_evm_to_sol(args: LoadTestArgs, sizing: RunSizing) -> Res
     let cfg = ChainsConfig::load(&args.config).await?;
 
     let evm_rpc_url = args.source_rpc.to_string();
+    // Private endpoint first, chains-config public RPC as failover.
+    let source_rpc_urls = source_rpc_candidates(&args).await;
 
     // Validate RPCs before doing any work
     validate_evm_rpc(&evm_rpc_url).await?;
@@ -297,11 +313,9 @@ pub(super) async fn run_evm_to_sol(args: LoadTestArgs, sizing: RunSizing) -> Res
         .parse()?;
     ui::address("EVM gateway", &format!("{gateway_addr}"));
 
-    let (signer, main_key) = load_evm_signer(&args, &evm_rpc_url).await?;
-    let read_provider = ProviderBuilder::new().connect_http(evm_rpc_url.parse()?);
-    let write_provider = ProviderBuilder::new()
-        .wallet(signer.clone())
-        .connect_http(evm_rpc_url.parse()?);
+    let (signer, main_key) = load_evm_signer(&args, &source_rpc_urls).await?;
+    let read_provider = connect_evm(&source_rpc_urls)?;
+    let write_provider = connect_evm_signed(&source_rpc_urls, signer.clone())?;
 
     // --- Deploy/reuse SenderReceiver on source chain ---
     let cache_key = &format!("{src}-evm-to-sol");
@@ -337,7 +351,7 @@ pub(super) async fn run_evm_to_sol(args: LoadTestArgs, sizing: RunSizing) -> Res
                     plan,
                     sender_receiver: sender_receiver_addr,
                     main_key,
-                    evm_rpc_url: evm_rpc_url.clone(),
+                    rpc_urls: source_rpc_urls.clone(),
                     destination_address: destination_address.to_string(),
                     verify_tx: Some(context.verify_tx),
                     send_done: Some(context.send_done),
@@ -353,7 +367,7 @@ pub(super) async fn run_evm_to_sol(args: LoadTestArgs, sizing: RunSizing) -> Res
             sizing.require_burst("GMP evm-to-sol")?,
             sender_receiver_addr,
             &main_key,
-            &evm_rpc_url,
+            &source_rpc_urls,
             destination_address,
             GmpPayloadEncoding::SolanaExecutable,
         )
@@ -404,14 +418,12 @@ fn resolve_evm_gmp_contracts(
 
 async fn prepare_evm_gmp_source(
     chain: &str,
-    rpc_url: &str,
+    rpc_urls: &[String],
     signer: PrivateKeySigner,
     contracts: EvmGmpContracts,
 ) -> Result<Address> {
-    let read_provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let write_provider = ProviderBuilder::new()
-        .wallet(signer)
-        .connect_http(rpc_url.parse()?);
+    let read_provider = connect_evm(rpc_urls)?;
+    let write_provider = connect_evm_signed(rpc_urls, signer)?;
     let cache_key = format!("{chain}-evm-to-evm");
     let cache = read_cache(&cache_key).await;
     let sender_receiver = deploy_or_reuse_sender_receiver(
@@ -479,6 +491,8 @@ pub(super) async fn run_evm_to_evm(args: LoadTestArgs, sizing: RunSizing) -> Res
     let legacy_route = src_legacy || dst_legacy;
 
     let source_rpc_url = args.source_rpc.to_string();
+    // Private endpoint first, chains-config public RPC as failover.
+    let source_rpc_urls = source_rpc_candidates(&args).await;
     let dest_rpc_url = args.destination_rpc.to_string();
 
     // Validate RPCs before doing any work
@@ -494,10 +508,10 @@ pub(super) async fn run_evm_to_evm(args: LoadTestArgs, sizing: RunSizing) -> Res
     ui::kv("source", src);
     ui::kv("destination", dest);
 
-    let (signer, main_key) = load_evm_signer(&args, &source_rpc_url).await?;
+    let (signer, main_key) = load_evm_signer(&args, &source_rpc_urls).await?;
     let source_contracts = resolve_evm_gmp_contracts(&cfg, src, "source gateway")?;
     let sender_receiver_addr =
-        prepare_evm_gmp_source(src, &source_rpc_url, signer.clone(), source_contracts).await?;
+        prepare_evm_gmp_source(src, &source_rpc_urls, signer.clone(), source_contracts).await?;
     let destination_contracts = resolve_evm_gmp_contracts(&cfg, dest, "destination gateway")?;
     let (dest_sender_receiver, dest_read_provider) =
         prepare_evm_gmp_destination(dest, &dest_rpc_url, signer, destination_contracts).await?;
@@ -522,7 +536,7 @@ pub(super) async fn run_evm_to_evm(args: LoadTestArgs, sizing: RunSizing) -> Res
                     plan,
                     sender_receiver: sender_receiver_addr,
                     main_key,
-                    evm_rpc_url: source_rpc_url.clone(),
+                    rpc_urls: source_rpc_urls.clone(),
                     destination_address: destination_address.clone(),
                     verify_tx: Some(context.verify_tx),
                     send_done: Some(context.send_done),
@@ -538,7 +552,7 @@ pub(super) async fn run_evm_to_evm(args: LoadTestArgs, sizing: RunSizing) -> Res
             sizing.require_burst("GMP evm-to-evm")?,
             sender_receiver_addr,
             &main_key,
-            &source_rpc_url,
+            &source_rpc_urls,
             &destination_address,
             GmpPayloadEncoding::AbiString,
         )
@@ -918,6 +932,8 @@ pub(super) async fn run_evm_to_stellar(args: LoadTestArgs, sizing: RunSizing) ->
     let dest = &args.destination_chain;
     let cfg = ChainsConfig::load(&args.config).await?;
     let evm_rpc_url = args.source_rpc.to_string();
+    // Private endpoint first, chains-config public RPC as failover.
+    let source_rpc_urls = source_rpc_candidates(&args).await;
     validate_evm_rpc(&evm_rpc_url).await?;
 
     // EVM source ITS proxy is reused for GMP — we send via the destination
@@ -981,7 +997,7 @@ pub(super) async fn run_evm_to_stellar(args: LoadTestArgs, sizing: RunSizing) ->
         sizing.require_burst("GMP evm-to-stellar")?,
         sender_receiver_addr,
         &main_key,
-        &evm_rpc_url,
+        &source_rpc_urls,
         &stellar_example_addr,
         GmpPayloadEncoding::AbiString,
     )

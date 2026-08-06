@@ -9,7 +9,7 @@
 use alloy::primitives::keccak256;
 use std::time::Instant;
 
-use super::its_evm_source::EvmTokenRunSizing as RunSizing;
+use super::its_evm_source::{EvmTokenRunSizing as RunSizing, source_rpc_candidates};
 use super::its_prerequisites::{self, GatewayRequirement};
 use super::its_verification;
 use super::its_verification::{ItsBurstReport, StellarItsTarget, finish_burst};
@@ -20,12 +20,13 @@ use super::{LoadTestArgs, check_evm_balance, validate_evm_rpc};
 use crate::config::AxelarChainContract;
 use crate::config::ChainContract;
 use crate::config::ChainsConfig;
-use crate::evm::InterchainTokenService;
+use crate::evm::{EvmEndpoints, InterchainTokenService, connect_evm_signed};
+use crate::retry::retry_with_fallback_all;
 use crate::stellar::StellarClient;
 use crate::ui;
 use alloy::{
     primitives::{Address, Bytes, FixedBytes, U256},
-    providers::{Provider, ProviderBuilder},
+    providers::Provider,
     signers::local::PrivateKeySigner,
 };
 use eyre::eyre;
@@ -35,6 +36,8 @@ pub async fn run(args: LoadTestArgs, validated_sizing: ValidatedRunSizing) -> ey
     let dest = &args.destination_chain;
 
     let evm_rpc_url = args.source_rpc.to_string();
+    // Private endpoint first, chains-config public RPC as failover.
+    let source_rpc_urls = source_rpc_candidates(&args).await;
     validate_evm_rpc(&evm_rpc_url).await?;
 
     let cfg = ChainsConfig::load(&args.config).await?;
@@ -44,7 +47,8 @@ pub async fn run(args: LoadTestArgs, validated_sizing: ValidatedRunSizing) -> ey
     ui::kv("destination", dest);
     ui::kv("protocol", "ITS (interchainTransfer via hub)");
 
-    let evm_src = init_evm_source_context(args.private_key.as_deref(), evm_rpc_url.clone()).await?;
+    let evm_src =
+        init_evm_source_context(args.private_key.as_deref(), source_rpc_urls.clone()).await?;
     let evm_targets = resolve_evm_targets(&cfg, src)?;
     let stellar = resolve_stellar_targets(&args, evm_src.deployer_address).await?;
     let gas_value_wei = super::its_evm_source::standard_gas_value_wei(&args).await?;
@@ -58,12 +62,12 @@ pub async fn run(args: LoadTestArgs, validated_sizing: ValidatedRunSizing) -> ey
     // compute_run_sizing assumes EVM-18 source decimals; rescale to the
     // actual on-chain decimals (Hedera HTS-fork AXE = 6 dec).
     {
-        let read_provider = ProviderBuilder::new().connect_http(evm_rpc_url.parse()?);
+        let endpoints = EvmEndpoints::connect(&source_rpc_urls)?;
         super::its_evm_source::rescale_sizing_for_decimals(
             &mut sizing.amount_per_tx,
             &mut sizing.amount_per_key,
             &mut sizing.total_supply,
-            &read_provider,
+            &endpoints,
             token.token_addr,
         )
         .await?;
@@ -99,7 +103,7 @@ pub async fn run(args: LoadTestArgs, validated_sizing: ValidatedRunSizing) -> ey
             .await;
 
     let transfer = TransferContext {
-        rpc_url: evm_rpc_url,
+        rpc_urls: source_rpc_urls,
         derived,
         its_proxy_addr: evm_targets.its_proxy_addr,
         token_id: token.token_id,
@@ -128,13 +132,13 @@ pub async fn run(args: LoadTestArgs, validated_sizing: ValidatedRunSizing) -> ey
     }
 }
 
-/// EVM source-side state: signer, derived addresses, and the RPC URL used for
-/// every per-call provider this module builds.
+/// EVM source-side state: signer, derived addresses, and the RPC candidates
+/// (`[private, public]`) used for every per-call provider this module builds.
 struct EvmSourceContext {
     signer: PrivateKeySigner,
     deployer_address: Address,
     main_key: [u8; 32],
-    rpc_url: String,
+    rpc_urls: Vec<String>,
 }
 
 /// EVM source ITS contract addresses.
@@ -156,7 +160,7 @@ struct StellarTargets {
 /// Bundle of values consumed by both the burst and sustained pipelines when
 /// firing `interchainTransfer` calls from the derived EVM signers.
 struct TransferContext {
-    rpc_url: String,
+    rpc_urls: Vec<String>,
     derived: Vec<PrivateKeySigner>,
     its_proxy_addr: Address,
     token_id: FixedBytes<32>,
@@ -193,19 +197,24 @@ impl From<(FixedBytes<32>, Address, Option<String>)> for TokenIdentity {
 /// (deployer address, main key bytes, RPC URL).
 async fn init_evm_source_context(
     private_key: Option<&str>,
-    rpc_url: String,
+    rpc_urls: Vec<String>,
 ) -> eyre::Result<EvmSourceContext> {
     let private_key = private_key.ok_or_else(|| {
         eyre!("EVM private key required. Set EVM_PRIVATE_KEY env var or use --private-key")
     })?;
     let signer: PrivateKeySigner = private_key.parse()?;
     let deployer_address = signer.address();
-    let read_provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    check_evm_balance(&read_provider, deployer_address).await?;
+    let endpoints = EvmEndpoints::connect(&rpc_urls)?;
+    check_evm_balance(endpoints.primary(), deployer_address).await?;
     let main_key: [u8; 32] = signer.to_bytes().into();
 
     {
-        let balance: u128 = read_provider.get_balance(deployer_address).await?.to();
+        let balance: u128 =
+            retry_with_fallback_all("wallet balance", endpoints.providers(), |p| async move {
+                p.get_balance(deployer_address).await
+            })
+            .await?
+            .to();
         let eth = balance as f64 / 1e18;
         ui::kv("wallet", &format!("{deployer_address} ({eth:.6} ETH)"));
     }
@@ -214,7 +223,7 @@ async fn init_evm_source_context(
         signer,
         deployer_address,
         main_key,
-        rpc_url,
+        rpc_urls,
     })
 }
 
@@ -296,23 +305,20 @@ async fn resolve_or_deploy_token(
     sizing: &RunSizing,
 ) -> eyre::Result<TokenIdentity> {
     let src = &args.source_chain;
-    let write_provider = ProviderBuilder::new()
-        .wallet(evm_src.signer.clone())
-        .connect_http(evm_src.rpc_url.parse()?);
-    let its_service = InterchainTokenService::new(evm_targets.its_proxy_addr, &write_provider);
+    let endpoints = EvmEndpoints::connect(&evm_src.rpc_urls)?;
     let needed = sizing.amount_per_tx * U256::from(sizing.num_keys);
     let config_token = super::helpers::reusable_config_axe(
         &args.config,
         src,
         evm_targets.its_proxy_addr,
-        &write_provider,
+        endpoints.primary(),
         evm_src.deployer_address,
         needed,
     )
     .await?;
 
     if let Some(token_id) = args.token_id.as_deref() {
-        return resolve_provided_token(token_id, stellar, &its_service).await;
+        return resolve_provided_token(token_id, stellar, evm_targets, &endpoints).await;
     }
     if let Some((tid, addr, stellar_token_addr)) =
         registered_config_token(stellar, config_token).await?
@@ -329,24 +335,33 @@ async fn resolve_or_deploy_token(
         stellar,
         gas_value,
         sizing,
-        &write_provider,
+        &endpoints,
     )
     .await
 }
 
-async fn resolve_provided_token<P: Provider>(
+async fn resolve_provided_token(
     value: &str,
     stellar: &StellarTargets,
-    its_service: &InterchainTokenService::InterchainTokenServiceInstance<P>,
+    evm_targets: &EvmTargets,
+    endpoints: &EvmEndpoints,
 ) -> eyre::Result<TokenIdentity> {
     let token_id: FixedBytes<32> = value
         .parse()
         .map_err(|e| eyre!("invalid --token-id: {e}"))?;
-    let token_addr = its_service
-        .interchainTokenAddress(token_id)
-        .call()
-        .await
-        .map_err(|e| eyre!("failed to look up token address for {token_id}: {e}"))?;
+    let its_proxy = evm_targets.its_proxy_addr;
+    let token_addr = retry_with_fallback_all(
+        "token address lookup",
+        endpoints.providers(),
+        |p| async move {
+            InterchainTokenService::new(its_proxy, p)
+                .interchainTokenAddress(token_id)
+                .call()
+                .await
+        },
+    )
+    .await
+    .map_err(|e| eyre!("failed to look up token address for {token_id}: {e}"))?;
     let stellar_token_addr = require_registered_stellar_token(stellar, token_id).await?;
     ui::kv("token ID (provided)", &format!("{token_id}"));
     ui::address("token address", &format!("{token_addr}"));
@@ -369,21 +384,21 @@ async fn registered_config_token(
     Ok(Some((token_id, token_addr, stellar_token_addr)))
 }
 
-async fn resolve_cached_or_deploy<P: Provider>(
+async fn resolve_cached_or_deploy(
     args: &LoadTestArgs,
     evm_src: &EvmSourceContext,
     evm_targets: &EvmTargets,
     stellar: &StellarTargets,
     gas_value: U256,
     sizing: &RunSizing,
-    provider: &P,
+    endpoints: &EvmEndpoints,
 ) -> eyre::Result<TokenIdentity> {
     if let Some(cached) =
         super::its_evm_source::cached_evm_token(&args.source_chain, &args.destination_chain).await?
     {
         let needed = sizing.amount_per_tx * U256::from(sizing.num_keys);
         let balance = super::its_evm_source::token_balance(
-            provider,
+            endpoints.primary(),
             cached.token_address,
             evm_src.deployer_address,
         )
@@ -408,9 +423,9 @@ async fn resolve_cached_or_deploy<P: Provider>(
         }
     }
     Ok(super::its_evm_source::deploy_its_token(
-        provider,
+        endpoints,
+        &evm_src.signer,
         evm_targets.its_factory_addr,
-        evm_src.deployer_address,
         &args.destination_chain,
         sizing.total_supply,
         &args.source_chain,
@@ -450,9 +465,9 @@ async fn derive_and_fund_signers(
     let derived = keypairs::derive_evm_signers(&evm_src.main_key, sizing.num_keys)?;
     ui::info(&format!("derived {} EVM signing keys", derived.len()));
 
-    let funding_provider = ProviderBuilder::new()
-        .wallet(evm_src.signer.clone())
-        .connect_http(evm_src.rpc_url.parse()?);
+    // Multi-transport provider: funding reads/sends fail over to the public
+    // RPC on transport-level errors.
+    let funding_provider = connect_evm_signed(&evm_src.rpc_urls, evm_src.signer.clone())?;
     // ITS hub routing pays 2× gas_value per transfer (two commands).
     let hub_gas_value_wei = gas_value_wei.saturating_mul(2);
     let gas_extra_per_key = if sizing.is_burst() {
@@ -480,11 +495,15 @@ async fn distribute_axe_tokens(
     derived: &[PrivateKeySigner],
     amount_per_key: U256,
 ) -> eyre::Result<()> {
-    let token_provider = ProviderBuilder::new()
-        .wallet(evm_src.signer.clone())
-        .connect_http(evm_src.rpc_url.parse()?);
-    super::its_evm_source::distribute_tokens(&token_provider, token_addr, derived, amount_per_key)
-        .await
+    let endpoints = EvmEndpoints::connect(&evm_src.rpc_urls)?;
+    super::its_evm_source::distribute_tokens(
+        &endpoints,
+        &evm_src.signer,
+        token_addr,
+        derived,
+        amount_per_key,
+    )
+    .await
 }
 
 /// Load the Stellar recipient wallet (requires `STELLAR_PRIVATE_KEY`) and
@@ -522,10 +541,16 @@ async fn run_sustained_pipeline(
         key_cycle,
     } = plan;
 
-    let nonce_provider = ProviderBuilder::new().connect_http(transfer.rpc_url.parse()?);
+    let nonce_endpoints = EvmEndpoints::connect(&transfer.rpc_urls)?;
     let mut nonces: Vec<u64> = Vec::with_capacity(sizing.num_keys);
     for s in &transfer.derived {
-        let n = nonce_provider.get_transaction_count(s.address()).await?;
+        let address = s.address();
+        let n = retry_with_fallback_all(
+            "starting nonce",
+            nonce_endpoints.providers(),
+            |p| async move { p.get_transaction_count(address).await },
+        )
+        .await?;
         nonces.push(n);
     }
 
@@ -534,7 +559,7 @@ async fn run_sustained_pipeline(
         .contract_address(AxelarChainContract::VotingVerifier, &args.source_axelar_id)
         .is_ok();
     let TransferContext {
-        rpc_url,
+        rpc_urls,
         derived,
         its_proxy_addr,
         token_id,
@@ -545,7 +570,7 @@ async fn run_sustained_pipeline(
         ..
     } = transfer;
     let submitter = super::its_evm_source::ItsEvmSubmitter {
-        rpc_urls: vec![rpc_url.to_string()],
+        rpc_urls,
         its_proxy: its_proxy_addr,
         token_id: token_id.into(),
         destination_chain: args.destination_axelar_id.to_string(),
@@ -605,7 +630,7 @@ async fn run_burst_pipeline(
     let test_start = Instant::now();
     let burst = super::its_evm_source::run_its_burst(
         super::its_evm_source::ItsEvmSubmitter {
-            rpc_urls: vec![transfer.rpc_url.to_string()],
+            rpc_urls: transfer.rpc_urls.clone(),
             its_proxy: transfer.its_proxy_addr,
             token_id: transfer.token_id.into(),
             destination_chain: args.destination_axelar_id.to_string(),

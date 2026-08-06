@@ -31,19 +31,21 @@ use super::{
 };
 use crate::config::ChainContract;
 use crate::config::ChainsConfig;
-use crate::evm::{ERC20, InterchainTokenService};
+use crate::evm::{ERC20, EvmEndpoints, InterchainTokenService, connect_evm_signed};
+use crate::retry::retry_with_fallback_all;
 use crate::ui;
 use alloy::{
     primitives::{Address, Bytes, FixedBytes, U256},
-    providers::{Provider, ProviderBuilder},
+    providers::Provider,
     signers::local::PrivateKeySigner,
 };
 use eyre::eyre;
 
-/// Resolved EVM source-chain context: signer, ITS proxy + linked token, RPC.
+/// Resolved EVM source-chain context: signer, ITS proxy + linked token, and
+/// the RPC candidates (`[private, public]`).
 struct EvmContext {
     main_signer: PrivateKeySigner,
-    rpc_url: String,
+    rpc_urls: Vec<String>,
     its_proxy_addr: Address,
     token_id: FixedBytes<32>,
     linked_token_addr: Address,
@@ -64,6 +66,8 @@ pub async fn run(args: LoadTestArgs, sizing: RunSizing) -> eyre::Result<()> {
     let dest = &args.destination_chain;
 
     let evm_rpc_url = args.source_rpc.to_string();
+    // Private endpoint first, chains-config public RPC as failover.
+    let source_rpc_urls = super::its_evm_source::source_rpc_candidates(&args).await;
     validate_evm_rpc(&evm_rpc_url).await?;
 
     let cfg = ChainsConfig::load(&args.config).await?;
@@ -76,7 +80,7 @@ pub async fn run(args: LoadTestArgs, sizing: RunSizing) -> eyre::Result<()> {
         "ITS (interchainTransfer via hub, Sui destination)",
     );
 
-    let evm = resolve_evm_context(&args, &cfg, evm_rpc_url.clone()).await?;
+    let evm = resolve_evm_context(&args, &cfg, source_rpc_urls).await?;
     let sui = resolve_sui_context(&args).await?;
 
     let derived = derive_and_fund_signers(&evm, &sizing).await?;
@@ -95,15 +99,20 @@ pub async fn run(args: LoadTestArgs, sizing: RunSizing) -> eyre::Result<()> {
 async fn resolve_evm_context(
     args: &LoadTestArgs,
     cfg: &ChainsConfig,
-    rpc_url: String,
+    rpc_urls: Vec<String>,
 ) -> eyre::Result<EvmContext> {
     let src = &args.source_chain;
     let dest = &args.destination_chain;
     let main_signer = parse_main_signer(args.private_key.as_deref())?;
     let main_addr = main_signer.address();
-    let read_provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    check_evm_balance(&read_provider, main_addr).await?;
-    let balance: u128 = read_provider.get_balance(main_addr).await?.to();
+    let endpoints = EvmEndpoints::connect(&rpc_urls)?;
+    check_evm_balance(endpoints.primary(), main_addr).await?;
+    let balance: u128 =
+        retry_with_fallback_all("wallet balance", endpoints.providers(), |p| async move {
+            p.get_balance(main_addr).await
+        })
+        .await?
+        .to();
     let eth = balance as f64 / 1e18;
     ui::kv("wallet", &format!("{main_addr} ({eth:.6} ETH)"));
 
@@ -124,12 +133,18 @@ async fn resolve_evm_context(
         &format!("0x{}", hex::encode(token_id_bytes)),
     );
 
-    let its = InterchainTokenService::new(its_proxy_addr, &read_provider);
-    let linked_token_addr = its
-        .interchainTokenAddress(token_id)
-        .call()
-        .await
-        .map_err(|e| eyre!("ITS.interchainTokenAddress({token_id}) failed: {e}"))?;
+    let linked_token_addr = retry_with_fallback_all(
+        "ITS.interchainTokenAddress",
+        endpoints.providers(),
+        |p| async move {
+            InterchainTokenService::new(its_proxy_addr, p)
+                .interchainTokenAddress(token_id)
+                .call()
+                .await
+        },
+    )
+    .await
+    .map_err(|e| eyre!("ITS.interchainTokenAddress({token_id}) failed: {e}"))?;
     if linked_token_addr == Address::ZERO {
         eyre::bail!(
             "EVM source ITS at {its_proxy_addr} has no token linked to Sui AXE tokenId 0x{}. \
@@ -140,8 +155,18 @@ async fn resolve_evm_context(
     }
     ui::address("EVM linked ERC-20", &format!("{linked_token_addr}"));
 
-    let token = ERC20::new(linked_token_addr, &read_provider);
-    let main_token_balance = token.balanceOf(main_addr).call().await.unwrap_or_default();
+    let main_token_balance = retry_with_fallback_all(
+        "linked token balance",
+        endpoints.providers(),
+        |p| async move {
+            ERC20::new(linked_token_addr, p)
+                .balanceOf(main_addr)
+                .call()
+                .await
+        },
+    )
+    .await
+    .unwrap_or_default();
     if main_token_balance == U256::ZERO {
         eyre::bail!(
             "source signer {main_addr} has zero balance of linked ERC-20 {linked_token_addr}. \
@@ -165,7 +190,7 @@ async fn resolve_evm_context(
 
     Ok(EvmContext {
         main_signer,
-        rpc_url,
+        rpc_urls,
         its_proxy_addr,
         token_id,
         linked_token_addr,
@@ -201,10 +226,10 @@ async fn derive_and_fund_signers(
     // Each tx forwards 2 * gas_value as msg.value (one hub leg, one
     // destination leg). Fund derived keys with 4x that headroom so each
     // can cover its share of sends plus tx fees.
-    let read_provider = ProviderBuilder::new().connect_http(evm.rpc_url.parse()?);
+    let funding_provider = connect_evm_signed(&evm.rpc_urls, evm.main_signer.clone())?;
     let per_call_msg_value_wei = evm.gas_value_wei.saturating_mul(2);
     keypairs::ensure_funded_evm_with_extra(
-        &read_provider,
+        &funding_provider,
         &evm.main_signer,
         &derived,
         super::units::Wei::from_u128(per_call_msg_value_wei.saturating_mul(2)),
@@ -217,11 +242,10 @@ async fn derive_and_fund_signers(
     let txs_per_key = sizing.transactions_per_key();
     let amount_per_key = U256::from(txs_per_key);
 
-    let write_provider = ProviderBuilder::new()
-        .wallet(evm.main_signer.clone())
-        .connect_http(evm.rpc_url.parse()?);
+    let endpoints = EvmEndpoints::connect(&evm.rpc_urls)?;
     super::its_evm_source::distribute_tokens(
-        &write_provider,
+        &endpoints,
+        &evm.main_signer,
         evm.linked_token_addr,
         &derived,
         amount_per_key,
@@ -247,7 +271,7 @@ async fn run_burst_pipeline(
             .await;
     let burst = super::its_evm_source::run_its_burst(
         super::its_evm_source::ItsEvmSubmitter {
-            rpc_urls: vec![evm.rpc_url.to_string()],
+            rpc_urls: evm.rpc_urls.clone(),
             its_proxy: evm.its_proxy_addr,
             token_id: evm.token_id.into(),
             destination_chain: args.destination_axelar_id.to_string(),
@@ -292,10 +316,16 @@ async fn run_sustained_pipeline(
 
     // Pre-fetch each derived signer's nonce so the rate-limited loop can
     // bump them locally per dispatch (avoids RPC round-trips on each tx).
-    let read_provider = ProviderBuilder::new().connect_http(evm.rpc_url.parse()?);
+    let nonce_endpoints = EvmEndpoints::connect(&evm.rpc_urls)?;
     let mut nonces: Vec<u64> = Vec::with_capacity(sizing.num_keys);
     for s in &derived {
-        let n = read_provider.get_transaction_count(s.address()).await?;
+        let address = s.address();
+        let n = retry_with_fallback_all(
+            "starting nonce",
+            nonce_endpoints.providers(),
+            |p| async move { p.get_transaction_count(address).await },
+        )
+        .await?;
         nonces.push(n);
     }
 
@@ -309,7 +339,7 @@ async fn run_sustained_pipeline(
             .await;
     let make_task = super::its_evm_source::its_sustained_tasks(
         super::its_evm_source::ItsEvmSubmitter {
-            rpc_urls: vec![evm.rpc_url.to_string()],
+            rpc_urls: evm.rpc_urls.clone(),
             its_proxy: evm.its_proxy_addr,
             token_id: evm.token_id.into(),
             destination_chain: args.destination_axelar_id.to_string(),
