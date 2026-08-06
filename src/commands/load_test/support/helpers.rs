@@ -30,7 +30,7 @@ use super::verify;
 use super::{GmpCache, LoadTestArgs, read_cache, save_cache};
 use crate::config::{ChainContract, ChainsConfig};
 use crate::evm::{ERC20, InterchainTokenService, SenderReceiver, read_artifact_bytecode};
-use crate::retry::{DEFAULT_ATTEMPTS, retry_all, retry_async};
+use crate::retry::{FALLBACK_ATTEMPTS, retry_all, retry_async};
 use crate::stellar::StellarWallet;
 use crate::sui::{SuiWallet, read_sui_chain_config};
 use crate::ui;
@@ -329,8 +329,12 @@ pub(crate) async fn deploy_sender_receiver<P: Provider>(
     gas_service: Address,
 ) -> Result<Address> {
     // Legacy (pre-1559) chains break alloy's default fee estimation; detect and
-    // send a type-0 tx with an explicit gas_price instead.
-    let fee_mode = super::gas_mode::EvmFeeMode::detect(provider).await?;
+    // send a type-0 tx with an explicit gas_price instead. Retried: two
+    // read-only calls whose transient failure would otherwise abort the deploy.
+    let fee_mode = retry_all("detect fee mode", || {
+        super::gas_mode::EvmFeeMode::detect(provider)
+    })
+    .await?;
 
     // Pre-Shanghai chains (e.g. Kava) reject the default bytecode's PUSH0
     // opcode. Probe with eth_call (no nonce consumed) so we send exactly one
@@ -379,10 +383,14 @@ fn is_unsupported_opcode(error: &TransportError) -> bool {
 }
 
 fn is_retryable_evm_transport(error: &TransportError) -> bool {
-    if error
-        .as_error_resp()
-        .is_some_and(|response| response.is_retry_err())
-    {
+    if error.as_error_resp().is_some_and(|response| {
+        // Avalanche's pending-state rejection isn't in alloy's retryable set
+        // but is endpoint-transient (see `retry::is_transient_default`).
+        response.is_retry_err()
+            || response
+                .message
+                .contains("state not available for pending block")
+    }) {
         return true;
     }
     let Some(transport) = error.as_transport_err() else {
@@ -417,12 +425,15 @@ async fn deploy_with_artifact<P: Provider>(
     deploy_code.extend_from_slice(&(gateway, gas_service).abi_encode_params());
 
     // Wrap `send_transaction` with retry on transient transport / 5xx /
-    // 429 errors — observed flakes on HL and Hedera mainnet RPCs where
-    // the same submission succeeds on retry. Real reverts (insufficient
-    // funds, custom errors) are typed RPC responses and skip the retry.
+    // 429 / pending-state errors — observed flakes on HL, Hedera, and
+    // Avalanche RPCs where the same submission succeeds on retry. Real
+    // reverts (insufficient funds, custom errors) are typed RPC responses
+    // and skip the retry. FALLBACK_ATTEMPTS (5): the Avalanche pending-state
+    // stretch outlasts the 3-attempt budget (proven by stagenet run
+    // 31115899822, which died here).
     let pending = retry_async(
         "deploy_sender_receiver.send_transaction",
-        DEFAULT_ATTEMPTS,
+        FALLBACK_ATTEMPTS,
         is_retryable_evm_transport,
         || {
             let tx = fee_mode.apply(

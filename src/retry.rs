@@ -202,6 +202,10 @@ pub fn is_transient_default<E: std::fmt::Display>(err: &E) -> bool {
         || msg.contains("service unavailable")
         || msg.contains("gateway timeout")
         || msg.contains("server error")
+        // Avalanche coreth node that momentarily can't serve pending-block
+        // state (nonce/gas fills, eth_call probes). Endpoint-transient — the
+        // same call succeeds on retry or on the next endpoint.
+        || msg.contains("state not available for pending block")
 }
 
 #[cfg(test)]
@@ -316,6 +320,7 @@ mod tests {
             "503 service unavailable",
             "429 Too Many Requests",
             "network error",
+            "error code -32000: state not available for pending block",
         ] {
             assert!(is_transient_default(&s), "expected transient: {s}");
         }
