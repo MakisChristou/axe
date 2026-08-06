@@ -5,7 +5,7 @@ use alloy::signers::k256::PublicKey;
 use alloy::signers::k256::elliptic_curve::sec1::ToEncodedPoint;
 use alloy::{
     consensus::TxEnvelope,
-    eips::eip2718::Encodable2718,
+    eips::{BlockId, eip2718::Encodable2718},
     hex,
     network::{Network, ReceiptResponse},
     primitives::{Address, Bytes, FixedBytes, TxHash, keccak256},
@@ -130,7 +130,34 @@ impl EvmEndpoints {
     /// fail over freely. Returns the signed envelope: its hash is known before
     /// any broadcast, and its raw bytes can be re-broadcast on any endpoint
     /// idempotently (same bytes ⇒ same tx ⇒ at most one can land).
+    ///
+    /// alloy's nonce and gas fillers query the **pending** block, and some
+    /// nodes (Avalanche coreth, recurringly) intermittently can't serve
+    /// pending state — for stretches longer than the whole retry budget. When
+    /// the retried fill dies on exactly that error, degrade once: pre-resolve
+    /// the nonce and gas against `latest` (which those nodes do serve), then
+    /// re-run the fill — only the fee/chain-id lookups remain, and those are
+    /// latest-based already.
     pub async fn fill_and_sign(
+        &self,
+        signer: &PrivateKeySigner,
+        tx: TransactionRequest,
+    ) -> Result<TxEnvelope> {
+        match self.fill_and_sign_once(signer, tx.clone()).await {
+            Err(error) if is_pending_state_error(&error) => {
+                ui::warn(
+                    "fill kept hitting 'state not available for pending block' — \
+                     re-filling with nonce+gas pinned to the latest block",
+                );
+                let pinned = self.prefill_from_latest(tx).await?;
+                self.fill_and_sign_once(signer, pinned).await
+            }
+            other => other,
+        }
+    }
+
+    /// One retried, fallback-capable pass of alloy's fill + local signing.
+    async fn fill_and_sign_once(
         &self,
         signer: &PrivateKeySigner,
         tx: TransactionRequest,
@@ -157,6 +184,39 @@ impl EvmEndpoints {
             },
         )
         .await
+    }
+
+    /// Resolve the fields whose fillers depend on pending-block state — nonce
+    /// and gas limit — against `latest` instead, so the subsequent fill skips
+    /// the pending-block queries entirely.
+    async fn prefill_from_latest(&self, mut tx: TransactionRequest) -> Result<TransactionRequest> {
+        let from = tx
+            .from
+            .ok_or_else(|| eyre::eyre!("prefill_from_latest: tx.from not set"))?;
+        if tx.nonce.is_none() {
+            let nonce = crate::retry::retry_with_fallback_all(
+                "nonce (latest block)",
+                &self.providers,
+                |provider| async move { provider.get_transaction_count(from).await },
+            )
+            .await?;
+            tx.nonce = Some(nonce);
+        }
+        if tx.gas.is_none() {
+            let estimate = crate::retry::retry_with_fallback_all(
+                "estimate gas (latest block)",
+                &self.providers,
+                |provider| {
+                    let tx = tx.clone();
+                    async move { provider.estimate_gas(tx).block(BlockId::latest()).await }
+                },
+            )
+            .await?;
+            // 20% headroom: a latest-block estimate can undershoot the state
+            // the tx actually executes against.
+            tx.gas = Some(estimate.saturating_mul(12) / 10);
+        }
+        Ok(tx)
     }
 
     /// Broadcast a signed envelope's raw bytes, retrying across endpoints.
