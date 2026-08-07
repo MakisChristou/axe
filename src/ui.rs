@@ -148,3 +148,32 @@ pub fn truncated_json(json_str: &str, max_lines: usize) -> String {
         tail.join("\n")
     )
 }
+
+/// Replace any `http://…` / `https://…` substring with `<redacted-url>`,
+/// preserving the surrounding text. Used to keep RPC URLs (which can come
+/// from repo secrets) out of the load-test JSON report and other surfaces
+/// that may include propagated error messages.
+///
+/// Terminators recognised as the end of a URL: whitespace, `'`, `"`, `)`,
+/// `]`, `,`, `;`, `<`, `>`.
+pub fn scrub_urls(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        let rest = &input[i..];
+        if rest.starts_with("http://") || rest.starts_with("https://") {
+            let end = rest
+                .find(|c: char| {
+                    c.is_whitespace() || matches!(c, '\'' | '"' | ')' | ']' | ',' | ';' | '<' | '>')
+                })
+                .unwrap_or(rest.len());
+            out.push_str("<redacted-url>");
+            i += end;
+        } else {
+            let ch_len = rest.chars().next().map_or(1, char::len_utf8);
+            out.push_str(&input[i..i + ch_len]);
+            i += ch_len;
+        }
+    }
+    out
+}

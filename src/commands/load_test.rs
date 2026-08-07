@@ -263,6 +263,9 @@ pub(crate) struct LoadTestArgs {
 }
 
 pub async fn run(args: LoadTestArgs) -> Result<()> {
+    // Scope the ITS/GMP cache files and the axe-tokens overlay lookups to the
+    // network this invocation runs on (chain ids collide across networks).
+    resolve::set_cache_network(args.network);
     let run_sizing = run_sizing::RunSizing::new(&args)?;
 
     ui::section(&format!(

@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use tokio::fs;
 
 use eyre::{Result, WrapErr};
@@ -51,7 +52,13 @@ pub(crate) fn cache_path(axelar_id: &str) -> PathBuf {
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("axe");
-    data_dir.join(format!("load-test-{axelar_id}.json"))
+    // Network-scoped for the same reason as `its_cache_path`: chain ids like
+    // `avalanche` exist on several networks, and a shared cache file lets one
+    // network's SenderReceiver clobber another's.
+    match ITS_CACHE_NETWORK.get() {
+        Some(network) => data_dir.join(format!("load-test-{network}-{axelar_id}.json")),
+        None => data_dir.join(format!("load-test-{axelar_id}.json")),
+    }
 }
 
 async fn read_json_cache<T>(path: &Path) -> T
@@ -524,11 +531,37 @@ fn auto_detect_all(
         "cannot auto-detect test type from config. Use --test-type, or --source-chain + --destination-chain."
     ))
 }
+/// Network scope for the ITS cache filenames, set once at load-test entry.
+///
+/// Chain ids are NOT globally unique across Axelar networks (testnet and
+/// stagenet both have `avalanche` → `ethereum-sepolia`; mainnet and testnet
+/// both have `xrpl` → `xrpl-evm`), and an unscoped cache file let a stagenet
+/// run reuse a token deployed on testnet — a deterministic revert (observed
+/// live). A `OnceLock` keeps every cache caller signature unchanged: one CLI
+/// invocation only ever runs one network.
+static ITS_CACHE_NETWORK: OnceLock<Network> = OnceLock::new();
+
+/// Record the network for cache/overlay scoping. Called once from the
+/// load-test entrypoint; later calls (same process, same network) are no-ops.
+pub(crate) fn set_cache_network(network: Network) {
+    let _ = ITS_CACHE_NETWORK.set(network);
+}
+
+/// The network recorded by [`set_cache_network`], if any.
+pub(crate) fn cache_network() -> Option<Network> {
+    ITS_CACHE_NETWORK.get().copied()
+}
+
 pub(crate) fn its_cache_path(src: &str, dst: &str) -> PathBuf {
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("axe");
-    data_dir.join(format!("its-load-test-{src}-{dst}.json"))
+    match ITS_CACHE_NETWORK.get() {
+        Some(network) => data_dir.join(format!("its-load-test-{network}-{src}-{dst}.json")),
+        // Entrypoint didn't set the scope (shouldn't happen for load-test
+        // callers) — legacy unscoped name.
+        None => data_dir.join(format!("its-load-test-{src}-{dst}.json")),
+    }
 }
 
 pub(crate) async fn read_its_cache(src: &str, dst: &str) -> ItsCache {

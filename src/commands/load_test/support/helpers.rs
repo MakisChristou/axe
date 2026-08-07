@@ -80,6 +80,40 @@ async fn get_code_with_retry<P: Provider>(provider: &P, addr: Address) -> Result
     Ok(last)
 }
 
+/// SenderReceiver address recorded for the current network in this repo's
+/// axe-tokens overlay (`chains.<chain>.contracts.SenderReceiver.address`).
+/// The helper contract is deploy-once — recording it here lets every CI and
+/// local run reuse it instead of redeploying a receiver per run.
+async fn overlay_sender_receiver(chain: &str) -> Option<Address> {
+    let network = super::resolve::cache_network()?;
+    let overlay = Path::new("axe-tokens").join(format!("{network}.json"));
+    let cfg = ChainsConfig::load(&overlay).await.ok()?;
+    cfg.chains
+        .get(chain)?
+        .contracts
+        .as_ref()?
+        .get("SenderReceiver")?
+        .address
+        .as_deref()?
+        .parse()
+        .ok()
+}
+
+/// Verify a candidate SenderReceiver is live and wired to the expected
+/// gateway. Shared by the overlay and local-cache reuse paths.
+async fn sender_receiver_is_valid<R: Provider>(
+    read_provider: &R,
+    addr: Address,
+    gateway_addr: Address,
+) -> Result<bool> {
+    let code = get_code_with_retry(read_provider, addr).await?;
+    if code.is_empty() {
+        return Ok(false);
+    }
+    let sr = SenderReceiver::new(addr, read_provider);
+    Ok(matches!(sr.gateway().call().await, Ok(gw) if gw == gateway_addr))
+}
+
 pub(crate) async fn deploy_or_reuse_sender_receiver<R: Provider, W: Provider>(
     cache: &GmpCache,
     cache_key: &str,
@@ -89,6 +123,21 @@ pub(crate) async fn deploy_or_reuse_sender_receiver<R: Provider, W: Provider>(
     gas_service_addr: Address,
     label: &str,
 ) -> Result<Address> {
+    // Committed overlay first: deployed-once helpers recorded in
+    // axe-tokens/<network>.json survive fresh CI checkouts, unlike the local
+    // GmpCache.
+    if let Some(addr) = overlay_sender_receiver(cache_key).await {
+        if sender_receiver_is_valid(read_provider, addr, gateway_addr).await? {
+            ui::info(&format!(
+                "SenderReceiver ({label}): using configured {addr}"
+            ));
+            return Ok(addr);
+        }
+        ui::warn(&format!(
+            "configured SenderReceiver ({label}) at {addr} failed verification \
+             (no code or wrong gateway) — falling back to cache/deploy"
+        ));
+    }
     if let Some(addr_str) = cache.sender_receiver_address.as_deref() {
         let addr: Address = addr_str.parse()?;
         let code = get_code_with_retry(read_provider, addr).await?;
@@ -125,6 +174,7 @@ pub(crate) async fn deploy_or_reuse_sender_receiver<R: Provider, W: Provider>(
             let mut cache = cache.clone();
             cache.sender_receiver_address = Some(new_addr.to_string());
             save_cache(cache_key, &cache).await?;
+            hint_persist_sender_receiver(cache_key, new_addr);
             Ok(new_addr)
         } else {
             ui::info(&format!("SenderReceiver ({label}): reusing {addr}"));
@@ -136,37 +186,20 @@ pub(crate) async fn deploy_or_reuse_sender_receiver<R: Provider, W: Provider>(
         let mut cache = cache.clone();
         cache.sender_receiver_address = Some(addr.to_string());
         save_cache(cache_key, &cache).await?;
+        hint_persist_sender_receiver(cache_key, addr);
         Ok(addr)
     }
 }
 
-/// Replace any `http://…` / `https://…` substring with `<redacted-url>`,
-/// preserving the surrounding text. Used to keep RPC URLs (which can come
-/// from repo secrets) out of the load-test JSON report and other surfaces
-/// that may include propagated error messages.
-///
-/// Terminators recognised as the end of a URL: whitespace, `'`, `"`, `)`,
-/// `]`, `,`, `;`, `<`, `>`.
-pub(crate) fn scrub_urls(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut i = 0;
-    while i < input.len() {
-        let rest = &input[i..];
-        if rest.starts_with("http://") || rest.starts_with("https://") {
-            let end = rest
-                .find(|c: char| {
-                    c.is_whitespace() || matches!(c, '\'' | '"' | ')' | ']' | ',' | ';' | '<' | '>')
-                })
-                .unwrap_or(rest.len());
-            out.push_str("<redacted-url>");
-            i += end;
-        } else {
-            let ch_len = rest.chars().next().map_or(1, char::len_utf8);
-            out.push_str(&input[i..i + ch_len]);
-            i += ch_len;
-        }
-    }
-    out
+/// Print a hint suggesting the fresh SenderReceiver be recorded in the
+/// axe-tokens overlay so future runs (including fresh CI checkouts) reuse it.
+fn hint_persist_sender_receiver(chain: &str, addr: Address) {
+    let network = super::resolve::cache_network()
+        .map_or_else(|| "<network>".to_string(), |network| network.to_string());
+    ui::info(&format!(
+        "💡 To skip this deploy on future runs, add to axe-tokens/{network}.json:\n  \
+         chains.{chain}.contracts.SenderReceiver.address = \"{addr}\""
+    ));
 }
 
 pub(crate) async fn finish_report(report: &mut LoadTestReport, run_start: Instant) -> Result<()> {
@@ -175,7 +208,7 @@ pub(crate) async fn finish_report(report: &mut LoadTestReport, run_start: Instan
     // refactor: private RPC URLs (from repo secrets) must not appear in the
     // JSON artifact, regardless of where the underlying error came from.
     for tx in &mut report.transactions {
-        tx.map_error(scrub_urls);
+        tx.map_error(ui::scrub_urls);
     }
     print_final_report(report);
 
@@ -450,10 +483,22 @@ async fn deploy_with_artifact<P: Provider>(
     // 240 s tolerates HL's ~60 s big-blocks cadence + Hedera HTS-create
     // latency. Fast EVMs (Solana, Stellar destinations) still return as
     // soon as the receipt is available; this is an upper bound, not a
-    // floor.
-    let receipt = time::timeout(Duration::from_secs(240), pending.get_receipt())
-        .await
-        .map_err(|_| eyre::eyre!("deploy tx timed out after 240s"))??;
+    // floor. Polled by hash so a transient RPC error mid-wait (observed:
+    // QuikNode dropping the connection) retries instead of aborting a
+    // deploy whose tx already landed.
+    let deploy_tx_hash = *pending.tx_hash();
+    let deadline = Instant::now() + Duration::from_secs(240);
+    let receipt = loop {
+        if let Ok(Some(receipt)) = provider.get_transaction_receipt(deploy_tx_hash).await {
+            break receipt;
+        }
+        if Instant::now() >= deadline {
+            return Err(eyre::eyre!(
+                "deploy tx {deploy_tx_hash:#x} timed out after 240s"
+            ));
+        }
+        time::sleep(Duration::from_secs(3)).await;
+    };
 
     let addr = receipt
         .contract_address

@@ -1,0 +1,13 @@
+{
+  "chains": {
+    "eth-sepolia": {
+      "contracts": {
+        "AXE": {
+          "tokenId": "0x2310a2fb101c032851c68fabdec6ef736b7ad31a3adc6e87cb84a983db91f9fa",
+          "address": "0x83876cfaaA1615F59bD8B5CB9a366c9f739b948D"
+        },
+        "SenderReceiver": { "address": "0x9a440971dc1de2be850063f9410f992276b973b9" }
+      }
+    }
+  }
+}

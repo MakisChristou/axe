@@ -246,9 +246,22 @@ async fn run_test(
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
     dotenvy::dotenv_override().ok();
 
+    // Errors are printed through `ui::scrub_urls` so RPC URLs (which can come
+    // from private/keyed secrets) never reach stderr — upstream-crate errors
+    // (reqwest, alloy transports) embed the full request URL in their Display.
+    match run_cli().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {}", ui::scrub_urls(&format!("{error:?}")));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_cli() -> Result<()> {
     let cli = cli::Cli::parse();
 
     match cli.command {
