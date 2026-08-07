@@ -5,8 +5,9 @@ run-name: "Stagenet: ${{ inputs.protocol }} ${{ inputs.source_chain }} → ${{ i
 # Stagenet variant of Single Test. GitHub cannot vary a chain dropdown by the
 # selected network, so each non-production network gets its own workflow whose
 # dropdowns list exactly the chains wired in stagenet.json + the composite
-# action's CHAIN_MAP. Stagenet has no Stellar deployment and no usable Binance
-# gateway — hence their absence here.
+# action's CHAIN_MAP. Absent by design: Stellar (no deployment), Binance (no
+# usable gateway), and Monad (the config gateway address has no code on the
+# current monad chain — the chain was reset under the stagenet deployment).
 
 on:
   workflow_dispatch:
@@ -29,7 +30,6 @@ on:
           - Kava
           - Linea
           - Mantle
-          - Monad
           - Moonbeam
           - Optimism
           - Plume
@@ -56,7 +56,6 @@ on:
           - Kava
           - Linea
           - Mantle
-          - Monad
           - Moonbeam
           - Optimism
           - Plume

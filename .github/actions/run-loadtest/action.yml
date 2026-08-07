@@ -123,7 +123,7 @@ runs:
           "Kava":        {"mainnet": "kava",       "testnet": "kava",             "stagenet": "kava"},
           "Linea":       {"mainnet": "linea",      "testnet": "linea-sepolia",    "stagenet": "linea-sepolia"},
           "Mantle":      {"mainnet": "mantle",     "testnet": "mantle-sepolia",   "stagenet": "mantle-sepolia"},
-          "Monad":       {"mainnet": "monad",     "testnet": "monad-3",          "stagenet": "monad"},
+          "Monad":       {"mainnet": "monad",     "testnet": "monad-3"},
           "Moonbeam":    {"mainnet": "moonbeam",   "testnet": "moonbeam",         "stagenet": "moonbeam"},
           "Optimism":    {"mainnet": "optimism",   "testnet": "optimism-sepolia", "stagenet": "optimism-sepolia", "devnet-amplifier": "optimism-sepolia"},
           "Plume":       {"stagenet": "plume",     "devnet-amplifier": "plume-2"},

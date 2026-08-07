@@ -2,12 +2,19 @@
   "chains": {
     "arbitrum-sepolia": {
       "contracts": {
-        "SenderReceiver": { "address": "0xDBB0e0443EA5DceAcC4d478E60B5C2a40603EEA2" }
+        "SenderReceiver": {
+          "address": "0xDBB0e0443EA5DceAcC4d478E60B5C2a40603EEA2"
+        }
       }
     },
     "avalanche": {
       "contracts": {
-        "SenderReceiver": { "address": "0x2D8c2b43cFB8a8C01779351a95da9d890a425Ce0" }
+        "SenderReceiver": {
+          "address": "0x2D8c2b43cFB8a8C01779351a95da9d890a425Ce0"
+        },
+        "AXE": {
+          "tokenId": "0x5f0dbcb98c1a6e84a7a20cf40fdd999fe8f3e1c673b2723973b786109dee5d27"
+        }
       }
     }
   }

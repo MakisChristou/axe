@@ -21,6 +21,7 @@ use super::checks::{
 };
 use super::legacy;
 use super::pipeline::{check_cosmos_routed, check_hub_approved, parse_payload_hash};
+use crate::commands::load_test::resolve::cache_network;
 use crate::config::AxelarChainContract;
 use crate::config::AxelarGlobalContract;
 use crate::config::ChainsConfig;
@@ -29,6 +30,17 @@ use crate::evm::AxelarAmplifierGateway;
 use crate::stellar::{MessageApprovalQuery, StellarClient};
 use crate::types::Network;
 use crate::ui;
+
+/// Remote-deploy propagation budget. Stagenet / devnet-amplifier relayers lag
+/// production: a stagenet deploy was observed executing shortly AFTER the old
+/// flat 500 s budget, turning a healthy route into a false failure. Production
+/// networks keep the tighter bound.
+fn remote_deploy_timeout() -> Duration {
+    match cache_network() {
+        Some(Network::Stagenet | Network::DevnetAmplifier) => Duration::from_secs(900),
+        _ => Duration::from_secs(500),
+    }
+}
 
 pub struct StellarRemoteDeployWait {
     pub config: PathBuf,
@@ -345,7 +357,7 @@ pub async fn wait_for_its_remote_deploy(
     ui::kv("deploy message ID", deploy_message_id);
     let spinner = ui::wait_spinner("waiting for remote deploy to propagate through hub...");
     let start = Instant::now();
-    let timeout = Duration::from_secs(500);
+    let timeout = remote_deploy_timeout();
     let hub_context = HubDeployContext {
         lcd: &lcd,
         rpc: &rpc,
@@ -468,7 +480,7 @@ pub async fn wait_for_its_remote_deploy_to_stellar(args: StellarRemoteDeployWait
     let spinner =
         ui::wait_spinner("waiting for remote deploy to propagate through hub to Stellar...");
     let start = Instant::now();
-    let timeout = Duration::from_secs(500);
+    let timeout = remote_deploy_timeout();
     let hub_context = HubDeployContext {
         lcd: &lcd,
         rpc: &rpc,
@@ -624,7 +636,7 @@ pub async fn wait_for_its_remote_deploy_to_solana(
     let spinner =
         ui::wait_spinner("waiting for remote deploy to propagate through hub to Solana...");
     let start = Instant::now();
-    let timeout = Duration::from_secs(500);
+    let timeout = remote_deploy_timeout();
     let hub_context = HubDeployContext {
         lcd: &lcd,
         rpc: &rpc,
