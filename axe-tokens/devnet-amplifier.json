@@ -6,7 +6,16 @@
           "tokenId": "0x2310a2fb101c032851c68fabdec6ef736b7ad31a3adc6e87cb84a983db91f9fa",
           "address": "0x83876cfaaA1615F59bD8B5CB9a366c9f739b948D"
         },
-        "SenderReceiver": { "address": "0x9a440971dc1de2be850063f9410f992276b973b9" }
+        "SenderReceiver": {
+          "address": "0xE21e1b014dAE2492FD80251495D664c8D155d3Dc"
+        }
+      }
+    },
+    "avalanche-fuji": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0xf582f347Ce4e1482AB0508876ac3Dce6eF858990"
+        }
       }
     }
   }

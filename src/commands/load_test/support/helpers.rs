@@ -88,19 +88,31 @@ async fn get_code_with_retry<P: Provider>(provider: &P, addr: Address) -> Result
 /// axe-tokens overlay (`chains.<chain>.contracts.SenderReceiver.address`).
 /// The helper contract is deploy-once — recording it here lets every CI and
 /// local run reuse it instead of redeploying a receiver per run.
-async fn overlay_sender_receiver(chain: &str) -> Option<Address> {
+async fn overlay_sender_receiver(cache_key: &str) -> Option<Address> {
     let network = super::resolve::cache_network()?;
     let overlay = Path::new("axe-tokens").join(format!("{network}.json"));
     let cfg = ChainsConfig::load(&overlay).await.ok()?;
-    cfg.chains
-        .get(chain)?
-        .contracts
-        .as_ref()?
-        .get("SenderReceiver")?
-        .address
-        .as_deref()?
-        .parse()
-        .ok()
+    // GMP cache keys can be composite (`avalanche-fuji-evm-to-evm-dest`) while
+    // the overlay is keyed by plain chain ids — strip trailing `-<segment>`s
+    // until a chains entry matches (chain ids themselves contain dashes, so
+    // only suffix-stripping is safe).
+    let mut key = cache_key;
+    loop {
+        if let Some(addr) = cfg
+            .chains
+            .get(key)
+            .and_then(|chain| chain.contracts.as_ref())
+            .and_then(|contracts| contracts.get("SenderReceiver"))
+            .and_then(|entry| entry.address.as_deref())
+            .and_then(|address| address.parse().ok())
+        {
+            return Some(addr);
+        }
+        match key.rfind('-') {
+            Some(i) => key = &key[..i],
+            None => return None,
+        }
+    }
 }
 
 /// Verify a candidate SenderReceiver is live and wired to the expected
