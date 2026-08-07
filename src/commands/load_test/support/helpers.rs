@@ -11,11 +11,13 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use alloy::eips::BlockId;
 use alloy::transports::TransportError;
 use alloy::{
+    network::Ethereum,
     network::TransactionBuilder,
     primitives::{Address, Bytes, FixedBytes, U256},
-    providers::{Provider, ProviderBuilder},
+    providers::{PendingTransactionBuilder, Provider, ProviderBuilder},
     rpc::types::TransactionRequest,
     signers::local::PrivateKeySigner,
     sol_types::SolValue,
@@ -29,7 +31,9 @@ use super::metrics::{AmplifierTiming, LoadTestReport, VerificationReport};
 use super::verify;
 use super::{GmpCache, LoadTestArgs, read_cache, save_cache};
 use crate::config::{ChainContract, ChainsConfig, ContractEntry};
-use crate::evm::{ERC20, InterchainTokenService, SenderReceiver, read_artifact_bytecode};
+use crate::evm::{
+    ERC20, InterchainTokenService, SenderReceiver, is_pending_state_error, read_artifact_bytecode,
+};
 use crate::retry::{FALLBACK_ATTEMPTS, retry_all, retry_async};
 use crate::stellar::StellarWallet;
 use crate::sui::{SuiWallet, read_sui_chain_config};
@@ -415,6 +419,56 @@ fn is_unsupported_opcode(error: &TransportError) -> bool {
     })
 }
 
+/// Last-resort deploy send with nonce + gas pinned to the `latest` block,
+/// used when the pending-block state the default fillers query is
+/// persistently unavailable. The deployer address comes from the run's EVM
+/// key (`EVM_PRIVATE_KEY`, which the CLI flag also maps to) — the same wallet
+/// `provider` signs with.
+async fn deploy_pinned_to_latest<P: Provider>(
+    provider: &P,
+    deploy_code: &[u8],
+    fee_mode: super::gas_mode::EvmFeeMode,
+) -> Result<PendingTransactionBuilder<Ethereum>> {
+    ui::warn(
+        "deploy fill kept hitting 'state not available for pending block' — \
+         re-sending with nonce+gas pinned to the latest block",
+    );
+    let from = env::var("EVM_PRIVATE_KEY")
+        .ok()
+        .and_then(|key| key.parse::<PrivateKeySigner>().ok())
+        .map(|signer| signer.address())
+        .ok_or_else(|| {
+            eyre::eyre!("latest-pinned deploy needs EVM_PRIVATE_KEY to derive the deployer address")
+        })?;
+    let base = fee_mode
+        .apply(TransactionRequest::default().with_deploy_code(Bytes::from(deploy_code.to_vec())))
+        .with_from(from);
+    let nonce = retry_all("deploy nonce (latest block)", || async {
+        provider.get_transaction_count(from).await
+    })
+    .await?;
+    let estimate = retry_all("deploy gas (latest block)", || {
+        let tx = base.clone();
+        async move { provider.estimate_gas(tx).block(BlockId::latest()).await }
+    })
+    .await?;
+    // 20% headroom over the latest-block estimate.
+    let tx = base
+        .with_nonce(nonce)
+        .with_gas_limit(estimate.saturating_mul(12) / 10);
+    retry_async(
+        "deploy send (latest-pinned)",
+        FALLBACK_ATTEMPTS,
+        is_retryable_evm_transport,
+        || {
+            let tx = tx.clone();
+            async { provider.send_transaction(tx).await }
+        },
+    )
+    .await
+    .map_err(Into::into)
+}
+
 fn is_retryable_evm_transport(error: &TransportError) -> bool {
     if error.as_error_resp().is_some_and(|response| {
         // Avalanche's pending-state rejection isn't in alloy's retryable set
@@ -464,7 +518,7 @@ async fn deploy_with_artifact<P: Provider>(
     // and skip the retry. FALLBACK_ATTEMPTS (5): the Avalanche pending-state
     // stretch outlasts the 3-attempt budget (proven by stagenet run
     // 31115899822, which died here).
-    let pending = retry_async(
+    let sent = retry_async(
         "deploy_sender_receiver.send_transaction",
         FALLBACK_ATTEMPTS,
         is_retryable_evm_transport,
@@ -475,7 +529,20 @@ async fn deploy_with_artifact<P: Provider>(
             async { provider.send_transaction(tx).await }
         },
     )
-    .await?;
+    .await;
+    let pending = match sent {
+        Ok(pending) => pending,
+        // Avalanche-family nodes go through stretches where pending-block
+        // state (which alloy's nonce + gas fillers query) is unavailable for
+        // longer than the whole retry budget, while `latest` keeps working.
+        // Degrade exactly like `EvmEndpoints::fill_and_sign`: resolve nonce +
+        // gas against `latest` ourselves, then re-send with the fillers
+        // bypassed.
+        Err(error) if is_pending_state_error(&error) => {
+            deploy_pinned_to_latest(provider, &deploy_code, fee_mode).await?
+        }
+        Err(error) => return Err(error.into()),
+    };
     let tx_hash = *pending.tx_hash();
     ui::tx_hash("deploy tx", &format!("{tx_hash}"));
     ui::info("waiting for confirmation...");

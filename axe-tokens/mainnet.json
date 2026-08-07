@@ -1,0 +1,14 @@
+{
+  "chains": {
+    "avalanche": {
+      "contracts": {
+        "SenderReceiver": { "address": "0x69484e0C70a54F18376EF89269bF4fC1751ccCda" }
+      }
+    },
+    "arbitrum": {
+      "contracts": {
+        "SenderReceiver": { "address": "0xA3509e690a430F05BD5aaA5dd7786154374F9f4a" }
+      }
+    }
+  }
+}

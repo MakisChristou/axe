@@ -1,0 +1,14 @@
+{
+  "chains": {
+    "arbitrum-sepolia": {
+      "contracts": {
+        "SenderReceiver": { "address": "0xF225E7d032F8666D94C41F779B91940e172FAC26" }
+      }
+    },
+    "avalanche": {
+      "contracts": {
+        "SenderReceiver": { "address": "0x13AEbE0D053937D99116186eFb7CAD6bCA7a6212" }
+      }
+    }
+  }
+}
