@@ -6,6 +6,7 @@
 //! `commands::test_gmp` calls into it for the `--config` sol→evm flow.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::env;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -85,6 +86,64 @@ async fn get_code_with_retry<P: Provider>(provider: &P, addr: Address) -> Result
     Ok(last)
 }
 
+/// Minimal schema for this repo's `axe-tokens/<network>.json` overlay files:
+/// `{ "chains": { <id>: { "contracts": { <Name>: { … } } } } }`.
+///
+/// Deliberately NOT `ChainsConfig`: that type requires the full chains-config
+/// shape (a top-level `axelar` section the overlays don't have), and the
+/// resulting deserialization failure was silently swallowed by `.ok()` —
+/// which disabled the entire registry (observed live: CI redeployed
+/// receivers that were already recorded).
+#[derive(serde::Deserialize)]
+struct OverlayDoc {
+    chains: HashMap<String, OverlayChain>,
+}
+
+#[derive(serde::Deserialize)]
+struct OverlayChain {
+    contracts: Option<HashMap<String, ContractEntry>>,
+}
+
+/// Read + parse an overlay file. A missing file is a normal miss (`None`);
+/// a present-but-unparseable file WARNS — never silently — so a schema
+/// mismatch can't quietly disable the registry again.
+async fn load_overlay(path: &Path) -> Option<OverlayDoc> {
+    let text = fs::read_to_string(path).await.ok()?;
+    match serde_json::from_str(&text) {
+        Ok(doc) => Some(doc),
+        Err(error) => {
+            ui::warn(&format!(
+                "overlay {} exists but failed to parse (registry disabled for this run): {error}",
+                path.display()
+            ));
+            None
+        }
+    }
+}
+
+/// Resolve `chains.<key>.contracts.<name>` in an overlay, stripping trailing
+/// `-<segment>`s off composite cache keys (`avalanche-fuji-evm-to-evm-dest`)
+/// until a plain chain id matches. Chain ids themselves contain dashes, so
+/// only suffix-stripping is safe.
+fn overlay_contract<'doc>(
+    doc: &'doc OverlayDoc,
+    cache_key: &str,
+    contract: &str,
+) -> Option<&'doc ContractEntry> {
+    let mut key = cache_key;
+    loop {
+        if let Some(entry) = doc
+            .chains
+            .get(key)
+            .and_then(|chain| chain.contracts.as_ref())
+            .and_then(|contracts| contracts.get(contract))
+        {
+            return Some(entry);
+        }
+        key = &key[..key.rfind('-')?];
+    }
+}
+
 /// SenderReceiver address recorded for the current network in this repo's
 /// axe-tokens overlay (`chains.<chain>.contracts.SenderReceiver.address`).
 /// The helper contract is deploy-once — recording it here lets every CI and
@@ -92,28 +151,12 @@ async fn get_code_with_retry<P: Provider>(provider: &P, addr: Address) -> Result
 async fn overlay_sender_receiver(cache_key: &str) -> Option<Address> {
     let network = super::resolve::cache_network()?;
     let overlay = Path::new("axe-tokens").join(format!("{network}.json"));
-    let cfg = ChainsConfig::load(&overlay).await.ok()?;
-    // GMP cache keys can be composite (`avalanche-fuji-evm-to-evm-dest`) while
-    // the overlay is keyed by plain chain ids — strip trailing `-<segment>`s
-    // until a chains entry matches (chain ids themselves contain dashes, so
-    // only suffix-stripping is safe).
-    let mut key = cache_key;
-    loop {
-        if let Some(addr) = cfg
-            .chains
-            .get(key)
-            .and_then(|chain| chain.contracts.as_ref())
-            .and_then(|contracts| contracts.get("SenderReceiver"))
-            .and_then(|entry| entry.address.as_deref())
-            .and_then(|address| address.parse().ok())
-        {
-            return Some(addr);
-        }
-        match key.rfind('-') {
-            Some(i) => key = &key[..i],
-            None => return None,
-        }
-    }
+    let doc = load_overlay(&overlay).await?;
+    overlay_contract(&doc, cache_key, "SenderReceiver")?
+        .address
+        .as_deref()?
+        .parse()
+        .ok()
 }
 
 /// Verify a candidate SenderReceiver is live and wired to the expected
@@ -1042,10 +1085,8 @@ async fn axe_overlay_field(
 ) -> Option<String> {
     let stem = config.file_stem()?.to_str()?;
     let overlay = Path::new("axe-tokens").join(format!("{stem}.json"));
-    axe_config_field(&overlay, chain_axelar_id, pick)
-        .await
-        .ok()
-        .flatten()
+    let doc = load_overlay(&overlay).await?;
+    overlay_contract(&doc, chain_axelar_id, "AXE").and_then(pick)
 }
 
 /// Companion to `read_pre_registered_axe_token`: returns the AXE
@@ -1368,7 +1409,7 @@ pub(crate) async fn finalize_sui_dest_run_its(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_token_id_hex;
+    use super::{OverlayDoc, overlay_contract, parse_token_id_hex};
 
     #[test]
     fn token_id_parser_accepts_prefixed_and_unprefixed_32_byte_hex() {
@@ -1395,5 +1436,39 @@ mod tests {
                 .to_string()
                 .contains("must be 32 bytes")
         );
+    }
+
+    #[test]
+    fn overlay_parses_chains_only_json() {
+        // The overlay files carry ONLY `chains` — no top-level `axelar`
+        // section. Regression: parsing them as `ChainsConfig` fails on the
+        // missing field, which silently disabled the whole registry.
+        let doc: OverlayDoc = serde_json::from_str(
+            r#"{"chains":{"avalanche":{"contracts":{"SenderReceiver":{"address":"0x2D8c2b43cFB8a8C01779351a95da9d890a425Ce0"}}}}}"#,
+        )
+        .expect("chains-only overlay must parse");
+        assert!(doc.chains.contains_key("avalanche"));
+    }
+
+    #[test]
+    fn overlay_contract_strips_composite_cache_keys() {
+        let doc: OverlayDoc = serde_json::from_str(
+            r#"{"chains":{
+                "avalanche-fuji":{"contracts":{"SenderReceiver":{"address":"0xf582f347Ce4e1482AB0508876ac3Dce6eF858990"}}},
+                "arbitrum-sepolia":{"contracts":{"SenderReceiver":{"address":"0xF225E7d032F8666D94C41F779B91940e172FAC26"}}}
+            }}"#,
+        )
+        .expect("parse");
+        // Composite GMP cache keys resolve to their chain entry.
+        let entry = overlay_contract(&doc, "avalanche-fuji-evm-to-evm-dest", "SenderReceiver")
+            .expect("composite key must resolve");
+        assert_eq!(
+            entry.address.as_deref(),
+            Some("0xf582f347Ce4e1482AB0508876ac3Dce6eF858990")
+        );
+        // Plain keys resolve directly; unknown chains miss.
+        assert!(overlay_contract(&doc, "arbitrum-sepolia", "SenderReceiver").is_some());
+        assert!(overlay_contract(&doc, "monad", "SenderReceiver").is_none());
+        assert!(overlay_contract(&doc, "avalanche-fuji", "AXE").is_none());
     }
 }
