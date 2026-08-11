@@ -342,6 +342,25 @@ pub async fn send_tx_robust(
                 // Ours: an earlier broadcast landed despite its lost response.
                 // Fall through to confirmation.
             }
+            // Monad: a pooled tx (typically a previous run's dropped-but-
+            // still-pooled send) occupies this nonce at a higher fee, so the
+            // node refuses ours. Wait for it to mine or expire, then re-fill —
+            // the fresh nonce query lands past it. Bounded by SEND_ROUNDS.
+            Err(error)
+                if error
+                    .to_string()
+                    .contains("existing transaction had higher priority") =>
+            {
+                ui::warn(&format!(
+                    "{label}: nonce occupied by a higher-priority pooled tx — waiting, \
+                     then re-signing at a fresh nonce (round {}/{SEND_ROUNDS})",
+                    round + 2,
+                ));
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                nonce_override = None;
+                envelope = None;
+                continue;
+            }
             Err(error) => return Err(error),
         }
 
