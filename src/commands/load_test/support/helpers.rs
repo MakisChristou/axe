@@ -140,10 +140,7 @@ fn overlay_contract<'doc>(
         {
             return Some(entry);
         }
-        match key.rfind('-') {
-            Some(i) => key = &key[..i],
-            None => return None,
-        }
+        key = &key[..key.rfind('-')?];
     }
 }
 
