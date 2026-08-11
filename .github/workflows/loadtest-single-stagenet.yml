@@ -1,0 +1,143 @@
+name: Single Test (stagenet)
+
+run-name: "Stagenet: ${{ inputs.protocol }} ${{ inputs.source_chain }} → ${{ inputs.destination_chain }}"
+
+# Stagenet variant of Single Test. GitHub cannot vary a chain dropdown by the
+# selected network, so each non-production network gets its own workflow whose
+# dropdowns list exactly the chains wired in stagenet.json + the composite
+# action's CHAIN_MAP. Absent by design: Stellar (no deployment), Binance (no
+# usable gateway), Monad (the config gateway address has no code on the
+# current monad chain — the chain was reset under the stagenet deployment),
+# and Moonbeam (both the public moonbase RPC and the private endpoint are
+# persistently unhealthy — re-add once either recovers).
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_chain:
+        description: Source chain (stagenet-wired chains only)
+        type: choice
+        required: true
+        options:
+          - Arbitrum
+          - Avalanche
+          - Base
+          - Berachain
+          - Blast
+          - Celo
+          - Ethereum
+          - Flow
+          - Hedera
+          - Hyperliquid
+          - Kava
+          - Linea
+          - Mantle
+          - Optimism
+          - Plume
+          - Polygon
+          - Solana
+          - Sui
+          - XRPL
+          - XRPL EVM
+      destination_chain:
+        description: Destination chain (stagenet-wired chains only)
+        type: choice
+        required: true
+        options:
+          - Arbitrum
+          - Avalanche
+          - Base
+          - Berachain
+          - Blast
+          - Celo
+          - Ethereum
+          - Flow
+          - Hedera
+          - Hyperliquid
+          - Kava
+          - Linea
+          - Mantle
+          - Optimism
+          - Plume
+          - Polygon
+          - Solana
+          - Sui
+          - XRPL
+          - XRPL EVM
+      protocol:
+        description: Protocol
+        type: choice
+        required: true
+        default: gmp
+        options:
+          - gmp
+          - its
+          - its-with-data
+      source_rpc:
+        description: Optional - override the source RPC URL (blank = secret/config default)
+        type: string
+        required: false
+        default: ""
+      destination_rpc:
+        description: Optional - override the destination RPC URL
+        type: string
+        required: false
+        default: ""
+      gas_value:
+        description: Optional - cross-chain gas value override
+        type: string
+        required: false
+        default: ""
+      token_id:
+        description: Optional - reuse an existing ITS token (hex) instead of deploying
+        type: string
+        required: false
+        default: ""
+
+jobs:
+  loadtest:
+    runs-on: ubuntu-latest
+    # Private RPC secrets for stagenet chains (see loadtest-single.yml for the
+    # naming convention). Chains without a secret fall through to the public
+    # chains-config RPC.
+    env:
+      ARBITRUM_STAGENET_RPC:    ${{ secrets.ARBITRUM_STAGENET_RPC }}
+      AVALANCHE_STAGENET_RPC:   ${{ secrets.AVALANCHE_STAGENET_RPC }}
+      BASE_STAGENET_RPC:        ${{ secrets.BASE_STAGENET_RPC }}
+      BERACHAIN_STAGENET_RPC:   ${{ secrets.BERACHAIN_STAGENET_RPC }}
+      BLAST_STAGENET_RPC:       ${{ secrets.BLAST_STAGENET_RPC }}
+      CELO_STAGENET_RPC:        ${{ secrets.CELO_STAGENET_RPC }}
+      ETHEREUM_STAGENET_RPC:    ${{ secrets.ETHEREUM_STAGENET_RPC }}
+      FLOW_STAGENET_RPC:        ${{ secrets.FLOW_STAGENET_RPC }}
+      HEDERA_STAGENET_RPC:      ${{ secrets.HEDERA_STAGENET_RPC }}
+      HYPERLIQUID_STAGENET_RPC: ${{ secrets.HYPERLIQUID_STAGENET_RPC }}
+      KAVA_STAGENET_RPC:        ${{ secrets.KAVA_STAGENET_RPC }}
+      LINEA_STAGENET_RPC:       ${{ secrets.LINEA_STAGENET_RPC }}
+      MANTLE_STAGENET_RPC:      ${{ secrets.MANTLE_STAGENET_RPC }}
+      MONAD_STAGENET_RPC:       ${{ secrets.MONAD_STAGENET_RPC }}
+      MOONBEAM_STAGENET_RPC:    ${{ secrets.MOONBEAM_STAGENET_RPC }}
+      OPTIMISM_STAGENET_RPC:    ${{ secrets.OPTIMISM_STAGENET_RPC }}
+      PLUME_STAGENET_RPC:       ${{ secrets.PLUME_STAGENET_RPC }}
+      POLYGON_STAGENET_RPC:     ${{ secrets.POLYGON_STAGENET_RPC }}
+      SOLANA_STAGENET_RPC:      ${{ secrets.SOLANA_STAGENET_RPC }}
+      SUI_STAGENET_RPC:         ${{ secrets.SUI_STAGENET_RPC }}
+      XRPL_STAGENET_RPC:        ${{ secrets.XRPL_STAGENET_RPC }}
+      XRPL_EVM_STAGENET_RPC:    ${{ secrets.XRPL_EVM_STAGENET_RPC }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/run-loadtest
+        with:
+          network: stagenet
+          source_chain: ${{ inputs.source_chain }}
+          destination_chain: ${{ inputs.destination_chain }}
+          protocol: ${{ inputs.protocol }}
+          source_rpc: ${{ inputs.source_rpc }}
+          destination_rpc: ${{ inputs.destination_rpc }}
+          num_txs: "1"
+          gas_value: ${{ inputs.gas_value }}
+          token_id: ${{ inputs.token_id }}
+          evm_private_key: ${{ secrets.EVM_PRIVATE_KEY }}
+          solana_private_key: ${{ secrets.SOLANA_PRIVATE_KEY }}
+          sui_private_key: ${{ secrets.SUI_PRIVATE_KEY }}
+          xrpl_private_key: ${{ secrets.XRPL_PRIVATE_KEY }}
+          stellar_private_key: ${{ secrets.STELLAR_PRIVATE_KEY }}

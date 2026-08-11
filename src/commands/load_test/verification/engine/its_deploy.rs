@@ -21,6 +21,7 @@ use super::checks::{
 };
 use super::legacy;
 use super::pipeline::{check_cosmos_routed, check_hub_approved, parse_payload_hash};
+use crate::commands::load_test::resolve::cache_network;
 use crate::config::AxelarChainContract;
 use crate::config::AxelarGlobalContract;
 use crate::config::ChainsConfig;
@@ -29,6 +30,17 @@ use crate::evm::AxelarAmplifierGateway;
 use crate::stellar::{MessageApprovalQuery, StellarClient};
 use crate::types::Network;
 use crate::ui;
+
+/// Remote-deploy propagation budget. Stagenet / devnet-amplifier relayers lag
+/// production: a stagenet deploy was observed executing shortly AFTER the old
+/// flat 500 s budget, turning a healthy route into a false failure. Production
+/// networks keep the tighter bound.
+fn remote_deploy_timeout() -> Duration {
+    match cache_network() {
+        Some(Network::Stagenet | Network::DevnetAmplifier) => Duration::from_secs(900),
+        _ => Duration::from_secs(500),
+    }
+}
 
 pub struct StellarRemoteDeployWait {
     pub config: PathBuf,
@@ -244,11 +256,18 @@ async fn check_amplifier_evm_deploy<P: Provider>(
         (RemoteDeployPhase::Executed, Ok(true)) => {
             spinner.set_message("remote deploy: waiting for EVM execution...");
         }
+        // A destination-RPC blip on one poll cycle must not abort the wait —
+        // warn, keep the phase, and let the next cycle (or the wait's own
+        // timeout) resolve it.
         (RemoteDeployPhase::Approved, Err(error)) => {
-            return Err(error.wrap_err("remote deploy EVM approval check failed"));
+            ui::warn(&format!(
+                "remote deploy EVM approval check failed (retrying next poll): {error}"
+            ));
         }
         (RemoteDeployPhase::Executed, Err(error)) => {
-            return Err(error.wrap_err("remote deploy EVM execution check failed"));
+            ui::warn(&format!(
+                "remote deploy EVM execution check failed (retrying next poll): {error}"
+            ));
         }
         _ => {}
     }
@@ -338,7 +357,7 @@ pub async fn wait_for_its_remote_deploy(
     ui::kv("deploy message ID", deploy_message_id);
     let spinner = ui::wait_spinner("waiting for remote deploy to propagate through hub...");
     let start = Instant::now();
-    let timeout = Duration::from_secs(500);
+    let timeout = remote_deploy_timeout();
     let hub_context = HubDeployContext {
         lcd: &lcd,
         rpc: &rpc,
@@ -461,7 +480,7 @@ pub async fn wait_for_its_remote_deploy_to_stellar(args: StellarRemoteDeployWait
     let spinner =
         ui::wait_spinner("waiting for remote deploy to propagate through hub to Stellar...");
     let start = Instant::now();
-    let timeout = Duration::from_secs(500);
+    let timeout = remote_deploy_timeout();
     let hub_context = HubDeployContext {
         lcd: &lcd,
         rpc: &rpc,
@@ -617,7 +636,7 @@ pub async fn wait_for_its_remote_deploy_to_solana(
     let spinner =
         ui::wait_spinner("waiting for remote deploy to propagate through hub to Solana...");
     let start = Instant::now();
-    let timeout = Duration::from_secs(500);
+    let timeout = remote_deploy_timeout();
     let hub_context = HubDeployContext {
         lcd: &lcd,
         rpc: &rpc,

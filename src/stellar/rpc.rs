@@ -29,6 +29,22 @@ use super::wallet::{StellarWallet, network_passphrase_for};
 
 /// Default poll cadence after submit.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Classic-op fee ladder for `TxInsufficientFee` recovery. 1k stroops covers
+/// normal traffic; surge pricing occasionally clears above it. Stellar bills
+/// `min(submitted, market-clearing)` per op, so climbing the ladder buys
+/// acceptance without raising the real cost (0.0001 -> 0.001 -> 0.01 XLM).
+const CLASSIC_FEE_LADDER: [u32; 3] = [1_000, 10_000, 100_000];
+
+/// Ceiling for the Soroban inclusion-fee bump (2 XLM). The ITS floors are
+/// 100k-200k stroops; two x10 bumps reach this cap.
+const MAX_SOROBAN_INCLUSION_FEE: u32 = 20_000_000;
+
+/// A submission rejected with `TxInsufficientFee` never entered the queue, so
+/// rebuilding the envelope with a higher fee cannot double-send.
+fn is_insufficient_fee<E: std::fmt::Display>(error: &E) -> bool {
+    format!("{error}").contains("TxInsufficientFee")
+}
 // Stellar bills `min(submitted_fee, market_clearing_fee)` per op — a high
 // submitted fee buys priority but doesn't actually pay more when the
 // market clears lower. Horizon `/fee_stats` mainnet p99 is currently
@@ -115,7 +131,20 @@ impl StellarClient {
     /// Fetch the current account sequence number. Returns `None` if the
     /// account is unfunded / missing.
     pub async fn account_sequence(&self, address: &str) -> Result<Option<i64>> {
-        match self.rpc.get_account(address).await {
+        // This read gates every submit (and the `invoke_contract` resubmit
+        // guard), so a transient RPC blip here used to kill a run. Retry
+        // transient errors only: `NotFound` (unfunded account) is
+        // deterministic and falls straight through to the `Ok(None)` mapping.
+        // An exhausted retry still surfaces as `Err`, which the resubmit
+        // guard keeps interpreting as "don't resubmit".
+        let fetched = crate::retry::retry_async(
+            "stellar.get_account",
+            crate::retry::FALLBACK_ATTEMPTS,
+            crate::retry::is_transient_default,
+            || async { self.rpc.get_account(address).await },
+        )
+        .await;
+        match fetched {
             Ok(entry) => Ok(Some(entry.seq_num.0)),
             Err(e) => {
                 if matches!(e, stellar_rpc_client::Error::NotFound(_, _)) {
@@ -162,24 +191,50 @@ impl StellarClient {
             }),
         };
         let ops: VecM<Operation, 100> = vec![op].try_into().map_err(|e| eyre!("ops: {e}"))?;
-        let tx = Transaction {
-            source_account: funder.muxed_account(),
-            // Classic ops use only the per-op base fee. Stellar mainnet base
-            // fee is 100 stroops/op; bump it 10x for headroom against
-            // network fee spikes — still cheap (1000 stroops = 0.0001 XLM).
-            fee: 1_000,
-            seq_num: SequenceNumber(seq + 1),
-            cond: Preconditions::None,
-            memo: Memo::None,
-            operations: ops,
-            ext: TransactionExt::V0,
-        };
-        let signed = self.sign(funder, tx)?;
-        let hash = self
-            .rpc
-            .send_transaction(&signed)
-            .await
-            .map_err(|e| eyre!("send_transaction: {e}"))?;
+        // Climb the fee ladder on TxInsufficientFee (surge pricing): a
+        // rejected submission never entered the queue, so a rebuilt
+        // higher-fee envelope at the same sequence cannot double-send.
+        let mut hash = None;
+        for (tier, &fee) in CLASSIC_FEE_LADDER.iter().enumerate() {
+            let tx = Transaction {
+                source_account: funder.muxed_account(),
+                fee,
+                seq_num: SequenceNumber(seq + 1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: ops.clone(),
+                ext: TransactionExt::V0,
+            };
+            let signed = self.sign(funder, tx)?;
+            // Rebroadcasting the identical signed envelope is idempotent
+            // (fixed sequence — at most one copy lands), so transient
+            // transport errors safely retry the same envelope. Never re-sign
+            // inside the retry.
+            let sent = crate::retry::retry_async(
+                "stellar.send_transaction",
+                crate::retry::FALLBACK_ATTEMPTS,
+                crate::retry::is_transient_default,
+                || async { self.rpc.send_transaction(&signed).await },
+            )
+            .await;
+            match sent {
+                Ok(sent_hash) => {
+                    hash = Some(sent_hash);
+                    break;
+                }
+                Err(error)
+                    if is_insufficient_fee(&error) && tier + 1 < CLASSIC_FEE_LADDER.len() =>
+                {
+                    crate::ui::warn(&format!(
+                        "stellar create_account: TxInsufficientFee at {fee} stroops — \
+                         resubmitting at {}",
+                        CLASSIC_FEE_LADDER[tier + 1]
+                    ));
+                }
+                Err(error) => return Err(eyre!("send_transaction: {error}")),
+            }
+        }
+        let hash = hash.ok_or_else(|| eyre!("create_account: fee ladder exhausted"))?;
         let tx_hash_hex = hex::encode(hash.0);
 
         let start = Instant::now();
@@ -208,7 +263,16 @@ impl StellarClient {
     /// Native-XLM balance of `address` in stroops. Returns `None` if the
     /// account does not exist yet.
     pub async fn native_balance_stroops(&self, address: &str) -> Result<Option<i64>> {
-        match self.rpc.get_account(address).await {
+        // Same retry/NotFound split as `account_sequence`: retry transient
+        // RPC errors, map a deterministic `NotFound` to `Ok(None)`.
+        let fetched = crate::retry::retry_async(
+            "stellar.get_account",
+            crate::retry::FALLBACK_ATTEMPTS,
+            crate::retry::is_transient_default,
+            || async { self.rpc.get_account(address).await },
+        )
+        .await;
+        match fetched {
             Ok(entry) => Ok(Some(entry.balance)),
             Err(e) => {
                 if matches!(e, stellar_rpc_client::Error::NotFound(_, _)) {
@@ -237,6 +301,7 @@ impl StellarClient {
         // colliding tx has either settled or been dropped.
         const MAX_SEQ_RETRIES: u8 = 4;
         let mut attempt: u8 = 0;
+        let mut fee_tier: usize = 0;
         let hash = loop {
             let seq = self
                 .account_sequence(&funder.address())
@@ -260,7 +325,7 @@ impl StellarClient {
             let ops: VecM<Operation, 100> = vec![op].try_into().map_err(|e| eyre!("ops: {e}"))?;
             let tx = Transaction {
                 source_account: funder.muxed_account(),
-                fee: 1_000,
+                fee: CLASSIC_FEE_LADDER[fee_tier],
                 seq_num: SequenceNumber(seq + 1),
                 cond: Preconditions::None,
                 memo: Memo::None,
@@ -268,7 +333,18 @@ impl StellarClient {
                 ext: TransactionExt::V0,
             };
             let signed = self.sign(funder, tx)?;
-            match self.rpc.send_transaction(&signed).await {
+            // Transient transport errors rebroadcast the identical signed
+            // envelope (idempotent: fixed sequence, at most one copy lands).
+            // TxBadSeq is not transient, so it bails out of the retry and
+            // falls through to the re-fetch recovery below.
+            let sent = crate::retry::retry_async(
+                "stellar.send_transaction",
+                crate::retry::FALLBACK_ATTEMPTS,
+                crate::retry::is_transient_default,
+                || async { self.rpc.send_transaction(&signed).await },
+            )
+            .await;
+            match sent {
                 Ok(hash) => break hash,
                 Err(e) if attempt + 1 < MAX_SEQ_RETRIES && format!("{e}").contains("TxBadSeq") => {
                     crate::ui::warn(&format!(
@@ -279,6 +355,16 @@ impl StellarClient {
                     // Brief backoff so the colliding tx settles.
                     tokio::time::sleep(Duration::from_millis(500u64 << attempt)).await;
                     attempt += 1;
+                    continue;
+                }
+                Err(e) if is_insufficient_fee(&e) && fee_tier + 1 < CLASSIC_FEE_LADDER.len() => {
+                    crate::ui::warn(&format!(
+                        "stellar pay_native_classic: TxInsufficientFee at {} stroops — \
+                         resubmitting at {}",
+                        CLASSIC_FEE_LADDER[fee_tier],
+                        CLASSIC_FEE_LADDER[fee_tier + 1],
+                    ));
+                    fee_tier += 1;
                     continue;
                 }
                 Err(e) => return Err(eyre!("send_transaction: {e}")),
@@ -379,11 +465,22 @@ impl StellarClient {
             tx: tx.clone(),
             signatures: VecM::default(),
         });
-        let sim = self
-            .rpc
-            .simulate_transaction_envelope(&envelope, None)
-            .await
-            .map_err(|e| eyre!("simulate_transaction_envelope: {e}"))?;
+        // Simulation is a pure read, so transient RPC errors retry safely.
+        // Deterministic failures bail immediately: contract errors arrive in
+        // `sim.error` on the Ok path, and non-transient transport errors are
+        // filtered out by the predicate.
+        let sim = crate::retry::retry_async(
+            "stellar.simulate_invoke",
+            crate::retry::FALLBACK_ATTEMPTS,
+            crate::retry::is_transient_default,
+            || async {
+                self.rpc
+                    .simulate_transaction_envelope(&envelope, None)
+                    .await
+            },
+        )
+        .await
+        .map_err(|e| eyre!("simulate_transaction_envelope: {e}"))?;
         if let Some(err) = &sim.error {
             return Err(eyre!("Stellar simulation failed: {err}"));
         }
@@ -419,11 +516,20 @@ impl StellarClient {
         // 4. Sign.
         let signed = self.sign(wallet, tx)?;
 
-        // 5. Submit.
-        self.rpc
-            .send_transaction(&signed)
-            .await
-            .map_err(|e| eyre!("send_transaction: {e}"))
+        // 5. Submit. Transient transport errors rebroadcast the identical
+        // signed envelope — idempotent (fixed sequence: at most one copy
+        // lands; a rebroadcast after the tx already landed surfaces TxBadSeq,
+        // which is not transient and bails out to the caller's TxBadSeq
+        // loop). Never re-sign inside the retry: a fresh envelope with a
+        // re-read sequence would be a real double-send.
+        crate::retry::retry_async(
+            "stellar.send_transaction",
+            crate::retry::FALLBACK_ATTEMPTS,
+            crate::retry::is_transient_default,
+            || async { self.rpc.send_transaction(&signed).await },
+        )
+        .await
+        .map_err(|e| eyre!("send_transaction: {e}"))
     }
 
     /// Build + simulate + sign + submit an InvokeContract call, then poll.
@@ -462,6 +568,10 @@ impl StellarClient {
         // already consumed (so we stop instead).
         const MAX_VALIDATE_RESUBMITS: u8 = 2;
         let mut resubmit: u8 = 0;
+        // Working inclusion fee: starts at the caller's floor and is bumped
+        // x10 (capped) on TxInsufficientFee. Persists across dropped-tx
+        // resubmits — a dropped tx was usually underpriced.
+        let mut fee = base_fee;
         loop {
             let seq_before = self
                 .account_sequence(&wallet.address())
@@ -477,8 +587,16 @@ impl StellarClient {
             const MAX_SEQ_RETRIES: u8 = 4;
             let mut attempt: u8 = 0;
             let hash = loop {
-                match self.submit_invoke_once(wallet, &invoke, base_fee).await {
+                match self.submit_invoke_once(wallet, &invoke, fee).await {
                     Ok(hash) => break hash,
+                    Err(e) if is_insufficient_fee(&e) && fee < MAX_SOROBAN_INCLUSION_FEE => {
+                        fee = fee.saturating_mul(10).min(MAX_SOROBAN_INCLUSION_FEE);
+                        crate::ui::warn(&format!(
+                            "stellar invoke_contract: TxInsufficientFee — resubmitting with \
+                             inclusion fee bumped to {fee} stroops"
+                        ));
+                        continue;
+                    }
                     Err(e)
                         if attempt + 1 < MAX_SEQ_RETRIES && format!("{e}").contains("TxBadSeq") =>
                     {

@@ -38,7 +38,12 @@ pub async fn run_config(
     recent: usize,
     timeout_secs: u64,
 ) -> Result<()> {
-    let base = gmp_api::base_url(network);
+    let base = gmp_api::base_url(network).ok_or_else(|| {
+        eyre::eyre!(
+            "network {} has no Axelarscan GMP API deployment",
+            network.as_str()
+        )
+    })?;
 
     ui::section("Express Execution Monitor (observe-only)");
     ui::kv("network", network.as_str());

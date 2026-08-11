@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use sui_sdk_types::{Address as SuiAddress, Digest, ObjectReference};
 
 use super::tx::SubmittedTx;
+use crate::retry::{FALLBACK_ATTEMPTS, is_transient_default, retry_async};
 
 /// Public Sui RPCs used as silent fallbacks if the configured endpoint errors.
 /// Mainnet and testnet share keys; we pick by URL hint.
@@ -58,6 +59,19 @@ enum SuiRpcError {
 }
 
 impl SuiRpcError {
+    /// Whether another pass over the endpoints could plausibly succeed.
+    /// Transport, HTTP-status, body-read, and non-JSON failures are endpoint
+    /// flakiness; a JSON-RPC error body is only retried when its text matches
+    /// the transient signatures (429, timeouts, 5xx) — a deterministic
+    /// failure (MoveAbort, object not found, insufficient gas) answers the
+    /// same on every pass, so retrying just delays the real error.
+    fn is_transient(&self) -> bool {
+        match self {
+            Self::Rpc { .. } => is_transient_default(self),
+            _ => true,
+        }
+    }
+
     fn is_query_events_indexer_pending(&self) -> bool {
         matches!(
             self,
@@ -108,6 +122,11 @@ impl SuiClient {
             .map_err(eyre::Report::new)
     }
 
+    /// One pass over `[primary, ...fallbacks]`, retried up to
+    /// [`FALLBACK_ATTEMPTS`] passes with geometric backoff while the last
+    /// error of a pass looks transient ([`SuiRpcError::is_transient`]).
+    /// Every pass reuses the same serialized params, so re-POSTing a signed
+    /// transaction is safe — Sui dedups by digest.
     async fn call_typed(
         &self,
         method: &str,
@@ -115,8 +134,25 @@ impl SuiClient {
     ) -> std::result::Result<Value, SuiRpcError> {
         let mut endpoints = vec![self.primary.clone()];
         endpoints.extend(self.fallbacks.iter().cloned());
+        retry_async(
+            &format!("Sui RPC {method}"),
+            FALLBACK_ATTEMPTS,
+            SuiRpcError::is_transient,
+            || self.call_each_endpoint(method, &params, &endpoints),
+        )
+        .await
+    }
+
+    /// Single pass: try each endpoint in order, moving on to the next
+    /// whenever one fails; returns the last endpoint's error if all do.
+    async fn call_each_endpoint(
+        &self,
+        method: &str,
+        params: &Value,
+        endpoints: &[String],
+    ) -> std::result::Result<Value, SuiRpcError> {
         let mut last_err = None;
-        for endpoint in &endpoints {
+        for endpoint in endpoints {
             let body = json!({
                 "jsonrpc": "2.0",
                 "id": 1,

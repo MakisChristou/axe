@@ -1,0 +1,123 @@
+{
+  "chains": {
+    "arbitrum-sepolia": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0xF225E7d032F8666D94C41F779B91940e172FAC26"
+        }
+      }
+    },
+    "avalanche": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x13AEbE0D053937D99116186eFb7CAD6bCA7a6212"
+        }
+      }
+    },
+    "base-sepolia": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x69A879C119327563Ed350238ACAd6C38EF423F71"
+        }
+      }
+    },
+    "binance": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0xE1696DdE1B0B50A8eB3519fe2AeB3A17F57b55c0"
+        }
+      }
+    },
+    "ethereum-sepolia": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x7cCa4c1Aade94fD5A033D2C11D40075541E45717"
+        }
+      }
+    },
+    "filecoin-2": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0xD680Db0f7e932f5f2505D60E8cD6687A0F808Ce8"
+        }
+      }
+    },
+    "hedera": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0xe7Ca1b05B182E2eD96A8b5277aa1014F13A5e04C"
+        }
+      }
+    },
+    "hyperliquid": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0xaE4A1985a83CDff1b7D34De4dC5cFe135fC2916a"
+        }
+      }
+    },
+    "immutable": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x2E7a3C96c781B613675Ac32430A8B4FbA3012b54"
+        }
+      }
+    },
+    "kava": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x30546c08834bBf2b497D8A51585B3d79dfA5328b"
+        }
+      }
+    },
+    "linea-sepolia": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0xDBB0e0443EA5DceAcC4d478E60B5C2a40603EEA2"
+        }
+      }
+    },
+    "mantle-sepolia": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x40A7907B66c8C64088f296aa4Fcd4A8b54137C62"
+        }
+      }
+    },
+    "monad-3": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x36aaed5dC0d8e321FF5465bA6B1fCe842FC382E4"
+        }
+      }
+    },
+    "optimism-sepolia": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x96601A0811b926C5ADd800D2A0d859C84203A367"
+        }
+      }
+    },
+    "polygon-sepolia": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0xD0EfDC90Bdb5127A407dABa673eC1a42a6869A19"
+        }
+      }
+    },
+    "scroll": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x201C47CE7d849A5B2B3892B716bae479de27BeE3"
+        }
+      }
+    },
+    "xrpl-evm": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0xEfAa6955BFc1FC498C7Ce962ab9E49b23A7943f0"
+        }
+      }
+    }
+  }
+}

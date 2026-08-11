@@ -14,7 +14,9 @@
 //! Callers fall back to their existing constants when the API can't be
 //! reached or returns 0 (testnet/stagenet do this for unsupported routes).
 
+use crate::retry::{FALLBACK_ATTEMPTS, retry_async};
 use crate::types::Network;
+use reqwest::StatusCode;
 
 /// Multiplier applied to the relayer's quote: returned = raw × 3/2.
 /// Covers intraday destination-gas-price swings between estimate-at-startup
@@ -50,16 +52,36 @@ pub(super) async fn estimate_route_gas(
          &gasMultiplier=auto\
          &sourceTokenSymbol={source_token_symbol}"
     );
-    let resp = reqwest::get(&url).await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let body = resp.text().await.ok()?;
+    let client = reqwest::Client::new();
+    // Retry transient failures before giving up; once the retry budget is
+    // exhausted (or on a permanent 4xx) still return `None` so callers keep
+    // their hardcoded fallback.
+    let body = retry_async(
+        "gmp-api estimateGasFee",
+        FALLBACK_ATTEMPTS,
+        is_transient_http,
+        || async {
+            let resp = client.get(&url).send().await?.error_for_status()?;
+            resp.text().await
+        },
+    )
+    .await
+    .ok()?;
     let raw: u128 = body.trim().parse().ok()?;
     if raw == 0 {
         return None;
     }
     Some(raw.saturating_mul(SAFETY_NUM) / SAFETY_DEN)
+}
+
+/// Retry classification: transport errors (connect / timeout / body read)
+/// and HTTP 429/5xx are transient; any other 4xx is a permanent request
+/// error and surfaces immediately.
+fn is_transient_http(err: &reqwest::Error) -> bool {
+    match err.status() {
+        Some(status) => status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error(),
+        None => true, // transport-level: no HTTP status attached
+    }
 }
 
 fn api_base_url(network: Network) -> Option<&'static str> {

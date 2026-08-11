@@ -1,0 +1,130 @@
+{
+  "chains": {
+    "avalanche": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x69484e0C70a54F18376EF89269bF4fC1751ccCda"
+        }
+      }
+    },
+    "arbitrum": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0xA3509e690a430F05BD5aaA5dd7786154374F9f4a"
+        }
+      }
+    },
+    "base": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x3790d8D666039b22c7Ca76F5c829574DAe97BB6e"
+        }
+      }
+    },
+    "binance": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x93540654402A2e18A1B5c9857898871D5298C0Ee"
+        }
+      }
+    },
+    "blast": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0xcfB3781c4Ee2CF54fCeb71113da97D650505EA70"
+        }
+      }
+    },
+    "ethereum": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0xE92e795cad574077342bD2e8E5A6Cc4D9B10e13F"
+        }
+      }
+    },
+    "filecoin": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0xB78ebE401B54849Ce9C829d1236328D16f2ebCfC"
+        }
+      }
+    },
+    "hedera": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x361EfDfF1De6fF0a7087f23e34Db2044dab08203"
+        }
+      }
+    },
+    "hyperliquid": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x4070803ED966388B720c2d37f72D19639829F81D"
+        }
+      }
+    },
+    "immutable": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x27892c11888de1280DfECE90b4E8B452416576DD"
+        }
+      }
+    },
+    "kava": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x9A99cEc3Ba8a45fd07185862fdd7D2e984497baE"
+        }
+      }
+    },
+    "linea": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x86bF6A161588bf308D600830a58EF69b57B65428"
+        }
+      }
+    },
+    "mantle": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x88a1EE1F7D5906D0De3105bA33e2247fEa690c40"
+        }
+      }
+    },
+    "monad": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0xDe7470e5Bb15D61B19FCa43d19EA611C88c86124"
+        }
+      }
+    },
+    "optimism": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x12d68CF22019dfDE54E2F00A80cefF7f180884df"
+        }
+      }
+    },
+    "polygon": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x68331c7a103055fE3Dd5141F258cc7376B03cFA2"
+        }
+      }
+    },
+    "scroll": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x52308d99234c9A413BbBB93C33cFf0E86852fA1a"
+        }
+      }
+    },
+    "xrpl-evm": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x685EF76DcC3ABcE929575399162EB47f2b1d83A2"
+        }
+      }
+    }
+  }
+}

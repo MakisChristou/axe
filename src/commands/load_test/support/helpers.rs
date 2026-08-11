@@ -11,11 +11,13 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use alloy::eips::BlockId;
 use alloy::transports::TransportError;
 use alloy::{
+    network::Ethereum,
     network::TransactionBuilder,
     primitives::{Address, Bytes, FixedBytes, U256},
-    providers::{Provider, ProviderBuilder},
+    providers::{PendingTransactionBuilder, Provider, ProviderBuilder},
     rpc::types::TransactionRequest,
     signers::local::PrivateKeySigner,
     sol_types::SolValue,
@@ -28,9 +30,12 @@ use tokio::{fs, time};
 use super::metrics::{AmplifierTiming, LoadTestReport, VerificationReport};
 use super::verify;
 use super::{GmpCache, LoadTestArgs, read_cache, save_cache};
-use crate::config::{ChainContract, ChainsConfig};
-use crate::evm::{ERC20, InterchainTokenService, SenderReceiver, read_artifact_bytecode};
-use crate::retry::{DEFAULT_ATTEMPTS, retry_async};
+use crate::config::{ChainContract, ChainsConfig, ContractEntry};
+use crate::evm::{
+    ERC20, InterchainTokenService, SenderReceiver, is_pending_state_error, parse_expected_nonce,
+    read_artifact_bytecode,
+};
+use crate::retry::{FALLBACK_ATTEMPTS, retry_all, retry_async};
 use crate::stellar::StellarWallet;
 use crate::sui::{SuiWallet, read_sui_chain_config};
 use crate::ui;
@@ -80,6 +85,52 @@ async fn get_code_with_retry<P: Provider>(provider: &P, addr: Address) -> Result
     Ok(last)
 }
 
+/// SenderReceiver address recorded for the current network in this repo's
+/// axe-tokens overlay (`chains.<chain>.contracts.SenderReceiver.address`).
+/// The helper contract is deploy-once — recording it here lets every CI and
+/// local run reuse it instead of redeploying a receiver per run.
+async fn overlay_sender_receiver(cache_key: &str) -> Option<Address> {
+    let network = super::resolve::cache_network()?;
+    let overlay = Path::new("axe-tokens").join(format!("{network}.json"));
+    let cfg = ChainsConfig::load(&overlay).await.ok()?;
+    // GMP cache keys can be composite (`avalanche-fuji-evm-to-evm-dest`) while
+    // the overlay is keyed by plain chain ids — strip trailing `-<segment>`s
+    // until a chains entry matches (chain ids themselves contain dashes, so
+    // only suffix-stripping is safe).
+    let mut key = cache_key;
+    loop {
+        if let Some(addr) = cfg
+            .chains
+            .get(key)
+            .and_then(|chain| chain.contracts.as_ref())
+            .and_then(|contracts| contracts.get("SenderReceiver"))
+            .and_then(|entry| entry.address.as_deref())
+            .and_then(|address| address.parse().ok())
+        {
+            return Some(addr);
+        }
+        match key.rfind('-') {
+            Some(i) => key = &key[..i],
+            None => return None,
+        }
+    }
+}
+
+/// Verify a candidate SenderReceiver is live and wired to the expected
+/// gateway. Shared by the overlay and local-cache reuse paths.
+async fn sender_receiver_is_valid<R: Provider>(
+    read_provider: &R,
+    addr: Address,
+    gateway_addr: Address,
+) -> Result<bool> {
+    let code = get_code_with_retry(read_provider, addr).await?;
+    if code.is_empty() {
+        return Ok(false);
+    }
+    let sr = SenderReceiver::new(addr, read_provider);
+    Ok(matches!(sr.gateway().call().await, Ok(gw) if gw == gateway_addr))
+}
+
 pub(crate) async fn deploy_or_reuse_sender_receiver<R: Provider, W: Provider>(
     cache: &GmpCache,
     cache_key: &str,
@@ -89,6 +140,21 @@ pub(crate) async fn deploy_or_reuse_sender_receiver<R: Provider, W: Provider>(
     gas_service_addr: Address,
     label: &str,
 ) -> Result<Address> {
+    // Committed overlay first: deployed-once helpers recorded in
+    // axe-tokens/<network>.json survive fresh CI checkouts, unlike the local
+    // GmpCache.
+    if let Some(addr) = overlay_sender_receiver(cache_key).await {
+        if sender_receiver_is_valid(read_provider, addr, gateway_addr).await? {
+            ui::info(&format!(
+                "SenderReceiver ({label}): using configured {addr}"
+            ));
+            return Ok(addr);
+        }
+        ui::warn(&format!(
+            "configured SenderReceiver ({label}) at {addr} failed verification \
+             (no code or wrong gateway) — falling back to cache/deploy"
+        ));
+    }
     if let Some(addr_str) = cache.sender_receiver_address.as_deref() {
         let addr: Address = addr_str.parse()?;
         let code = get_code_with_retry(read_provider, addr).await?;
@@ -125,6 +191,7 @@ pub(crate) async fn deploy_or_reuse_sender_receiver<R: Provider, W: Provider>(
             let mut cache = cache.clone();
             cache.sender_receiver_address = Some(new_addr.to_string());
             save_cache(cache_key, &cache).await?;
+            hint_persist_sender_receiver(cache_key, new_addr);
             Ok(new_addr)
         } else {
             ui::info(&format!("SenderReceiver ({label}): reusing {addr}"));
@@ -136,37 +203,20 @@ pub(crate) async fn deploy_or_reuse_sender_receiver<R: Provider, W: Provider>(
         let mut cache = cache.clone();
         cache.sender_receiver_address = Some(addr.to_string());
         save_cache(cache_key, &cache).await?;
+        hint_persist_sender_receiver(cache_key, addr);
         Ok(addr)
     }
 }
 
-/// Replace any `http://…` / `https://…` substring with `<redacted-url>`,
-/// preserving the surrounding text. Used to keep RPC URLs (which can come
-/// from repo secrets) out of the load-test JSON report and other surfaces
-/// that may include propagated error messages.
-///
-/// Terminators recognised as the end of a URL: whitespace, `'`, `"`, `)`,
-/// `]`, `,`, `;`, `<`, `>`.
-pub(crate) fn scrub_urls(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut i = 0;
-    while i < input.len() {
-        let rest = &input[i..];
-        if rest.starts_with("http://") || rest.starts_with("https://") {
-            let end = rest
-                .find(|c: char| {
-                    c.is_whitespace() || matches!(c, '\'' | '"' | ')' | ']' | ',' | ';' | '<' | '>')
-                })
-                .unwrap_or(rest.len());
-            out.push_str("<redacted-url>");
-            i += end;
-        } else {
-            let ch_len = rest.chars().next().map_or(1, char::len_utf8);
-            out.push_str(&input[i..i + ch_len]);
-            i += ch_len;
-        }
-    }
-    out
+/// Print a hint suggesting the fresh SenderReceiver be recorded in the
+/// axe-tokens overlay so future runs (including fresh CI checkouts) reuse it.
+fn hint_persist_sender_receiver(chain: &str, addr: Address) {
+    let network = super::resolve::cache_network()
+        .map_or_else(|| "<network>".to_string(), |network| network.to_string());
+    ui::info(&format!(
+        "💡 To skip this deploy on future runs, add to axe-tokens/{network}.json:\n  \
+         chains.{chain}.contracts.SenderReceiver.address = \"{addr}\""
+    ));
 }
 
 pub(crate) async fn finish_report(report: &mut LoadTestReport, run_start: Instant) -> Result<()> {
@@ -175,7 +225,7 @@ pub(crate) async fn finish_report(report: &mut LoadTestReport, run_start: Instan
     // refactor: private RPC URLs (from repo secrets) must not appear in the
     // JSON artifact, regardless of where the underlying error came from.
     for tx in &mut report.transactions {
-        tx.map_error(scrub_urls);
+        tx.map_error(ui::scrub_urls);
     }
     print_final_report(report);
 
@@ -259,12 +309,16 @@ pub(crate) async fn validate_evm_rpc(rpc_url: &str) -> Result<()> {
             .parse()
             .map_err(|e| eyre::eyre!("invalid EVM RPC URL: {e}"))?,
     );
-    provider.get_chain_id().await.map_err(|_| {
-        eyre::eyre!(
-            "configured EVM RPC does not appear to be a valid endpoint \
-             (eth_chainId failed). Check the chain-config or RPC override."
-        )
-    })?;
+    // Retried: a transient blip on the pre-flight probe must not kill a run
+    // whose actual sends carry full retry + fallback.
+    retry_all("validate_evm_rpc", || provider.get_chain_id())
+        .await
+        .map_err(|_| {
+            eyre::eyre!(
+                "configured EVM RPC does not appear to be a valid endpoint \
+                 (eth_chainId failed). Check the chain-config or RPC override."
+            )
+        })?;
     Ok(())
 }
 
@@ -325,8 +379,12 @@ pub(crate) async fn deploy_sender_receiver<P: Provider>(
     gas_service: Address,
 ) -> Result<Address> {
     // Legacy (pre-1559) chains break alloy's default fee estimation; detect and
-    // send a type-0 tx with an explicit gas_price instead.
-    let fee_mode = super::gas_mode::EvmFeeMode::detect(provider).await?;
+    // send a type-0 tx with an explicit gas_price instead. Retried: two
+    // read-only calls whose transient failure would otherwise abort the deploy.
+    let fee_mode = retry_all("detect fee mode", || {
+        super::gas_mode::EvmFeeMode::detect(provider)
+    })
+    .await?;
 
     // Pre-Shanghai chains (e.g. Kava) reject the default bytecode's PUSH0
     // opcode. Probe with eth_call (no nonce consumed) so we send exactly one
@@ -374,11 +432,78 @@ fn is_unsupported_opcode(error: &TransportError) -> bool {
     })
 }
 
+/// Last-resort deploy send with nonce + gas pinned manually, used when the
+/// default fillers' queries are unusable: pending-block state persistently
+/// unavailable (`nonce_override: None` — resolve both against `latest`), or
+/// a stale-nonce node whose rejection reported the true next nonce
+/// (`nonce_override: Some`). The deployer address comes from the run's EVM
+/// key (`EVM_PRIVATE_KEY`, which the CLI flag also maps to) — the same wallet
+/// `provider` signs with.
+async fn deploy_pinned<P: Provider>(
+    provider: &P,
+    deploy_code: &[u8],
+    fee_mode: super::gas_mode::EvmFeeMode,
+    nonce_override: Option<u64>,
+) -> Result<PendingTransactionBuilder<Ethereum>> {
+    match nonce_override {
+        Some(nonce) => ui::warn(&format!(
+            "deploy fill got a stale nonce — re-sending pinned to node-reported nonce {nonce}"
+        )),
+        None => ui::warn(
+            "deploy fill kept hitting 'state not available for pending block' — \
+             re-sending with nonce+gas pinned to the latest block",
+        ),
+    }
+    let from = env::var("EVM_PRIVATE_KEY")
+        .ok()
+        .and_then(|key| key.parse::<PrivateKeySigner>().ok())
+        .map(|signer| signer.address())
+        .ok_or_else(|| {
+            eyre::eyre!("latest-pinned deploy needs EVM_PRIVATE_KEY to derive the deployer address")
+        })?;
+    let base = fee_mode
+        .apply(TransactionRequest::default().with_deploy_code(Bytes::from(deploy_code.to_vec())))
+        .with_from(from);
+    let nonce = match nonce_override {
+        Some(nonce) => nonce,
+        None => {
+            retry_all("deploy nonce (latest block)", || async {
+                provider.get_transaction_count(from).await
+            })
+            .await?
+        }
+    };
+    let estimate = retry_all("deploy gas (latest block)", || {
+        let tx = base.clone();
+        async move { provider.estimate_gas(tx).block(BlockId::latest()).await }
+    })
+    .await?;
+    // 20% headroom over the latest-block estimate.
+    let tx = base
+        .with_nonce(nonce)
+        .with_gas_limit(estimate.saturating_mul(12) / 10);
+    retry_async(
+        "deploy send (latest-pinned)",
+        FALLBACK_ATTEMPTS,
+        is_retryable_evm_transport,
+        || {
+            let tx = tx.clone();
+            async { provider.send_transaction(tx).await }
+        },
+    )
+    .await
+    .map_err(Into::into)
+}
+
 fn is_retryable_evm_transport(error: &TransportError) -> bool {
-    if error
-        .as_error_resp()
-        .is_some_and(|response| response.is_retry_err())
-    {
+    if error.as_error_resp().is_some_and(|response| {
+        // Avalanche's pending-state rejection isn't in alloy's retryable set
+        // but is endpoint-transient (see `retry::is_transient_default`).
+        response.is_retry_err()
+            || response
+                .message
+                .contains("state not available for pending block")
+    }) {
         return true;
     }
     let Some(transport) = error.as_transport_err() else {
@@ -413,12 +538,15 @@ async fn deploy_with_artifact<P: Provider>(
     deploy_code.extend_from_slice(&(gateway, gas_service).abi_encode_params());
 
     // Wrap `send_transaction` with retry on transient transport / 5xx /
-    // 429 errors — observed flakes on HL and Hedera mainnet RPCs where
-    // the same submission succeeds on retry. Real reverts (insufficient
-    // funds, custom errors) are typed RPC responses and skip the retry.
-    let pending = retry_async(
+    // 429 / pending-state errors — observed flakes on HL, Hedera, and
+    // Avalanche RPCs where the same submission succeeds on retry. Real
+    // reverts (insufficient funds, custom errors) are typed RPC responses
+    // and skip the retry. FALLBACK_ATTEMPTS (5): the Avalanche pending-state
+    // stretch outlasts the 3-attempt budget (proven by stagenet run
+    // 31115899822, which died here).
+    let sent = retry_async(
         "deploy_sender_receiver.send_transaction",
-        DEFAULT_ATTEMPTS,
+        FALLBACK_ATTEMPTS,
         is_retryable_evm_transport,
         || {
             let tx = fee_mode.apply(
@@ -427,7 +555,27 @@ async fn deploy_with_artifact<P: Provider>(
             async { provider.send_transaction(tx).await }
         },
     )
-    .await?;
+    .await;
+    let pending = match sent {
+        Ok(pending) => pending,
+        // Avalanche-family nodes go through stretches where pending-block
+        // state (which alloy's nonce + gas fillers query) is unavailable for
+        // longer than the whole retry budget, while `latest` keeps working.
+        // Degrade exactly like `EvmEndpoints::fill_and_sign`: resolve nonce +
+        // gas against `latest` ourselves, then re-send with the fillers
+        // bypassed.
+        Err(error) if is_pending_state_error(&error) => {
+            deploy_pinned(provider, &deploy_code, fee_mode, None).await?
+        }
+        // Stale-nonce node (Blast sepolia observed): the fill's nonce query
+        // lags the tx pool, but the rejection carries the true next nonce —
+        // pin it and re-send.
+        Err(error) if parse_expected_nonce(&error.to_string()).is_some() => {
+            let expected = parse_expected_nonce(&error.to_string());
+            deploy_pinned(provider, &deploy_code, fee_mode, expected).await?
+        }
+        Err(error) => return Err(error.into()),
+    };
     let tx_hash = *pending.tx_hash();
     ui::tx_hash("deploy tx", &format!("{tx_hash}"));
     ui::info("waiting for confirmation...");
@@ -435,10 +583,22 @@ async fn deploy_with_artifact<P: Provider>(
     // 240 s tolerates HL's ~60 s big-blocks cadence + Hedera HTS-create
     // latency. Fast EVMs (Solana, Stellar destinations) still return as
     // soon as the receipt is available; this is an upper bound, not a
-    // floor.
-    let receipt = time::timeout(Duration::from_secs(240), pending.get_receipt())
-        .await
-        .map_err(|_| eyre::eyre!("deploy tx timed out after 240s"))??;
+    // floor. Polled by hash so a transient RPC error mid-wait (observed:
+    // QuikNode dropping the connection) retries instead of aborting a
+    // deploy whose tx already landed.
+    let deploy_tx_hash = *pending.tx_hash();
+    let deadline = Instant::now() + Duration::from_secs(240);
+    let receipt = loop {
+        if let Ok(Some(receipt)) = provider.get_transaction_receipt(deploy_tx_hash).await {
+            break receipt;
+        }
+        if Instant::now() >= deadline {
+            return Err(eyre::eyre!(
+                "deploy tx {deploy_tx_hash:#x} timed out after 240s"
+            ));
+        }
+        time::sleep(Duration::from_secs(3)).await;
+    };
 
     let addr = receipt
         .contract_address
@@ -839,20 +999,53 @@ pub(crate) async fn read_pre_registered_axe_token(
     config: &Path,
     chain_axelar_id: &str,
 ) -> Result<Option<FixedBytes<32>>> {
-    let config = ChainsConfig::load(config).await?;
-    let tid_str = config
-        .chains
-        .get(chain_axelar_id)
-        .and_then(|chain| chain.contracts.as_ref())
-        .and_then(|contracts| contracts.get("AXE"))
-        .and_then(|axe| axe.token_id.as_deref());
+    let tid_str =
+        match axe_config_field(config, chain_axelar_id, |axe| axe.token_id.clone()).await? {
+            Some(value) => Some(value),
+            None => axe_overlay_field(config, chain_axelar_id, |axe| axe.token_id.clone()).await,
+        };
     match tid_str {
         Some(value) => Ok(Some(FixedBytes::from(parse_token_id_hex(
-            value,
+            &value,
             &format!("AXE.tokenId for chain {chain_axelar_id}"),
         )?))),
         None => Ok(None),
     }
+}
+
+/// Read one `chains.<chain>.contracts.AXE.<field>` value from a chains-config
+/// file.
+async fn axe_config_field(
+    config: &Path,
+    chain_axelar_id: &str,
+    pick: fn(&ContractEntry) -> Option<String>,
+) -> Result<Option<String>> {
+    let config = ChainsConfig::load(config).await?;
+    Ok(config
+        .chains
+        .get(chain_axelar_id)
+        .and_then(|chain| chain.contracts.as_ref())
+        .and_then(|contracts| contracts.get("AXE"))
+        .and_then(pick))
+}
+
+/// Same lookup against this repo's AXE-token overlay,
+/// `axe-tokens/<network>.json` (network = the chains-config file stem). The
+/// upstream chains-config for stagenet / devnet-amplifier records no
+/// `contracts.AXE` entries and axe cannot push there, so tokens deployed on
+/// those networks persist HERE — the CI checkout and local runs both see the
+/// file. Missing/unreadable overlay is simply "no entry".
+async fn axe_overlay_field(
+    config: &Path,
+    chain_axelar_id: &str,
+    pick: fn(&ContractEntry) -> Option<String>,
+) -> Option<String> {
+    let stem = config.file_stem()?.to_str()?;
+    let overlay = Path::new("axe-tokens").join(format!("{stem}.json"));
+    axe_config_field(&overlay, chain_axelar_id, pick)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Companion to `read_pre_registered_axe_token`: returns the AXE
@@ -879,13 +1072,11 @@ pub(crate) async fn read_pre_registered_axe_token_address(
     // the caller fell back to ITS.interchainTokenAddress(tokenId), which
     // reverts on the Hedera HTS-fork (its `registeredTokenAddress` view
     // replaces it).
-    let config = ChainsConfig::load(config).await?;
-    let addr_str = config
-        .chains
-        .get(chain_axelar_id)
-        .and_then(|chain| chain.contracts.as_ref())
-        .and_then(|contracts| contracts.get("AXE"))
-        .and_then(|axe| axe.address.as_deref());
+    let addr_str =
+        match axe_config_field(config, chain_axelar_id, |axe| axe.address.clone()).await? {
+            Some(value) => Some(value),
+            None => axe_overlay_field(config, chain_axelar_id, |axe| axe.address.clone()).await,
+        };
     match addr_str {
         Some(s) => Ok(Some(s.parse().map_err(|e| {
             eyre::eyre!("invalid AXE.address for chain {chain_axelar_id}: {e}")
@@ -937,13 +1128,23 @@ pub(crate) async fn reusable_config_axe<P: Provider>(
     // that then reverts with InitialSupplyUnsupported. Scale `needed` by the
     // source token's actual decimals so the comparison is apples-to-apples.
     let token = ERC20::new(addr, provider);
-    let decimals: u8 = token.decimals().call().await.unwrap_or(18);
+    let decimals: u8 = retry_all("config AXE decimals", || async {
+        token.decimals().call().await
+    })
+    .await
+    .unwrap_or(18);
     let scaled_needed = if decimals < 18 {
         needed / U256::from(10).pow(U256::from(18 - u32::from(decimals)))
     } else {
         needed
     };
-    let balance = token.balanceOf(holder).call().await.unwrap_or_default();
+    // Retried: a transient error that silently reads as balance 0 would
+    // trigger a spurious fresh deploy of the config AXE token.
+    let balance = retry_all("config AXE balance", || async {
+        token.balanceOf(holder).call().await
+    })
+    .await
+    .unwrap_or_default();
     if balance >= scaled_needed {
         Ok(Some((tid, addr)))
     } else {
@@ -961,7 +1162,9 @@ pub(crate) async fn reusable_config_axe<P: Provider>(
 /// per-chain deploy helpers right after the source-side deploy succeeds.
 pub(crate) fn hint_persist_axe_token(chain_axelar_id: &str, token_id: &FixedBytes<32>) {
     ui::info(&format!(
-        "💡 To skip the deploy on future runs, add to chains-config:\n  \
+        "💡 To skip the deploy on future runs, add to chains-config (or, for \
+         networks whose upstream config axe can't edit, to this repo's \
+         axe-tokens/<network>.json overlay):\n  \
          chains.{chain_axelar_id}.contracts.AXE.tokenId = \"{token_id}\"\n  \
          (assumes the destination chains you care about already have the remote registered)"
     ));

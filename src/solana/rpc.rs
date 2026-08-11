@@ -14,6 +14,59 @@ use solana_commitment_config::CommitmentConfig;
 use solana_sdk::signature::Signature;
 use solana_transaction_status::UiTransactionEncoding;
 
+use crate::retry::{FALLBACK_ATTEMPTS, backoff_for_attempt, is_transient_default};
+use crate::ui;
+
+/// Blocking counterpart of `crate::retry::retry_async` — the solana_client
+/// calls in this module are synchronous, so the async helper can't be used.
+/// Same schedule: [`FALLBACK_ATTEMPTS`] (5) attempts with geometric backoff
+/// (500ms, 1s, 2s, 4s) ≈ 7.5s worst-case wall-clock.
+///
+/// Safe for submits ONLY when `op` re-sends the SAME already-signed
+/// transaction: Solana dedups by signature (identical bytes = same tx), so
+/// at most one copy lands. The ≈7.5s retry window sits well inside the
+/// ~2min blockhash validity, and `send_and_confirm_transaction` already
+/// retries internally while the blockhash is valid — this outer loop covers
+/// transport-level flakiness (429s, timeouts, dropped connections). Never
+/// re-fetch the blockhash or re-sign inside `op`: a fresh signature is a
+/// new transaction and a real double-send.
+pub(crate) fn retry_blocking<T, E: std::fmt::Display>(
+    label: &str,
+    is_transient: impl Fn(&E) -> bool,
+    mut op: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    let mut attempt: u32 = 0;
+    loop {
+        match op() {
+            Ok(t) => return Ok(t),
+            Err(e) if attempt + 1 < FALLBACK_ATTEMPTS && is_transient(&e) => {
+                let backoff = backoff_for_attempt(attempt);
+                ui::warn(&format!(
+                    "{label}: attempt {} failed: {e}; retrying in {}ms",
+                    attempt + 1,
+                    backoff.as_millis(),
+                ));
+                std::thread::sleep(backoff);
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Transient classifier for Solana submits: `is_transient_default` plus the
+/// "rate limit" phrasing some Solana RPCs use, minus anything blockhash-
+/// related — re-sending the same signed bytes can't fix an expired or
+/// unknown blockhash, so those surface immediately. Simulation failures and
+/// instruction errors match no transient signature and bail on attempt 1.
+pub(crate) fn is_transient_solana<E: std::fmt::Display>(err: &E) -> bool {
+    let msg = err.to_string().to_lowercase();
+    if msg.contains("blockhash") {
+        return false;
+    }
+    is_transient_default(err) || msg.contains("rate limit")
+}
+
 /// Construct an `RpcClient` with finalized commitment — single helper so
 /// callers don't sprinkle `RpcClient::new_with_commitment(_, finalized())`
 /// across the codebase.

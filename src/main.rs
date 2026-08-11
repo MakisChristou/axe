@@ -23,7 +23,10 @@ mod xrpl;
 use clap::Parser;
 use eyre::Result;
 
-async fn run_deploy(command: cli::DeployCommands) -> Result<()> {
+async fn run_deploy(
+    command: cli::DeployCommands,
+    global_network: Option<types::Network>,
+) -> Result<()> {
     match command {
         cli::DeployCommands::Init => commands::init::run().await,
         cli::DeployCommands::Status { axelar_id } => commands::status::run(axelar_id).await,
@@ -44,6 +47,15 @@ async fn run_deploy(command: cli::DeployCommands) -> Result<()> {
             .await
         }
         cli::DeployCommands::Reset { axelar_id } => commands::reset::run(axelar_id).await,
+        cli::DeployCommands::SenderReceiver {
+            config,
+            chain,
+            rpc,
+            private_key,
+        } => {
+            commands::deploy_sender_receiver::run(config, chain, rpc, private_key, global_network)
+                .await
+        }
     }
 }
 
@@ -246,13 +258,26 @@ async fn run_test(
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
     dotenvy::dotenv_override().ok();
 
+    // Errors are printed through `ui::scrub_urls` so RPC URLs (which can come
+    // from private/keyed secrets) never reach stderr — upstream-crate errors
+    // (reqwest, alloy transports) embed the full request URL in their Display.
+    match run_cli().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {}", ui::scrub_urls(&format!("{error:?}")));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_cli() -> Result<()> {
     let cli = cli::Cli::parse();
 
     match cli.command {
-        cli::Commands::Deploy { subcommand } => run_deploy(subcommand).await,
+        cli::Commands::Deploy { subcommand } => run_deploy(subcommand, cli.network).await,
         cli::Commands::Decode { subcommand } => run_decode(subcommand, cli.network).await,
         cli::Commands::Info { subcommand } => match subcommand {
             cli::InfoCommands::Block {

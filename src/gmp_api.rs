@@ -11,16 +11,22 @@ mod types;
 
 pub use types::{AmountCheck, ExpressRecord, Phase1, Phase2};
 
-use eyre::{Context, Result};
+use crate::retry::{FALLBACK_ATTEMPTS, retry_async};
+use eyre::{Context, Report, Result};
+use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
 
-/// GMP API base URL for the given network. Testnet/stagenet/devnet share the
-/// testnet Axelarscan deployment; mainnet has its own.
-pub fn base_url(network: crate::types::Network) -> &'static str {
+/// GMP API base URL for the given network. Mainnet, testnet, and stagenet
+/// each have their own Axelarscan deployment; devnet-amplifier has none
+/// (`None` — callers must skip the query rather than hit a wrong network's
+/// index).
+pub fn base_url(network: crate::types::Network) -> Option<&'static str> {
     match network {
-        crate::types::Network::Mainnet => "https://api.axelarscan.io",
-        _ => "https://testnet.api.axelarscan.io",
+        crate::types::Network::Mainnet => Some("https://api.axelarscan.io"),
+        crate::types::Network::Testnet => Some("https://testnet.api.axelarscan.io"),
+        crate::types::Network::Stagenet => Some("https://stagenet.api.axelarscan.io"),
+        crate::types::Network::DevnetAmplifier => None,
     }
 }
 
@@ -30,21 +36,43 @@ struct SearchResponse {
     data: Vec<ExpressRecord>,
 }
 
+/// Retry classification: transport errors (connect / timeout / body read)
+/// and HTTP 429/5xx are transient; any other 4xx is a permanent request
+/// error and surfaces immediately.
+fn is_transient_gmp_error(err: &Report) -> bool {
+    let Some(e) = err.chain().find_map(|c| c.downcast_ref::<reqwest::Error>()) else {
+        return true;
+    };
+    match e.status() {
+        Some(status) => status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error(),
+        None => true, // transport-level: no HTTP status attached
+    }
+}
+
 async fn post_search(base: &str, body: serde_json::Value) -> Result<Vec<ExpressRecord>> {
     let url = format!("{base}/gmp/searchGMP");
-    let resp = reqwest::Client::new()
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?
-        .error_for_status()
-        .with_context(|| format!("GMP API returned an error status for {url}"))?;
-    let parsed: SearchResponse = resp
-        .json()
-        .await
-        .with_context(|| format!("decoding GMP API response from {url}"))?;
-    Ok(parsed.data)
+    let client = reqwest::Client::new();
+    retry_async(
+        "gmp-api searchGMP",
+        FALLBACK_ATTEMPTS,
+        is_transient_gmp_error,
+        || async {
+            let resp = client
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .with_context(|| format!("POST {url}"))?
+                .error_for_status()
+                .with_context(|| format!("GMP API returned an error status for {url}"))?;
+            let parsed: SearchResponse = resp
+                .json()
+                .await
+                .with_context(|| format!("decoding GMP API response from {url}"))?;
+            Ok(parsed.data)
+        },
+    )
+    .await
 }
 
 /// List the most recent express transfers, newest first. Only records that

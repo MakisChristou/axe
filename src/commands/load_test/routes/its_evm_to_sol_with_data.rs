@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use alloy::hex;
 use alloy::{
     primitives::{Address, Bytes, FixedBytes, TxHash, U256},
-    providers::{Provider, ProviderBuilder},
+    providers::Provider,
     signers::local::PrivateKeySigner,
 };
 use eyre::eyre;
@@ -21,7 +21,6 @@ use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;
 use tokio::sync::mpsc;
 use tokio::task::spawn_blocking;
-use tokio::time;
 
 use super::gmp_payload::memo_program_id;
 use super::its_prerequisites::{self, GatewayRequirement};
@@ -39,7 +38,11 @@ use crate::commands::test_its::{
     extract_contract_call_event, extract_token_deployed_event, generate_salt,
 };
 use crate::config::{AxelarChainContract, ChainContract, ChainsConfig};
-use crate::evm::{ERC20, InterchainTokenFactory, InterchainTokenService};
+use crate::evm::{
+    EvmEndpoints, InterchainTokenFactory, InterchainTokenService, connect_evm_signed,
+    send_tx_robust,
+};
+use crate::retry::retry_with_fallback_all;
 use crate::solana::{find_interchain_token_pda, find_its_root_pda, load_keypair};
 use crate::ui;
 
@@ -110,6 +113,8 @@ pub async fn run(args: LoadTestArgs, sizing: RunSizing) -> eyre::Result<()> {
     let dest = &args.destination_chain;
 
     let evm_rpc_url = args.source_rpc.to_string();
+    // Private endpoint first, chains-config public RPC as failover.
+    let source_rpc_urls = super::its_evm_source::source_rpc_candidates(&args).await;
 
     validate_evm_rpc(&evm_rpc_url).await?;
     validate_solana_rpc(&args.destination_rpc).await?;
@@ -124,12 +129,10 @@ pub async fn run(args: LoadTestArgs, sizing: RunSizing) -> eyre::Result<()> {
         "ITS with data (interchainTransfer + memo execute)",
     );
 
-    let evm = init_evm_signer_and_provider(&evm_rpc_url, args.private_key.as_deref()).await?;
+    let evm = init_evm_signer_and_provider(&source_rpc_urls, args.private_key.as_deref()).await?;
     let its_addrs = resolve_its_addresses(&cfg, src)?;
 
-    let write_provider = ProviderBuilder::new()
-        .wallet(evm.signer.clone())
-        .connect_http(evm_rpc_url.parse()?);
+    let source_endpoints = EvmEndpoints::connect(&source_rpc_urls)?;
 
     let memo_program_id = memo_program_id(args.network);
     let (counter_pda, _) = Pubkey::find_program_address(&[b"counter"], &memo_program_id);
@@ -143,9 +146,9 @@ pub async fn run(args: LoadTestArgs, sizing: RunSizing) -> eyre::Result<()> {
 
     let (token_id, token_addr, deploy_message_id) = resolve_its_token(
         &args,
-        &write_provider,
+        &source_endpoints,
         &its_addrs,
-        evm.deployer_address,
+        &evm,
         gas_value,
         &sizing,
         amount_per_key,
@@ -163,7 +166,7 @@ pub async fn run(args: LoadTestArgs, sizing: RunSizing) -> eyre::Result<()> {
 
     let gas_extra_per_key = compute_gas_extra_per_key(sizing, gas_value_wei);
     fund_and_distribute(
-        &evm_rpc_url,
+        &source_rpc_urls,
         &evm.signer,
         &derived,
         token_addr,
@@ -192,7 +195,7 @@ pub async fn run(args: LoadTestArgs, sizing: RunSizing) -> eyre::Result<()> {
             run_sustained_pipeline(
                 &args,
                 &cfg,
-                &evm_rpc_url,
+                &source_rpc_urls,
                 &derived,
                 &sizing,
                 plan,
@@ -201,7 +204,7 @@ pub async fn run(args: LoadTestArgs, sizing: RunSizing) -> eyre::Result<()> {
             .await
         }
         RunMode::Burst { .. } => {
-            run_burst_pipeline(&args, &evm_rpc_url, &derived, &sizing, &transfer_ctx).await
+            run_burst_pipeline(&args, &source_rpc_urls, &derived, &sizing, &transfer_ctx).await
         }
     }
 }
@@ -234,7 +237,7 @@ struct TransferContext {
 /// Build the EVM signer, validate the deployer balance, and emit the wallet
 /// UI line.
 async fn init_evm_signer_and_provider(
-    evm_rpc_url: &str,
+    rpc_urls: &[String],
     private_key: Option<&str>,
 ) -> eyre::Result<EvmSetup> {
     let private_key = private_key.ok_or_else(|| {
@@ -242,13 +245,18 @@ async fn init_evm_signer_and_provider(
     })?;
     let signer: PrivateKeySigner = private_key.parse()?;
     let deployer_address = signer.address();
-    let read_provider = ProviderBuilder::new().connect_http(evm_rpc_url.parse()?);
-    check_evm_balance(&read_provider, deployer_address).await?;
+    let endpoints = EvmEndpoints::connect(rpc_urls)?;
+    check_evm_balance(endpoints.primary(), deployer_address).await?;
 
     let main_key: [u8; 32] = signer.to_bytes().into();
 
     {
-        let balance: u128 = read_provider.get_balance(deployer_address).await?.to();
+        let balance: u128 =
+            retry_with_fallback_all("wallet balance", endpoints.providers(), |p| async move {
+                p.get_balance(deployer_address).await
+            })
+            .await?
+            .to();
         let eth = balance as f64 / 1e18;
         ui::kv("wallet", &format!("{deployer_address} ({eth:.6} ETH)"));
     }
@@ -288,11 +296,11 @@ fn resolve_its_addresses(cfg: &ChainsConfig, src: &str) -> eyre::Result<ItsAddrs
 /// Resolve the ITS token: prefer `--token-id`, then a pre-registered AXE from
 /// chains-config (`contracts.AXE.tokenId` on the source chain), then a cached
 /// entry with sufficient supply, otherwise deploy a fresh interchain token.
-async fn resolve_its_token<P: Provider>(
+async fn resolve_its_token(
     args: &LoadTestArgs,
-    write_provider: &P,
+    endpoints: &EvmEndpoints,
     its_addrs: &ItsAddrs,
-    deployer_address: Address,
+    evm: &EvmSetup,
     gas_value: U256,
     sizing: &RunSizing,
     amount_per_key: U256,
@@ -301,15 +309,21 @@ async fn resolve_its_token<P: Provider>(
     let dest = &args.destination_chain;
     let total_supply = U256::from(1_000_000) * U256::from(1_000_000_000_000_000_000u128);
 
-    let its_service = InterchainTokenService::new(its_addrs.its_proxy_addr, write_provider);
-
     if let Some(ref tid) = args.token_id {
         let token_id: FixedBytes<32> = tid.parse().map_err(|e| eyre!("invalid --token-id: {e}"))?;
-        let addr = its_service
-            .interchainTokenAddress(token_id)
-            .call()
-            .await
-            .map_err(|e| eyre!("failed to look up token address for {token_id}: {e}"))?;
+        let its_proxy = its_addrs.its_proxy_addr;
+        let addr = retry_with_fallback_all(
+            "token address lookup",
+            endpoints.providers(),
+            |p| async move {
+                InterchainTokenService::new(its_proxy, p)
+                    .interchainTokenAddress(token_id)
+                    .call()
+                    .await
+            },
+        )
+        .await
+        .map_err(|e| eyre!("failed to look up token address for {token_id}: {e}"))?;
         ui::kv("token ID (provided)", &format!("{token_id}"));
         ui::address("token address", &format!("{addr}"));
         return Ok((token_id, addr, None));
@@ -320,8 +334,8 @@ async fn resolve_its_token<P: Provider>(
         &args.config,
         src,
         its_addrs.its_proxy_addr,
-        write_provider,
-        deployer_address,
+        endpoints.primary(),
+        evm.deployer_address,
         needed,
     )
     .await?
@@ -344,13 +358,10 @@ async fn resolve_its_token<P: Provider>(
         );
 
     if let Some((tid, addr)) = cached {
-        let token = ERC20::new(addr, write_provider);
         let needed = amount_per_key * U256::from(sizing.num_keys);
-        let balance = token
-            .balanceOf(deployer_address)
-            .call()
-            .await
-            .unwrap_or_default();
+        let balance =
+            super::its_evm_source::token_balance(endpoints.primary(), addr, evm.deployer_address)
+                .await;
         if balance >= needed {
             ui::info(&format!("reusing cached ITS token: {addr}"));
             ui::kv("token ID (cached)", &format!("{tid}"));
@@ -360,9 +371,9 @@ async fn resolve_its_token<P: Provider>(
     }
 
     deploy_its_token(
-        write_provider,
+        endpoints,
+        &evm.signer,
         its_addrs.its_factory_addr,
-        deployer_address,
         dest,
         total_supply,
         src,
@@ -505,16 +516,16 @@ fn compute_gas_extra_per_key(sizing: RunSizing, gas_value_wei: u128) -> u128 {
 /// Fund the derived EVM wallets with the gas budget for the planned run and
 /// distribute the per-key ITS token allocation.
 async fn fund_and_distribute(
-    evm_rpc_url: &str,
+    rpc_urls: &[String],
     signer: &PrivateKeySigner,
     derived: &[PrivateKeySigner],
     token_addr: Address,
     amount_per_key: U256,
     gas_extra_per_key: u128,
 ) -> eyre::Result<()> {
-    let funding_provider = ProviderBuilder::new()
-        .wallet(signer.clone())
-        .connect_http(evm_rpc_url.parse()?);
+    // Multi-transport provider: funding reads/sends fail over to the public
+    // RPC on transport-level errors.
+    let funding_provider = connect_evm_signed(rpc_urls, signer.clone())?;
     keypairs::ensure_funded_evm_with_extra(
         &funding_provider,
         signer,
@@ -523,11 +534,15 @@ async fn fund_and_distribute(
     )
     .await?;
 
-    let token_provider = ProviderBuilder::new()
-        .wallet(signer.clone())
-        .connect_http(evm_rpc_url.parse()?);
-    super::its_evm_source::distribute_tokens(&token_provider, token_addr, derived, amount_per_key)
-        .await?;
+    let endpoints = EvmEndpoints::connect(rpc_urls)?;
+    super::its_evm_source::distribute_tokens(
+        &endpoints,
+        signer,
+        token_addr,
+        derived,
+        amount_per_key,
+    )
+    .await?;
     Ok(())
 }
 
@@ -537,7 +552,7 @@ async fn fund_and_distribute(
 async fn run_sustained_pipeline(
     args: &LoadTestArgs,
     cfg: &ChainsConfig,
-    evm_rpc_url: &str,
+    source_rpc_urls: &[String],
     derived: &[PrivateKeySigner],
     sizing: &RunSizing,
     plan: SustainedPlan,
@@ -549,12 +564,16 @@ async fn run_sustained_pipeline(
         duration_secs,
         key_cycle,
     } = plan;
-    let nonce_provider = ProviderBuilder::new().connect_http(evm_rpc_url.parse()?);
+    let nonce_endpoints = EvmEndpoints::connect(source_rpc_urls)?;
     let mut nonces: Vec<u64> = Vec::with_capacity(sizing.num_keys);
     for signer in derived {
-        let n = nonce_provider
-            .get_transaction_count(signer.address())
-            .await?;
+        let address = signer.address();
+        let n = retry_with_fallback_all(
+            "starting nonce",
+            nonce_endpoints.providers(),
+            |p| async move { p.get_transaction_count(address).await },
+        )
+        .await?;
         nonces.push(n);
     }
 
@@ -564,7 +583,7 @@ async fn run_sustained_pipeline(
         .contract_address(AxelarChainContract::VotingVerifier, &args.source_chain)
         .is_ok();
 
-    let submitter = ItsEvmWithDataSubmitter::new(evm_rpc_url, dest, transfer_ctx)?;
+    let submitter = ItsEvmWithDataSubmitter::new(source_rpc_urls, dest, transfer_ctx);
     let destination_address = transfer_ctx.its_proxy_addr.to_string();
     its_verification::run_sustained(
         args,
@@ -603,7 +622,7 @@ async fn run_sustained_pipeline(
 /// batch-verify on Solana, and hand off to `finish_report`.
 async fn run_burst_pipeline(
     args: &LoadTestArgs,
-    evm_rpc_url: &str,
+    source_rpc_urls: &[String],
     derived: &[PrivateKeySigner],
     sizing: &RunSizing,
     transfer_ctx: &TransferContext,
@@ -623,7 +642,7 @@ async fn run_burst_pipeline(
         })
         .collect();
     let burst = super::submitter::run_burst(
-        ItsEvmWithDataSubmitter::new(evm_rpc_url, dest, transfer_ctx)?,
+        ItsEvmWithDataSubmitter::new(source_rpc_urls, dest, transfer_ctx),
         jobs,
         100,
     )
@@ -663,11 +682,12 @@ async fn run_burst_pipeline(
     .await
 }
 
-/// Deploy a new interchain token and its remote counterpart.
-async fn deploy_its_token<P: Provider>(
-    provider: &P,
+/// Deploy a new interchain token and its remote counterpart. The minter is
+/// the signer's address.
+async fn deploy_its_token(
+    endpoints: &EvmEndpoints,
+    signer: &PrivateKeySigner,
     factory_addr: Address,
-    deployer: Address,
     dest_chain: &str,
     total_supply: U256,
     source_chain: &str,
@@ -681,26 +701,31 @@ async fn deploy_its_token<P: Provider>(
     ui::kv("decimals", &TOKEN_DECIMALS.to_string());
     ui::kv("supply", &format!("{total_supply}"));
 
-    let factory = InterchainTokenFactory::new(factory_addr, provider);
+    let factory = InterchainTokenFactory::new(factory_addr, endpoints.primary().clone());
 
-    let deploy_call = factory
+    let mut deploy_tx = factory
         .deployInterchainToken(
             salt,
             TOKEN_NAME.to_string(),
             TOKEN_SYMBOL.to_string(),
             TOKEN_DECIMALS,
             total_supply,
-            deployer,
+            signer.address(),
         )
-        .value(U256::ZERO);
+        .value(U256::ZERO)
+        .into_transaction_request();
+    deploy_tx.from = Some(signer.address());
 
-    let pending = deploy_call.send().await?;
-    let tx_hash = *pending.tx_hash();
-    ui::tx_hash("deploy tx", &format!("{tx_hash}"));
-
-    let receipt = time::timeout(Duration::from_secs(120), pending.get_receipt())
-        .await
-        .map_err(|_| eyre!("deploy tx timed out after 120s"))??;
+    let receipt = send_tx_robust(
+        endpoints,
+        signer,
+        deploy_tx,
+        "deploy tx",
+        Duration::from_secs(120),
+    )
+    .await
+    .map_err(|error| eyre!("deploy tx failed: {error}"))?;
+    ui::tx_hash("deploy tx", &format!("{}", receipt.transaction_hash));
 
     let (token_id, token_addr) = extract_token_deployed_event(&receipt)?;
     ui::kv("token ID", &format!("{token_id}"));
@@ -711,17 +736,23 @@ async fn deploy_its_token<P: Provider>(
     // ITS routes via the hub, so two commands are created (source→hub and
     // hub→destination). Pay 2× gas_value so both legs are covered.
     let hub_gas = gas_value * U256::from(2);
-    let remote_call = factory
+    let mut remote_tx = factory
         .deployRemoteInterchainToken(salt, dest_chain.to_string(), hub_gas)
-        .value(hub_gas);
+        .value(hub_gas)
+        .into_transaction_request();
+    remote_tx.from = Some(signer.address());
 
-    let pending = remote_call.send().await?;
-    let tx_hash = *pending.tx_hash();
+    let receipt = send_tx_robust(
+        endpoints,
+        signer,
+        remote_tx,
+        "remote deploy tx",
+        Duration::from_secs(120),
+    )
+    .await
+    .map_err(|error| eyre!("remote deploy tx failed: {error}"))?;
+    let tx_hash = receipt.transaction_hash;
     ui::tx_hash("remote deploy tx", &format!("{tx_hash}"));
-
-    let receipt = time::timeout(Duration::from_secs(120), pending.get_receipt())
-        .await
-        .map_err(|_| eyre!("remote deploy tx timed out after 120s"))??;
 
     ui::success(&format!(
         "remote deploy confirmed in block {}",
@@ -753,7 +784,9 @@ async fn deploy_its_token<P: Provider>(
 /// route's rate-limit policy.
 #[derive(Clone)]
 struct ItsEvmWithDataSubmitter {
-    rpc_url: reqwest::Url,
+    /// Source RPCs in preference order — `[private, public]` — so submission
+    /// fails over to the public RPC.
+    rpc_urls: Vec<String>,
     its_proxy: Address,
     token_id: FixedBytes<32>,
     destination_chain: String,
@@ -766,13 +799,9 @@ struct ItsEvmWithDataSubmitter {
 }
 
 impl ItsEvmWithDataSubmitter {
-    fn new(
-        evm_rpc_url: &str,
-        destination_chain: &str,
-        transfer: &TransferContext,
-    ) -> eyre::Result<Self> {
-        Ok(Self {
-            rpc_url: evm_rpc_url.parse()?,
+    fn new(rpc_urls: &[String], destination_chain: &str, transfer: &TransferContext) -> Self {
+        Self {
+            rpc_urls: rpc_urls.to_vec(),
             its_proxy: transfer.its_proxy_addr,
             token_id: transfer.token_id,
             destination_chain: destination_chain.to_string(),
@@ -782,7 +811,7 @@ impl ItsEvmWithDataSubmitter {
             counter_pda: transfer.counter_pda,
             extra_accounts: transfer.extra_accounts,
             token_mint_ata: transfer.token_mint_ata,
-        })
+        }
     }
 }
 
@@ -796,12 +825,15 @@ impl TransactionSubmitter for ItsEvmWithDataSubmitter {
     type Job = ItsEvmWithDataSubmitJob;
 
     async fn submit(&self, job: Self::Job) -> TxMetrics {
-        let provider = ProviderBuilder::new()
-            .wallet(job.signer)
-            .connect_http(self.rpc_url.clone());
+        let submit_start = Instant::now();
+        let endpoints = match EvmEndpoints::connect(&self.rpc_urls) {
+            Ok(endpoints) => endpoints,
+            Err(error) => return make_failure(submit_start, &error.to_string()),
+        };
         let submit = || {
             execute_interchain_transfer_with_data(
-                &provider,
+                &endpoints,
+                &job.signer,
                 InterchainTransferWithDataRequest {
                     its_proxy: self.its_proxy,
                     token_id: self.token_id,
@@ -873,8 +905,9 @@ struct InterchainTransferWithDataRequest {
     explicit_nonce: Option<u64>,
 }
 
-async fn execute_interchain_transfer_with_data<P: Provider>(
-    provider: &P,
+async fn execute_interchain_transfer_with_data(
+    endpoints: &EvmEndpoints,
+    signer: &PrivateKeySigner,
     request: InterchainTransferWithDataRequest,
 ) -> TxMetrics {
     let InterchainTransferWithDataRequest {
@@ -901,8 +934,11 @@ async fn execute_interchain_transfer_with_data<P: Provider>(
     // ITS routes via the hub, so two commands are created (source→hub and
     // hub→destination). Pay 2× gas_value so both legs are covered.
     let hub_gas = gas_value * U256::from(2);
-    let its = InterchainTokenService::new(its_proxy, provider);
-    let base_call = its
+    // Build the calldata once, then hand the whole fill→sign→broadcast→confirm
+    // sequence to `send_tx_robust`: retry + private→public fallback at every
+    // phase, idempotent same-bytes re-broadcast.
+    let its = InterchainTokenService::new(its_proxy, endpoints.primary().clone());
+    let mut tx = its
         .interchainTransfer(
             token_id,
             dest_chain.to_string(),
@@ -911,51 +947,57 @@ async fn execute_interchain_transfer_with_data<P: Provider>(
             metadata,
             hub_gas,
         )
-        .value(hub_gas);
-    let call = match explicit_nonce {
-        Some(n) => base_call.nonce(n),
-        None => base_call,
-    };
+        .value(hub_gas)
+        .into_transaction_request();
+    tx.from = Some(signer.address());
+    tx.nonce = explicit_nonce;
 
-    match call.send().await {
-        Ok(pending) => {
-            let tx_hash = *pending.tx_hash();
-            match time::timeout(EVM_RECEIPT_TIMEOUT, pending.get_receipt()).await {
-                Ok(Ok(receipt)) => {
-                    let latency_ms = submit_start.elapsed().as_millis() as u64;
+    match send_tx_robust(
+        endpoints,
+        signer,
+        tx,
+        "source interchainTransfer",
+        EVM_RECEIPT_TIMEOUT,
+    )
+    .await
+    {
+        Ok(receipt) => {
+            let tx_hash = receipt.transaction_hash;
+            let latency_ms = submit_start.elapsed().as_millis() as u64;
+            if !receipt.status() {
+                return make_failure_with_hash(
+                    submit_start,
+                    &format!(
+                        "source-side interchainTransfer reverted (status 0x0, gas_used {})",
+                        receipt.gas_used
+                    ),
+                    Some(tx_hash),
+                );
+            }
+            match extract_contract_call_event(&receipt) {
+                Ok((event_index, _payload, payload_hash_bytes, dest_chain, dest_address)) => {
+                    let message_id = format!("{tx_hash:#x}-{event_index}");
+                    let source_address = format!("{its_proxy}");
+                    let payload_hash = hex::encode(payload_hash_bytes.as_slice());
 
-                    match extract_contract_call_event(&receipt) {
-                        Ok((
-                            event_index,
-                            _payload,
-                            payload_hash_bytes,
-                            dest_chain,
-                            dest_address,
-                        )) => {
-                            let message_id = format!("{tx_hash:#x}-{event_index}");
-                            let source_address = format!("{its_proxy}");
-                            let payload_hash = hex::encode(payload_hash_bytes.as_slice());
-
-                            TxMetrics {
-                                confirm_time_ms: Some(latency_ms),
-                                latency_ms: Some(latency_ms),
-                                compute_units: Some(receipt.gas_used),
-                                slot: receipt.block_number,
-                                payload_hash,
-                                source_address,
-                                gmp_destination_chain: dest_chain,
-                                gmp_destination_address: dest_address,
-                                send_instant: Some(submit_start),
-                                ..TxMetrics::succeeded(message_id, 0)
-                            }
-                        }
-                        Err(e) => {
-                            make_failure(submit_start, &format!("no ContractCall event: {e}"))
-                        }
+                    TxMetrics {
+                        confirm_time_ms: Some(latency_ms),
+                        latency_ms: Some(latency_ms),
+                        compute_units: Some(receipt.gas_used),
+                        slot: receipt.block_number,
+                        payload_hash,
+                        source_address,
+                        gmp_destination_chain: dest_chain,
+                        gmp_destination_address: dest_address,
+                        send_instant: Some(submit_start),
+                        ..TxMetrics::succeeded(message_id, 0)
                     }
                 }
-                Ok(Err(e)) => make_failure_with_hash(submit_start, &e.to_string(), Some(tx_hash)),
-                Err(_) => make_failure_with_hash(submit_start, "tx timed out", Some(tx_hash)),
+                Err(e) => make_failure_with_hash(
+                    submit_start,
+                    &format!("no ContractCall event: {e}"),
+                    Some(tx_hash),
+                ),
             }
         }
         Err(e) => make_failure(submit_start, &e.to_string()),

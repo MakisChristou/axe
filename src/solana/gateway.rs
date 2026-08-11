@@ -21,7 +21,9 @@ use solana_transaction_status::{
     UiInnerInstructions, UiInstruction, option_serializer::OptionSerializer,
 };
 
-use super::rpc::{fetch_confirmed_tx, fetch_tx_details, rpc_client};
+use super::rpc::{
+    fetch_confirmed_tx, fetch_tx_details, is_transient_solana, retry_blocking, rpc_client,
+};
 use crate::commands::load_test::metrics::{TxMetrics, TxOutcome};
 use crate::types::Network;
 use crate::ui;
@@ -103,14 +105,21 @@ pub fn send_call_contract(
         }
     };
 
-    let blockhash = rpc_client.get_latest_blockhash()?;
+    let blockhash = retry_blocking(
+        "solana get_latest_blockhash",
+        |_| true,
+        || rpc_client.get_latest_blockhash(),
+    )?;
     let message = Message::new_with_blockhash(&instructions, Some(&fee_payer), &blockhash);
     let mut transaction = Transaction::new_unsigned(message);
     transaction.sign(&[keypair], blockhash);
 
     let submit_time_ms = submit_start.elapsed().as_millis() as u64;
 
-    let signature = rpc_client.send_and_confirm_transaction(&transaction)?;
+    // Same signed tx on every attempt — dedup by signature makes this safe.
+    let signature = retry_blocking("solana submit call_contract", is_transient_solana, || {
+        rpc_client.send_and_confirm_transaction(&transaction)
+    })?;
 
     let confirm_time_ms = submit_start.elapsed().as_millis() as u64;
     let latency_ms = confirm_time_ms.saturating_sub(submit_time_ms);
@@ -413,7 +422,11 @@ fn initialize_verification_session(
         data: ix_data.data(),
     };
 
-    let recent_blockhash = rpc.get_latest_blockhash()?;
+    let recent_blockhash = retry_blocking(
+        "solana get_latest_blockhash",
+        |_| true,
+        || rpc.get_latest_blockhash(),
+    )?;
     let tx = Transaction::new_signed_with_payer(
         &[ix],
         Some(&payer.pubkey()),
@@ -421,7 +434,10 @@ fn initialize_verification_session(
         recent_blockhash,
     );
 
-    let sig = rpc.send_and_confirm_transaction_with_spinner(&tx)?;
+    // Same signed tx on every attempt — dedup by signature makes this safe.
+    let sig = retry_blocking("solana submit init_session", is_transient_solana, || {
+        rpc.send_and_confirm_transaction_with_spinner(&tx)
+    })?;
     Ok(sig)
 }
 
@@ -486,7 +502,11 @@ fn verify_signature(
         data: [&[0x02], cu_limit.to_le_bytes().as_slice()].concat(),
     };
 
-    let recent_blockhash = rpc.get_latest_blockhash()?;
+    let recent_blockhash = retry_blocking(
+        "solana get_latest_blockhash",
+        |_| true,
+        || rpc.get_latest_blockhash(),
+    )?;
     let tx = Transaction::new_signed_with_payer(
         &[cu_ix, ix],
         Some(&payer.pubkey()),
@@ -494,7 +514,12 @@ fn verify_signature(
         recent_blockhash,
     );
 
-    let sig = rpc.send_and_confirm_transaction_with_spinner(&tx)?;
+    // Same signed tx on every attempt — dedup by signature makes this safe.
+    let sig = retry_blocking(
+        "solana submit verify_signature",
+        is_transient_solana,
+        || rpc.send_and_confirm_transaction_with_spinner(&tx),
+    )?;
     Ok(sig)
 }
 
@@ -558,7 +583,11 @@ fn approve_message(
         data: ix_data.data(),
     };
 
-    let recent_blockhash = rpc.get_latest_blockhash()?;
+    let recent_blockhash = retry_blocking(
+        "solana get_latest_blockhash",
+        |_| true,
+        || rpc.get_latest_blockhash(),
+    )?;
     let tx = Transaction::new_signed_with_payer(
         &[ix],
         Some(&payer.pubkey()),
@@ -566,7 +595,10 @@ fn approve_message(
         recent_blockhash,
     );
 
-    let sig = rpc.send_and_confirm_transaction_with_spinner(&tx)?;
+    // Same signed tx on every attempt — dedup by signature makes this safe.
+    let sig = retry_blocking("solana submit approve_message", is_transient_solana, || {
+        rpc.send_and_confirm_transaction_with_spinner(&tx)
+    })?;
     Ok(sig)
 }
 
@@ -786,7 +818,11 @@ pub fn execute_on_memo(
         data: [&[0x02], cu_limit.to_le_bytes().as_slice()].concat(),
     };
 
-    let recent_blockhash = rpc.get_latest_blockhash()?;
+    let recent_blockhash = retry_blocking(
+        "solana get_latest_blockhash",
+        |_| true,
+        || rpc.get_latest_blockhash(),
+    )?;
     let tx = Transaction::new_signed_with_payer(
         &[cu_ix, ix],
         Some(&payer.pubkey()),
@@ -794,6 +830,9 @@ pub fn execute_on_memo(
         recent_blockhash,
     );
 
-    let sig = rpc.send_and_confirm_transaction_with_spinner(&tx)?;
+    // Same signed tx on every attempt — dedup by signature makes this safe.
+    let sig = retry_blocking("solana submit memo_execute", is_transient_solana, || {
+        rpc.send_and_confirm_transaction_with_spinner(&tx)
+    })?;
     Ok(sig)
 }

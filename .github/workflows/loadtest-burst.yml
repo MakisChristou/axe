@@ -14,8 +14,6 @@ on:
         required: true
         default: testnet
         options:
-          - devnet-amplifier
-          - stagenet
           - testnet
           - mainnet
       source_chain:
@@ -30,11 +28,13 @@ on:
           - Blast
           - Ethereum
           - Filecoin
+          - Hedera
           - Hyperliquid
           - Immutable
           - Kava
           - Linea
           - Mantle
+          - Monad
           - Moonbeam
           - Optimism
           - Polygon
@@ -56,11 +56,13 @@ on:
           - Blast
           - Ethereum
           - Filecoin
+          - Hedera
           - Hyperliquid
           - Immutable
           - Kava
           - Linea
           - Mantle
+          - Monad
           - Moonbeam
           - Optimism
           - Polygon

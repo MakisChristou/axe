@@ -21,7 +21,7 @@ use super::encoding::{
     get_associated_token_address, interchain_token_id, mpl_token_metadata_program_id,
     spl_associated_token_account_program_id,
 };
-use super::rpc::{fetch_tx_details, rpc_client};
+use super::rpc::{fetch_tx_details, is_transient_solana, retry_blocking, rpc_client};
 use crate::commands::load_test::metrics::{TxMetrics, TxOutcome};
 use crate::types::Network;
 
@@ -126,12 +126,21 @@ pub fn send_its_deploy_interchain_token(
         data: ix_data,
     };
 
-    let blockhash = rpc_client.get_latest_blockhash()?;
+    let blockhash = retry_blocking(
+        "solana get_latest_blockhash",
+        |_| true,
+        || rpc_client.get_latest_blockhash(),
+    )?;
     let message = Message::new_with_blockhash(&[ix], Some(&fee_payer), &blockhash);
     let mut transaction = Transaction::new_unsigned(message);
     transaction.sign(&[keypair], blockhash);
 
-    let signature = rpc_client.send_and_confirm_transaction(&transaction)?;
+    // Same signed tx on every attempt — dedup by signature makes this safe.
+    let signature = retry_blocking(
+        "solana submit its_deploy_token",
+        is_transient_solana,
+        || rpc_client.send_and_confirm_transaction(&transaction),
+    )?;
     Ok(signature.to_string())
 }
 
@@ -210,12 +219,21 @@ pub fn send_its_deploy_remote_interchain_token(
         data: ix_data,
     };
 
-    let blockhash = rpc_client.get_latest_blockhash()?;
+    let blockhash = retry_blocking(
+        "solana get_latest_blockhash",
+        |_| true,
+        || rpc_client.get_latest_blockhash(),
+    )?;
     let message = Message::new_with_blockhash(&[ix], Some(&fee_payer), &blockhash);
     let mut transaction = Transaction::new_unsigned(message);
     transaction.sign(&[keypair], blockhash);
 
-    let signature = rpc_client.send_and_confirm_transaction(&transaction)?;
+    // Same signed tx on every attempt — dedup by signature makes this safe.
+    let signature = retry_blocking(
+        "solana submit its_deploy_remote",
+        is_transient_solana,
+        || rpc_client.send_and_confirm_transaction(&transaction),
+    )?;
     Ok(signature.to_string())
 }
 
@@ -336,14 +354,24 @@ pub fn send_its_interchain_transfer(
     let fee_payer = keypair.pubkey();
     let ix = build_interchain_transfer_instruction(&request, fee_payer);
 
-    let blockhash = rpc_client.get_latest_blockhash()?;
+    let blockhash = retry_blocking(
+        "solana get_latest_blockhash",
+        |_| true,
+        || rpc_client.get_latest_blockhash(),
+    )?;
     let message = Message::new_with_blockhash(&[ix], Some(&fee_payer), &blockhash);
     let mut transaction = Transaction::new_unsigned(message);
     transaction.sign(&[keypair], blockhash);
 
     let submit_time_ms = submit_start.elapsed().as_millis() as u64;
 
-    let signature = match rpc_client.send_and_confirm_transaction(&transaction) {
+    // Same signed tx on every attempt — dedup by signature makes this safe.
+    // Non-transient errors (simulation/instruction failures) bail on the
+    // first attempt and still get the simulation-diagnostics dump below.
+    let send_result = retry_blocking("solana submit its_transfer", is_transient_solana, || {
+        rpc_client.send_and_confirm_transaction(&transaction)
+    });
+    let signature = match send_result {
         Ok(sig) => sig,
         Err(send_err) => {
             let log_dump = simulation_diagnostics(&rpc_client, &transaction);
