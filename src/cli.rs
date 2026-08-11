@@ -157,6 +157,24 @@ pub enum DeployCommands {
         #[arg(long)]
         axelar_id: Option<String>,
     },
+
+    /// Deploy (or verify + reuse) the GMP SenderReceiver helper on an EVM
+    /// chain. Checks the axe-tokens overlay and local cache first; a fresh
+    /// deploy prints the overlay line to record so no run ever redeploys.
+    SenderReceiver {
+        /// Path to the chains-config JSON for the target network
+        #[arg(long, env = "CHAINS_CONFIG")]
+        config: PathBuf,
+        /// Chain key in the config (e.g. base-sepolia)
+        #[arg(long)]
+        chain: String,
+        /// RPC override (falls back to the chain's config rpc)
+        #[arg(long)]
+        rpc: Option<String>,
+        /// EVM private key (hex)
+        #[arg(long, env = "EVM_PRIVATE_KEY", hide_env_values = true)]
+        private_key: String,
+    },
 }
 
 #[derive(Subcommand)]

@@ -16,6 +16,104 @@
           "tokenId": "0x5f0dbcb98c1a6e84a7a20cf40fdd999fe8f3e1c673b2723973b786109dee5d27"
         }
       }
+    },
+    "base-sepolia": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0xE1696DdE1B0B50A8eB3519fe2AeB3A17F57b55c0"
+        }
+      }
+    },
+    "berachain": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x77245A4f2c7Aed9fA2dDAD3C5677eE8a647Aa716"
+        }
+      }
+    },
+    "celo-sepolia": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x9cb8710332F63296e77D612eA9d8De4dc1a1CF5E"
+        }
+      }
+    },
+    "ethereum-sepolia": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x345885411916186bF934367d34C36Dcb0dd47acE"
+        }
+      }
+    },
+    "flow": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0xa154d64e9800c569e4C09790331678653b131EeA"
+        }
+      }
+    },
+    "hedera": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x8e33ac8702b2a070A24119b310e832F95eCf9f21"
+        }
+      }
+    },
+    "hyperliquid": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0xFCFb70719D329e2C08fCdDE8a8668c08ffA22998"
+        }
+      }
+    },
+    "kava": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x9cb8710332F63296e77D612eA9d8De4dc1a1CF5E"
+        }
+      }
+    },
+    "linea-sepolia": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x54df5BBAc442AE334911d0e37664B4F41DD28A55"
+        }
+      }
+    },
+    "mantle-sepolia": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0xDE95C70713a055bdde31CcB7D5B39AE23df5A328"
+        }
+      }
+    },
+    "optimism-sepolia": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x02afc6a9938258311AF71BD2fc30Cda86b53A8E3"
+        }
+      }
+    },
+    "plume": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0xCfA63a95ca7428CCc7ca9e874BaD54F4314d4D47"
+        }
+      }
+    },
+    "polygon-sepolia": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x2109CEA2103C02Eb929a4BC6feebC1B93B3b8D5a"
+        }
+      }
+    },
+    "xrpl-evm": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x84684795b1A90604efD9c3bB67fec498a51d8124"
+        }
+      }
     }
   }
 }

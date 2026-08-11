@@ -121,6 +121,7 @@ pub(super) use resolve::{
 // `pub(crate)` (not `pub(super)`): cli::resolve_network also detects the
 // network from `--config` filenames.
 pub(crate) use resolve::detect_network_from_config;
+pub(crate) use resolve::set_cache_network;
 
 use std::env;
 use std::fmt::{Display, Formatter, Result as FmtResult};

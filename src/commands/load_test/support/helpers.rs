@@ -32,7 +32,8 @@ use super::verify;
 use super::{GmpCache, LoadTestArgs, read_cache, save_cache};
 use crate::config::{ChainContract, ChainsConfig, ContractEntry};
 use crate::evm::{
-    ERC20, InterchainTokenService, SenderReceiver, is_pending_state_error, read_artifact_bytecode,
+    ERC20, InterchainTokenService, SenderReceiver, is_pending_state_error, parse_expected_nonce,
+    read_artifact_bytecode,
 };
 use crate::retry::{FALLBACK_ATTEMPTS, retry_all, retry_async};
 use crate::stellar::StellarWallet;
@@ -431,20 +432,28 @@ fn is_unsupported_opcode(error: &TransportError) -> bool {
     })
 }
 
-/// Last-resort deploy send with nonce + gas pinned to the `latest` block,
-/// used when the pending-block state the default fillers query is
-/// persistently unavailable. The deployer address comes from the run's EVM
+/// Last-resort deploy send with nonce + gas pinned manually, used when the
+/// default fillers' queries are unusable: pending-block state persistently
+/// unavailable (`nonce_override: None` — resolve both against `latest`), or
+/// a stale-nonce node whose rejection reported the true next nonce
+/// (`nonce_override: Some`). The deployer address comes from the run's EVM
 /// key (`EVM_PRIVATE_KEY`, which the CLI flag also maps to) — the same wallet
 /// `provider` signs with.
-async fn deploy_pinned_to_latest<P: Provider>(
+async fn deploy_pinned<P: Provider>(
     provider: &P,
     deploy_code: &[u8],
     fee_mode: super::gas_mode::EvmFeeMode,
+    nonce_override: Option<u64>,
 ) -> Result<PendingTransactionBuilder<Ethereum>> {
-    ui::warn(
-        "deploy fill kept hitting 'state not available for pending block' — \
-         re-sending with nonce+gas pinned to the latest block",
-    );
+    match nonce_override {
+        Some(nonce) => ui::warn(&format!(
+            "deploy fill got a stale nonce — re-sending pinned to node-reported nonce {nonce}"
+        )),
+        None => ui::warn(
+            "deploy fill kept hitting 'state not available for pending block' — \
+             re-sending with nonce+gas pinned to the latest block",
+        ),
+    }
     let from = env::var("EVM_PRIVATE_KEY")
         .ok()
         .and_then(|key| key.parse::<PrivateKeySigner>().ok())
@@ -455,10 +464,15 @@ async fn deploy_pinned_to_latest<P: Provider>(
     let base = fee_mode
         .apply(TransactionRequest::default().with_deploy_code(Bytes::from(deploy_code.to_vec())))
         .with_from(from);
-    let nonce = retry_all("deploy nonce (latest block)", || async {
-        provider.get_transaction_count(from).await
-    })
-    .await?;
+    let nonce = match nonce_override {
+        Some(nonce) => nonce,
+        None => {
+            retry_all("deploy nonce (latest block)", || async {
+                provider.get_transaction_count(from).await
+            })
+            .await?
+        }
+    };
     let estimate = retry_all("deploy gas (latest block)", || {
         let tx = base.clone();
         async move { provider.estimate_gas(tx).block(BlockId::latest()).await }
@@ -551,7 +565,14 @@ async fn deploy_with_artifact<P: Provider>(
         // gas against `latest` ourselves, then re-send with the fillers
         // bypassed.
         Err(error) if is_pending_state_error(&error) => {
-            deploy_pinned_to_latest(provider, &deploy_code, fee_mode).await?
+            deploy_pinned(provider, &deploy_code, fee_mode, None).await?
+        }
+        // Stale-nonce node (Blast sepolia observed): the fill's nonce query
+        // lags the tx pool, but the rejection carries the true next nonce —
+        // pin it and re-send.
+        Err(error) if parse_expected_nonce(&error.to_string()).is_some() => {
+            let expected = parse_expected_nonce(&error.to_string());
+            deploy_pinned(provider, &deploy_code, fee_mode, expected).await?
         }
         Err(error) => return Err(error.into()),
     };
