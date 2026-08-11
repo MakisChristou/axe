@@ -55,7 +55,6 @@ pub(super) enum VerificationState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum VerificationFailure {
-    #[cfg(test)]
     Error(String),
     TimedOut(String),
 }
@@ -63,7 +62,6 @@ pub(super) enum VerificationFailure {
 impl VerificationFailure {
     fn reason(&self) -> &str {
         match self {
-            #[cfg(test)]
             Self::Error(reason) => reason,
             Self::TimedOut(reason) => reason,
         }
@@ -261,7 +259,6 @@ impl PendingTx {
 
     /// Mark the tx failed. Ignored if it already reached a terminal state, so
     /// the first recorded reason wins.
-    #[cfg(test)]
     pub(super) fn fail(&mut self, reason: String) -> bool {
         self.fail_with(VerificationFailure::Error(reason))
     }

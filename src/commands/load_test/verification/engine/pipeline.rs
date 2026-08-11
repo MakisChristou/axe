@@ -11,6 +11,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
+use std::time::Instant;
 
 use alloy::hex;
 use alloy::primitives::{Address, FixedBytes, keccak256};
@@ -226,6 +227,67 @@ impl PhaseIndices {
 const GMP_API_RECHECK_TIMEOUT: Duration = Duration::from_secs(15);
 const GMP_API_RECHECK_ATTEMPTS: u32 = 3;
 const GMP_API_RECHECK_BACKOFF: Duration = Duration::from_secs(10);
+
+/// Interval between GMP-API terminal-status sweeps while polling.
+const GMP_FAIL_CHECK_INTERVAL: Duration = Duration::from_secs(120);
+
+/// Poll-time fast-fail on GMP-reported terminal errors.
+///
+/// The phase polls only observe forward progress (approved -> executed); a
+/// message whose hub or destination execute REVERTED never advances, so a run
+/// idled for the full inactivity budget (hours) on a message Axelarscan had
+/// already marked failed and refunded (observed live: mainnet
+/// solana -> ethereum ITS, hub execute reverted 44 s in). Sweeping the API
+/// every couple of minutes turns that into a fast, correctly attributed
+/// failure. Best-effort: API misses and errors just skip the sweep.
+struct GmpFailFast {
+    network: Network,
+    last_check: Instant,
+}
+
+impl GmpFailFast {
+    fn new(network: Network) -> Self {
+        Self {
+            network,
+            last_check: Instant::now(),
+        }
+    }
+
+    async fn sweep(&mut self, txs: &mut [PendingTx]) {
+        let Some(base) = gmp_api::base_url(self.network) else {
+            return;
+        };
+        if self.last_check.elapsed() < GMP_FAIL_CHECK_INTERVAL {
+            return;
+        }
+        self.last_check = Instant::now();
+        for tx in txs.iter_mut().filter(|tx| tx.is_active()) {
+            let lookup = async {
+                if let Some(rec) = gmp_api::search_by_message_id(base, &tx.message_id).await? {
+                    return Ok::<_, eyre::Report>(Some(rec));
+                }
+                match tx.message_id.rsplit_once('-') {
+                    Some((source_tx, _)) => gmp_api::search_by_tx(base, source_tx).await,
+                    None => Ok(None),
+                }
+            };
+            let Ok(Ok(Some(rec))) = time::timeout(GMP_API_RECHECK_TIMEOUT, lookup).await else {
+                continue;
+            };
+            if rec.is_failed() {
+                ui::warn(&format!(
+                    "GMP API reports {} terminally failed — failing fast instead of waiting \
+                     out the inactivity timeout",
+                    tx.message_id
+                ));
+                tx.fail(
+                    "GMP API reports the message failed (hub/destination execute error)"
+                        .to_string(),
+                );
+            }
+        }
+    }
+}
 
 /// Best-effort, non-fatal final check: ask the Axelarscan GMP API whether this
 /// message actually executed on-chain. A slow final leg or a missed poll can
@@ -626,6 +688,7 @@ pub(super) async fn poll_pipeline<V: DestinationVerifier>(
     let spinner =
         external_spinner.unwrap_or_else(|| ui::wait_spinner("verifying pipeline (starting)..."));
     let mut scheduler = PollScheduler::new();
+    let mut fail_fast = GmpFailFast::new(network);
     let mut rt_stats = RealTimeStats::new();
     let mut received_first_tx = false;
 
@@ -657,6 +720,8 @@ pub(super) async fn poll_pipeline<V: DestinationVerifier>(
                 sending_complete,
             } => (active, total, sending_complete),
         };
+
+        fail_fast.sweep(txs).await;
 
         if !received_first_tx {
             received_first_tx = true;
@@ -1326,6 +1391,7 @@ pub(super) async fn poll_pipeline_its_hub<V: DestinationVerifier>(
         backfill_voted_timing: false,
     };
     let mut scheduler = PollScheduler::new();
+    let mut fail_fast = GmpFailFast::new(network);
     let mut rt_stats = RealTimeStats::new();
 
     for tx in txs.iter_mut() {
@@ -1348,6 +1414,8 @@ pub(super) async fn poll_pipeline_its_hub<V: DestinationVerifier>(
                 sending_complete,
             } => (active, total, sending_complete),
         };
+
+        fail_fast.sweep(txs).await;
 
         let phases = PhaseIndices::collect(txs, &active);
         if hub_verifier.check(txs, &phases).await? {
@@ -1638,6 +1706,7 @@ pub(super) async fn poll_pipeline_its_hub_evm<P: Provider>(
         backfill_voted_timing: true,
     };
     let mut scheduler = PollScheduler::new();
+    let mut fail_fast = GmpFailFast::new(network);
     let mut rt_stats = RealTimeStats::new();
 
     for tx in txs.iter_mut() {
@@ -1660,6 +1729,8 @@ pub(super) async fn poll_pipeline_its_hub_evm<P: Provider>(
                 sending_complete,
             } => (active, total, sending_complete),
         };
+
+        fail_fast.sweep(txs).await;
 
         let phases = PhaseIndices::collect(txs, &active);
         if hub_verifier.check(txs, &phases).await? {
