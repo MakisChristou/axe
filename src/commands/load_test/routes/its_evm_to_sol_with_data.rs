@@ -141,8 +141,8 @@ pub async fn run(args: LoadTestArgs, sizing: RunSizing) -> eyre::Result<()> {
 
     let (gas_value_wei, gas_value) = super::its_evm_source::standard_gas_value(&args).await?;
 
-    let amount_per_tx = U256::from(1_000_000_000_000_000_000u128); // 1 token
-    let amount_per_key = amount_per_tx * U256::from(100);
+    let mut amount_per_tx = U256::from(1_000_000_000_000_000_000u128); // 1 token
+    let mut amount_per_key = amount_per_tx * U256::from(100);
 
     let (token_id, token_addr, deploy_message_id) = resolve_its_token(
         &args,
@@ -152,6 +152,20 @@ pub async fn run(args: LoadTestArgs, sizing: RunSizing) -> eyre::Result<()> {
         gas_value,
         &sizing,
         amount_per_key,
+    )
+    .await?;
+
+    // The amounts above are written in 18-decimal sub-units. Tokens with fewer
+    // decimals (the Solana-home AXE is 9) would otherwise ask for orders of
+    // magnitude more than the wallet holds, and the source burn reverts with
+    // `TakeTokenFailed`.
+    let mut deploy_supply = U256::ZERO;
+    super::its_evm_source::rescale_sizing_for_decimals(
+        &mut amount_per_tx,
+        &mut amount_per_key,
+        &mut deploy_supply,
+        &source_endpoints,
+        token_addr,
     )
     .await?;
 
