@@ -175,6 +175,18 @@ pub async fn run(args: LoadTestArgs, sizing: RunSizing) -> eyre::Result<()> {
     )
     .await?;
 
+    // The derived keys must let the token manager pull their balance, or the
+    // source `interchainTransfer` reverts with `TakeTokenFailed`.
+    super::its_evm_source::approve_its_for_keys(
+        &source_rpc_urls,
+        token_addr,
+        its_addrs.its_proxy_addr,
+        token_id,
+        &derived,
+        amount_per_key,
+    )
+    .await?;
+
     // Destination is the memo program (not a wallet), since we want it to
     // execute with the interchain token.
     let receiver_bytes = Bytes::from(memo_program_id.to_bytes().to_vec());

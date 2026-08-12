@@ -152,6 +152,19 @@ impl EvmEndpoints {
                 let pinned = self.prefill_from_latest(tx).await?;
                 self.fill_and_sign_once(signer, pinned).await
             }
+            // Pre-EIP-1559 chain (Kava): alloy's 1559 fee estimation cannot
+            // decode the null `baseFeePerGas`. Degrade once to a legacy type-0
+            // tx with an explicit `gas_price`, which routes alloy's filler
+            // through the legacy path and skips `eth_feeHistory` entirely.
+            Err(error) if is_missing_base_fee_error(&error) => {
+                ui::warn(
+                    "fill hit a pre-EIP-1559 fee history (null baseFeePerGas) — \
+                     re-filling as a legacy type-0 tx with an explicit gas price",
+                );
+                let gas_price = self.primary().get_gas_price().await?;
+                self.fill_and_sign_once(signer, tx.gas_price(gas_price))
+                    .await
+            }
             other => other,
         }
     }
@@ -246,6 +259,17 @@ impl EvmEndpoints {
 pub fn is_pending_state_error<E: std::fmt::Display>(err: &E) -> bool {
     err.to_string()
         .contains("state not available for pending block")
+}
+
+/// Whether the fill died because the chain predates EIP-1559.
+///
+/// Pre-1559 chains (Kava) return a null `baseFeePerGas` from
+/// `eth_feeHistory`, and alloy's 1559 estimator deserializes that field as a
+/// `u128` and fails hard, before any legacy fallback of its own runs, so the
+/// only signal is the deserialization error text.
+pub fn is_missing_base_fee_error<E: std::fmt::Display>(err: &E) -> bool {
+    let text = err.to_string();
+    text.contains("expected a 16 byte hex string") && text.contains("invalid type: null")
 }
 
 /// Broadcast rejections that mean the transaction (or its nonce) is already
