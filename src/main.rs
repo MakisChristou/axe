@@ -101,6 +101,75 @@ async fn resolve_test_config(
     Ok((network, config))
 }
 
+/// CLI inputs for `--originate`, grouped so the glue function stays under the
+/// argument ceiling.
+struct OriginateInputs {
+    source_chain: Option<String>,
+    destination_chain: Option<String>,
+    amount: String,
+    gas_value: String,
+    app_address: Option<String>,
+    private_key: Option<String>,
+    source_rpc: Option<String>,
+}
+
+/// Build and send the AxelarApp express transfer, returning its source tx hash
+/// for the two-phase monitor to watch.
+async fn originate_express_transfer(
+    network: types::Network,
+    config: Option<&std::path::Path>,
+    inputs: OriginateInputs,
+) -> Result<String> {
+    use commands::express_originate::{AXELAR_APP_PROXY, OriginateArgs, originate};
+
+    let source_chain = inputs
+        .source_chain
+        .ok_or_else(|| eyre::eyre!("--originate requires --source-chain"))?;
+    let destination_chain = inputs
+        .destination_chain
+        .ok_or_else(|| eyre::eyre!("--originate requires --destination-chain"))?;
+    let key = inputs
+        .private_key
+        .ok_or_else(|| eyre::eyre!("--originate requires EVM_PRIVATE_KEY or --private-key"))?;
+
+    let config_path = match config {
+        Some(path) => path.to_path_buf(),
+        None => config_source::resolve(network, None).await?.into_path(),
+    };
+    let chains = config::ChainsConfig::load(&config_path).await?;
+    let chain = chains.chain(&source_chain)?;
+    let gateway: alloy::primitives::Address = chain
+        .contract_address(config::ChainContract::AxelarGateway, &source_chain)?
+        .parse()?;
+
+    let rpc = inputs
+        .source_rpc
+        .or_else(|| chain.rpc.clone())
+        .ok_or_else(|| eyre::eyre!("no RPC for source chain '{source_chain}'"))?;
+
+    let signer: alloy::signers::local::PrivateKeySigner = key.trim_start_matches("0x").parse()?;
+    let recipient = signer.address();
+
+    let hash = originate(
+        &signer,
+        OriginateArgs {
+            source_rpc_urls: vec![rpc],
+            source_gateway: gateway,
+            app_address: inputs
+                .app_address
+                .as_deref()
+                .unwrap_or(AXELAR_APP_PROXY)
+                .parse()?,
+            destination_chain,
+            amount: inputs.amount.parse()?,
+            recipient,
+            gas_value_wei: inputs.gas_value.parse()?,
+        },
+    )
+    .await?;
+    Ok(format!("{hash:#x}"))
+}
+
 async fn run_gmp_test(
     command: cli::TestCommands,
     global_network: Option<types::Network>,
@@ -249,8 +318,36 @@ async fn run_test(
             config,
             recent,
             timeout_secs,
+            originate,
+            source_chain,
+            destination_chain,
+            amount,
+            gas_value,
+            app_address,
+            private_key,
+            source_rpc,
         } => {
             let network = cli::resolve_network(global_network, config.as_deref())?;
+            let source_tx = if originate {
+                Some(
+                    originate_express_transfer(
+                        network,
+                        config.as_deref(),
+                        OriginateInputs {
+                            source_chain,
+                            destination_chain,
+                            amount,
+                            gas_value,
+                            app_address,
+                            private_key,
+                            source_rpc,
+                        },
+                    )
+                    .await?,
+                )
+            } else {
+                source_tx
+            };
             commands::test_express::run_config(network, chains, source_tx, recent, timeout_secs)
                 .await
         }

@@ -7,9 +7,12 @@
 //! inside that execute tx. The signal this monitor reports is exactly that:
 //! did the express executor get reimbursed?
 //!
-//! This is a monitor, not an executor: v1 only *observes* via the Axelarscan
-//! GMP API. It never originates an express transfer and never relays. Two
-//! modes:
+//! This module never express-executes anything itself. It observes via the
+//! Axelarscan GMP API, so a reported reimbursement is always the real
+//! `gmp-express-executor` service being paid back, never a stand-in. The
+//! transfer under watch can be originated by
+//! [`crate::commands::express_originate`] (`--originate`), which only sends
+//! the qualifying source call and hands the tx hash here. Two modes:
 //! - `--source-tx <hash>`: poll one message through both phases to
 //!   terminal/timeout.
 //! - else: for each requested chain, list the `--recent` newest express
@@ -45,7 +48,7 @@ pub async fn run_config(
         )
     })?;
 
-    ui::section("Express Execution Monitor (observe-only)");
+    ui::section("Express Execution Monitor");
     ui::kv("network", network.as_str());
     ui::kv("gmp api", base);
 
