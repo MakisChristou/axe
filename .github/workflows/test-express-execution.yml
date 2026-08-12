@@ -44,7 +44,7 @@ on:
       amount:
         type: string
         required: false
-        default: '4000000'
+        default: '10'
       gas_value:
         type: string
         required: false
@@ -70,10 +70,10 @@ on:
         required: false
         default: ethereum-sepolia
       amount:
-        description: 'originate mode: express-asset base units (6 dp). Must stay under the registry cap (testnet $1000, mainnet $5000).'
+        description: 'originate mode: express-asset base units (6 dp). Dust is fine - the registry min is 0. Must stay under the cap (testnet $1000, mainnet $5000).'
         type: string
         required: false
-        default: '4000000'
+        default: '10'
       chains:
         description: 'Express-supported chain(s) to monitor. "all" scans every express chain for the chosen network; or pick one for a focused run.'
         type: choice
@@ -148,7 +148,7 @@ jobs:
           NETWORK: ${{ inputs.network || 'testnet' }}
           SOURCE_CHAIN: ${{ inputs.source_chain || 'avalanche' }}
           DEST_CHAIN: ${{ inputs.destination_chain || 'ethereum-sepolia' }}
-          AMOUNT: ${{ inputs.amount || '4000000' }}
+          AMOUNT: ${{ inputs.amount || '10' }}
           GAS_VALUE: ${{ inputs.gas_value || '350000000000000000' }}
           EVM_PRIVATE_KEY: ${{ secrets.EVM_PRIVATE_KEY }}
           AVALANCHE_TESTNET_RPC: ${{ secrets.AVALANCHE_TESTNET_RPC }}

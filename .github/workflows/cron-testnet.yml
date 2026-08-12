@@ -32,6 +32,7 @@ jobs:
       network: testnet
       source_chain: avalanche
       destination_chain: ethereum-sepolia
+      amount: '10'
     secrets: inherit
 
   testnet-its:
