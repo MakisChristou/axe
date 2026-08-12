@@ -292,8 +292,8 @@ pub enum TestCommands {
         #[arg(long)]
         destination_chain: Option<String>,
 
-        /// aUSDC base units (6 decimals) to send with --originate. Must stay
-        /// inside the express registry's per-chain cap.
+        /// Express-asset base units (6 decimals) to send with --originate.
+        /// Must stay inside the express registry's per-chain cap.
         #[arg(long, default_value = "5000000")]
         amount: String,
 
@@ -304,6 +304,12 @@ pub enum TestCommands {
         /// Override the AxelarApp proxy address used by --originate.
         #[arg(long)]
         app_address: Option<String>,
+
+        /// Override the gateway token symbol for --originate. Defaults to the
+        /// network's registered express asset (testnet aUSDC, mainnet
+        /// axlUSDC/USDC).
+        #[arg(long)]
+        symbol: Option<String>,
 
         /// EVM private key for --originate.
         #[arg(long, env = "EVM_PRIVATE_KEY")]

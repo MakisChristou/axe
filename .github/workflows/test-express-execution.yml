@@ -1,10 +1,8 @@
 name: Test Express Execution
 
-# Observe-only monitor for Axelar express-execution reimbursement. For each
-# requested express-supported chain it queries the Axelarscan GMP API and
-# reports, per recent express transfer, the two phases:
-#   Phase 1 — express executed (a relayer fronted funds to the recipient)
-#   Phase 2 — executor reimbursed (canonical ITS.execute landed, firing
+# Verifies Axelar express-execution reimbursement in two phases:
+#   Phase 1 — express executed (the relayer fronted funds to the recipient)
+#   Phase 2 — executor reimbursed (the canonical execute landed, firing
 #             ExpressExecutionFulfilled atomically)
 #
 # Two modes:
@@ -12,7 +10,8 @@ name: Test Express Execution
 #   monitor   (default) — observe only. Reads the public GMP API, so it needs
 #             no wallet keys, RPC overrides, or chains-config.
 #
-#   originate — end-to-end test of the REAL express executor. axe sends aUSDC
+#   originate — end-to-end test of the REAL express executor. axe sends the
+#             registry's express asset (testnet aUSDC, mainnet axlUSDC)
 #             through the AxelarApp proxy registered under the `axelar-app`
 #             project in gmp-api/config/projects.yml, which is the only shape
 #             the gmp-express-executor service picks up: the gateway path
@@ -42,6 +41,14 @@ on:
         type: string
         required: false
         default: ethereum-sepolia
+      amount:
+        type: string
+        required: false
+        default: '4000000'
+      gas_value:
+        type: string
+        required: false
+        default: '350000000000000000'
   workflow_dispatch:
     inputs:
       mode:
@@ -53,7 +60,7 @@ on:
           - originate
           - monitor
       source_chain:
-        description: 'originate mode: source chain (must carry aUSDC + the AxelarApp proxy).'
+        description: 'originate mode: source chain (must carry the express asset + the AxelarApp proxy).'
         type: string
         required: false
         default: avalanche
@@ -63,7 +70,7 @@ on:
         required: false
         default: ethereum-sepolia
       amount:
-        description: 'originate mode: aUSDC base units (6 dp). Must stay under the registry cap ($1000).'
+        description: 'originate mode: express-asset base units (6 dp). Must stay under the registry cap (testnet $1000, mainnet $5000).'
         type: string
         required: false
         default: '4000000'
@@ -142,8 +149,10 @@ jobs:
           SOURCE_CHAIN: ${{ inputs.source_chain || 'avalanche' }}
           DEST_CHAIN: ${{ inputs.destination_chain || 'ethereum-sepolia' }}
           AMOUNT: ${{ inputs.amount || '4000000' }}
+          GAS_VALUE: ${{ inputs.gas_value || '350000000000000000' }}
           EVM_PRIVATE_KEY: ${{ secrets.EVM_PRIVATE_KEY }}
           AVALANCHE_TESTNET_RPC: ${{ secrets.AVALANCHE_TESTNET_RPC }}
+          AVALANCHE_MAINNET_RPC: ${{ secrets.AVALANCHE_MAINNET_RPC }}
         run: |
           set -euo pipefail
           if [ -z "${EVM_PRIVATE_KEY:-}" ]; then
@@ -151,14 +160,19 @@ jobs:
             exit 1
           fi
           # Prefer the private source RPC when the secret is set.
-          if [ "$SOURCE_CHAIN" = avalanche ] && [ -n "${AVALANCHE_TESTNET_RPC:-}" ]; then
-            export SOURCE_RPC="$AVALANCHE_TESTNET_RPC"
+          if [ "$SOURCE_CHAIN" = avalanche ]; then
+            if [ "$NETWORK" = mainnet ] && [ -n "${AVALANCHE_MAINNET_RPC:-}" ]; then
+              export SOURCE_RPC="$AVALANCHE_MAINNET_RPC"
+            elif [ "$NETWORK" != mainnet ] && [ -n "${AVALANCHE_TESTNET_RPC:-}" ]; then
+              export SOURCE_RPC="$AVALANCHE_TESTNET_RPC"
+            fi
           fi
           ./target/release/axe --network "$NETWORK" test express-execution \
             --originate \
             --source-chain "$SOURCE_CHAIN" \
             --destination-chain "$DEST_CHAIN" \
             --amount "$AMOUNT" \
+            --gas-value "$GAS_VALUE" \
             --timeout-secs 1200
 
       - name: Monitor express execution

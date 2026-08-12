@@ -109,6 +109,7 @@ struct OriginateInputs {
     amount: String,
     gas_value: String,
     app_address: Option<String>,
+    symbol: Option<String>,
     private_key: Option<String>,
     source_rpc: Option<String>,
 }
@@ -120,7 +121,9 @@ async fn originate_express_transfer(
     config: Option<&std::path::Path>,
     inputs: OriginateInputs,
 ) -> Result<String> {
-    use commands::express_originate::{AXELAR_APP_PROXY, OriginateArgs, originate};
+    use commands::express_originate::{
+        OriginateArgs, default_app_proxy, default_symbols, originate,
+    };
 
     let source_chain = inputs
         .source_chain
@@ -158,9 +161,13 @@ async fn originate_express_transfer(
             app_address: inputs
                 .app_address
                 .as_deref()
-                .unwrap_or(AXELAR_APP_PROXY)
+                .unwrap_or_else(|| default_app_proxy(network))
                 .parse()?,
             destination_chain,
+            symbols: inputs
+                .symbol
+                .map(|s| vec![s])
+                .unwrap_or_else(|| default_symbols(network)),
             amount: inputs.amount.parse()?,
             recipient,
             gas_value_wei: inputs.gas_value.parse()?,
@@ -324,6 +331,7 @@ async fn run_test(
             amount,
             gas_value,
             app_address,
+            symbol,
             private_key,
             source_rpc,
         } => {
@@ -339,6 +347,7 @@ async fn run_test(
                             amount,
                             gas_value,
                             app_address,
+                            symbol,
                             private_key,
                             source_rpc,
                         },
