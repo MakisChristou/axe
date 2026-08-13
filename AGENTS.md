@@ -72,7 +72,32 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 ---
 
-## 6. Rust-Specific Guidelines
+## 6. Key material never lives in this repo
+
+**No secret ever gets written inside the working tree — not even temporarily,
+not even gitignored.**
+
+Mnemonics, private keys, keystores, and seed files belong *outside* the repo
+directory entirely: `~/.config/`, a keyring, a password manager, or an env file
+kept elsewhere and referenced by path. `.env` is the only exception, and only
+because it is already ignored and never leaves the machine.
+
+Why a gitignore entry is not enough:
+
+- Ignore rules are per-branch. A `git checkout` or `git reset` onto a branch
+  whose `.gitignore` predates the rule silently makes the file stageable again,
+  and the next `git add -A` commits it.
+- Recovering from a push means rotating the key, not rewriting history: the
+  blob stays reachable by SHA on the forge, and forks and caches keep copies.
+
+So the rule is placement, not ignoring. If you need a key for a task, read it
+from outside the repo. If you find one inside the repo, move it out before
+doing anything else — do not merely add it to `.gitignore`.
+
+Prefer `git add <paths>` over `git add -A` when a run may have dropped files in
+the tree.
+
+## 7. Rust-Specific Guidelines
 
 **Use the type system. Keep functions small. Make business logic read like pseudocode.**
 
