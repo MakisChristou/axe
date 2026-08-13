@@ -357,20 +357,14 @@ const NONCE_CONTENTION_ATTEMPTS: u32 = 6;
 /// Hard ceiling on loop iterations, so no re-sign path can spin forever.
 const MAX_SEND_ATTEMPTS: u32 = 16;
 
-/// Backoff for the nth nonce-contention attempt: 1, 2, 4, 8, 16, 32 s, each
-/// jittered by +/-20%.
+/// Backoff for the nth nonce-contention attempt: 1, 2, 4, 8, 16, 32 s.
 ///
-/// The jitter is the point, not a garnish. When several runs share a wallet
-/// they collide on the *same* nonce at the same moment, so a fixed schedule
-/// would march them into the next collision together. Spreading the waits lets
-/// one win each round.
+/// Longer than the shared transport schedule because it is waiting on another
+/// party's transaction to mine or expire, not on a flaky socket. Jitter comes
+/// from [`crate::retry::jittered`], the same spread every retry in the tree
+/// uses.
 fn nonce_contention_backoff(attempt: u32) -> std::time::Duration {
-    use rand::Rng as _;
-    let base = 1u64 << attempt.min(5);
-    let millis = base * 1000;
-    let jitter = rand::thread_rng().gen_range(0.8..1.2);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    std::time::Duration::from_millis((millis as f64 * jitter) as u64)
+    crate::retry::jittered(std::time::Duration::from_secs(1 << attempt.min(5)))
 }
 
 /// Send an EVM transaction with retry + private→public fallback at every
