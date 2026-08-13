@@ -1,20 +1,79 @@
 name: Test Express Execution
 
-# Observe-only monitor for Axelar express-execution reimbursement. For each
-# requested express-supported chain it queries the Axelarscan GMP API and
-# reports, per recent express transfer, the two phases:
-#   Phase 1 — express executed (a relayer fronted funds to the recipient)
-#   Phase 2 — executor reimbursed (canonical ITS.execute landed, firing
+# Verifies Axelar express-execution reimbursement in two phases:
+#   Phase 1 — express executed (the relayer fronted funds to the recipient)
+#   Phase 2 — executor reimbursed (the canonical execute landed, firing
 #             ExpressExecutionFulfilled atomically)
 #
-# This is a MONITOR, not an executor: axe never originates an express transfer
-# and never relays. The command reads the public GMP API only — no wallet keys,
-# RPC overrides, or chains-config are needed, so this workflow defines no
-# secrets and no per-chain RPC env block.
+# Two modes:
+#
+#   monitor   (default) — observe only. Reads the public GMP API, so it needs
+#             no wallet keys, RPC overrides, or chains-config.
+#
+#   originate — end-to-end test of the REAL express executor. axe sends the
+#             registry's express asset (testnet aUSDC, mainnet axlUSDC)
+#             through the AxelarApp proxy registered under the `axelar-app`
+#             project in gmp-api/config/projects.yml, which is the only shape
+#             the gmp-express-executor service picks up: the gateway path
+#             (ContractCallWithToken — express never sees ITS), an allowlisted
+#             access-controlled destination, an amount inside the registry cap,
+#             and gas paid via payNativeGasForExpressCallWithToken. axe does
+#             NOT express-execute anything itself; it originates and then
+#             watches, so a green run means the service fronted the funds and
+#             was reimbursed in full. Needs EVM_PRIVATE_KEY.
 
 on:
+  workflow_call:
+    inputs:
+      mode:
+        type: string
+        required: false
+        default: originate
+      network:
+        type: string
+        required: false
+        default: testnet
+      source_chain:
+        type: string
+        required: false
+        default: avalanche
+      destination_chain:
+        type: string
+        required: false
+        default: ethereum-sepolia
+      amount:
+        type: string
+        required: false
+        default: '10'
+      gas_value:
+        type: string
+        required: false
+        default: '350000000000000000'
   workflow_dispatch:
     inputs:
+      mode:
+        description: 'monitor = observe recent express transfers; originate = drive a real express transfer through the actual express executor and verify reimbursement.'
+        type: choice
+        required: true
+        default: originate
+        options:
+          - originate
+          - monitor
+      source_chain:
+        description: 'originate mode: source chain (must carry the express asset + the AxelarApp proxy).'
+        type: string
+        required: false
+        default: avalanche
+      destination_chain:
+        description: 'originate mode: destination chain (must be in the express executor config).'
+        type: string
+        required: false
+        default: ethereum-sepolia
+      amount:
+        description: 'originate mode: express-asset base units (6 dp). Dust is fine - the registry min is 0. Must stay under the cap (testnet $1000, mainnet $5000).'
+        type: string
+        required: false
+        default: '10'
       chains:
         description: 'Express-supported chain(s) to monitor. "all" scans every express chain for the chosen network; or pick one for a focused run.'
         type: choice
@@ -79,11 +138,49 @@ jobs:
         shell: bash
         run: cargo build --release --locked
 
+      # Real-executor end-to-end test: originate a qualifying transfer, then
+      # watch it through both phases. Fails red if the service never fronts it
+      # or the fronted/reimbursed amounts differ.
+      - name: Originate + verify real express execution
+        if: ${{ (inputs.mode || 'originate') == 'originate' }}
+        shell: bash
+        env:
+          NETWORK: ${{ inputs.network || 'testnet' }}
+          SOURCE_CHAIN: ${{ inputs.source_chain || 'avalanche' }}
+          DEST_CHAIN: ${{ inputs.destination_chain || 'ethereum-sepolia' }}
+          AMOUNT: ${{ inputs.amount || '10' }}
+          GAS_VALUE: ${{ inputs.gas_value || '350000000000000000' }}
+          EVM_PRIVATE_KEY: ${{ secrets.EVM_PRIVATE_KEY }}
+          AVALANCHE_TESTNET_RPC: ${{ secrets.AVALANCHE_TESTNET_RPC }}
+          AVALANCHE_MAINNET_RPC: ${{ secrets.AVALANCHE_MAINNET_RPC }}
+        run: |
+          set -euo pipefail
+          if [ -z "${EVM_PRIVATE_KEY:-}" ]; then
+            echo "::error::originate mode needs the EVM_PRIVATE_KEY secret" >&2
+            exit 1
+          fi
+          # Prefer the private source RPC when the secret is set.
+          if [ "$SOURCE_CHAIN" = avalanche ]; then
+            if [ "$NETWORK" = mainnet ] && [ -n "${AVALANCHE_MAINNET_RPC:-}" ]; then
+              export SOURCE_RPC="$AVALANCHE_MAINNET_RPC"
+            elif [ "$NETWORK" != mainnet ] && [ -n "${AVALANCHE_TESTNET_RPC:-}" ]; then
+              export SOURCE_RPC="$AVALANCHE_TESTNET_RPC"
+            fi
+          fi
+          ./target/release/axe --network "$NETWORK" test express-execution \
+            --originate \
+            --source-chain "$SOURCE_CHAIN" \
+            --destination-chain "$DEST_CHAIN" \
+            --amount "$AMOUNT" \
+            --gas-value "$GAS_VALUE" \
+            --timeout-secs 1200
+
       - name: Monitor express execution
+        if: ${{ (inputs.mode || 'originate') == 'monitor' }}
         shell: bash
         env:
           CHAINS: ${{ inputs.chains }}
-          NETWORK: ${{ inputs.network }}
+          NETWORK: ${{ inputs.network || 'testnet' }}
         run: |
           set -euo pipefail
           # "all" expands to the network's express-supported chains; any other

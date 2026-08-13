@@ -11,3 +11,9 @@ bench-results/
 scripts/run-baseline-matrix.sh
 scripts/compare-load-test-baseline.sh
 scripts/plot_load_tests.py
+
+# Key material belongs outside the repo entirely (see AGENTS.md 6). These
+# patterns are a backstop, not the policy.
+*.mnemonic
+*.seed
+axelar1*.txt

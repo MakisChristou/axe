@@ -20,6 +20,25 @@ on:
   workflow_dispatch: {}
 
 jobs:
+  # Real express-executor check against the live service. Originates a small
+  # axlUSDC transfer through the allowlisted AxelarApp proxy and fails red
+  # unless the executor fronts it and is reimbursed the exact amount.
+  #
+  # COST: real gas per run. The axlUSDC is dust (10 base units = 0.00001) and
+  # goes to our own address on the destination, so it is not lost, it just
+  # migrates source -> destination. At this size the source balance lasts
+  # effectively indefinitely.
+  mainnet-express:
+    uses: ./.github/workflows/test-express-execution.yml
+    with:
+      mode: originate
+      network: mainnet
+      source_chain: avalanche
+      destination_chain: base
+      amount: '10'
+      gas_value: '60000000000000000'
+    secrets: inherit
+
   mainnet-its:
     uses: ./.github/workflows/test-routes.yml
     with:

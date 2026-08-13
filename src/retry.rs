@@ -32,9 +32,28 @@ pub const FALLBACK_ATTEMPTS: u32 = 5;
 const BASE_BACKOFF_MS: u64 = 500;
 const MAX_BACKOFF_MS: u64 = 8_000;
 
-/// Compute the geometric backoff for a zero-based attempt index.
+/// Fraction each delay is randomly spread by, either side of its nominal
+/// value. 0.2 gives the usual +/-20% band.
+const JITTER_FRACTION: f64 = 0.2;
+
+/// Spread `base` by +/-[`JITTER_FRACTION`] so concurrent retriers separate.
+///
+/// This matters whenever several runs contend for one resource - a shared
+/// wallet's nonce, a rate-limited RPC, a Stellar account sequence. They fail
+/// at the same instant, so an unjittered schedule makes them sleep the same
+/// amount and collide again in lockstep, turning one collision into a run of
+/// them. Spreading the waits lets one win each round.
+pub(crate) fn jittered(base: Duration) -> Duration {
+    use rand::Rng as _;
+    let factor = rand::thread_rng().gen_range(1.0 - JITTER_FRACTION..1.0 + JITTER_FRACTION);
+    base.mul_f64(factor)
+}
+
+/// Compute the geometric backoff for a zero-based attempt index, jittered.
 pub(crate) fn backoff_for_attempt(attempt: u32) -> Duration {
-    Duration::from_millis((BASE_BACKOFF_MS << attempt.min(31)).min(MAX_BACKOFF_MS))
+    jittered(Duration::from_millis(
+        (BASE_BACKOFF_MS << attempt.min(31)).min(MAX_BACKOFF_MS),
+    ))
 }
 
 /// Retry an async fallible operation with geometric backoff. `op` must be

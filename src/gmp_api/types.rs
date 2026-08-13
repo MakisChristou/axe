@@ -229,6 +229,17 @@ impl ExpressRecord {
             || self.executed.is_some()
     }
 
+    /// Whether the GMP API reports this message terminally failed: status
+    /// `"error"`, set when the hub or destination execute reverted. A failed
+    /// message can occasionally be revived by manual intervention (re-execute
+    /// with more gas), but the automated relay is done — for a load-test
+    /// verdict that is a failure.
+    pub fn is_failed(&self) -> bool {
+        self.status
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("error"))
+    }
+
     /// Classify this record into its two express-reimbursement phases.
     pub fn phase_status(&self) -> (Phase1, Phase2) {
         let Some(ee) = &self.express_executed else {

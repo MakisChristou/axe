@@ -635,6 +635,13 @@ pub(super) async fn distribute_tokens(
 
     for (i, signer) in derived.iter().enumerate() {
         let holder = signer.address();
+        // Single-tx runs derive the deployer itself as key 0 — distributing to
+        // it is a self-transfer, which is a no-op on normal EVMs but an HTS
+        // revert on Hedera (ACCOUNT_REPEATED_IN_ACCOUNT_AMOUNTS, observed in
+        // both Aug 7 mainnet crons when a flaky balance read fell back to 0).
+        if holder == deployer.address() {
+            continue;
+        }
         let balance =
             retry_with_fallback_all("token balance", endpoints.providers(), |p| async move {
                 ERC20::new(token_addr, p).balanceOf(holder).call().await

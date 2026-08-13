@@ -713,7 +713,7 @@ enum GatewayOperation {
     ApproveMessage,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum GatewayErrorDisposition {
     AlreadyApplied,
     Fatal,
@@ -728,8 +728,13 @@ fn classify_idempotent_gateway_error(
         GatewayOperation::InitializeSession | GatewayOperation::ApproveMessage => {
             message.contains("already in use")
         }
+        // Scoped to the "this slot is already verified" phrasings. A bare
+        // "already" would also swallow unrelated runtime failures - Solana
+        // reports account contention as "already borrowed" - and treating one
+        // of those as success would carry on with a signature that never
+        // verified.
         GatewayOperation::VerifySignature => {
-            message.contains("SlotAlreadyVerified") || message.contains("already")
+            message.contains("SlotAlreadyVerified") || message.contains("already verified")
         }
     };
     if already_applied {
@@ -835,4 +840,58 @@ pub fn execute_on_memo(
         rpc.send_and_confirm_transaction_with_spinner(&tx)
     })?;
     Ok(sig)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GatewayErrorDisposition, GatewayOperation, classify_idempotent_gateway_error as classify,
+    };
+
+    fn err(message: &str) -> eyre::Report {
+        eyre::eyre!(message.to_string())
+    }
+
+    #[test]
+    fn already_verified_slot_is_idempotent() {
+        for message in ["SlotAlreadyVerified", "signature already verified"] {
+            assert_eq!(
+                classify(GatewayOperation::VerifySignature, &err(message)),
+                GatewayErrorDisposition::AlreadyApplied,
+                "{message} should count as already applied"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_already_wording_is_still_fatal() {
+        // Account contention surfaces as "already borrowed". Swallowing it
+        // would continue the approval flow with an unverified signature.
+        for message in [
+            "Account already borrowed",
+            "blockhash already processed",
+            "custom program error: 0x1",
+        ] {
+            assert_eq!(
+                classify(GatewayOperation::VerifySignature, &err(message)),
+                GatewayErrorDisposition::Fatal,
+                "{message} should stay fatal"
+            );
+        }
+    }
+
+    #[test]
+    fn session_and_approval_use_account_in_use() {
+        assert_eq!(
+            classify(
+                GatewayOperation::InitializeSession,
+                &err("Allocate: account Address { .. } already in use")
+            ),
+            GatewayErrorDisposition::AlreadyApplied
+        );
+        assert_eq!(
+            classify(GatewayOperation::ApproveMessage, &err("already borrowed")),
+            GatewayErrorDisposition::Fatal
+        );
+    }
 }

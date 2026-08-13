@@ -75,6 +75,9 @@ on:
 jobs:
   loadtest:
     runs-on: ubuntu-latest
+    # Hard stop well past any healthy run; a dead message must not bill the
+    # runner for GitHub's 6 h default.
+    timeout-minutes: 60
     # Private RPC secrets for devnet-amplifier chains (see loadtest-single.yml
     # for the naming convention). Chains without a secret fall through to the
     # public chains-config RPC.

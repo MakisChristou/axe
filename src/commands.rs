@@ -7,6 +7,7 @@ pub mod decode_tx;
 pub mod deploy;
 pub mod deploy_sender_receiver;
 pub mod event_extractors;
+pub mod express_originate;
 pub mod info_block;
 pub mod init;
 pub mod its_ownership;

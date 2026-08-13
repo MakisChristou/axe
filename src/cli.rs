@@ -274,6 +274,50 @@ pub enum TestCommands {
         /// single-tx mode before reporting PENDING/timeout.
         #[arg(long, default_value = "1800")]
         timeout_secs: u64,
+
+        /// Originate a transfer that Axelar's own express executor will front,
+        /// then watch it through both phases. Sends aUSDC through the
+        /// AxelarApp proxy registered in the express registry, which is the
+        /// only shape the service picks up (gateway path, allowlisted
+        /// contract, capped amount). Requires --source-chain and
+        /// --destination-chain.
+        #[arg(long)]
+        originate: bool,
+
+        /// Source chain axelar ID for --originate.
+        #[arg(long)]
+        source_chain: Option<String>,
+
+        /// Destination chain axelar ID for --originate.
+        #[arg(long)]
+        destination_chain: Option<String>,
+
+        /// Express-asset base units (6 decimals) to send with --originate.
+        /// Must stay inside the express registry's per-chain cap.
+        #[arg(long, default_value = "5000000")]
+        amount: String,
+
+        /// Native gas to attach to the --originate call, in wei.
+        #[arg(long, default_value = "350000000000000000")]
+        gas_value: String,
+
+        /// Override the AxelarApp proxy address used by --originate.
+        #[arg(long)]
+        app_address: Option<String>,
+
+        /// Override the gateway token symbol for --originate. Defaults to the
+        /// network's registered express asset (testnet aUSDC, mainnet
+        /// axlUSDC/USDC).
+        #[arg(long)]
+        symbol: Option<String>,
+
+        /// EVM private key for --originate.
+        #[arg(long, env = "EVM_PRIVATE_KEY")]
+        private_key: Option<String>,
+
+        /// Override the source chain RPC URL for --originate.
+        #[arg(long, env = "SOURCE_RPC")]
+        source_rpc: Option<String>,
     },
 
     /// Cross-chain load test (auto-detects chains, RPCs, and test type from config)

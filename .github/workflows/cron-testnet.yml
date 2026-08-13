@@ -21,6 +21,20 @@ on:
   workflow_dispatch: {}
 
 jobs:
+  # Real express-executor check: originates an aUSDC transfer through the
+  # allowlisted AxelarApp proxy and fails red unless the gmp-express-executor
+  # service fronts it and is reimbursed the exact amount. This exercises the
+  # live service, not a stand-in executor.
+  testnet-express:
+    uses: ./.github/workflows/test-express-execution.yml
+    with:
+      mode: originate
+      network: testnet
+      source_chain: avalanche
+      destination_chain: ethereum-sepolia
+      amount: '10'
+    secrets: inherit
+
   testnet-its:
     uses: ./.github/workflows/test-routes.yml
     with:

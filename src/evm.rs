@@ -125,6 +125,32 @@ impl EvmEndpoints {
         &self.providers[0]
     }
 
+    /// The endpoint URLs, in preference order. Test-only: production code
+    /// reaches endpoints through the retry helpers, never by URL.
+    #[cfg(test)]
+    pub fn urls(&self) -> &[String] {
+        &self.urls
+    }
+
+    /// The same pool with the preferred endpoint advanced by `n`, order
+    /// otherwise preserved.
+    ///
+    /// The retry helpers always start at the front of the pool, so a caller
+    /// that wants its *next* attempt to reach a different node has to rotate.
+    /// Used when an error is endpoint-specific in effect rather than in kind -
+    /// a mempool that already holds our nonce, say - where retrying the same
+    /// node just re-reads the same view. A single-endpoint pool rotates to
+    /// itself, which is harmless.
+    pub fn rotated(&self, n: usize) -> Self {
+        let len = self.providers.len();
+        let shift = if len == 0 { 0 } else { n % len };
+        let mut urls = self.urls.clone();
+        let mut providers = self.providers.clone();
+        urls.rotate_left(shift);
+        providers.rotate_left(shift);
+        Self { urls, providers }
+    }
+
     /// Fill (nonce, gas, fees, chain id) and sign `tx` WITHOUT broadcasting,
     /// retrying the fill across endpoints — the fill is pure reads, so it can
     /// fail over freely. Returns the signed envelope: its hash is known before
@@ -151,6 +177,19 @@ impl EvmEndpoints {
                 );
                 let pinned = self.prefill_from_latest(tx).await?;
                 self.fill_and_sign_once(signer, pinned).await
+            }
+            // Pre-EIP-1559 chain (Kava): alloy's 1559 fee estimation cannot
+            // decode the null `baseFeePerGas`. Degrade once to a legacy type-0
+            // tx with an explicit `gas_price`, which routes alloy's filler
+            // through the legacy path and skips `eth_feeHistory` entirely.
+            Err(error) if is_missing_base_fee_error(&error) => {
+                ui::warn(
+                    "fill hit a pre-EIP-1559 fee history (null baseFeePerGas) — \
+                     re-filling as a legacy type-0 tx with an explicit gas price",
+                );
+                let gas_price = self.primary().get_gas_price().await?;
+                self.fill_and_sign_once(signer, tx.gas_price(gas_price))
+                    .await
             }
             other => other,
         }
@@ -248,6 +287,17 @@ pub fn is_pending_state_error<E: std::fmt::Display>(err: &E) -> bool {
         .contains("state not available for pending block")
 }
 
+/// Whether the fill died because the chain predates EIP-1559.
+///
+/// Pre-1559 chains (Kava) return a null `baseFeePerGas` from
+/// `eth_feeHistory`, and alloy's 1559 estimator deserializes that field as a
+/// `u128` and fails hard, before any legacy fallback of its own runs, so the
+/// only signal is the deserialization error text.
+pub fn is_missing_base_fee_error<E: std::fmt::Display>(err: &E) -> bool {
+    let text = err.to_string();
+    text.contains("expected a 16 byte hex string") && text.contains("invalid type: null")
+}
+
 /// Broadcast rejections that mean the transaction (or its nonce) is already
 /// on-chain or in the mempool — i.e. an earlier attempt may have landed even
 /// though its RPC response was lost (Hedera's consensus-node "timeout
@@ -260,7 +310,25 @@ pub fn send_error_may_mean_landed<E: std::fmt::Display>(err: &E) -> bool {
         "already known",
         "already exists",
         "already imported",
+    ]
+    .iter()
+    .any(|signature| message.contains(signature))
+}
+
+/// Broadcast rejections meaning a *different*, already-pooled transaction owns
+/// this nonce at a fee ours does not beat.
+///
+/// Distinct from [`send_error_may_mean_landed`]: the node never accepted our
+/// bytes, so ours cannot have landed, and re-signing immediately just loses the
+/// same race again. Re-broadcasting identical bytes yields "already known", not
+/// these - so this only fires when something else holds the nonce, which on a
+/// wallet shared by concurrent runs means waiting for that transaction to mine
+/// or expire and then re-filling at a fresh nonce.
+pub fn nonce_held_by_pooled_tx<E: std::fmt::Display>(err: &E) -> bool {
+    let message = err.to_string().to_lowercase();
+    [
         "replacement transaction underpriced",
+        "existing transaction had higher priority",
     ]
     .iter()
     .any(|signature| message.contains(signature))
@@ -280,6 +348,24 @@ pub fn parse_expected_nonce(err: &str) -> Option<u64> {
 /// carries full per-phase retry + endpoint fallback, so rounds only replay for
 /// nonce re-resolution or an unmined-after-timeout re-broadcast.
 const SEND_ROUNDS: u32 = 3;
+
+/// Attempts spent waiting out a nonce another pooled transaction holds.
+/// Separate from [`SEND_ROUNDS`]: losing a nonce race costs a short sleep, not
+/// a `receipt_timeout`, so it can afford far more attempts.
+const NONCE_CONTENTION_ATTEMPTS: u32 = 6;
+
+/// Hard ceiling on loop iterations, so no re-sign path can spin forever.
+const MAX_SEND_ATTEMPTS: u32 = 16;
+
+/// Backoff for the nth nonce-contention attempt: 1, 2, 4, 8, 16, 32 s.
+///
+/// Longer than the shared transport schedule because it is waiting on another
+/// party's transaction to mine or expire, not on a flaky socket. Jitter comes
+/// from [`crate::retry::jittered`], the same spread every retry in the tree
+/// uses.
+fn nonce_contention_backoff(attempt: u32) -> std::time::Duration {
+    crate::retry::jittered(std::time::Duration::from_secs(1 << attempt.min(5)))
+}
 
 /// Send an EVM transaction with retry + private→public fallback at every
 /// phase, and at-most-once semantics end to end:
@@ -308,13 +394,23 @@ pub async fn send_tx_robust(
     let mut envelope: Option<TxEnvelope> = None;
     let mut nonce_override: Option<u64> = tx.nonce;
     let mut last_hash: Option<TxHash> = None;
-    for round in 0..SEND_ROUNDS {
+    // Broadcast rounds and nonce-contention attempts are budgeted separately:
+    // only an unmined-after-`receipt_timeout` tx consumes a broadcast round.
+    let mut round: u32 = 0;
+    let mut contention: u32 = 0;
+    // Contention rotates the preferred endpoint, so a wallet-level race is not
+    // re-fought against the same node's mempool view every time.
+    let mut pool = endpoints.clone();
+    for _ in 0..MAX_SEND_ATTEMPTS {
+        if round >= SEND_ROUNDS {
+            break;
+        }
         let env = match envelope.clone() {
             Some(env) => env,
             None => {
                 let mut request = tx.clone();
                 request.nonce = nonce_override;
-                let env = endpoints.fill_and_sign(signer, request).await?;
+                let env = pool.fill_and_sign(signer, request).await?;
                 envelope = Some(env.clone());
                 env
             }
@@ -322,10 +418,10 @@ pub async fn send_tx_robust(
         let tx_hash = *env.tx_hash();
         last_hash = Some(tx_hash);
 
-        match endpoints.broadcast_raw(&env).await {
+        match pool.broadcast_raw(&env).await {
             Ok(_) => {}
             Err(error) if send_error_may_mean_landed(&error) => {
-                if !tx_known_by_hash(endpoints, tx_hash).await {
+                if !tx_known_by_hash(&pool, tx_hash).await {
                     // Not ours: the fill used a stale nonce. Re-resolve (from
                     // the node's own report when present) and re-sign.
                     nonce_override = parse_expected_nonce(&error.to_string());
@@ -342,17 +438,48 @@ pub async fn send_tx_robust(
                 // Ours: an earlier broadcast landed despite its lost response.
                 // Fall through to confirmation.
             }
+            // Something else holds this nonce: a previous run's dropped-but-
+            // still-pooled send (Monad), or a concurrent run on the same wallet
+            // that got there first (the cron matrix schedules several routes
+            // per source chain in parallel). Either way the node refused ours,
+            // so it cannot have landed. Wait for the pooled tx to mine or
+            // expire, rotate to the next endpoint, and re-fill - the fresh
+            // nonce query then lands past it.
+            Err(error) if nonce_held_by_pooled_tx(&error) => {
+                if contention >= NONCE_CONTENTION_ATTEMPTS {
+                    return Err(error.wrap_err(format!(
+                        "{label}: nonce still held after {NONCE_CONTENTION_ATTEMPTS} \
+                         backoff attempts"
+                    )));
+                }
+                let backoff = nonce_contention_backoff(contention);
+                contention += 1;
+                pool = endpoints.rotated(contention as usize);
+                ui::warn(&format!(
+                    "{label}: nonce held by another pooled tx — waiting {:.1}s, then \
+                     re-signing at a fresh nonce on the next endpoint \
+                     (attempt {contention}/{NONCE_CONTENTION_ATTEMPTS})",
+                    backoff.as_secs_f64(),
+                ));
+                tokio::time::sleep(backoff).await;
+                nonce_override = None;
+                envelope = None;
+                continue;
+            }
             Err(error) => return Err(error),
         }
 
-        match wait_receipt_by_hash(endpoints, tx_hash, receipt_timeout).await {
+        match wait_receipt_by_hash(&pool, tx_hash, receipt_timeout).await {
             Some(receipt) => return Ok(receipt),
-            None => ui::warn(&format!(
-                "{label}: tx {tx_hash:#x} not mined in {}s — re-broadcasting same bytes \
-                 (round {}/{SEND_ROUNDS})",
-                receipt_timeout.as_secs(),
-                round + 2,
-            )),
+            None => {
+                round += 1;
+                ui::warn(&format!(
+                    "{label}: tx {tx_hash:#x} not mined in {}s — re-broadcasting same bytes \
+                     (round {}/{SEND_ROUNDS})",
+                    receipt_timeout.as_secs(),
+                    round + 1,
+                ));
+            }
         }
     }
     Err(eyre::eyre!(
@@ -854,7 +981,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{is_pending_state_error, parse_expected_nonce, send_error_may_mean_landed};
+    use super::{
+        is_pending_state_error, nonce_contention_backoff, nonce_held_by_pooled_tx,
+        parse_expected_nonce, send_error_may_mean_landed,
+    };
 
     #[test]
     fn parses_geth_nonce_too_low() {
@@ -892,5 +1022,80 @@ mod tests {
         assert!(!send_error_may_mean_landed(
             &"execution reverted: TakeTokenFailed"
         ));
+    }
+
+    #[test]
+    fn pooled_nonce_holder_is_not_treated_as_landed() {
+        // A concurrent run on the same wallet won the nonce. Ours was never
+        // accepted, so this must not take the "may have landed" path - that
+        // re-signs immediately and loses the race again.
+        let underpriced = "server returned an error response: error code -32000: \
+                           replacement transaction underpriced";
+        assert!(nonce_held_by_pooled_tx(&underpriced));
+        assert!(!send_error_may_mean_landed(&underpriced));
+
+        assert!(nonce_held_by_pooled_tx(
+            &"existing transaction had higher priority"
+        ));
+        assert!(!nonce_held_by_pooled_tx(&"nonce too low"));
+        assert!(!nonce_held_by_pooled_tx(&"already known"));
+    }
+
+    #[test]
+    fn contention_backoff_doubles_within_jitter_and_caps() {
+        // 1, 2, 4, 8, 16, 32 s, each within +/-20%.
+        for (attempt, base) in [(0, 1.0), (1, 2.0), (2, 4.0), (3, 8.0), (4, 16.0), (5, 32.0)] {
+            for _ in 0..50 {
+                let secs = nonce_contention_backoff(attempt).as_secs_f64();
+                assert!(
+                    secs >= base * 0.8 && secs <= base * 1.2,
+                    "attempt {attempt} gave {secs}s, outside +/-20% of {base}s"
+                );
+            }
+        }
+        // Past the schedule it stays at the 32 s step rather than growing.
+        let capped = nonce_contention_backoff(9).as_secs_f64();
+        assert!((25.6..=38.4).contains(&capped), "cap gave {capped}s");
+    }
+
+    #[test]
+    fn contention_backoff_is_jittered_not_fixed() {
+        // Two runs colliding on a nonce must not wait the identical time, or
+        // they just collide again on the retry.
+        let samples: Vec<u64> = (0..25)
+            .map(|_| nonce_contention_backoff(3).as_millis() as u64)
+            .collect();
+        assert!(
+            samples
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 1,
+            "backoff produced a single fixed value: {samples:?}"
+        );
+    }
+
+    #[test]
+    fn rotation_advances_the_preferred_endpoint() {
+        let pool = super::EvmEndpoints::connect(&[
+            "http://a.invalid".to_string(),
+            "http://b.invalid".to_string(),
+            "http://c.invalid".to_string(),
+        ])
+        .expect("pool");
+        assert_eq!(
+            pool.urls(),
+            ["http://a.invalid", "http://b.invalid", "http://c.invalid"]
+        );
+        assert_eq!(
+            pool.rotated(1).urls(),
+            ["http://b.invalid", "http://c.invalid", "http://a.invalid"]
+        );
+        // Wraps, so an attempt counter past the pool size stays in range.
+        assert_eq!(pool.rotated(4).urls(), pool.rotated(1).urls());
+
+        let single =
+            super::EvmEndpoints::connect(&["http://only.invalid".to_string()]).expect("pool");
+        assert_eq!(single.rotated(3).urls(), ["http://only.invalid"]);
     }
 }

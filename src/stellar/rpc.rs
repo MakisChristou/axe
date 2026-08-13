@@ -352,8 +352,9 @@ impl StellarClient {
                          (concurrent funder use? re-fetching sequence)",
                         attempt + 1,
                     ));
-                    // Brief backoff so the colliding tx settles.
-                    tokio::time::sleep(Duration::from_millis(500u64 << attempt)).await;
+                    // Jittered backoff so the colliding tx settles - and so two
+                    // racing runs do not wake together and collide again.
+                    tokio::time::sleep(crate::retry::backoff_for_attempt(u32::from(attempt))).await;
                     attempt += 1;
                     continue;
                 }
@@ -605,8 +606,10 @@ impl StellarClient {
                              (stale/racing sequence? re-simulating)",
                             attempt + 1,
                         ));
-                        // Brief backoff so the colliding tx settles.
-                        tokio::time::sleep(Duration::from_millis(500u64 << attempt)).await;
+                        // Jittered backoff so the colliding tx settles - and so two
+                        // racing runs do not wake together and collide again.
+                        tokio::time::sleep(crate::retry::backoff_for_attempt(u32::from(attempt)))
+                            .await;
                         attempt += 1;
                         continue;
                     }
