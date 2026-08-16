@@ -76,7 +76,7 @@ pub(super) async fn prepare_source(args: &LoadTestArgs) -> Result<PreparedSuiIts
     ui::kv("token id", &format!("0x{}", hex::encode(token_id)));
     ui::kv("coin type", &coin_type);
     let (_, coin_balance) = client
-        .pick_coin_of_type(&wallet.address, &coin_type)
+        .pick_coins_for_amount(&wallet.address, &coin_type, 0)
         .await?;
     ui::kv("Coin<T> balance", &coin_balance.to_string());
     Ok(PreparedSuiIts {

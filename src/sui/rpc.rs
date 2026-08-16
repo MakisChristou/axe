@@ -247,37 +247,83 @@ impl SuiClient {
 
     /// Get the largest SUI coin object owned by `owner`. Returns its ObjectReference
     /// (id, version, digest) suitable for `GasPayment::objects`.
-    pub async fn pick_gas_coin(&self, owner: &SuiAddress) -> Result<ObjectReference> {
-        let r = self
-            .call(
-                "suix_getCoins",
-                json!([owner_addr_hex(owner), "0x2::sui::SUI", null, 50]),
-            )
-            .await?;
-        let arr = r["data"]
-            .as_array()
-            .ok_or_else(|| eyre!("getCoins response missing data: {r}"))?;
-        if arr.is_empty() {
+    /// Fetch ALL owned `Coin<T>` objects for `owner`, every page, sorted
+    /// largest-first. A single `suix_getCoins` page (50 items) is NOT the
+    /// whole wallet: cron refunds fragment it into hundreds of small coins,
+    /// and picking only from page one made the largest real coin invisible.
+    pub async fn all_coins_of_type(
+        &self,
+        owner: &SuiAddress,
+        coin_type: &str,
+    ) -> Result<Vec<(ObjectReference, u128)>> {
+        // 20 pages x 100 = 2000 objects — far beyond any sane wallet.
+        const MAX_PAGES: usize = 20;
+        let mut coins: Vec<(ObjectReference, u128)> = Vec::new();
+        let mut cursor = Value::Null;
+        for _ in 0..MAX_PAGES {
+            let r = self
+                .call(
+                    "suix_getCoins",
+                    json!([owner_addr_hex(owner), coin_type, cursor, 100]),
+                )
+                .await?;
+            let arr = r["data"]
+                .as_array()
+                .ok_or_else(|| eyre!("getCoins(coin_type='{coin_type}') missing data: {r}"))?;
+            for c in arr {
+                let bal: u128 = c["balance"]
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                coins.push((object_ref_from_json(c)?, bal));
+            }
+            if !r["hasNextPage"].as_bool().unwrap_or(false) {
+                break;
+            }
+            cursor = r["nextCursor"].clone();
+        }
+        coins.sort_by_key(|(_, bal)| std::cmp::Reverse(*bal));
+        Ok(coins)
+    }
+
+    /// Collect SUI gas coins totalling at least `min_total_mist`, largest
+    /// first (capped at 200 — Sui accepts up to 256 gas-payment objects).
+    /// Every listed object is "smashed" into one by the runtime before
+    /// execution, so this both survives a fragmented wallet (observed live:
+    /// 150+ sub-0.2-SUI objects while no single object covered the
+    /// cross-chain gas split) and permanently defragments it a little on
+    /// every run.
+    pub async fn pick_gas_coins(
+        &self,
+        owner: &SuiAddress,
+        min_total_mist: u128,
+    ) -> Result<Vec<ObjectReference>> {
+        const MAX_GAS_OBJECTS: usize = 200;
+        let coins = self.all_coins_of_type(owner, "0x2::sui::SUI").await?;
+        if coins.is_empty() {
             return Err(eyre!(
                 "wallet {} has no SUI coins — fund it first",
                 owner_addr_hex(owner)
             ));
         }
-        // Pick the largest balance.
-        let mut best: Option<&Value> = None;
-        let mut best_bal: u128 = 0;
-        for c in arr {
-            let bal: u128 = c["balance"]
-                .as_str()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            if bal > best_bal {
-                best_bal = bal;
-                best = Some(c);
+        let total: u128 = coins.iter().map(|(_, bal)| bal).sum();
+        let mut picked = Vec::new();
+        let mut sum: u128 = 0;
+        for (obj, bal) in coins {
+            if (sum >= min_total_mist && !picked.is_empty()) || picked.len() >= MAX_GAS_OBJECTS {
+                break;
             }
+            sum += bal;
+            picked.push(obj);
         }
-        let c = best.ok_or_else(|| eyre!("no usable gas coin"))?;
-        object_ref_from_json(c)
+        if sum < min_total_mist {
+            return Err(eyre!(
+                "wallet {} holds {total} mist of SUI in total — less than the {min_total_mist} \
+                 mist needed for gas budget + cross-chain gas",
+                owner_addr_hex(owner)
+            ));
+        }
+        Ok(picked)
     }
 
     /// Fetch `(initial_shared_version, latest_version, digest)` for a shared
