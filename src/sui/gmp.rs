@@ -66,7 +66,12 @@ pub async fn send_gmp_call(
         client.get_shared_object_initial_version(&contracts.gas_service_object),
     )?;
 
-    let gas_coin = client.pick_gas_coin(&wallet.address).await?;
+    let gas_coins = client
+        .pick_gas_coins(
+            &wallet.address,
+            u128::from(call.gas_value_mist) + u128::from(call.gas_budget_mist),
+        )
+        .await?;
     let rgp = client.get_reference_gas_price().await?;
 
     let mut b = PtbBuilder::new();
@@ -102,7 +107,7 @@ pub async fn send_gmp_call(
     let tx = b.build(
         wallet.address,
         GasPayment {
-            objects: vec![gas_coin],
+            objects: gas_coins,
             owner: wallet.address,
             price: rgp,
             budget: call.gas_budget_mist,

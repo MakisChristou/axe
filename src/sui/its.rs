@@ -28,7 +28,7 @@ use sui_sdk_types::{
 };
 
 use super::config::parse_sui_addr;
-use super::rpc::{SuiClient, object_ref_from_json, owner_addr_hex};
+use super::rpc::{SuiClient, owner_addr_hex};
 use super::tx::{PtbBuilder, sign_and_submit};
 use super::wallet::SuiWallet;
 use crate::config::{ChainContract, ChainsConfig};
@@ -129,42 +129,45 @@ pub async fn read_sui_its_config(
 }
 
 impl SuiClient {
-    /// Pick the largest owned `Coin<T>` object for `owner` (matched by exact
-    /// Move type tag). Used to source the input coin for an ITS transfer.
-    pub async fn pick_coin_of_type(
+    /// Select owned `Coin<T>` objects covering `amount`, largest first: the
+    /// first element is the primary coin, the rest get PTB-merged into it
+    /// before the transfer split. Also returns the wallet's TOTAL balance of
+    /// the type (across all pages) for display and error messages. Errors
+    /// when the whole wallet cannot cover `amount`.
+    pub async fn pick_coins_for_amount(
         &self,
         owner: &SuiAddress,
         coin_type: &str,
-    ) -> Result<(ObjectReference, u128)> {
-        let r = self
-            .call(
-                "suix_getCoins",
-                json!([owner_addr_hex(owner), coin_type, null, 50]),
-            )
-            .await?;
-        let arr = r["data"]
-            .as_array()
-            .ok_or_else(|| eyre!("getCoins(coin_type='{coin_type}') missing data: {r}"))?;
-        if arr.is_empty() {
+        amount: u128,
+    ) -> Result<(Vec<ObjectReference>, u128)> {
+        // Sui caps PTB inputs; 100 merged coins covers any realistic
+        // fragmentation while staying far under the limits.
+        const MAX_MERGE_OBJECTS: usize = 100;
+        let coins = self.all_coins_of_type(owner, coin_type).await?;
+        if coins.is_empty() {
             return Err(eyre!(
                 "wallet {} has no Coin<{coin_type}> objects — mint or transfer some first",
                 owner_addr_hex(owner)
             ));
         }
-        let mut best: Option<&Value> = None;
-        let mut best_bal: u128 = 0;
-        for c in arr {
-            let bal: u128 = c["balance"]
-                .as_str()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            if bal > best_bal {
-                best_bal = bal;
-                best = Some(c);
+        let total: u128 = coins.iter().map(|(_, bal)| bal).sum();
+        let mut picked = Vec::new();
+        let mut sum: u128 = 0;
+        for (obj, bal) in coins {
+            if (sum >= amount && !picked.is_empty()) || picked.len() >= MAX_MERGE_OBJECTS {
+                break;
             }
+            sum += bal;
+            picked.push(obj);
         }
-        let c = best.ok_or_else(|| eyre!("no usable Coin<{coin_type}> object"))?;
-        Ok((object_ref_from_json(c)?, best_bal))
+        if sum < amount {
+            return Err(eyre!(
+                "wallet {} holds {total} base units of Coin<{coin_type}> in total — less than \
+                 the {amount} needed for this transfer",
+                owner_addr_hex(owner)
+            ));
+        }
+        Ok((picked, total))
     }
 
     /// Resolve the Move coin type tag T from a 32-byte ITS token id by
@@ -288,7 +291,12 @@ struct SharedVersions {
 async fn resolve_transfer_inputs(
     request: &InterchainTransferRequest<'_>,
     clock: &SuiAddress,
-) -> Result<(SharedVersions, ObjectReference, ObjectReference, u64)> {
+) -> Result<(
+    SharedVersions,
+    Vec<ObjectReference>,
+    Vec<ObjectReference>,
+    u64,
+)> {
     let client = request.client;
     let contracts = request.contracts;
     let (singleton, its, gateway, gas_service, clock) = tokio::try_join!(
@@ -298,19 +306,19 @@ async fn resolve_transfer_inputs(
         client.get_shared_object_initial_version(&contracts.gas_service_object),
         client.get_shared_object_initial_version(clock),
     )?;
-    let (gas_coin, coin_pick, gas_price) = tokio::try_join!(
-        client.pick_gas_coin(&request.wallet.address),
-        client.pick_coin_of_type(&request.wallet.address, request.coin_type_tag),
+    let (gas_coins, coin_pick, gas_price) = tokio::try_join!(
+        client.pick_gas_coins(
+            &request.wallet.address,
+            u128::from(request.gas_value_mist) + u128::from(request.gas_budget_mist),
+        ),
+        client.pick_coins_for_amount(
+            &request.wallet.address,
+            request.coin_type_tag,
+            request.transfer_amount as u128,
+        ),
         client.get_reference_gas_price(),
     )?;
-    let (coin, balance) = coin_pick;
-    if balance < request.transfer_amount as u128 {
-        return Err(eyre!(
-            "Coin<{}> object balance {balance} < transfer_amount {}",
-            request.coin_type_tag,
-            request.transfer_amount
-        ));
-    }
+    let (transfer_coins, _total) = coin_pick;
     Ok((
         SharedVersions {
             singleton,
@@ -319,8 +327,8 @@ async fn resolve_transfer_inputs(
             gas_service,
             clock,
         },
-        gas_coin,
-        coin,
+        gas_coins,
+        transfer_coins,
         gas_price,
     ))
 }
@@ -330,8 +338,8 @@ fn build_interchain_transfer(
     coin_type: TypeTag,
     clock: SuiAddress,
     versions: &SharedVersions,
-    gas_coin: ObjectReference,
-    transfer_coin: ObjectReference,
+    gas_coins: Vec<ObjectReference>,
+    transfer_coins: Vec<ObjectReference>,
     gas_price: u64,
 ) -> Result<Transaction> {
     let mut builder = PtbBuilder::new();
@@ -345,7 +353,20 @@ fn build_interchain_transfer(
         vec![],
         vec![token_id_arg],
     )?;
-    let transfer_coin = builder.owned_object(transfer_coin);
+    let mut transfer_coin_refs = transfer_coins.into_iter();
+    let transfer_coin = builder.owned_object(
+        transfer_coin_refs
+            .next()
+            .ok_or_else(|| eyre!("no transfer coin selected"))?,
+    );
+    // A fragmented wallet covers the amount across several coins — merge them
+    // into the primary before splitting.
+    let extra_coins: Vec<_> = transfer_coin_refs
+        .map(|obj| builder.owned_object(obj))
+        .collect();
+    if !extra_coins.is_empty() {
+        builder.merge_coins(transfer_coin, extra_coins);
+    }
     let transfer_amount = builder.pure_u64(request.transfer_amount)?;
     let transfer_coin = builder.split_coin(transfer_coin, transfer_amount);
     let gas_value = builder.pure_u64(request.gas_value_mist)?;
@@ -390,7 +411,7 @@ fn build_interchain_transfer(
     Ok(builder.build(
         request.wallet.address,
         GasPayment {
-            objects: vec![gas_coin],
+            objects: gas_coins,
             owner: request.wallet.address,
             price: gas_price,
             budget: request.gas_budget_mist,
@@ -433,15 +454,15 @@ pub async fn send_its_interchain_transfer(
         .parse()
         .map_err(|e| eyre!("invalid coin_type '{}': {e}", request.coin_type_tag))?;
     let clock = parse_sui_addr(SUI_CLOCK_ADDR_HEX)?;
-    let (versions, gas_coin, transfer_coin, gas_price) =
+    let (versions, gas_coins, transfer_coins, gas_price) =
         resolve_transfer_inputs(&request, &clock).await?;
     let transaction = build_interchain_transfer(
         &request,
         coin_type,
         clock,
         &versions,
-        gas_coin,
-        transfer_coin,
+        gas_coins,
+        transfer_coins,
         gas_price,
     )?;
     let submitted = sign_and_submit(request.client, request.wallet, transaction).await?;

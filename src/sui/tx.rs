@@ -5,7 +5,7 @@
 use eyre::{Result, eyre};
 use serde_json::Value;
 use sui_sdk_types::{
-    Address as SuiAddress, Argument, Command, GasPayment, Identifier, Input, MoveCall,
+    Address as SuiAddress, Argument, Command, GasPayment, Identifier, Input, MergeCoins, MoveCall,
     ObjectReference, ProgrammableTransaction, SharedInput, SplitCoins, Transaction,
     TransactionExpiration, TransactionKind, TypeTag,
 };
@@ -109,6 +109,15 @@ impl PtbBuilder {
             inputs: self.inputs,
             commands: self.commands,
         })
+    }
+
+    /// Merge `coins_to_merge` into `coin` (all the same `Coin<T>`). Used to
+    /// assemble a transfer amount from a fragmented wallet before splitting.
+    pub fn merge_coins(&mut self, coin: Argument, coins_to_merge: Vec<Argument>) {
+        self.commands.push(Command::MergeCoins(MergeCoins {
+            coin,
+            coins_to_merge,
+        }));
     }
 
     pub fn split_coin(&mut self, coin: Argument, amount: Argument) -> Argument {
