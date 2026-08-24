@@ -69,15 +69,19 @@
               clippy
               rustfmt
               rust-analyzer
+              git
 
               pkg-config
               openssl
             ];
 
-            # Opt every devshell user into the repo's git hooks
+            # Opt users entering from this checkout into its git hooks
             # (fmt + clippy + tests on commit and push, see .githooks/).
             shellHook = ''
-              git config core.hooksPath .githooks
+              axe_repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+              if [ -n "$axe_repo_root" ] && [ -x "$axe_repo_root/.githooks/pre-commit" ]; then
+                git -C "$axe_repo_root" config --local core.hooksPath .githooks
+              fi
             '';
           };
         }
