@@ -73,6 +73,12 @@
               pkg-config
               openssl
             ];
+
+            # Opt every devshell user into the repo's git hooks
+            # (fmt + clippy + tests on commit and push, see .githooks/).
+            shellHook = ''
+              git config core.hooksPath .githooks
+            '';
           };
         }
       );
