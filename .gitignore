@@ -17,3 +17,6 @@ scripts/plot_load_tests.py
 *.mnemonic
 *.seed
 axelar1*.txt
+
+# Nix build output symlink
+/result
