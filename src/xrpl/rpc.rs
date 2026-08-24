@@ -42,6 +42,7 @@ impl XrplClient {
     pub fn new(rpc_url: &str) -> Self {
         let inner = xrpl_http_client::Client::builder()
             .base_url(rpc_url)
+            .http_client(crate::http::client().clone())
             .build();
         Self {
             inner,
@@ -99,7 +100,7 @@ impl XrplClient {
     ///
     /// * `faucet_url` — e.g. `https://faucet.altnet.rippletest.net/accounts`
     pub async fn fund_from_faucet(&self, address: &str, faucet_url: &str) -> Result<()> {
-        let client = reqwest::Client::new();
+        let client = crate::http::client();
         let body = serde_json::json!({ "destination": address });
         let resp = client
             .post(faucet_url)

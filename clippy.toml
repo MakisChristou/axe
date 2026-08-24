@@ -4,6 +4,11 @@
 # src/solana/programs.rs, never from the crates. (CHAIN_NAME_HASH is a const
 # and can't be linted; see the dep comment in Cargo.toml.)
 disallowed-methods = [
+    # Default reqwest clients carry NO timeout: one stalled RPC connection
+    # hangs its route until the CI job timeout (observed: 30 min, run
+    # 32638549694). All outbound HTTP goes through crate::http::client().
+    { path = "reqwest::get", reason = "no timeout; use crate::http::client().get(url).send()" },
+    { path = "reqwest::Client::new", reason = "no timeout; use crate::http::client()" },
     { path = "solana_axelar_gateway::id", reason = "compile-time network ID; use Network::solana_gateway_id()" },
     { path = "solana_axelar_gas_service::id", reason = "compile-time network ID; use Network::solana_gas_service_id()" },
     { path = "solana_axelar_memo::id", reason = "compile-time network ID; use Network::solana_memo_id()" },

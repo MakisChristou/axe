@@ -179,7 +179,7 @@ where
         },
     });
 
-    let resp = reqwest::Client::new()
+    let resp = crate::http::client()
         .post(env.api_url())
         .json(&body)
         .send()

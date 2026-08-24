@@ -191,7 +191,7 @@ where
 
 pub(super) async fn lcd_query_account(lcd: &str, address: &str) -> Result<(u64, u64)> {
     let url = format!("{lcd}/cosmos/auth/v1beta1/accounts/{address}");
-    let raw: Value = reqwest::get(&url).await?.json().await?;
+    let raw: Value = crate::http::client().get(&url).send().await?.json().await?;
     if raw.get("account").is_none() {
         return Err(eyre::eyre!("no account in response: {raw}"));
     }
@@ -206,7 +206,7 @@ pub(super) async fn lcd_query_account(lcd: &str, address: &str) -> Result<(u64, 
 /// Query the bank balance of `address` for a single denom. Returns the amount in base units (e.g. uaxl).
 pub(super) async fn lcd_query_balance(lcd: &str, address: &str, denom: &str) -> Result<u128> {
     let url = format!("{lcd}/cosmos/bank/v1beta1/balances/{address}/by_denom?denom={denom}");
-    let raw: Value = reqwest::get(&url).await?.json().await?;
+    let raw: Value = crate::http::client().get(&url).send().await?.json().await?;
     let resp: BalanceResponse = serde_json::from_value(raw).wrap_err("invalid balance response")?;
     let balance = resp
         .balance
@@ -280,7 +280,7 @@ pub(super) async fn lcd_simulate_tx(lcd: &str, tx_bytes: &[u8]) -> Result<u64> {
         "tx_bytes": tx_b64,
         "mode": "BROADCAST_MODE_UNSPECIFIED"
     });
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let raw: Value = client
         .post(format!("{lcd}/cosmos/tx/v1beta1/simulate"))
         .json(&body)
@@ -314,7 +314,7 @@ pub(super) async fn lcd_broadcast_tx(lcd: &str, tx_bytes: &[u8]) -> Result<Value
         "tx_bytes": tx_b64,
         "mode": "BROADCAST_MODE_SYNC"
     });
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let resp: Value = client
         .post(format!("{lcd}/cosmos/tx/v1beta1/txs"))
         .json(&body)
@@ -342,7 +342,7 @@ pub(super) async fn lcd_wait_for_tx(lcd: &str, tx_hash: &str) -> Result<Value> {
     for _ in 0..crate::timing::LCD_WAIT_MAX_ATTEMPTS {
         tokio::time::sleep(crate::timing::LCD_WAIT_RETRY_INTERVAL).await;
         let url = format!("{lcd}/cosmos/tx/v1beta1/txs/{tx_hash}");
-        let resp: Value = match reqwest::get(&url).await {
+        let resp: Value = match crate::http::client().get(&url).send().await {
             Ok(r) => r.json().await.wrap_err("invalid tx lookup response")?,
             Err(_) => continue,
         };
@@ -367,7 +367,7 @@ pub(super) async fn lcd_wait_for_tx(lcd: &str, tx_hash: &str) -> Result<Value> {
 
 pub async fn lcd_query_proposal(lcd: &str, proposal_id: u64) -> Result<Value> {
     let url = format!("{lcd}/cosmos/gov/v1/proposals/{proposal_id}");
-    let resp: Value = reqwest::get(&url).await?.json().await?;
+    let resp: Value = crate::http::client().get(&url).send().await?.json().await?;
     resp.get("proposal")
         .cloned()
         .ok_or_else(|| eyre::eyre!("no 'proposal' field in response"))
@@ -554,7 +554,7 @@ pub async fn lcd_cosmwasm_smart_query_typed(
             "fallback LCD"
         };
         let url = format!("{endpoint}/cosmwasm/wasm/v1/contract/{contract}/smart/{query_b64}");
-        match reqwest::get(&url).await {
+        match crate::http::client().get(&url).send().await {
             Ok(response) => {
                 let status = response.status();
                 match response.text().await {
@@ -621,7 +621,7 @@ pub async fn lcd_fetch_code_id(lcd: &str, expected_checksum: &str) -> Result<u64
         if let Some(ref key) = next_key {
             url.push_str(&format!("&pagination.key={key}"));
         }
-        let raw: Value = reqwest::get(&url).await?.json().await?;
+        let raw: Value = crate::http::client().get(&url).send().await?.json().await?;
         let resp: CodeListResponse =
             serde_json::from_value(raw).wrap_err("invalid code list response")?;
         let codes = resp
@@ -760,7 +760,7 @@ pub async fn rpc_tx_search_event(rpc: &str, event_key: &str, event_value: &str) 
             "fallback Tendermint RPC"
         };
         let url = format!("{endpoint}/tx_search?query={encoded}&per_page=1");
-        match reqwest::get(&url).await {
+        match crate::http::client().get(&url).send().await {
             Ok(response) => {
                 let status = response.status();
                 if !status.is_success() {
@@ -818,7 +818,7 @@ pub async fn rpc_tx_search(
 ) -> Result<Value> {
     let json_quoted = serde_json::to_string(query)?;
     let order = if order_desc { "\"desc\"" } else { "\"asc\"" };
-    let resp = reqwest::Client::new()
+    let resp = crate::http::client()
         .get(format!("{rpc}/tx_search"))
         .query(&[
             ("query", json_quoted.as_str()),
@@ -838,7 +838,7 @@ pub async fn rpc_tx_search(
 /// Query Tendermint RPC `block` endpoint for a given height. Returns block.header.time.
 pub async fn rpc_block_time(rpc: &str, height: u64) -> Result<String> {
     let url = format!("{rpc}/block?height={height}");
-    let resp: BlockResponse = reqwest::get(&url).await?.json().await?;
+    let resp: BlockResponse = crate::http::client().get(&url).send().await?.json().await?;
     resp.result
         .and_then(|r| r.block)
         .and_then(|b| b.header)
@@ -883,7 +883,7 @@ pub async fn rpc_block_info(rpc: &str, height: Option<u64>) -> Result<(u64, Stri
             "fallback Tendermint RPC"
         };
         let url = format!("{endpoint}/{path}");
-        let response = match reqwest::get(&url).await {
+        let response = match crate::http::client().get(&url).send().await {
             Ok(r) => r,
             Err(e) => {
                 last_err = Some(eyre::eyre!("{role} request failed: {e}"));
@@ -963,7 +963,7 @@ pub async fn fetch_verifier_set(
     let url = format!("{lcd}/cosmwasm/wasm/v1/contract/{prover_addr}/smart/{query_b64}");
     ui::info(&format!("fetching verifier set from: {url}"));
 
-    let resp: VerifierSetResponse = reqwest::get(&url).await?.json().await?;
+    let resp: VerifierSetResponse = crate::http::client().get(&url).send().await?.json().await?;
 
     let data = resp
         .data

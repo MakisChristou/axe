@@ -14,6 +14,7 @@
 //! Callers fall back to their existing constants when the API can't be
 //! reached or returns 0 (testnet/stagenet do this for unsupported routes).
 
+use crate::http;
 use crate::retry::{FALLBACK_ATTEMPTS, retry_async};
 use crate::types::Network;
 use reqwest::StatusCode;
@@ -52,7 +53,7 @@ pub(super) async fn estimate_route_gas(
          &gasMultiplier=auto\
          &sourceTokenSymbol={source_token_symbol}"
     );
-    let client = reqwest::Client::new();
+    let client = http::client();
     // Retry transient failures before giving up; once the retry budget is
     // exhausted (or on a permanent 4xx) still return `None` so callers keep
     // their hardcoded fallback.

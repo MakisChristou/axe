@@ -146,7 +146,13 @@ async fn is_fresh(path: &Path) -> bool {
 /// Fetch `url` and confirm the body parses as a [`ChainsConfig`] so a 404
 /// page or truncated download can never poison the cache.
 async fn fetch_validated(url: &str) -> Result<String> {
-    let body = reqwest::get(url).await?.error_for_status()?.text().await?;
+    let body = crate::http::client()
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
     ChainsConfig::from_json_str(&body)
         .wrap_err_with(|| format!("fetched {url} but it does not parse as a chains config"))?;
     Ok(body)
