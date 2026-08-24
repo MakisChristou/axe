@@ -72,7 +72,7 @@ async fn print_axelar_balance(target_json: &std::path::Path, axelar_address: &st
     }
     let (lcd, _, fee_denom, _) = read_axelar_config(target_json).await?;
     let url = format!("{lcd}/cosmos/bank/v1beta1/balances/{axelar_address}");
-    match reqwest::get(&url).await {
+    match crate::http::client().get(&url).send().await {
         Ok(response) => {
             let data: Value = response.json().await?;
             if let Some(balances) = data["balances"].as_array() {

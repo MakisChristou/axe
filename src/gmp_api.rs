@@ -51,7 +51,7 @@ fn is_transient_gmp_error(err: &Report) -> bool {
 
 async fn post_search(base: &str, body: serde_json::Value) -> Result<Vec<ExpressRecord>> {
     let url = format!("{base}/gmp/searchGMP");
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     retry_async(
         "gmp-api searchGMP",
         FALLBACK_ATTEMPTS,

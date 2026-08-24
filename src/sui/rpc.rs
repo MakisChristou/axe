@@ -2,8 +2,6 @@
 //! response-parsing helpers (`owner_addr_hex`, `object_ref_from_json`,
 //! `parse_sui_digest`) used to lift raw JSON into `sui_sdk_types` values.
 
-use std::time::Duration;
-
 use base64::Engine;
 use eyre::{Result, eyre};
 use serde_json::{Value, json};
@@ -109,10 +107,7 @@ impl SuiClient {
         Self {
             primary,
             fallbacks,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            http: crate::http::client().clone(),
         }
     }
 

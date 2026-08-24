@@ -405,7 +405,9 @@ impl StellarClient {
             .await
             .map_err(|e| eyre!("friendbot_url: {e}"))?;
         let url = format!("{friendbot}?addr={address}");
-        let resp = reqwest::get(&url)
+        let resp = crate::http::client()
+            .get(&url)
+            .send()
             .await
             .map_err(|e| eyre!("friendbot GET failed: {e}"))?;
         if !resp.status().is_success() {

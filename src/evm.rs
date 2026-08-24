@@ -59,7 +59,12 @@ fn fallback_client(urls: &[String]) -> Result<RpcClient> {
     let transports: Vec<Http<reqwest::Client>> = urls
         .iter()
         .filter(|url| seen.insert((*url).clone()))
-        .map(|url| Ok::<_, eyre::Report>(Http::new(url.parse()?)))
+        .map(|url| {
+            Ok::<_, eyre::Report>(Http::with_client(
+                crate::http::client().clone(),
+                url.parse()?,
+            ))
+        })
         .collect::<Result<_>>()?;
     if transports.is_empty() {
         eyre::bail!("connect_evm: no RPC URLs provided");
@@ -310,6 +315,8 @@ pub fn send_error_may_mean_landed<E: std::fmt::Display>(err: &E) -> bool {
         "already known",
         "already exists",
         "already imported",
+        // Cosmos-EVM chains (XRPL EVM) phrase the same rejection via CometBFT.
+        "already in mempool",
     ]
     .iter()
     .any(|signature| message.contains(signature))
@@ -1018,6 +1025,12 @@ mod tests {
             &"HTTP error 400: [Request ID: x] Nonce too low. Provided nonce: 5, current nonce: 6"
         ));
         assert!(send_error_may_mean_landed(&"already known"));
+        // XRPL EVM (cosmos-evm) re-broadcast of identical bytes, observed in
+        // cron run 32638549694.
+        assert!(send_error_may_mean_landed(
+            &"server returned an error response: error code -32000: failed to \
+              broadcast transaction: : tx already in mempool"
+        ));
         assert!(!send_error_may_mean_landed(&"429 too many requests"));
         assert!(!send_error_may_mean_landed(
             &"execution reverted: TakeTokenFailed"

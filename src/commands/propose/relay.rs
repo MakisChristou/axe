@@ -21,6 +21,7 @@ use serde_json::Value;
 use crate::commands::test_helpers::{extract_event_attr, wait_for_proof};
 use crate::cosmos::{build_execute_msg_any, sign_and_broadcast_cosmos_tx};
 use crate::evm::{AxelarAmplifierGateway, AxelarServiceGovernance, broadcast_and_log};
+use crate::http;
 use crate::ui;
 
 use super::helpers::AsgInfo;
@@ -110,7 +111,9 @@ async fn find_governance_message(rpc: &str, payload_hash: B256) -> Result<GovMes
 }
 
 async fn latest_height(rpc: &str) -> Result<u64> {
-    let resp: Value = reqwest::get(format!("{}/status", rpc.trim_end_matches('/')))
+    let resp: Value = http::client()
+        .get(format!("{}/status", rpc.trim_end_matches('/')))
+        .send()
         .await?
         .json()
         .await?;
@@ -125,7 +128,7 @@ async fn scan_block(rpc: &str, height: u64, want_hash: &str) -> Result<Option<Go
         "{}/block_results?height={height}",
         rpc.trim_end_matches('/')
     );
-    let resp: Value = reqwest::get(&url).await?.json().await?;
+    let resp: Value = http::client().get(&url).send().await?.json().await?;
     let events = resp
         .pointer("/result/finalize_block_events")
         .or_else(|| resp.pointer("/finalize_block_events"))

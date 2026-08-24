@@ -6,6 +6,7 @@ mod cosmos;
 mod error;
 mod evm;
 mod gmp_api;
+mod http;
 mod hyperliquid;
 mod preflight;
 mod retry;
