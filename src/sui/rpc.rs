@@ -34,7 +34,8 @@ enum SuiRpcError {
     Rpc {
         endpoint: String,
         method: String,
-        payload: Value,
+        // Boxed to keep the enum under clippy's result_large_err threshold.
+        payload: Box<Value>,
         message: String,
     },
     #[error("Sui RPC {endpoint} non-JSON: {source}")]
@@ -173,7 +174,7 @@ impl SuiClient {
                                         last_err = Some(SuiRpcError::Rpc {
                                             endpoint: endpoint.clone(),
                                             method: method.to_string(),
-                                            payload: err.clone(),
+                                            payload: Box::new(err.clone()),
                                             message: err
                                                 .get("message")
                                                 .and_then(Value::as_str)
