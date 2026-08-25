@@ -13,6 +13,8 @@
 
         pkg-config
         openssl
+
+        cargo-audit
       ];
 
       envs = {
