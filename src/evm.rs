@@ -356,22 +356,20 @@ pub fn parse_expected_nonce(err: &str) -> Option<u64> {
 /// nonce re-resolution or an unmined-after-timeout re-broadcast.
 const SEND_ROUNDS: u32 = 3;
 
-/// Attempts spent waiting out a nonce another pooled transaction holds.
+/// Retries spent waiting out a nonce another pooled transaction holds:
+/// 1 original try + 5 backed-off retries, the repo-wide retry budget.
 /// Separate from [`SEND_ROUNDS`]: losing a nonce race costs a short sleep, not
-/// a `receipt_timeout`, so it can afford far more attempts.
-const NONCE_CONTENTION_ATTEMPTS: u32 = 6;
+/// a `receipt_timeout`.
+const NONCE_CONTENTION_ATTEMPTS: u32 = 5;
 
 /// Hard ceiling on loop iterations, so no re-sign path can spin forever.
 const MAX_SEND_ATTEMPTS: u32 = 16;
 
-/// Backoff for the nth nonce-contention attempt: 1, 2, 4, 8, 16, 32 s.
-///
-/// Longer than the shared transport schedule because it is waiting on another
-/// party's transaction to mine or expire, not on a flaky socket. Jitter comes
-/// from [`crate::retry::jittered`], the same spread every retry in the tree
-/// uses.
+/// Backoff for the nth nonce-contention attempt: the shared 4, 8, 16, 32,
+/// 64 s schedule ([`crate::retry`]), jittered so two runs colliding on a
+/// nonce do not wake together and collide again.
 fn nonce_contention_backoff(attempt: u32) -> std::time::Duration {
-    crate::retry::jittered(std::time::Duration::from_secs(1 << attempt.min(5)))
+    crate::retry::backoff_for_attempt(attempt)
 }
 
 /// Send an EVM transaction with retry + private→public fallback at every
@@ -1056,8 +1054,8 @@ mod tests {
 
     #[test]
     fn contention_backoff_doubles_within_jitter_and_caps() {
-        // 1, 2, 4, 8, 16, 32 s, each within +/-20%.
-        for (attempt, base) in [(0, 1.0), (1, 2.0), (2, 4.0), (3, 8.0), (4, 16.0), (5, 32.0)] {
+        // 4, 8, 16, 32, 64 s, each within +/-20%.
+        for (attempt, base) in [(0, 4.0), (1, 8.0), (2, 16.0), (3, 32.0), (4, 64.0)] {
             for _ in 0..50 {
                 let secs = nonce_contention_backoff(attempt).as_secs_f64();
                 assert!(
@@ -1066,9 +1064,9 @@ mod tests {
                 );
             }
         }
-        // Past the schedule it stays at the 32 s step rather than growing.
+        // Past the schedule it stays at the 64 s step rather than growing.
         let capped = nonce_contention_backoff(9).as_secs_f64();
-        assert!((25.6..=38.4).contains(&capped), "cap gave {capped}s");
+        assert!((51.2..=76.8).contains(&capped), "cap gave {capped}s");
     }
 
     #[test]

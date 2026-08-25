@@ -48,6 +48,7 @@ axe propose testnet avalanche --op pause --relay
 | `axe test gmp`            | End-to-end GMP test (manual relay supported)           | [testing](docs/load-testing.md) |
 | `axe test its`            | Deploy + transfer an interchain token                  | [testing](docs/load-testing.md) |
 | `axe test load-test`      | Burst / sustained cross-chain load test                | [testing](docs/load-testing.md) |
+| `axe test express-execution` | Express-reimbursement monitor (observe-only)        | — |
 | `axe decode calldata`     | Decode raw EVM calldata (embedded ABI database)        | [decode](docs/decode.md) |
 | `axe decode tx`           | Fetch & decode an EVM or Solana transaction            | [decode](docs/decode.md) |
 | `axe decode sol-activity` | Recent Solana program activity                         | [decode](docs/decode.md) |

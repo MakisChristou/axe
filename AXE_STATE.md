@@ -1,6 +1,6 @@
 # AXE — State of cross-chain test transfers
 
-_Last updated: 2026-06-25. Branch: `feat/add-legacy-support`._
+_Last updated: 2026-08-25. Branch: `fix/cron-xrpl-transients`._
 
 `axe test load-test` drives real cross-chain transfers (GMP `callContract` and
 ITS `interchainTransfer`) and verifies them **on-chain**. A route is "✅
@@ -12,17 +12,16 @@ This document is the validated state of what works, what is still open, and the
 **known limitations** we need to tackle. It is grounded in three sources of
 truth, in priority order:
 
-1. The dispatch match in `src/commands/load_test/mod.rs` — defines the
+1. The dispatch match in `src/commands/load_test.rs` — defines the
    **supported route surface** (which `(protocol, test-type)` pairs run vs. bail).
 2. The wired chain set in `.github/actions/run-loadtest/action.yml` `CHAIN_MAP`
-   (23 chains) — the chains the harness can target.
+   (28 chains) — the chains the harness can target.
 3. The on-chain results in `axe-load-test-logs/*.json` — the **validated** truth.
 
 Companion docs: per-pair dispatcher matrices in
 [`docs/routes.md`](docs/routes.md) and chain-type coverage in
-[`docs/load-test-coverage.md`](docs/load-test-coverage.md). ⚠️ Both are
-currently **stale** (they still list the purged Flow/Fantom and omit 11 wired
-chains) — reconciliation is tracked as a child task (see §7).
+[`docs/load-test-coverage.md`](docs/load-test-coverage.md). Both are
+reconciled with the 28-chain `CHAIN_MAP` (2026-08-25).
 
 ---
 
@@ -43,10 +42,12 @@ legacy-chain support is load-bearing for mainnet.
 
 ## 2. Supported route surface (from the dispatcher)
 
-The 23 wired chains (`CHAIN_MAP`): Arbitrum, Avalanche, Base, Binance, Blast,
-Ethereum, Filecoin, Hedera, Hyperliquid, Immutable, Kava, Linea, Mantle, Monad,
-Moonbeam, Optimism, Polygon, Scroll, Solana, Stellar, Sui, XRPL, XRPL EVM.
-Purged (gone from the repo): Flow, Fantom, Berachain, Plume, Centrifuge.
+The 28 wired chains (`CHAIN_MAP`): Arbitrum, Arc, Avalanche, Base, Berachain,
+Binance, Blast, Celo, Ethereum, Filecoin, Flow, Hedera, Hyperliquid, Immutable,
+Kava, Linea, Mantle, Monad, Moonbeam, Optimism, Plume, Polygon, Scroll, Solana,
+Stellar, Sui, XRPL, XRPL EVM. Arc/Berachain/Celo/Flow/Plume exist only on
+stagenet / devnet-amplifier — see [`docs/routes.md`](docs/routes.md) for the
+per-network roster. Purged (gone from the repo): Fantom, Centrifuge.
 
 Chain-type level, what the dispatcher runs (✅) vs. bails on (see §6 for why):
 
@@ -286,7 +287,7 @@ stellar→hyperliquid its (T+37 s total; second-leg T+16 s after routing).
 
 ### Protocol Engineer fixes (MOU-4) — done on this branch
 
-5. **✅ Raised `INACTIVITY_TIMEOUT`** 1000 s → 7200 s (`verify/mod.rs`). The 11
+5. **✅ Raised `INACTIVITY_TIMEOUT`** 1000 s → 7200 s (now in `src/commands/load_test/verification/engine.rs`). The 11
    executed-late routes were cut off by the 1000 s global inactivity window;
    max measured latency was 3226 s (mantle→kava), so 7200 s gives ~2.2x
    headroom. Commit `d558753`.
@@ -305,6 +306,25 @@ stellar→hyperliquid its (T+37 s total; second-leg T+16 s after routing).
    Both fixes verified against repo gates (fmt, clippy `-D warnings`, 81 tests).
    On-chain green re-validation of the affected routes is delegated to the CI
    route fleet / QA re-run (see §8).
+
+### Reliability fixes (2026-08, branch `fix/cron-xrpl-transients`)
+
+7. **Cosmos-EVM re-broadcast no longer fatal** (`evm.rs`): XRPL EVM answers a
+   same-bytes re-broadcast with `tx already in mempool`; that now falls through
+   to receipt-waiting like geth's `already known` instead of failing the route
+   (observed killing `xrpl-evm → xrpl` in cron run 32638549694).
+8. **All outbound HTTP has bounded timeouts** (`src/http.rs`): one shared
+   client (30 s request / 10 s connect) replaces every untimed
+   `reqwest::Client::new()` / `reqwest::get`; `clippy.toml` disallows the
+   untimed constructors so it cannot regress. Fixes the 30-min silent hang
+   that timed out `xrpl → xrpl-evm` in the same cron run.
+9. **One repo-wide retry policy**: every backoff ladder (central `retry.rs`,
+   EVM nonce contention, the 429 scheduler, Solana confirmed-tx fetch, Stellar
+   TxBadSeq, `get_code_with_retry`) is 1 original try + 5 retries at
+   4/8/16/32/64 s, +/-20% jitter.
+10. **Sui mainnet RPC fallback fixed**: PublicNode retired
+    `sui-mainnet-rpc.publicnode.com` (permanent 404, killed preflight in cron
+    run 32793045257); the fallback list now uses `sui-rpc.publicnode.com`.
 
 ---
 
@@ -399,8 +419,10 @@ The route fleet is already scripted and CI-wired:
 
 - `scripts/test_amplifier_routes.sh` — runnable route fleet (cycle-based so each
   chain is exercised as both source and destination).
-- `.github/workflows/test-amplifier-routes.yml`,
-  `cron-amplifier-{mainnet,testnet}.yml` — matrix-style parallel CI jobs.
+- `.github/workflows/test-routes.yml` (reusable matrix workflow) called by
+  `cron-mainnet.yml` / `cron-testnet.yml` — the twice-daily route fleet, with a
+  wallet preflight (`axe check-balances`, native gas + canonical-AXE minimums)
+  gating the matrix.
 
 Triage of the §4 open routes is parallelized across child tasks of
 [MOU-2](/MOU/issues/MOU-2): QA re-runs each open route and checks on-chain final

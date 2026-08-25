@@ -19,8 +19,8 @@ use crate::ui;
 
 /// Blocking counterpart of `crate::retry::retry_async` — the solana_client
 /// calls in this module are synchronous, so the async helper can't be used.
-/// Same schedule: [`FALLBACK_ATTEMPTS`] (5) attempts with geometric backoff
-/// (500ms, 1s, 2s, 4s) ≈ 7.5s worst-case wall-clock.
+/// Same schedule: [`FALLBACK_ATTEMPTS`] attempts with geometric backoff
+/// (4s, 8s, 16s, 32s, 64s), ~124s worst-case wall-clock.
 ///
 /// Safe for submits ONLY when `op` re-sends the SAME already-signed
 /// transaction: Solana dedups by signature (identical bytes = same tx), so
@@ -97,9 +97,9 @@ pub(super) fn fetch_tx_details(
 ///
 /// Public Solana devnet RPC (api.devnet.solana.com) often takes 30+ seconds
 /// to index a freshly-confirmed transaction so it's queryable via
-/// getTransaction. Use a generous retry budget (~60s wall-clock) before
-/// giving up, since the alternative — guessing the message_id — costs the
-/// caller a full 5-minute pipeline timeout downstream.
+/// getTransaction. Use a generous retry budget (~124s wall-clock: the shared
+/// 4..64s schedule) before giving up, since the alternative of guessing the
+/// message_id costs the caller a full 5-minute pipeline timeout downstream.
 pub(super) fn fetch_confirmed_tx(
     rpc_client: &RpcClient,
     signature: &Signature,
@@ -108,14 +108,14 @@ pub(super) fn fetch_confirmed_tx(
     // the tx is in `confirmed`, not that it's been backfilled into the
     // history endpoint queried by `getTransaction`.
     std::thread::sleep(std::time::Duration::from_millis(750));
-    for i in 0..15 {
+    const ATTEMPTS: u32 = 6;
+    for i in 0..ATTEMPTS {
         match rpc_client.get_transaction(signature, UiTransactionEncoding::Json) {
             Ok(tx) => return Ok(Some(tx)),
-            Err(_) => {
-                // Exponential backoff capped at 5s: 500ms, 1s, 2s, 4s, 5s, 5s, …
-                let delay = std::cmp::min(500u64 * (1 << i), 5000);
-                std::thread::sleep(std::time::Duration::from_millis(delay));
+            Err(_) if i + 1 < ATTEMPTS => {
+                std::thread::sleep(backoff_for_attempt(i));
             }
+            Err(_) => {}
         }
     }
     Ok(None)

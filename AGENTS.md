@@ -162,7 +162,7 @@ These seven rails cover EVM, Solana, Sui, Stellar, and XRPL source/destination a
 
 - If a rule can be expressed as a lint or a hook, do that — don't rely on review or memory to catch it.
 - Before adding a guideline here, ask: "Can clippy/rustfmt/a git hook enforce this?" If yes, configure the tool. CLAUDE.md is for what the tooling can't catch.
-- Existing deterministic gates: `[lints.clippy]` in `Cargo.toml`, `clippy.toml` (`disallowed-methods` blocking the solana-axelar crates' compile-time IDs), `.githooks/pre-commit` and `.githooks/pre-push` (fmt + clippy + tests). Extend these in preference to writing more prose.
+- Existing deterministic gates: `[lints.clippy]` in `Cargo.toml`, `clippy.toml` (`disallowed-methods` blocking the solana-axelar crates' compile-time IDs and the untimed `reqwest::get` / `reqwest::Client::new` constructors — all outbound HTTP goes through `crate::http::client()`), `.githooks/pre-commit` and `.githooks/pre-push` (fmt + clippy + tests). Extend these in preference to writing more prose.
 
 ### Before reporting an edit as done
 

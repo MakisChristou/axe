@@ -13,7 +13,7 @@ This mirrors [AXE_STATE.md](../AXE_STATE.md) §2. See
 [load-test-coverage.md](load-test-coverage.md) for per-cell verified-on-chain
 status, env-var requirements, and the outstanding Sui work.
 
-## 1. The 23 wired chains, by type
+## 1. The 28 wired chains, by type
 
 The authoritative wired set is the `CHAIN_MAP` in
 [`.github/actions/run-loadtest/action.yml`](../.github/actions/run-loadtest/action.yml).
@@ -22,28 +22,33 @@ The `✓` columns mark the networks each chain is configured for.
 | Chain | Type | mainnet | testnet | stagenet | devnet-amplifier |
 |---|---|:---:|:---:|:---:|:---:|
 | Arbitrum    | EVM     | ✓ | ✓ | ✓ |   |
-| Avalanche   | EVM     | ✓ | ✓ | ✓ |   |
+| Arc         | EVM     |   |   |   | ✓ |
+| Avalanche   | EVM     | ✓ | ✓ | ✓ | ✓ |
 | Base        | EVM     | ✓ | ✓ | ✓ |   |
+| Berachain   | EVM     |   |   | ✓ | ✓ |
 | Binance     | EVM     | ✓ | ✓ |   |   |
-| Blast       | EVM     | ✓ | ✓ |   |   |
-| Ethereum    | EVM     | ✓ | ✓ | ✓ |   |
+| Blast       | EVM     | ✓ | ✓ | ✓ |   |
+| Celo        | EVM     |   |   | ✓ |   |
+| Ethereum    | EVM     | ✓ | ✓ | ✓ | ✓ |
 | Filecoin    | EVM     | ✓ | ✓ |   |   |
-| Hedera      | EVM     | ✓ | ✓ |   |   |
+| Flow        | EVM     |   |   | ✓ | ✓ |
+| Hedera      | EVM     | ✓ | ✓ | ✓ |   |
 | Hyperliquid | EVM     | ✓ | ✓ | ✓ |   |
 | Immutable   | EVM     | ✓ | ✓ |   |   |
-| Kava        | EVM     | ✓ | ✓ |   |   |
-| Linea       | EVM     | ✓ | ✓ |   |   |
-| Mantle      | EVM     | ✓ | ✓ |   |   |
-| Monad       | EVM     | ✓ | ✓ | ✓ |   |
-| Moonbeam    | EVM     | ✓ | ✓ |   |   |
-| Optimism    | EVM     | ✓ | ✓ | ✓ |   |
-| Polygon     | EVM     | ✓ | ✓ |   |   |
+| Kava        | EVM     | ✓ | ✓ | ✓ |   |
+| Linea       | EVM     | ✓ | ✓ | ✓ |   |
+| Mantle      | EVM     | ✓ | ✓ | ✓ |   |
+| Monad       | EVM     | ✓ | ✓ |   |   |
+| Moonbeam    | EVM     | ✓ | ✓ | ✓ |   |
+| Optimism    | EVM     | ✓ | ✓ | ✓ | ✓ |
+| Plume       | EVM     |   |   | ✓ | ✓ |
+| Polygon     | EVM     | ✓ | ✓ | ✓ |   |
 | Scroll      | EVM     | ✓ | ✓ |   |   |
-| XRPL EVM    | EVM     | ✓ | ✓ | ✓ |   |
+| XRPL EVM    | EVM     | ✓ | ✓ | ✓ | ✓ |
 | Solana      | Solana  | ✓ | ✓ | ✓ | ✓ |
 | Stellar     | Stellar | ✓ | ✓ |   |   |
 | Sui         | Sui     | ✓ | ✓ | ✓ | ✓ |
-| XRPL        | XRPL    | ✓ | ✓ | ✓ | ✓ |
+| XRPL        | XRPL    | ✓ | ✓ | ✓ |   |
 
 XRPL EVM is an ordinary EVM chain (it has a `VotingVerifier` on testnet); only
 **XRPL** itself is the contract-less `XRPL` type.
