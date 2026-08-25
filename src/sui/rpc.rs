@@ -36,7 +36,7 @@ enum SuiRpcError {
     Rpc {
         endpoint: String,
         method: String,
-        // Boxed to keep the enum under clippy's result_large_err threshold.
+        // Boxed to keep the Err variant small (clippy::result_large_err).
         payload: Box<Value>,
         message: String,
     },

@@ -57,7 +57,12 @@ pub(crate) fn decode_bytes(data: &[u8], indent: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Try as a governance proposal payload (before ITS: command 0 collides with ITS msgType 0)
+    // Try as ITS hub frame (before governance: a hub frame's bytes offset also lands at 0xa0)
+    if try_print_its_hub(data, indent, 0) {
+        return Ok(());
+    }
+
+    // Try as a governance proposal payload (before plain ITS: command 0 collides with ITS msgType 0)
     if try_print_governance(data, indent, 0) {
         return Ok(());
     }
@@ -274,7 +279,12 @@ fn try_print_nested(data: &[u8], indent: &str, depth: usize) -> bool {
         return true;
     }
 
-    // Try governance proposal payload (before ITS: command 0 collides with ITS msgType 0)
+    // Try ITS hub frame (before governance: a hub frame's bytes offset also lands at 0xa0)
+    if try_print_its_hub(data, indent, depth) {
+        return true;
+    }
+
+    // Try governance proposal payload (before plain ITS: command 0 collides with ITS msgType 0)
     if try_print_governance(data, indent, depth) {
         return true;
     }
@@ -297,27 +307,57 @@ fn try_print_nested(data: &[u8], indent: &str, depth: usize) -> bool {
     false
 }
 
-fn try_print_its(data: &[u8], indent: &str, depth: usize) -> bool {
-    if data.len() < 32 || depth > MAX_DEPTH {
-        return false;
-    }
+/// A decoded ITS message: the schema definition for its message type plus the decoded values.
+struct ItsMessage {
+    name: &'static str,
+    types: Vec<DynSolType>,
+    labels: Vec<&'static str>,
+    values: Vec<DynSolValue>,
+}
 
+fn its_message_type(data: &[u8]) -> Option<u64> {
     // Message type is first uint256 — upper 24 bytes must be zero
-    if data[..24].iter().any(|&b| b != 0) {
-        return false;
+    if data.len() < 32 || data[..24].iter().any(|&b| b != 0) {
+        return None;
     }
+    let bytes = <[u8; 8]>::try_from(&data[24..32]).ok()?;
+    Some(u64::from_be_bytes(bytes))
+}
 
-    let Ok(bytes) = <[u8; 8]>::try_from(&data[24..32]) else {
-        return false;
-    };
-    let msg_type = u64::from_be_bytes(bytes);
-
-    let Some((name, types, labels)) = its_message_def(msg_type) else {
-        return false;
-    };
+fn parse_its(data: &[u8]) -> Option<ItsMessage> {
+    let msg_type = its_message_type(data)?;
+    let (name, types, labels) = its_message_def(msg_type)?;
 
     let tuple_type = DynSolType::Tuple(types.clone());
-    let Ok(DynSolValue::Tuple(values)) = tuple_type.abi_decode_params(data) else {
+    let DynSolValue::Tuple(values) = tuple_type.abi_decode_params(data).ok()? else {
+        return None;
+    };
+
+    Some(ItsMessage {
+        name,
+        types,
+        labels,
+        values,
+    })
+}
+
+/// Hub-routing frames only (SEND_TO_HUB=3, RECEIVE_FROM_HUB=4) — must run before the
+/// governance schema, which they'd otherwise satisfy with garbage values.
+fn try_print_its_hub(data: &[u8], indent: &str, depth: usize) -> bool {
+    matches!(its_message_type(data), Some(3 | 4)) && try_print_its(data, indent, depth)
+}
+
+fn try_print_its(data: &[u8], indent: &str, depth: usize) -> bool {
+    if depth > MAX_DEPTH {
+        return false;
+    }
+    let Some(ItsMessage {
+        name,
+        types,
+        labels,
+        values,
+    }) = parse_its(data)
+    else {
         return false;
     };
 
@@ -527,6 +567,18 @@ struct GovernanceProposal {
     eta: U256,
 }
 
+/// Unix seconds for 3000-01-01 — any eta beyond this is another schema's word misread as a
+/// timestamp, not a real timelock.
+const MAX_SANE_ETA_SECS: u64 = 32_503_680_000;
+
+/// A genuine proposal target is a deployed contract address; a tiny value or a word-aligned
+/// value inside the calldata is almost certainly a dynamic-field offset from a different schema.
+fn target_looks_like_abi_offset(target: Address, data_len: usize) -> bool {
+    let word = U256::from_be_slice(target.as_slice());
+    word < U256::from(0x10000_u64)
+        || (word % U256::from(32) == U256::ZERO && word < U256::from(data_len))
+}
+
 fn parse_governance(data: &[u8]) -> Option<GovernanceProposal> {
     // Static head is 5 words (command, target, callData offset, nativeValue, eta); the bytes
     // field needs at least its length word, so 6 words minimum.
@@ -565,6 +617,9 @@ fn parse_governance(data: &[u8]) -> Option<GovernanceProposal> {
         DynSolValue::Address(a) => *a,
         _ => return None,
     };
+    if target_looks_like_abi_offset(target, data.len()) {
+        return None;
+    }
     let call_data = match &values[2] {
         DynSolValue::Bytes(b) => b.clone(),
         _ => return None,
@@ -577,6 +632,9 @@ fn parse_governance(data: &[u8]) -> Option<GovernanceProposal> {
         DynSolValue::Uint(n, _) => *n,
         _ => return None,
     };
+    if eta > U256::from(MAX_SANE_ETA_SECS) {
+        return None;
+    }
 
     Some(GovernanceProposal {
         command,
@@ -715,6 +773,65 @@ mod tests {
     fn governance_rejects_dirty_address_word() {
         let mut data = parse_hex(SCHEDULE_590).unwrap();
         data[32] = 0xff; // address word's upper bytes must be zero
+        assert!(parse_governance(&data).is_none());
+    }
+
+    // Real ITS hub SEND_TO_HUB payload (Stellar → Ethereum SolvBTC transfer). Its head words
+    // (3, 0x60, 0xa0, …) also satisfy the governance schema's shape checks, so it used to
+    // misdecode as [Governance CancelOperatorApproval] with garbage values.
+    const SEND_TO_HUB_STELLAR_ETH: &str = "0x0000000000000000000000000000000000000000000000000000000000000003000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000a00000000000000000000000000000000000000000000000000000000000000008457468657265756d00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001a00000000000000000000000000000000000000000000000000000000000000000edb4e6c60750463f5e3970bd7bdbf4af48ffdcb8ac4e40b680e491ca338dd1ba00000000000000000000000000000000000000000000000000000000000000c0000000000000000000000000000000000000000000000000000000000000012000000000000000000000000000000000000000000000000000000000000027100000000000000000000000000000000000000000000000000000000000000160000000000000000000000000000000000000000000000000000000000000003847413653594f424134334c5441554f424e4c32344f365a355746355a484f4746514d4933504e57324d4c56493535424f49334c4544344e5000000000000000000000000000000000000000000000000000000000000000000000000000000014c902c442dc4d8c39c33c7cdd648ef44c986c395700000000000000000000000000000000000000000000000000000000000000000000000000000000000000033689de0000000000000000000000000000000000000000000000000000000000";
+
+    #[test]
+    fn send_to_hub_is_not_claimed_by_governance() {
+        let data = parse_hex(SEND_TO_HUB_STELLAR_ETH).unwrap();
+        assert!(parse_governance(&data).is_none());
+    }
+
+    #[test]
+    fn send_to_hub_decodes_as_its_hub_frame_with_inner_transfer() {
+        let data = parse_hex(SEND_TO_HUB_STELLAR_ETH).unwrap();
+        let outer = parse_its(&data).expect("should parse as ITS");
+        assert_eq!(outer.name, "SEND_TO_HUB");
+        assert_eq!(outer.values[1], DynSolValue::String("Ethereum".to_string()));
+
+        let DynSolValue::Bytes(inner) = &outer.values[2] else {
+            panic!("payload field should be bytes");
+        };
+        let transfer = parse_its(inner).expect("inner payload should parse as ITS");
+        assert_eq!(transfer.name, "INTERCHAIN_TRANSFER");
+        assert_eq!(
+            transfer.values[3],
+            DynSolValue::Bytes(hex::decode("c902c442dc4d8c39c33c7cdd648ef44c986c3957").unwrap())
+        );
+        assert_eq!(
+            transfer.values[4],
+            DynSolValue::Uint(U256::from(10000), 256)
+        );
+        assert_eq!(
+            transfer.values[5],
+            DynSolValue::Bytes(hex::decode("3689de").unwrap())
+        );
+    }
+
+    #[test]
+    fn decode_send_to_hub_end_to_end() {
+        run(SEND_TO_HUB_STELLAR_ETH).unwrap();
+    }
+
+    #[test]
+    fn governance_rejects_offset_like_target() {
+        let mut data = parse_hex(SCHEDULE_590).unwrap();
+        // overwrite the target word with 0x60 — a string offset, not an address
+        data[32..64].fill(0);
+        data[63] = 0x60;
+        assert!(parse_governance(&data).is_none());
+    }
+
+    #[test]
+    fn governance_rejects_implausible_eta() {
+        let mut data = parse_hex(SCHEDULE_590).unwrap();
+        // overwrite the eta word with ASCII garbage far beyond year 3000
+        data[128..160].copy_from_slice(b"Ethereum\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
         assert!(parse_governance(&data).is_none());
     }
 
