@@ -34,20 +34,13 @@ The `axe test load-test` command sends cross-chain transactions through the Axel
 
 See [load-test-coverage.md](load-test-coverage.md) for the full source × destination × protocol matrix, per-environment chain availability, and required env vars / RPC overrides per chain.
 
-**Supported pairs** (verified end-to-end on testnet unless noted; mainnet works for any pair where both chains are deployed there):
-
-| Pair | GMP | ITS |
-|---|---|---|
-| EVM ↔ EVM | ✅ | (use evm-to-evm with token id) |
-| EVM ↔ Solana | ✅ both directions, sustained-mode supported | ✅ both directions, sustained-mode supported |
-| EVM ↔ XRPL | n/a (XRPL has no contracts) | ✅ canonical XRP, both directions |
-| EVM ↔ Stellar | ✅ both directions | ⚠️ Stellar → EVM passed; EVM → Stellar reaches Stellar approval but times out at execution on testnet |
-| EVM ↔ Sui | ✅ EVM → Sui *(Sui → EVM works on source side; voter coverage upstream is sparse for `Example::gmp` messages today)* | (deferred — needs Sui ITS PTB type-tag resolution) |
-| Solana ↔ Stellar | ✅ both directions | ⚠️ Stellar testnet ITS doesn't list `solana` as trusted yet (Contract #7 = UntrustedChain). Wire-complete on our side. |
-| Solana ↔ Sui | ✅ Sol → Sui | (deferred) |
-| Solana ↔ Solana | ✅ | ✅ |
-| Stellar ↔ Sui | ✅ Stellar → Sui | (deferred) |
-| Stellar ↔ XRPL / Sui ↔ XRPL | (deferred) | (deferred) |
+**Supported pairs**: the authoritative per-type dispatch matrix (which
+`(source, destination, protocol)` triples run, bail, or are unavailable by
+design) lives in [routes.md](routes.md), with per-cell caveats and validated
+status in [load-test-coverage.md](load-test-coverage.md). In short: every
+pairing of EVM/Solana/Stellar/Sui runs GMP (and most run ITS, including
+Sui ↔ EVM/Solana); XRPL is ITS-only via the canonical XRP wrapper against
+XRPL EVM.
 
 **The network is a runtime choice**: pass `--network mainnet | testnet | stagenet | devnet-amplifier` (or set `AXE_NETWORK`). The chains-config is resolved automatically (see [Config resolution](../Readme.md#configuration)); `--config <path>` overrides it, and the binary fails fast if `--network` contradicts the config filename.
 
@@ -82,7 +75,7 @@ axe test load-test --tps 10 --duration-secs 300 ...
 - The final summary shows end-to-end latency (avg/min/max), throughput, per-phase step and cumulative timing, pipeline counts, and any stuck transactions.
 - A JSON report is written to `axe-load-test-logs/axe-load-test-<timestamp>.json` after each run for post-mortem analysis.
 
-**Protocols supported in sustained mode:** GMP and ITS for EVM ↔ Solana (both directions). Other source chains (Stellar, XRPL, Sui) currently support burst-mode only — sustained mode delegates to the per-chain ephemeral-wallet machinery, which exists for EVM and Solana today; PRs welcome to extend it.
+**Protocols supported in sustained mode:** EVM, Solana, Stellar, and XRPL sources all run sustained mode (GMP and ITS where the route exists). Sui routes (Sui-source ITS, and Solana/Stellar → Sui ITS) are burst-only by design — Sui's account model serializes submissions.
 
 **ITS note:** Token deployment happens once upfront (cached across runs). Each pool key is pre-funded with enough tokens for its share of the total transfers before the send phase begins.
 
@@ -92,7 +85,7 @@ axe test load-test --tps 10 --duration-secs 300 ...
 
 **ITS (`--protocol its`):** Deploys an interchain token on the source chain, deploys the remote counterpart on the destination via the ITS Hub, then sends `InterchainTransfer` transactions. Supports both EVM → Sol and Sol → EVM directions.
 
-**Verification:** Polling covers the full pipeline: `voted → routed → approved → executed` (GMP), or `voted → hub-approved → second-leg discovery → routed → approved → executed` (ITS). In sustained mode, verification runs concurrently with sending. In burst mode, it runs after all sends complete. Inactivity timeout is 200 seconds — the poller resets the timeout each time any transaction makes progress.
+**Verification:** Polling covers the full pipeline: `voted → routed → approved → executed` (GMP), or `voted → hub-approved → second-leg discovery → routed → approved → executed` (ITS). In sustained mode, verification runs concurrently with sending. In burst mode, it runs after all sends complete. Inactivity timeout is 7200 seconds (2 h, sized for the slowest observed legacy-EVM routes) — the poller resets the timeout each time any transaction makes progress.
 
 ### Burst examples
 
