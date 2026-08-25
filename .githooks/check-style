@@ -7,12 +7,12 @@ if find src -type f -name mod.rs -print -quit | grep -q .; then
     exit 1
 fi
 
-if rg -n 'tracing::(trace|debug|info|warn|error)!' src --glob '*.rs'; then
+if grep -rEn 'tracing::(trace|debug|info|warn|error)!' src --include='*.rs'; then
     echo "Import tracing macros before calling them."
     exit 1
 fi
 
-if rg -n '#\[tokio::main\([^]]*current_thread' src --glob '*.rs'; then
+if grep -rEn '#\[tokio::main\([^]]*current_thread' src --include='*.rs'; then
     echo "Use the default multithreaded Tokio runtime."
     exit 1
 fi
