@@ -36,7 +36,7 @@ use crate::evm::{
     ERC20, InterchainTokenService, SenderReceiver, is_pending_state_error, parse_expected_nonce,
     read_artifact_bytecode,
 };
-use crate::retry::{FALLBACK_ATTEMPTS, retry_all, retry_async};
+use crate::retry::{FALLBACK_ATTEMPTS, backoff_for_attempt, retry_all, retry_async};
 use crate::stellar::StellarWallet;
 use crate::sui::{SuiWallet, read_sui_chain_config};
 use crate::ui;
@@ -72,11 +72,11 @@ pub(crate) async fn ensure_sender_receiver_on_evm_chain(
 /// empty code for live contracts under concurrent load; without retries that
 /// triggers a wasteful on-chain redeploy of a SenderReceiver that's still there.
 async fn get_code_with_retry<P: Provider>(provider: &P, addr: Address) -> Result<Bytes> {
-    const ATTEMPTS: u32 = 3;
+    const ATTEMPTS: u32 = 6;
     let mut last = Bytes::new();
     for attempt in 0..ATTEMPTS {
         if attempt > 0 {
-            time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
+            time::sleep(backoff_for_attempt(attempt - 1)).await;
         }
         last = provider.get_code_at(addr).await?;
         if !last.is_empty() {

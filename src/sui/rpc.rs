@@ -19,7 +19,9 @@ const TESTNET_FALLBACKS: &[&str] = &[
 ];
 const MAINNET_FALLBACKS: &[&str] = &[
     "https://fullnode.mainnet.sui.io:443",
-    "https://sui-mainnet-rpc.publicnode.com",
+    // PublicNode retired sui-mainnet-rpc.publicnode.com (permanent 404,
+    // observed killing preflight in cron run 32793045257).
+    "https://sui-rpc.publicnode.com",
 ];
 
 #[derive(Debug, thiserror::Error)]

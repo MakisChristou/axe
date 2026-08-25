@@ -297,9 +297,9 @@ impl StellarClient {
         // Multiple parallel cron jobs share `STELLAR_PRIVATE_KEY`, so two
         // concurrent `pay_native_classic`s on the same wallet fetch the same
         // server-side sequence and both submit `seq + 1`. One wins, the other
-        // gets TxBadSeq. Re-fetch on TxBadSeq up to 4 times — by then the
+        // gets TxBadSeq. Re-fetch on TxBadSeq up to 5 times - by then the
         // colliding tx has either settled or been dropped.
-        const MAX_SEQ_RETRIES: u8 = 4;
+        const MAX_SEQ_RETRIES: u8 = 6;
         let mut attempt: u8 = 0;
         let mut fee_tier: usize = 0;
         let hash = loop {
@@ -586,8 +586,8 @@ impl StellarClient {
             // Soroban txs whose sequence bump the RPC hasn't reflected yet both
             // leave the fetched sequence stale, so a submit races another
             // `seq + 1` and gets TxBadSeq. Re-fetch + re-simulate + resubmit up
-            // to 4 times — the same recovery `pay_native_classic` uses.
-            const MAX_SEQ_RETRIES: u8 = 4;
+            // to 5 times - the same recovery `pay_native_classic` uses.
+            const MAX_SEQ_RETRIES: u8 = 6;
             let mut attempt: u8 = 0;
             let hash = loop {
                 match self.submit_invoke_once(wallet, &invoke, fee).await {

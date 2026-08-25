@@ -10,7 +10,7 @@
 //!
 //! Composes with the per-client fallback patterns we already have
 //! (`SuiClient::call` iterates configured endpoints; Solana
-//! `fetch_confirmed_tx` retries 15× with capped exponential backoff).
+//! `fetch_confirmed_tx` retries on the same schedule).
 //! `retry_async` adds an outer time-axis retry for the call sites that
 //! don't already have one (alloy provider calls, XRPL `account_info`,
 //! Stellar reads, etc.).
@@ -18,19 +18,20 @@
 use std::future::Future;
 use std::time::Duration;
 
-/// Default attempts for `retry_all`. 3 attempts × geometric backoff
-/// (500ms, 1s, 2s) ≈ 3.5s worst-case wall-clock if every attempt fails.
-pub const DEFAULT_ATTEMPTS: u32 = 3;
+/// Default attempts for `retry_all`: 1 original try + 5 retries backed off
+/// at 2s, 4s, 8s, 16s, 32s, or ~62s worst-case wall-clock if every attempt
+/// fails.
+pub const DEFAULT_ATTEMPTS: u32 = 6;
 
 /// Attempts against EACH endpoint in `retry_with_fallback` before advancing
-/// to the next one. 5 attempts × geometric backoff (500ms, 1s, 2s, 4s)
-/// ≈ 7.5s worst-case per endpoint, ≈ 15s across a [private, public] pair.
-pub const FALLBACK_ATTEMPTS: u32 = 5;
+/// to the next one. 6 attempts x geometric backoff (2s, 4s, 8s, 16s, 32s)
+/// is ~62s worst-case per endpoint, ~124s across a [private, public] pair.
+pub const FALLBACK_ATTEMPTS: u32 = 6;
 
 /// Base backoff between attempts. Doubles each subsequent retry:
-/// 500ms → 1s → 2s → 4s. Capped at 8s for any single sleep.
-const BASE_BACKOFF_MS: u64 = 500;
-const MAX_BACKOFF_MS: u64 = 8_000;
+/// 2s -> 4s -> 8s -> 16s -> 32s. Capped at 32s for any single sleep.
+const BASE_BACKOFF_MS: u64 = 2_000;
+const MAX_BACKOFF_MS: u64 = 32_000;
 
 /// Fraction each delay is randomly spread by, either side of its nominal
 /// value. 0.2 gives the usual +/-20% band.
@@ -232,7 +233,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn retry_succeeds_on_second_attempt() {
         let counter = AtomicU32::new(0);
         let result: Result<&'static str, &'static str> = retry_all("test", || {
@@ -250,7 +251,7 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn retry_gives_up_after_max_attempts() {
         let counter = AtomicU32::new(0);
         let result: Result<(), &'static str> = retry_all("test", || {
