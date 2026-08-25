@@ -3,88 +3,52 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    flake-parts.url = "github:hercules-ci/flake-parts";
+    fenix = {
+      url = "github:nix-community/fenix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    treefmt-nix = {
+      url = "github:numtide/treefmt-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
-    { self, nixpkgs }:
-    let
+    inputs@{ flake-parts, nixpkgs, ... }:
+    flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [
         "x86_64-linux"
         "aarch64-linux"
         "aarch64-darwin"
       ];
-      forAllSystems = nixpkgs.lib.genAttrs systems;
-      version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
-    in
-    {
-      packages = forAllSystems (
-        system:
+
+      imports = [
+        ./nix/devshell.nix
+        ./nix/formatting.nix
+        ./nix/package.nix
+      ];
+
+      perSystem =
+        { system, ... }:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
-        in
-        rec {
-          axe = pkgs.rustPlatform.buildRustPackage {
-            pname = "axe";
-            inherit version;
-            src = self;
+          pkgs = import nixpkgs { inherit system; };
 
-            cargoLock = {
-              lockFile = ./Cargo.lock;
-              # All four crates come from the same pinned xrpl-sdk-rust checkout.
-              outputHashes = {
-                "xrpl_api-0.16.6" = "sha256-oacgaU/4EHS8LlDOihTsCe5GzyXf2zpb07MItJaH4W0=";
-                "xrpl_binary_codec-0.16.6" = "sha256-oacgaU/4EHS8LlDOihTsCe5GzyXf2zpb07MItJaH4W0=";
-                "xrpl_http_client-0.16.6" = "sha256-oacgaU/4EHS8LlDOihTsCe5GzyXf2zpb07MItJaH4W0=";
-                "xrpl_types-0.16.6" = "sha256-oacgaU/4EHS8LlDOihTsCe5GzyXf2zpb07MItJaH4W0=";
-              };
-            };
+          # rust-toolchain.toml is the source of truth for the component
+          # list. `fenix.stable` itself is pinned by the fenix flake input,
+          # so the toolchain only moves on `nix flake update` — no
+          # per-toolchain sha256 to babysit.
+          toolchain = (pkgs.lib.importTOML ./rust-toolchain.toml).toolchain;
 
-            nativeBuildInputs = [ pkgs.pkg-config ];
-            buildInputs = [ pkgs.openssl ];
-
-            meta = {
-              description = "Swiss army knife CLI for Axelar cross-chain development: deploy, test, decode, monitor";
-              homepage = "https://github.com/axelarnetwork/axe";
-              mainProgram = "axe";
-            };
-          };
-          default = axe;
-        }
-      );
-
-      overlays.default = final: prev: {
-        axe = self.packages.${final.stdenv.hostPlatform.system}.axe;
-      };
-
-      devShells = forAllSystems (
-        system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
+          rustToolchain =
+            assert pkgs.lib.assertMsg (toolchain.channel == "stable")
+              "rust-toolchain.toml pins the '${toolchain.channel}' channel, but this flake only wires up fenix's stable channel.";
+            inputs.fenix.packages.${system}.stable.withComponents toolchain.components;
         in
         {
-          default = pkgs.mkShell {
-            packages = with pkgs; [
-              cargo
-              rustc
-              clippy
-              rustfmt
-              rust-analyzer
-              git
-
-              pkg-config
-              openssl
-            ];
-
-            # Opt users entering from this checkout into its git hooks
-            # (fmt + clippy + tests on commit and push, see .githooks/).
-            shellHook = ''
-              axe_repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-              if [ -n "$axe_repo_root" ] && [ -x "$axe_repo_root/.githooks/pre-commit" ]; then
-                git -C "$axe_repo_root" config --local core.hooksPath .githooks
-              fi
-            '';
+          _module.args = {
+            inherit pkgs rustToolchain;
           };
-        }
-      );
+        };
     };
 }
