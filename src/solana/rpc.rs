@@ -20,7 +20,7 @@ use crate::ui;
 /// Blocking counterpart of `crate::retry::retry_async` — the solana_client
 /// calls in this module are synchronous, so the async helper can't be used.
 /// Same schedule: [`FALLBACK_ATTEMPTS`] attempts with geometric backoff
-/// (500ms, 1s, 2s, 4s) ≈ 7.5s worst-case wall-clock.
+/// (4s, 8s, 16s, 32s, 64s), ~124s worst-case wall-clock.
 ///
 /// Safe for submits ONLY when `op` re-sends the SAME already-signed
 /// transaction: Solana dedups by signature (identical bytes = same tx), so
@@ -97,8 +97,8 @@ pub(super) fn fetch_tx_details(
 ///
 /// Public Solana devnet RPC (api.devnet.solana.com) often takes 30+ seconds
 /// to index a freshly-confirmed transaction so it's queryable via
-/// getTransaction. Use a generous retry budget (~62s wall-clock: the shared
-/// 2..32s schedule) before giving up, since the alternative of guessing the
+/// getTransaction. Use a generous retry budget (~124s wall-clock: the shared
+/// 4..64s schedule) before giving up, since the alternative of guessing the
 /// message_id costs the caller a full 5-minute pipeline timeout downstream.
 pub(super) fn fetch_confirmed_tx(
     rpc_client: &RpcClient,

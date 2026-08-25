@@ -19,19 +19,19 @@ use std::future::Future;
 use std::time::Duration;
 
 /// Default attempts for `retry_all`: 1 original try + 5 retries backed off
-/// at 2s, 4s, 8s, 16s, 32s, or ~62s worst-case wall-clock if every attempt
+/// at 4s, 8s, 16s, 32s, 64s, or ~124s worst-case wall-clock if every attempt
 /// fails.
 pub const DEFAULT_ATTEMPTS: u32 = 6;
 
 /// Attempts against EACH endpoint in `retry_with_fallback` before advancing
-/// to the next one. 6 attempts x geometric backoff (2s, 4s, 8s, 16s, 32s)
-/// is ~62s worst-case per endpoint, ~124s across a [private, public] pair.
+/// to the next one. 6 attempts x geometric backoff (4s, 8s, 16s, 32s, 64s)
+/// is ~124s worst-case per endpoint, ~248s across a [private, public] pair.
 pub const FALLBACK_ATTEMPTS: u32 = 6;
 
 /// Base backoff between attempts. Doubles each subsequent retry:
-/// 2s -> 4s -> 8s -> 16s -> 32s. Capped at 32s for any single sleep.
-const BASE_BACKOFF_MS: u64 = 2_000;
-const MAX_BACKOFF_MS: u64 = 32_000;
+/// 4s -> 8s -> 16s -> 32s -> 64s. Capped at 64s for any single sleep.
+const BASE_BACKOFF_MS: u64 = 4_000;
+const MAX_BACKOFF_MS: u64 = 64_000;
 
 /// Fraction each delay is randomly spread by, either side of its nominal
 /// value. 0.2 gives the usual +/-20% band.

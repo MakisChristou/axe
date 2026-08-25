@@ -365,8 +365,8 @@ const NONCE_CONTENTION_ATTEMPTS: u32 = 5;
 /// Hard ceiling on loop iterations, so no re-sign path can spin forever.
 const MAX_SEND_ATTEMPTS: u32 = 16;
 
-/// Backoff for the nth nonce-contention attempt: the shared 2, 4, 8, 16,
-/// 32 s schedule ([`crate::retry`]), jittered so two runs colliding on a
+/// Backoff for the nth nonce-contention attempt: the shared 4, 8, 16, 32,
+/// 64 s schedule ([`crate::retry`]), jittered so two runs colliding on a
 /// nonce do not wake together and collide again.
 fn nonce_contention_backoff(attempt: u32) -> std::time::Duration {
     crate::retry::backoff_for_attempt(attempt)
@@ -1054,8 +1054,8 @@ mod tests {
 
     #[test]
     fn contention_backoff_doubles_within_jitter_and_caps() {
-        // 2, 4, 8, 16, 32 s, each within +/-20%.
-        for (attempt, base) in [(0, 2.0), (1, 4.0), (2, 8.0), (3, 16.0), (4, 32.0)] {
+        // 4, 8, 16, 32, 64 s, each within +/-20%.
+        for (attempt, base) in [(0, 4.0), (1, 8.0), (2, 16.0), (3, 32.0), (4, 64.0)] {
             for _ in 0..50 {
                 let secs = nonce_contention_backoff(attempt).as_secs_f64();
                 assert!(
@@ -1064,9 +1064,9 @@ mod tests {
                 );
             }
         }
-        // Past the schedule it stays at the 32 s step rather than growing.
+        // Past the schedule it stays at the 64 s step rather than growing.
         let capped = nonce_contention_backoff(9).as_secs_f64();
-        assert!((25.6..=38.4).contains(&capped), "cap gave {capped}s");
+        assert!((51.2..=76.8).contains(&capped), "cap gave {capped}s");
     }
 
     #[test]
