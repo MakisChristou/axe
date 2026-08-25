@@ -415,5 +415,6 @@ async fn run_cli() -> Result<()> {
         } => commands::verifier_votes::run(network, chain, verifier, limit, json).await,
         cli::Commands::Propose(args) => commands::propose::run(args).await,
         cli::Commands::Test { subcommand } => run_test(subcommand, cli.network).await,
+        cli::Commands::Bench { subcommand } => commands::bench::run(subcommand).await,
     }
 }

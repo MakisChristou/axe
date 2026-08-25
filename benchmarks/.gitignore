@@ -1,0 +1,6 @@
+# Generated build + fetched artifacts — never committed.
+evm-gas/out/
+evm-gas/cache/
+solana-cu/target/
+# Mainnet program binaries fetched by scripts/fetch-testdata.sh (~2 MB, go stale on redeploy).
+solana-cu/tests/testdata/*.so

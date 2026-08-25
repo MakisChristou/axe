@@ -63,6 +63,12 @@ pub enum Commands {
         subcommand: TestCommands,
     },
 
+    /// Run the fee-api gas / compute-unit benchmarks (EVM + Solana harnesses)
+    Bench {
+        #[command(subcommand)]
+        subcommand: BenchCommands,
+    },
+
     /// Decode EVM calldata or full transactions
     Decode {
         #[command(subcommand)]
@@ -121,6 +127,23 @@ pub enum Commands {
 
     /// Submit an AxelarServiceGovernance proposal to an edge chain's ASG
     Propose(ProposeArgs),
+}
+
+#[derive(Subcommand)]
+pub enum BenchCommands {
+    /// EVM source-gas benchmark: `forge test` GasHarness on a mainnet fork.
+    /// Prints per-operation gasUsed for the cost.source_gas_units config.
+    EvmGas {
+        /// Ethereum mainnet RPC URL (else uses MAINNET_RPC_URL, else a public node)
+        #[arg(long)]
+        rpc: Option<String>,
+    },
+    /// Solana compute-unit benchmark: runs the LiteSVM harness against the real
+    /// mainnet program binaries (fetched automatically when missing). Prints the
+    /// compute units for the cost.solana config.
+    SolanaCu,
+    /// Run both benchmarks.
+    All,
 }
 
 #[derive(Subcommand)]

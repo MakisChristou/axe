@@ -1,0 +1,51 @@
+# Solana ITS compute-unit (CU) measurement harness.
+#
+# The analog of the Foundry EVM `GasHarness.t.sol`: it measures
+# `compute_units_consumed` for the fee-api's Solana ITS operations and compares
+# them against the observed mainnet numbers.
+#
+# Detached from the parent `apps/contracts/solana` workspace (own `[workspace]`
+# table) so it can pin the `mainnet` network feature independently — the parent
+# builds `native-unwrapper` with `devnet-amplifier`, and the two `declare_id!`
+# variants cannot be feature-unified in one compilation.
+#
+# The tests run against the real mainnet program binaries dumped into
+# `tests/testdata/*.so` (via `solana program dump <id> --url mainnet-beta`), so
+# the measured CU reflects the deployed bytecode, not the calling crate.
+#
+#   cargo test -p its-cu-harness -- --nocapture
+[package]
+name = "its-cu-harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Detach from the parent workspace.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+litesvm = "0.12"
+solana-sdk = "3"
+anchor-lang = "1.0.2"
+anchor-spl = { version = "1.0.2", features = ["token", "token_2022", "associated_token"] }
+bytemuck = "1"
+
+# The published Axelar programs, pinned to the `mainnet` network so the embedded
+# program IDs match the dumped `tests/testdata/*.so` binaries. `no-entrypoint`
+# keeps the host (non-SBF) build from emitting a program entrypoint.
+solana-axelar-its = { version = "1.1.1", default-features = false, features = ["no-entrypoint", "mainnet"] }
+solana-axelar-gateway = { version = "1.1.1", default-features = false, features = ["no-entrypoint", "mainnet"] }
+solana-axelar-gas-service = { version = "1.1.1", default-features = false, features = ["no-entrypoint", "mainnet"] }
+# Cross-chain `Message` / `CrossChainId` + the `LeafHash` message-hash trait.
+solana-axelar-std = { version = "1.1.1" }
+# keccak256 for the GMP payload hash (matches the on-chain hasher).
+solana-keccak-hasher = "~3.1.0"
+# Inject an MPL Metadata account for the canonical-token deploy flow.
+mpl-token-metadata = "5.1.2-alpha.2"
+borsh = "1"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
