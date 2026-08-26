@@ -12,11 +12,9 @@ use rand::Rng;
 use solana_client::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::instruction::{AccountMeta, Instruction};
-use solana_sdk::message::Message;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
-use solana_sdk::transaction::Transaction;
 use tokio::task::spawn_blocking;
 
 use super::LoadTestArgs;
@@ -889,13 +887,14 @@ fn distribute_its_tokens(
         };
         instructions.push(transfer_ix);
 
-        let blockhash = rpc_client.get_latest_blockhash()?;
-        let message = Message::new_with_blockhash(&instructions, Some(&fee_payer), &blockhash);
-        let mut tx = Transaction::new_unsigned(message);
-        tx.sign(&[main_keypair], blockhash);
-        rpc_client
-            .send_and_confirm_transaction(&tx)
-            .map_err(|e| eyre!("failed to distribute tokens to key {i}: {e}"))?;
+        solana::sign_send_confirm(
+            &rpc_client,
+            "solana distribute tokens",
+            &instructions,
+            &fee_payer,
+            main_keypair,
+        )
+        .map_err(|e| eyre!("failed to distribute tokens to key {i}: {e}"))?;
 
         spinner.set_message(format!(
             "distributing tokens ({}/{} done)...",

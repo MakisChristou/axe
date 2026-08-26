@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 use alloy::signers::k256::PublicKey;
 use alloy::signers::k256::elliptic_curve::sec1::ToEncodedPoint;
 use alloy::{
-    consensus::TxEnvelope,
+    consensus::{Transaction as ConsensusTx, TxEnvelope},
     eips::{BlockId, eip2718::Encodable2718},
     hex,
     network::{Network, ReceiptResponse},
@@ -247,9 +247,10 @@ impl EvmEndpoints {
             tx.nonce = Some(nonce);
         }
         if tx.gas.is_none() {
-            let estimate = crate::retry::retry_with_fallback_all(
+            let estimate = crate::retry::retry_with_fallback(
                 "estimate gas (latest block)",
                 &self.providers,
+                |e| !deterministic_view_failure(e),
                 |provider| {
                     let tx = tx.clone();
                     async move { provider.estimate_gas(tx).block(BlockId::latest()).await }
@@ -282,6 +283,16 @@ impl EvmEndpoints {
         )
         .await
     }
+}
+
+/// Deterministic EVM view/estimate failures - not endpoint flakiness, so
+/// every retry on every endpoint answers the same, and the 4-64s ladder
+/// turns doomed retries into minutes of dead time. Two shapes: a call to an
+/// address with no deployed code returns empty data, and a revert (the
+/// estimate of a would-revert tx included).
+pub fn deterministic_view_failure<E: std::fmt::Display>(err: &E) -> bool {
+    let msg = err.to_string();
+    msg.contains("returned no data") || msg.contains("execution reverted")
 }
 
 /// Avalanche's coreth rejection when a node cannot serve pending-block state
@@ -372,6 +383,49 @@ fn nonce_contention_backoff(attempt: u32) -> std::time::Duration {
     crate::retry::backoff_for_attempt(attempt)
 }
 
+/// Fee floor carried into a replacement broadcast round: the previous
+/// envelope's fees, doubled. Doubling clears both the mempool replacement
+/// minimum (typically +10%) and a moderate fee spike in one step, and the
+/// rounds are capped by [`SEND_ROUNDS`].
+struct ReplacementFees {
+    gas_price: Option<u128>,
+    max_fee_per_gas: Option<u128>,
+    max_priority_fee_per_gas: Option<u128>,
+}
+
+impl ReplacementFees {
+    fn doubled_from(env: &TxEnvelope) -> Self {
+        if let Some(price) = env.gas_price() {
+            // Legacy (type-0) envelope.
+            Self {
+                gas_price: Some(price.saturating_mul(2)),
+                max_fee_per_gas: None,
+                max_priority_fee_per_gas: None,
+            }
+        } else {
+            Self {
+                gas_price: None,
+                max_fee_per_gas: Some(env.max_fee_per_gas().saturating_mul(2)),
+                max_priority_fee_per_gas: env
+                    .max_priority_fee_per_gas()
+                    .map(|tip| tip.saturating_mul(2)),
+            }
+        }
+    }
+
+    fn apply(&self, request: &mut TransactionRequest) {
+        if let Some(price) = self.gas_price {
+            request.gas_price = Some(price);
+        }
+        if let Some(fee) = self.max_fee_per_gas {
+            request.max_fee_per_gas = Some(fee);
+        }
+        if let Some(tip) = self.max_priority_fee_per_gas {
+            request.max_priority_fee_per_gas = Some(tip);
+        }
+    }
+}
+
 /// Send an EVM transaction with retry + private→public fallback at every
 /// phase, and at-most-once semantics end to end:
 ///
@@ -383,9 +437,11 @@ fn nonce_contention_backoff(attempt: u32) -> std::time::Duration {
 ///    pre-known hash: if the tx is on-chain or in the pool the send *already
 ///    succeeded* (the classic lost-response landing); otherwise the nonce was
 ///    stale — re-resolve it and re-sign.
-/// 3. **Confirm by hash** — receipt polled across endpoints (tolerant of
-///    per-endpoint errors) up to `receipt_timeout`; an unmined tx is
-///    re-broadcast (same bytes) for another round.
+/// 3. **Confirm by hash** - receipts polled across endpoints (tolerant of
+///    per-endpoint errors) up to `receipt_timeout`, for EVERY hash this send
+///    has broadcast. An unmined tx is replaced (same nonce, doubled fees)
+///    for another round, and either the original or the replacement counts
+///    as the result - same-nonce siblings can never both mine.
 ///
 /// Returns the mined receipt — reverted (status 0x0) receipts are returned,
 /// not errors, so callers keep their own status handling.
@@ -398,6 +454,12 @@ pub async fn send_tx_robust(
 ) -> Result<alloy::rpc::types::TransactionReceipt> {
     let mut envelope: Option<TxEnvelope> = None;
     let mut nonce_override: Option<u64> = tx.nonce;
+    // Fee floor for a replacement round: an unmined-after-timeout tx is
+    // usually underbidding the current market, and re-broadcasting the same
+    // bytes cannot change that. The floor doubles the previous envelope's
+    // fees so the re-signed tx (same nonce) cleanly replaces the pooled one.
+    let mut replacement_fees: Option<ReplacementFees> = None;
+    let mut sent_hashes: Vec<TxHash> = Vec::new();
     let mut last_hash: Option<TxHash> = None;
     // Broadcast rounds and nonce-contention attempts are budgeted separately:
     // only an unmined-after-`receipt_timeout` tx consumes a broadcast round.
@@ -415,6 +477,9 @@ pub async fn send_tx_robust(
             None => {
                 let mut request = tx.clone();
                 request.nonce = nonce_override;
+                if let Some(fees) = &replacement_fees {
+                    fees.apply(&mut request);
+                }
                 let env = pool.fill_and_sign(signer, request).await?;
                 envelope = Some(env.clone());
                 env
@@ -422,15 +487,25 @@ pub async fn send_tx_robust(
         };
         let tx_hash = *env.tx_hash();
         last_hash = Some(tx_hash);
+        // Every hash this logical send has ever broadcast (original +
+        // replacements). A replacement does not guarantee the original is
+        // gone - whichever the network mined is OUR result, so the landed
+        // check and the receipt wait must cover all of them, or a mined
+        // original would be misread as a foreign nonce conflict and re-sent
+        // at the next nonce (a genuine double-send).
+        if !sent_hashes.contains(&tx_hash) {
+            sent_hashes.push(tx_hash);
+        }
 
         match pool.broadcast_raw(&env).await {
             Ok(_) => {}
             Err(error) if send_error_may_mean_landed(&error) => {
-                if !tx_known_by_hash(&pool, tx_hash).await {
+                if !any_tx_known_by_hash(&pool, &sent_hashes).await {
                     // Not ours: the fill used a stale nonce. Re-resolve (from
                     // the node's own report when present) and re-sign.
                     nonce_override = parse_expected_nonce(&error.to_string());
                     envelope = None;
+                    replacement_fees = None;
                     ui::warn(&format!(
                         "{label}: nonce conflict ({error}); re-signing at {}",
                         match nonce_override {
@@ -469,18 +544,27 @@ pub async fn send_tx_robust(
                 tokio::time::sleep(backoff).await;
                 nonce_override = None;
                 envelope = None;
+                replacement_fees = None;
                 continue;
             }
             Err(error) => return Err(error),
         }
 
-        match wait_receipt_by_hash(&pool, tx_hash, receipt_timeout).await {
+        match wait_receipt_any(&pool, &sent_hashes, receipt_timeout).await {
             Some(receipt) => return Ok(receipt),
             None => {
                 round += 1;
+                // Re-sign a replacement at the SAME nonce with doubled fees
+                // instead of re-broadcasting identical (likely underpriced)
+                // bytes. Same-nonce replacement is double-send-safe: at most
+                // one of the two can ever mine.
+                if let Some(env) = envelope.take() {
+                    nonce_override = Some(env.nonce());
+                    replacement_fees = Some(ReplacementFees::doubled_from(&env));
+                }
                 ui::warn(&format!(
-                    "{label}: tx {tx_hash:#x} not mined in {}s — re-broadcasting same bytes \
-                     (round {}/{SEND_ROUNDS})",
+                    "{label}: tx {tx_hash:#x} not mined in {}s — re-signing a replacement \
+                     at the same nonce with doubled fees (round {}/{SEND_ROUNDS})",
                     receipt_timeout.as_secs(),
                     round + 1,
                 ));
@@ -496,7 +580,43 @@ pub async fn send_tx_robust(
     ))
 }
 
-/// Whether the transaction is visible on any endpoint — mined or pending in
+/// Whether ANY of this send's broadcast transactions (original or a fee-bump
+/// replacement) is visible on any endpoint - mined or pending. See
+/// [`tx_known_by_hash`] - a replacement round makes the set plural.
+async fn any_tx_known_by_hash(endpoints: &EvmEndpoints, hashes: &[TxHash]) -> bool {
+    for hash in hashes {
+        if tx_known_by_hash(endpoints, *hash).await {
+            return true;
+        }
+    }
+    false
+}
+
+/// Poll every endpoint for a receipt of ANY of this send's broadcast
+/// transactions until `timeout`. After a fee-bump replacement either the
+/// original or the replacement may be the one that mines - both count.
+async fn wait_receipt_any(
+    endpoints: &EvmEndpoints,
+    hashes: &[TxHash],
+    timeout: std::time::Duration,
+) -> Option<alloy::rpc::types::TransactionReceipt> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        for hash in hashes {
+            for provider in endpoints.providers() {
+                if let Ok(Some(receipt)) = provider.get_transaction_receipt(*hash).await {
+                    return Some(receipt);
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// Whether the transaction is visible on any endpoint - mined or pending in
 /// the mempool. Used to distinguish "our lost-response broadcast landed" from
 /// "the nonce was consumed by something else".
 async fn tx_known_by_hash(endpoints: &EvmEndpoints, tx_hash: TxHash) -> bool {
@@ -506,28 +626,6 @@ async fn tx_known_by_hash(endpoints: &EvmEndpoints, tx_hash: TxHash) -> bool {
         }
     }
     false
-}
-
-/// Poll every endpoint for the receipt until `timeout`. Per-endpoint errors
-/// (429s, flaky nodes) are tolerated by construction — the next endpoint or
-/// the next tick retries.
-pub async fn wait_receipt_by_hash(
-    endpoints: &EvmEndpoints,
-    tx_hash: TxHash,
-    timeout: std::time::Duration,
-) -> Option<alloy::rpc::types::TransactionReceipt> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        for provider in endpoints.providers() {
-            if let Ok(Some(receipt)) = provider.get_transaction_receipt(tx_hash).await {
-                return Some(receipt);
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    }
 }
 
 sol! {

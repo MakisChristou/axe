@@ -11,7 +11,6 @@ use solana_axelar_std::execute_data::{ExecuteData, MerklizedPayload};
 use solana_axelar_std::{MerklizedMessage, PayloadType, SigningVerifierSetInfo};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
-    message::Message,
     pubkey::Pubkey,
     signature::{Keypair, Signature},
     signer::Signer,
@@ -23,6 +22,7 @@ use solana_transaction_status::{
 
 use super::rpc::{
     fetch_confirmed_tx, fetch_tx_details, is_transient_solana, retry_blocking, rpc_client,
+    sign_send_confirm,
 };
 use crate::commands::load_test::metrics::{TxMetrics, TxOutcome};
 use crate::types::Network;
@@ -105,21 +105,15 @@ pub fn send_call_contract(
         }
     };
 
-    let blockhash = retry_blocking(
-        "solana get_latest_blockhash",
-        |_| true,
-        || rpc_client.get_latest_blockhash(),
-    )?;
-    let message = Message::new_with_blockhash(&instructions, Some(&fee_payer), &blockhash);
-    let mut transaction = Transaction::new_unsigned(message);
-    transaction.sign(&[keypair], blockhash);
-
     let submit_time_ms = submit_start.elapsed().as_millis() as u64;
 
-    // Same signed tx on every attempt — dedup by signature makes this safe.
-    let signature = retry_blocking("solana submit call_contract", is_transient_solana, || {
-        rpc_client.send_and_confirm_transaction(&transaction)
-    })?;
+    let signature = sign_send_confirm(
+        &rpc_client,
+        "solana submit call_contract",
+        &instructions,
+        &fee_payer,
+        keypair,
+    )?;
 
     let confirm_time_ms = submit_start.elapsed().as_millis() as u64;
     let latency_ms = confirm_time_ms.saturating_sub(submit_time_ms);

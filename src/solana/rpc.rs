@@ -8,10 +8,14 @@
 //! schedule that's tuned to the public devnet RPC's eventual-consistency
 //! window between `confirmed` and `getTransaction` indexing.
 
-use eyre::Result;
+use eyre::{Result, eyre};
 use solana_client::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
-use solana_sdk::signature::Signature;
+use solana_sdk::instruction::Instruction;
+use solana_sdk::message::Message;
+use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::{Signature, Signer};
+use solana_sdk::transaction::Transaction;
 use solana_transaction_status::UiTransactionEncoding;
 
 use crate::retry::{FALLBACK_ATTEMPTS, backoff_for_attempt, is_transient_default};
@@ -67,6 +71,134 @@ pub(crate) fn is_transient_solana<E: std::fmt::Display>(err: &E) -> bool {
     is_transient_default(err) || msg.contains("rate limit")
 }
 
+/// Whether a submit failure is a blockhash-expiry report. Expiry is the
+/// node's proof the transaction did NOT land and never can - so rebuilding
+/// on a fresh blockhash cannot double-send, while re-sending the expired
+/// bytes can never succeed.
+pub(crate) fn is_blockhash_expired<E: std::fmt::Display>(err: &E) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("blockhash not found") || msg.contains("block height exceeded")
+}
+
+/// A resend of already-landed bytes fails preflight with this phrasing: the
+/// signature is in the status cache, so an earlier broadcast whose response
+/// was lost DID land (the Solana twin of EVM's "nonce too low" after a lost
+/// response). The on-chain result must then be resolved by signature.
+fn is_already_processed<E: std::fmt::Display>(err: &E) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("already been processed") || msg.contains("alreadyprocessed")
+}
+
+/// Rebuild-on-expiry rounds in [`sign_send_confirm`]. Each round waits out
+/// send_and_confirm's own blockhash-validity window (~2 min), so a few
+/// rounds already spans several minutes of congestion.
+const MAX_BLOCKHASH_REBUILDS: u32 = 3;
+
+/// Sign `instructions` on a fresh blockhash and submit via
+/// `send_and_confirm_transaction`, with the two retry axes that are each
+/// safe on Solana:
+///
+/// - transient transport errors re-send the SAME signed bytes (dedup by
+///   signature - at most one copy lands), via [`retry_blocking`]
+/// - a blockhash-expiry failure re-signs on a fresh blockhash and resends
+///   (the expired tx provably never landed), up to
+///   [`MAX_BLOCKHASH_REBUILDS`] rounds
+///
+/// Terminal failures append `simulate_transaction` diagnostics (program
+/// logs) for the last attempted transaction.
+pub(crate) fn sign_send_confirm(
+    rpc_client: &RpcClient,
+    label: &str,
+    instructions: &[Instruction],
+    payer: &Pubkey,
+    signer: &dyn Signer,
+) -> Result<Signature> {
+    let mut rebuild: u32 = 0;
+    loop {
+        let blockhash = retry_blocking(
+            "solana get_latest_blockhash",
+            |_| true,
+            || rpc_client.get_latest_blockhash(),
+        )?;
+        let message = Message::new_with_blockhash(instructions, Some(payer), &blockhash);
+        let mut transaction = Transaction::new_unsigned(message);
+        transaction.sign(&[signer], blockhash);
+
+        // Same signed tx on every attempt - dedup by signature makes this
+        // safe. Blockhash errors are excluded from same-bytes retries by
+        // `is_transient_solana` and handled by the rebuild arm below.
+        let sent = retry_blocking(label, is_transient_solana, || {
+            rpc_client.send_and_confirm_transaction(&transaction)
+        });
+        match sent {
+            Ok(signature) => return Ok(signature),
+            Err(e) if is_blockhash_expired(&e) && rebuild + 1 < MAX_BLOCKHASH_REBUILDS => {
+                rebuild += 1;
+                ui::warn(&format!(
+                    "{label}: blockhash expired without the tx landing - re-signing on a \
+                     fresh blockhash (rebuild {rebuild}/{MAX_BLOCKHASH_REBUILDS})"
+                ));
+            }
+            Err(e) => {
+                if is_already_processed(&e)
+                    && let Some(signature) = transaction.signatures.first().copied()
+                {
+                    // Lost-response landing: resolve the result by signature
+                    // instead of reporting a failure for a landed tx. The
+                    // retry ladder rides out finalization lag.
+                    let landed = retry_blocking(
+                        "solana get_signature_status",
+                        |_| true,
+                        || match rpc_client.get_signature_status(&signature) {
+                            Ok(Some(result)) => Ok(result),
+                            Ok(None) => Err("signature not yet visible".to_string()),
+                            Err(fetch_err) => Err(fetch_err.to_string()),
+                        },
+                    );
+                    match landed {
+                        Ok(Ok(())) => return Ok(signature),
+                        Ok(Err(tx_err)) => {
+                            return Err(eyre!(
+                                "{label}: transaction landed but failed on chain: {tx_err}"
+                            ));
+                        }
+                        // Status never became visible - fall through to the
+                        // generic diagnostics path below.
+                        Err(_) => {}
+                    }
+                }
+                let diagnostics = simulation_diagnostics(rpc_client, &transaction);
+                return Err(eyre!("{label}: {e}\n  -> {diagnostics}"));
+            }
+        }
+    }
+}
+
+/// Simulate the failed transaction and render its program logs, so a
+/// terminal submit failure carries the on-chain reason.
+fn simulation_diagnostics(rpc_client: &RpcClient, transaction: &Transaction) -> String {
+    match rpc_client.simulate_transaction(transaction) {
+        Ok(simulation) => {
+            let logs = simulation.value.logs.unwrap_or_default();
+            let header = match simulation.value.err {
+                Some(error) => format!("simulation error: {error:?}"),
+                None => "simulation succeeded but submit failed".to_string(),
+            };
+            if logs.is_empty() {
+                header
+            } else {
+                let body = logs
+                    .iter()
+                    .map(|line| format!("    {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("{header}\n  program logs:\n{body}")
+            }
+        }
+        Err(error) => format!("simulate_transaction follow-up failed: {error}"),
+    }
+}
+
 /// Construct an `RpcClient` with finalized commitment — single helper so
 /// callers don't sprinkle `RpcClient::new_with_commitment(_, finalized())`
 /// across the codebase.
@@ -119,4 +251,19 @@ pub(super) fn fetch_confirmed_tx(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod already_processed_tests {
+    use super::is_already_processed;
+
+    #[test]
+    fn lost_response_landing_is_detected() {
+        assert!(is_already_processed(
+            &"Transaction simulation failed: This transaction has already been processed"
+        ));
+        assert!(is_already_processed(&"TransactionError::AlreadyProcessed"));
+        assert!(!is_already_processed(&"Account already borrowed"));
+        assert!(!is_already_processed(&"blockhash not found"));
+    }
 }

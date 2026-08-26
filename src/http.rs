@@ -31,3 +31,18 @@ static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 pub fn client() -> &'static reqwest::Client {
     &CLIENT
 }
+
+/// Test-only probe: does `url` still resolve and answer HTTP at all?
+/// A 404/410 from the host means the endpoint path was retired (the
+/// publicnode-renames-a-subdomain class) - any other status proves the
+/// service exists (JSON-RPC endpoints commonly answer GET with 405).
+#[cfg(test)]
+pub(crate) async fn probe_endpoint_alive(url: &str) -> Result<(), String> {
+    match client().get(url).send().await {
+        Ok(resp) if resp.status() == 404 || resp.status() == 410 => {
+            Err(format!("{url}: HTTP {} (endpoint retired?)", resp.status()))
+        }
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("{url}: {e}")),
+    }
+}

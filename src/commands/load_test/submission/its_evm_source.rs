@@ -51,9 +51,9 @@ use crate::config::ChainContract;
 use crate::config::ChainsConfig;
 use crate::evm::{
     ERC20, EvmEndpoints, InterchainTokenFactory, InterchainTokenService, connect_evm_signed,
-    send_tx_robust,
+    deterministic_view_failure, send_tx_robust,
 };
-use crate::retry::retry_with_fallback_all;
+use crate::retry::{retry_with_fallback, retry_with_fallback_all};
 use crate::types::Network;
 use crate::ui;
 
@@ -544,9 +544,10 @@ pub(super) async fn approve_its_for_keys(
     amount_per_key: U256,
 ) -> eyre::Result<()> {
     let endpoints = EvmEndpoints::connect(rpc_urls)?;
-    let token_manager: Address = retry_with_fallback_all(
+    let token_manager: Address = retry_with_fallback(
         "ITS.tokenManagerAddress",
         endpoints.providers(),
+        |e| !deterministic_view_failure(e),
         |p| async move {
             InterchainTokenService::new(its_proxy, p)
                 .tokenManagerAddress(token_id)
@@ -572,15 +573,19 @@ pub(super) async fn approve_its_for_keys(
     let mut approved = 0usize;
     for (i, signer) in derived.iter().enumerate() {
         let holder = signer.address();
-        let allowance =
-            retry_with_fallback_all("token allowance", endpoints.providers(), |p| async move {
+        let allowance = retry_with_fallback(
+            "token allowance",
+            endpoints.providers(),
+            |e| !deterministic_view_failure(e),
+            |p| async move {
                 ERC20::new(token_addr, p)
                     .allowance(holder, token_manager)
                     .call()
                     .await
-            })
-            .await
-            .unwrap_or_default();
+            },
+        )
+        .await
+        .unwrap_or_default();
         if allowance >= approve_threshold {
             continue;
         }
@@ -642,12 +647,14 @@ pub(super) async fn distribute_tokens(
         if holder == deployer.address() {
             continue;
         }
-        let balance =
-            retry_with_fallback_all("token balance", endpoints.providers(), |p| async move {
-                ERC20::new(token_addr, p).balanceOf(holder).call().await
-            })
-            .await
-            .unwrap_or_default();
+        let balance = retry_with_fallback(
+            "token balance",
+            endpoints.providers(),
+            |e| !deterministic_view_failure(e),
+            |p| async move { ERC20::new(token_addr, p).balanceOf(holder).call().await },
+        )
+        .await
+        .unwrap_or_default();
         if balance >= amount_per_key {
             continue;
         }
@@ -954,9 +961,10 @@ pub(super) async fn rescale_sizing_for_decimals(
     // Retry + fallback: this read runs on the source RPC (Hedera hard-429s its
     // JSON-RPC relay), and a transient rate-limit blip on a setup read
     // shouldn't fail the whole route.
-    let decimals = retry_with_fallback_all(
+    let decimals = retry_with_fallback(
         "read_source_token_decimals",
         endpoints.providers(),
+        |e| !deterministic_view_failure(e),
         |p| async move { ERC20::new(token_addr, p).decimals().call().await },
     )
     .await

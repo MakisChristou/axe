@@ -44,6 +44,7 @@ pub use its::{
     send_its_deploy_remote_interchain_token, send_its_interchain_transfer,
 };
 pub use rpc::rpc_client;
+pub(crate) use rpc::sign_send_confirm;
 
 #[cfg(test)]
 use solana_sdk::pubkey::Pubkey;

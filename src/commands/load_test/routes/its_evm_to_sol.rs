@@ -17,8 +17,8 @@ use super::run_sizing::{RunMode, RunSizing as ValidatedRunSizing, SustainedPlan}
 use super::{LoadTestArgs, validate_evm_rpc, validate_solana_rpc};
 use crate::config::AxelarChainContract;
 use crate::config::ChainsConfig;
-use crate::evm::{EvmEndpoints, InterchainTokenService};
-use crate::retry::retry_with_fallback_all;
+use crate::evm::{EvmEndpoints, InterchainTokenService, deterministic_view_failure};
+use crate::retry::{retry_with_fallback, retry_with_fallback_all};
 use crate::ui;
 use alloy::{
     primitives::{Address, Bytes, FixedBytes, U256},
@@ -241,9 +241,10 @@ async fn resolve_explicit_token(
         return Ok(None);
     };
     let its_proxy = its.its_proxy_addr;
-    let token_addr = retry_with_fallback_all(
+    let token_addr = retry_with_fallback(
         "token address lookup",
         endpoints.providers(),
+        |e| !deterministic_view_failure(e),
         |p| async move {
             let its_service = InterchainTokenService::new(its_proxy, p);
             if registered {

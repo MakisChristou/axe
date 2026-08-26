@@ -454,25 +454,38 @@ async fn probe_axe(
         .get("decimals")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(18) as u32;
-    match target.kind {
-        ChainKind::Evm => probe_axe_evm(chain, token, decimals).await,
-        ChainKind::Stellar => probe_axe_stellar(chain, token, decimals, network).await,
-        other => Err(eyre!(
-            "AXE balance check not implemented for {}",
-            other.label()
-        )),
+    let candidates = rpc_candidates(&target.chain_key, network, chain)?;
+    let mut last_err = None;
+    for (i, rpc_url) in candidates.iter().enumerate() {
+        let probed = match target.kind {
+            ChainKind::Evm => probe_axe_evm(rpc_url, token, decimals).await,
+            ChainKind::Stellar => probe_axe_stellar(rpc_url, chain, token, decimals, network).await,
+            other => {
+                return Err(eyre!(
+                    "AXE balance check not implemented for {}",
+                    other.label()
+                ));
+            }
+        };
+        match probed {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                if i + 1 < candidates.len() {
+                    crate::ui::warn(&format!(
+                        "{} (AXE): probe via endpoint {}/{} failed ({e}) - trying the next one",
+                        target.chain_key,
+                        i + 1,
+                        candidates.len(),
+                    ));
+                }
+                last_err = Some(e);
+            }
+        }
     }
+    Err(last_err.unwrap_or_else(|| eyre!("no rpc candidates for {}", target.chain_key)))
 }
 
-async fn probe_axe_evm(
-    chain: &ChainConfig,
-    token_addr: &str,
-    decimals: u32,
-) -> Result<(String, f64)> {
-    let rpc_url = chain
-        .rpc
-        .as_deref()
-        .ok_or_else(|| eyre!("no rpc in config"))?;
+async fn probe_axe_evm(rpc_url: &str, token_addr: &str, decimals: u32) -> Result<(String, f64)> {
     let key = std::env::var("EVM_PRIVATE_KEY").wrap_err("EVM_PRIVATE_KEY env not set")?;
     let signer: PrivateKeySigner = key
         .parse()
@@ -491,15 +504,12 @@ async fn probe_axe_evm(
 }
 
 async fn probe_axe_stellar(
+    rpc_url: &str,
     chain: &ChainConfig,
     token_addr: &str,
     decimals: u32,
     network: Network,
 ) -> Result<(String, f64)> {
-    let rpc_url = chain
-        .rpc
-        .as_deref()
-        .ok_or_else(|| eyre!("no rpc in config"))?;
     let network_type = stellar_network_type(chain, network);
     let client = StellarClient::new(rpc_url, &network_type)?;
     let key = std::env::var("STELLAR_PRIVATE_KEY").wrap_err("STELLAR_PRIVATE_KEY env not set")?;
@@ -522,6 +532,54 @@ fn token_units(raw: alloy::primitives::U256, decimals: u32) -> f64 {
     whole + remainder
 }
 
+/// Env-var chain prefix for the `<CHAIN>_<NETWORK>_RPC` private-RPC
+/// overrides the CI workflows export (same naming as run-loadtest's
+/// resolver). Derived from the config chain key by stripping per-network
+/// deployment suffixes.
+fn rpc_env_prefix(chain_key: &str) -> String {
+    let base = match chain_key {
+        "monad-3" => "monad",
+        "eth-sepolia" | "ethereum-sepolia" => "ethereum",
+        "xrpl-evm-devnet" => "xrpl-evm",
+        "sui-2" => "sui",
+        "solana-stagenet-3" | "solana-18" => "solana",
+        "avalanche-fuji" => "avalanche",
+        key if key.starts_with("stellar") => "stellar",
+        key => key,
+    };
+    base.to_uppercase().replace('-', "_")
+}
+
+/// Ordered RPC candidates for a preflight probe: the workflow's private RPC
+/// (when exported) first, then the public config `rpc`. A single dead
+/// endpoint must not skip the whole fleet - a dead public Sui fallback did
+/// exactly that in cron run 32793045257 - and a revoked secret must not
+/// either, so both are probed, private first (the order the routes use).
+fn rpc_candidates(chain_key: &str, network: Network, chain: &ChainConfig) -> Result<Vec<String>> {
+    let mut candidates = Vec::new();
+    let env_name = format!(
+        "{}_{}_RPC",
+        rpc_env_prefix(chain_key),
+        network.as_str().to_uppercase().replace('-', "_")
+    );
+    if let Ok(url) = std::env::var(&env_name)
+        && !url.trim().is_empty()
+    {
+        candidates.push(url);
+    }
+    if let Some(url) = chain.rpc.as_deref()
+        && !candidates.iter().any(|c| c == url)
+    {
+        candidates.push(url.to_string());
+    }
+    if candidates.is_empty() {
+        return Err(eyre!(
+            "no rpc in config and no {env_name} env for {chain_key}"
+        ));
+    }
+    Ok(candidates)
+}
+
 async fn probe_balance(
     config: &ChainsConfig,
     target: &ChainTarget,
@@ -531,20 +589,35 @@ async fn probe_balance(
         .chains
         .get(&target.chain_key)
         .ok_or_else(|| eyre!("chain '{}' not in {network} config", target.chain_key))?;
-    match target.kind {
-        ChainKind::Evm => probe_evm(chain).await,
-        ChainKind::Solana => probe_solana(chain).await,
-        ChainKind::Sui => probe_sui(chain).await,
-        ChainKind::Stellar => probe_stellar(chain, network).await,
-        ChainKind::Xrpl => probe_xrpl(chain).await,
+    let candidates = rpc_candidates(&target.chain_key, network, chain)?;
+    let mut last_err = None;
+    for (i, rpc_url) in candidates.iter().enumerate() {
+        let probed = match target.kind {
+            ChainKind::Evm => probe_evm(rpc_url).await,
+            ChainKind::Solana => probe_solana(rpc_url).await,
+            ChainKind::Sui => probe_sui(rpc_url).await,
+            ChainKind::Stellar => probe_stellar(rpc_url, chain, network).await,
+            ChainKind::Xrpl => probe_xrpl(rpc_url).await,
+        };
+        match probed {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                if i + 1 < candidates.len() {
+                    crate::ui::warn(&format!(
+                        "{}: probe via endpoint {}/{} failed ({e}) - trying the next one",
+                        target.chain_key,
+                        i + 1,
+                        candidates.len(),
+                    ));
+                }
+                last_err = Some(e);
+            }
+        }
     }
+    Err(last_err.unwrap_or_else(|| eyre!("no rpc candidates for {}", target.chain_key)))
 }
 
-async fn probe_evm(chain: &ChainConfig) -> Result<(String, f64)> {
-    let rpc_url = chain
-        .rpc
-        .as_deref()
-        .ok_or_else(|| eyre!("no rpc in config"))?;
+async fn probe_evm(rpc_url: &str) -> Result<(String, f64)> {
     let key = std::env::var("EVM_PRIVATE_KEY").wrap_err("EVM_PRIVATE_KEY env not set")?;
     let signer: PrivateKeySigner = key
         .parse()
@@ -553,7 +626,6 @@ async fn probe_evm(chain: &ChainConfig) -> Result<(String, f64)> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     // Wrap with retry: any transient RPC error means the preflight fails
     // and the whole cron run is skipped, even though wallets are funded.
-    // Geometric backoff over 3 attempts (~3.5s worst case).
     let wei = crate::retry::retry_all("probe_evm.get_balance", || async {
         provider.get_balance(addr).await
     })
@@ -561,11 +633,7 @@ async fn probe_evm(chain: &ChainConfig) -> Result<(String, f64)> {
     Ok((format!("{addr:#x}"), wei_to_eth(wei)))
 }
 
-async fn probe_solana(chain: &ChainConfig) -> Result<(String, f64)> {
-    let rpc_url = chain
-        .rpc
-        .as_deref()
-        .ok_or_else(|| eyre!("no rpc in config"))?;
+async fn probe_solana(rpc_url: &str) -> Result<(String, f64)> {
     // SOLANA_PRIVATE_KEY (when set) is a file path written by the workflow's
     // composite action. Falls back to ~/.config/solana/id.json otherwise.
     let key_path = std::env::var("SOLANA_PRIVATE_KEY").ok();
@@ -580,11 +648,7 @@ async fn probe_solana(chain: &ChainConfig) -> Result<(String, f64)> {
     Ok((pubkey.to_string(), lamports as f64 / 1_000_000_000.0))
 }
 
-async fn probe_sui(chain: &ChainConfig) -> Result<(String, f64)> {
-    let rpc_url = chain
-        .rpc
-        .as_deref()
-        .ok_or_else(|| eyre!("no rpc in config"))?;
+async fn probe_sui(rpc_url: &str) -> Result<(String, f64)> {
     let key = std::env::var("SUI_PRIVATE_KEY").wrap_err("SUI_PRIVATE_KEY env not set")?;
     let wallet = SuiWallet::from_secret_str(&key)?;
     let client = SuiClient::new(rpc_url);
@@ -598,11 +662,11 @@ async fn probe_sui(chain: &ChainConfig) -> Result<(String, f64)> {
     Ok((wallet.address_hex(), mist as f64 / 1_000_000_000.0))
 }
 
-async fn probe_stellar(chain: &ChainConfig, network: Network) -> Result<(String, f64)> {
-    let rpc_url = chain
-        .rpc
-        .as_deref()
-        .ok_or_else(|| eyre!("no rpc in config"))?;
+async fn probe_stellar(
+    rpc_url: &str,
+    chain: &ChainConfig,
+    network: Network,
+) -> Result<(String, f64)> {
     let network_type = stellar_network_type(chain, network);
     let client = StellarClient::new(rpc_url, &network_type)?;
     let key = std::env::var("STELLAR_PRIVATE_KEY").wrap_err("STELLAR_PRIVATE_KEY env not set")?;
@@ -617,11 +681,7 @@ async fn probe_stellar(chain: &ChainConfig, network: Network) -> Result<(String,
     Ok((address, stroops as f64 / 10_000_000.0))
 }
 
-async fn probe_xrpl(chain: &ChainConfig) -> Result<(String, f64)> {
-    let rpc_url = chain
-        .rpc
-        .as_deref()
-        .ok_or_else(|| eyre!("no rpc in config"))?;
+async fn probe_xrpl(rpc_url: &str) -> Result<(String, f64)> {
     let key = std::env::var("XRPL_PRIVATE_KEY").wrap_err("XRPL_PRIVATE_KEY env not set")?;
     let wallet = XrplWallet::from_secret_str(&key)?;
     let address = wallet.address();
@@ -924,5 +984,28 @@ mod tests {
             !testnet.iter().any(|k| k.starts_with("stellar")),
             "Stellar was removed from the testnet ITS cron"
         );
+    }
+}
+
+#[cfg(test)]
+mod rpc_candidate_tests {
+    use super::rpc_env_prefix;
+
+    #[test]
+    fn chain_keys_map_to_workflow_env_prefixes() {
+        for (key, expected) in [
+            ("monad-3", "MONAD"),
+            ("monad", "MONAD"),
+            ("xrpl-evm", "XRPL_EVM"),
+            ("xrpl-evm-devnet", "XRPL_EVM"),
+            ("stellar-2026-q1-2", "STELLAR"),
+            ("stellar", "STELLAR"),
+            ("solana-stagenet-3", "SOLANA"),
+            ("avalanche-fuji", "AVALANCHE"),
+            ("eth-sepolia", "ETHEREUM"),
+            ("hyperliquid", "HYPERLIQUID"),
+        ] {
+            assert_eq!(rpc_env_prefix(key), expected, "for chain key {key}");
+        }
     }
 }

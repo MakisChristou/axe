@@ -32,8 +32,8 @@ use super::{LoadTestArgs, validate_evm_rpc};
 use crate::config::AxelarChainContract;
 use crate::config::ChainContract;
 use crate::config::ChainsConfig;
-use crate::evm::{EvmEndpoints, InterchainTokenService};
-use crate::retry::{retry_all, retry_with_fallback_all};
+use crate::evm::{EvmEndpoints, InterchainTokenService, deterministic_view_failure};
+use crate::retry::{retry_all, retry_with_fallback, retry_with_fallback_all};
 use crate::ui;
 use alloy::{
     primitives::{Address, Bytes, FixedBytes, U256},
@@ -282,9 +282,10 @@ async fn resolve_provided_token(
         .parse()
         .map_err(|e| eyre!("invalid --token-id: {e}"))?;
     let its_proxy = its.its_proxy_addr;
-    let token_addr = retry_with_fallback_all(
+    let token_addr = retry_with_fallback(
         "token address lookup",
         endpoints.providers(),
+        |e| !deterministic_view_failure(e),
         |p| async move {
             InterchainTokenService::new(its_proxy, p)
                 .interchainTokenAddress(token_id)

@@ -445,11 +445,18 @@ runs:
         if [ -z "$REPORT" ] || [ "${RUN_OUTCOME}" != "success" ]; then
           STATUS="❌ Failed"
         else
-          # Clean = zero failures and (no verification, or all verified with none pending).
+          # Clean = at least one confirmed send AND a verification section
+          # proving every verified tx succeeded with none pending. A missing
+          # or empty verification section is NOT clean - an unverified green
+          # is a false green (the binary enforces the same rule on its exit
+          # code; this keeps the badge honest even with older binaries).
           CLEAN=$(jq -r '
             if (.total_failed == 0)
-               and ((.verification == null)
-                    or (.verification.pending == 0 and .verification.successful == .verification.total_verified))
+               and (.total_confirmed > 0)
+               and (.verification != null)
+               and (.verification.total_verified > 0)
+               and (.verification.pending == 0)
+               and (.verification.successful == .verification.total_verified)
             then "yes" else "no" end' "$REPORT")
           [ "$CLEAN" = "yes" ] && STATUS="✅ Success" || STATUS="⚠️ Partial"
         fi

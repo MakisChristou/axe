@@ -300,18 +300,42 @@ pub(crate) async fn finish_report(report: &mut LoadTestReport, run_start: Instan
         )),
     }
 
+    let report_hint = if report_written {
+        format!("; report written to {}", log_path.display())
+    } else {
+        String::new()
+    };
     let source_failures = report.total_failed;
     let verification_failures = report.verification.as_ref().map_or(0, |v| v.failed);
     if source_failures > 0 || verification_failures > 0 {
-        let report_hint = if report_written {
-            format!("; report written to {}", log_path.display())
-        } else {
-            String::new()
-        };
         return Err(eyre::eyre!(
             "load test failed: {source_failures} source tx failures, \
              {verification_failures} verification failures{report_hint}"
         ));
+    }
+    // Success must mean VERIFIED success. A run that confirmed source sends
+    // but produced no verification section (or verified zero transactions,
+    // or left some pending or unsuccessful) must not exit 0 - CI reads the
+    // exit code as the route verdict, and an unverified green is a false
+    // green.
+    if report.total_confirmed > 0 {
+        let verified_ok = report.verification.as_ref().is_some_and(|v| {
+            v.total_verified > 0 && v.pending == 0 && v.successful == v.total_verified
+        });
+        if !verified_ok {
+            let summary = report.verification.as_ref().map_or_else(
+                || "no verification was performed".to_string(),
+                |v| {
+                    format!(
+                        "verified {}/{} (successful {}, pending {}, failed {})",
+                        v.total_verified, report.total_confirmed, v.successful, v.pending, v.failed
+                    )
+                },
+            );
+            return Err(eyre::eyre!(
+                "load test NOT verified end-to-end: {summary}{report_hint}"
+            ));
+        }
     }
 
     ui::success(&format!(
