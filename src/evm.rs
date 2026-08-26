@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 use alloy::signers::k256::PublicKey;
 use alloy::signers::k256::elliptic_curve::sec1::ToEncodedPoint;
 use alloy::{
-    consensus::TxEnvelope,
+    consensus::{Transaction as ConsensusTx, TxEnvelope},
     eips::{BlockId, eip2718::Encodable2718},
     hex,
     network::{Network, ReceiptResponse},
@@ -372,6 +372,49 @@ fn nonce_contention_backoff(attempt: u32) -> std::time::Duration {
     crate::retry::backoff_for_attempt(attempt)
 }
 
+/// Fee floor carried into a replacement broadcast round: the previous
+/// envelope's fees, doubled. Doubling clears both the mempool replacement
+/// minimum (typically +10%) and a moderate fee spike in one step, and the
+/// rounds are capped by [`SEND_ROUNDS`].
+struct ReplacementFees {
+    gas_price: Option<u128>,
+    max_fee_per_gas: Option<u128>,
+    max_priority_fee_per_gas: Option<u128>,
+}
+
+impl ReplacementFees {
+    fn doubled_from(env: &TxEnvelope) -> Self {
+        if let Some(price) = env.gas_price() {
+            // Legacy (type-0) envelope.
+            Self {
+                gas_price: Some(price.saturating_mul(2)),
+                max_fee_per_gas: None,
+                max_priority_fee_per_gas: None,
+            }
+        } else {
+            Self {
+                gas_price: None,
+                max_fee_per_gas: Some(env.max_fee_per_gas().saturating_mul(2)),
+                max_priority_fee_per_gas: env
+                    .max_priority_fee_per_gas()
+                    .map(|tip| tip.saturating_mul(2)),
+            }
+        }
+    }
+
+    fn apply(&self, request: &mut TransactionRequest) {
+        if let Some(price) = self.gas_price {
+            request.gas_price = Some(price);
+        }
+        if let Some(fee) = self.max_fee_per_gas {
+            request.max_fee_per_gas = Some(fee);
+        }
+        if let Some(tip) = self.max_priority_fee_per_gas {
+            request.max_priority_fee_per_gas = Some(tip);
+        }
+    }
+}
+
 /// Send an EVM transaction with retry + private→public fallback at every
 /// phase, and at-most-once semantics end to end:
 ///
@@ -398,6 +441,11 @@ pub async fn send_tx_robust(
 ) -> Result<alloy::rpc::types::TransactionReceipt> {
     let mut envelope: Option<TxEnvelope> = None;
     let mut nonce_override: Option<u64> = tx.nonce;
+    // Fee floor for a replacement round: an unmined-after-timeout tx is
+    // usually underbidding the current market, and re-broadcasting the same
+    // bytes cannot change that. The floor doubles the previous envelope's
+    // fees so the re-signed tx (same nonce) cleanly replaces the pooled one.
+    let mut replacement_fees: Option<ReplacementFees> = None;
     let mut last_hash: Option<TxHash> = None;
     // Broadcast rounds and nonce-contention attempts are budgeted separately:
     // only an unmined-after-`receipt_timeout` tx consumes a broadcast round.
@@ -415,6 +463,9 @@ pub async fn send_tx_robust(
             None => {
                 let mut request = tx.clone();
                 request.nonce = nonce_override;
+                if let Some(fees) = &replacement_fees {
+                    fees.apply(&mut request);
+                }
                 let env = pool.fill_and_sign(signer, request).await?;
                 envelope = Some(env.clone());
                 env
@@ -431,6 +482,7 @@ pub async fn send_tx_robust(
                     // the node's own report when present) and re-sign.
                     nonce_override = parse_expected_nonce(&error.to_string());
                     envelope = None;
+                    replacement_fees = None;
                     ui::warn(&format!(
                         "{label}: nonce conflict ({error}); re-signing at {}",
                         match nonce_override {
@@ -469,6 +521,7 @@ pub async fn send_tx_robust(
                 tokio::time::sleep(backoff).await;
                 nonce_override = None;
                 envelope = None;
+                replacement_fees = None;
                 continue;
             }
             Err(error) => return Err(error),
@@ -478,9 +531,17 @@ pub async fn send_tx_robust(
             Some(receipt) => return Ok(receipt),
             None => {
                 round += 1;
+                // Re-sign a replacement at the SAME nonce with doubled fees
+                // instead of re-broadcasting identical (likely underpriced)
+                // bytes. Same-nonce replacement is double-send-safe: at most
+                // one of the two can ever mine.
+                if let Some(env) = envelope.take() {
+                    nonce_override = Some(env.nonce());
+                    replacement_fees = Some(ReplacementFees::doubled_from(&env));
+                }
                 ui::warn(&format!(
-                    "{label}: tx {tx_hash:#x} not mined in {}s — re-broadcasting same bytes \
-                     (round {}/{SEND_ROUNDS})",
+                    "{label}: tx {tx_hash:#x} not mined in {}s — re-signing a replacement \
+                     at the same nonce with doubled fees (round {}/{SEND_ROUNDS})",
                     receipt_timeout.as_secs(),
                     round + 1,
                 ));
