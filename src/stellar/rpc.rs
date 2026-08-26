@@ -569,11 +569,16 @@ impl StellarClient {
         // safe for the shared deploy path too — a resubmit can never become a
         // second transfer, because an advanced sequence means the slot was
         // already consumed (so we stop instead).
-        const MAX_VALIDATE_RESUBMITS: u8 = 2;
+        const MAX_VALIDATE_RESUBMITS: u8 = 3;
         let mut resubmit: u8 = 0;
         // Working inclusion fee: starts at the caller's floor and is bumped
-        // x10 (capped) on TxInsufficientFee. Persists across dropped-tx
-        // resubmits — a dropped tx was usually underpriced.
+        // x10 (capped) on TxInsufficientFee AND on every dropped-tx resubmit.
+        // A drop is almost always an underpriced inclusion bid: surge pricing
+        // evicts the tx from the queue without any TxInsufficientFee error,
+        // so resubmitting the identical fee rebuilds the identical tx (same
+        // sequence, same hash) and it just drops again (observed: cron run
+        // 32967345788, stellar -> hyperliquid). The x10 rungs walk
+        // base -> x10 -> x100 (capped), a different tx hash each time.
         let mut fee = base_fee;
         loop {
             let seq_before = self
@@ -645,9 +650,11 @@ impl StellarClient {
                     VALIDATE_TIMEOUT
                 ));
             }
+            fee = fee.saturating_mul(10).min(MAX_SOROBAN_INCLUSION_FEE);
             crate::ui::warn(&format!(
                 "stellar invoke_contract: tx {tx_hash_hex} not validated in {:?}, account \
-                 sequence unchanged (dropped) — resubmitting ({}/{MAX_VALIDATE_RESUBMITS})",
+                 sequence unchanged (dropped) — resubmitting with inclusion fee bumped to \
+                 {fee} stroops ({}/{MAX_VALIDATE_RESUBMITS})",
                 VALIDATE_TIMEOUT,
                 resubmit + 2,
             ));
