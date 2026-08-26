@@ -252,15 +252,19 @@ async fn fetch_block_timestamps(
     timestamps
 }
 
-fn print_json_votes(
+/// The vote rows as data.
+///
+/// Shared by `--json` and the MCP server so both front ends report exactly
+/// the same shape and cannot drift apart.
+fn votes_json(
     verifier: &str,
     display_name: Option<&str>,
     voting_verifier: &str,
     chain: &str,
     rows: &[VoteRow],
     timestamps: &std::collections::HashMap<u64, String>,
-) -> Result<()> {
-    let entries = json!({
+) -> Value {
+    json!({
         "verifier": verifier,
         "name": display_name,
         "voting_verifier": voting_verifier,
@@ -275,9 +279,7 @@ fn print_json_votes(
                 "summary": vote_summary(&row.votes),
             })
         }).collect::<Vec<_>>(),
-    });
-    println!("{}", serde_json::to_string_pretty(&entries)?);
-    Ok(())
+    })
 }
 
 fn print_vote_table(
@@ -326,13 +328,23 @@ fn print_vote_table(
     );
 }
 
-pub async fn run(
+/// Everything a vote report needs, gathered without printing.
+struct VoteReport {
+    chain_axelar_id: String,
+    voting_verifier: String,
+    display_name: Option<&'static str>,
+    rows: Vec<VoteRow>,
+    timestamps: std::collections::HashMap<u64, String>,
+}
+
+/// Query one verifier's recent votes. Prints nothing, so both front ends can
+/// share it.
+async fn gather(
     network: crate::types::Network,
-    chain: String,
-    verifier: String,
+    chain: &str,
+    verifier: &str,
     limit: usize,
-    json_mode: bool,
-) -> Result<()> {
+) -> Result<VoteReport> {
     if !SUPPORTED_NETWORKS.contains(&network) {
         return Err(eyre::eyre!(
             "verifier-votes only supports: {}",
@@ -345,11 +357,11 @@ pub async fn run(
     }
 
     let config_path = config_source::resolve(network, None).await?.into_path();
-    let chain_axelar_id = resolve_chain_axelar_id(&config_path, &chain).await?;
+    let chain_axelar_id = resolve_chain_axelar_id(&config_path, chain).await?;
     let rpc = read_axelar_rpc_from(&config_path).await?;
 
     let vv_pointer = format!("/axelar/contracts/VotingVerifier/{chain_axelar_id}/address");
-    let vv_addr = read_axelar_contract_field(&config_path, &vv_pointer)
+    let voting_verifier = read_axelar_contract_field(&config_path, &vv_pointer)
         .await
         .map_err(|_| {
         eyre::eyre!(
@@ -357,47 +369,85 @@ pub async fn run(
         )
     })?;
 
-    let display_name = lookup_name(network, &verifier);
-    let verifier_display = match display_name {
-        Some(name) => format!("{name} ({verifier})"),
-        None => verifier.clone(),
-    };
-
-    if !json_mode {
-        ui::section(&format!(
-            "Verifier votes: {network} / {chain_axelar_id} / {verifier_display}"
-        ));
-    }
-
-    let rows = query_vote_rows(&rpc, &verifier, &vv_addr, limit).await?;
+    let rows = query_vote_rows(&rpc, verifier, &voting_verifier, limit).await?;
     if rows.is_empty() {
         return Err(eyre::eyre!(
             "no wasm-voted events found for {} on {} (voting-verifier {}).",
             verifier,
             chain_axelar_id,
-            vv_addr
+            voting_verifier
         ));
     }
 
     let timestamps = fetch_block_timestamps(&rpc, &rows).await;
 
+    Ok(VoteReport {
+        chain_axelar_id,
+        voting_verifier,
+        display_name: lookup_name(network, verifier),
+        rows,
+        timestamps,
+    })
+}
+
+/// One verifier's recent votes, as data.
+pub(crate) async fn resolve(
+    network: crate::types::Network,
+    chain: &str,
+    verifier: &str,
+    limit: usize,
+) -> Result<Value> {
+    let report = gather(network, chain, verifier, limit).await?;
+    Ok(votes_json(
+        verifier,
+        report.display_name,
+        &report.voting_verifier,
+        &report.chain_axelar_id,
+        &report.rows,
+        &report.timestamps,
+    ))
+}
+
+pub async fn run(
+    network: crate::types::Network,
+    chain: String,
+    verifier: String,
+    limit: usize,
+    json_mode: bool,
+) -> Result<()> {
+    let report = gather(network, &chain, &verifier, limit).await?;
+
     if json_mode {
-        return print_json_votes(
+        let entries = votes_json(
             &verifier,
-            display_name,
-            &vv_addr,
-            &chain_axelar_id,
-            &rows,
-            &timestamps,
+            report.display_name,
+            &report.voting_verifier,
+            &report.chain_axelar_id,
+            &report.rows,
+            &report.timestamps,
         );
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+        return Ok(());
     }
+
+    let verifier_display = match report.display_name {
+        Some(name) => format!("{name} ({verifier})"),
+        None => verifier.clone(),
+    };
+    // Printed after the query rather than before it, so the shared gather can
+    // stay silent. Same text as before, just emitted once the answer is in.
+    ui::section(&format!(
+        "Verifier votes: {network} / {} / {verifier_display}",
+        report.chain_axelar_id
+    ));
+
     print_vote_table(
         &verifier_display,
-        &vv_addr,
-        &chain_axelar_id,
+        &report.voting_verifier,
+        &report.chain_axelar_id,
         limit,
-        &rows,
-        &timestamps,
+        &report.rows,
+        &report.timestamps,
     );
     Ok(())
 }

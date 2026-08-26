@@ -116,7 +116,7 @@ async fn discover_programs(
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
-struct ActivityEntry {
+pub(crate) struct ActivityEntry {
     network: String,
     chain: String,
     program: String,
@@ -184,12 +184,11 @@ fn print_activity_line(
 // Main entry point
 // ---------------------------------------------------------------------------
 
-pub async fn run(
+/// Find the programs to scan, shared by both front ends.
+async fn programs_to_scan(
     program_filter: Option<SolProgram>,
     network: Option<Network>,
-    limit: usize,
-    json_mode: bool,
-) -> Result<()> {
+) -> Result<Vec<DiscoveredProgram>> {
     let networks: Vec<Network> = match network {
         Some(n) => vec![n],
         None => Network::ALL.to_vec(),
@@ -212,6 +211,30 @@ pub async fn run(
         return Err(eyre::eyre!("no Solana programs found in chains config(s)"));
     }
 
+    Ok(programs)
+}
+
+/// Scan recent program activity without printing anything.
+///
+/// The scan prints its human output as it walks each program, so quiet mode
+/// is what makes the same code usable by a caller that wants the data.
+pub(crate) async fn resolve(
+    program_filter: Option<SolProgram>,
+    network: Option<Network>,
+    limit: usize,
+) -> Result<Vec<ActivityEntry>> {
+    let programs = programs_to_scan(program_filter, network).await?;
+    let known = decode_sol_tx::known_programs();
+    Ok(spawn_blocking(move || scan_program_activity(&programs, &known, limit, true)).await?)
+}
+
+pub async fn run(
+    program_filter: Option<SolProgram>,
+    network: Option<Network>,
+    limit: usize,
+    json_mode: bool,
+) -> Result<()> {
+    let programs = programs_to_scan(program_filter, network).await?;
     let known = decode_sol_tx::known_programs();
     let all_entries =
         spawn_blocking(move || scan_program_activity(&programs, &known, limit, json_mode)).await?;

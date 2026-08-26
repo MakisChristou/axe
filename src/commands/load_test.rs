@@ -69,7 +69,7 @@ mod resolve;
 #[path = "load_test/scheduling/retry.rs"]
 mod retry;
 #[path = "load_test/support/route.rs"]
-mod route;
+pub(crate) mod route;
 #[path = "load_test/scheduling/run_sizing.rs"]
 mod run_sizing;
 #[path = "load_test/submission/sol_sender.rs"]
@@ -122,6 +122,7 @@ pub(super) use resolve::{
 // network from `--config` filenames.
 pub(crate) use resolve::detect_network_from_config;
 pub(crate) use resolve::set_cache_network;
+pub(crate) use resolve::set_report_dir;
 
 use std::env;
 use std::fmt::{Display, Formatter, Result as FmtResult};
@@ -138,7 +139,10 @@ use chain_names::{AxelarChainId, ConfigChainId, RpcUrl};
 use route::{GmpRoute, ItsRoute, SupportedRoute};
 
 /// Load test type (extensible for future directions).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "kebab-case")]
 pub enum TestType {
     /// Solana -> EVM (GMP, ITS)
     SolToEvm,
@@ -208,7 +212,18 @@ impl Display for TestType {
 
 /// Protocol: GMP (callContract), ITS (interchainTransfer), or ITS with data
 /// (interchainTransfer that triggers a contract call on the destination).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    clap::ValueEnum,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "kebab-case")]
 pub enum Protocol {
     #[default]
     Gmp,
@@ -261,6 +276,10 @@ pub(crate) struct LoadTestArgs {
     /// The first extra account is a valid ATA for the ITS token mint;
     /// remaining accounts are random pubkeys. Useful for testing ALT paths.
     pub extra_accounts: u32,
+    /// Names the report artifact when set, so a caller that started this run
+    /// in the background can find its report afterwards. `None` keeps the
+    /// CLI's historical timestamp-derived filename.
+    pub run_id: Option<String>,
 }
 
 pub async fn run(args: LoadTestArgs) -> Result<()> {

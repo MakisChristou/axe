@@ -299,6 +299,27 @@ struct OwnershipFields {
     note: String,
 }
 
+/// The ITS owner and operator table for a network, as data.
+///
+/// Queries every deployment read-only and prints nothing, so the MCP server
+/// gets the same document `--json` produces.
+pub(crate) async fn resolve(network: Network) -> Result<Value> {
+    let config_path = config_source::resolve(network, None).await?.into_path();
+    let config = ChainsConfig::load(&config_path).await?;
+    let entries = collect_its_entries(&config, network);
+
+    if entries.is_empty() {
+        return Err(eyre::eyre!(
+            "no {ITS_CONTRACT} deployments found in {}",
+            config_path.display()
+        ));
+    }
+
+    let mut rows = query_entries(entries).await;
+    sort_rows(&mut rows);
+    Ok(ownership_json(network, &config_path, &rows))
+}
+
 pub async fn run(network: Network, json_output: bool) -> Result<()> {
     let config_path = config_source::resolve(network, None).await?.into_path();
     let config = ChainsConfig::load(&config_path).await?;
@@ -330,7 +351,10 @@ pub async fn run(network: Network, json_output: bool) -> Result<()> {
 
     sort_rows(&mut rows);
     if json_output {
-        render_json(network, &config_path, &rows)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&ownership_json(network, &config_path, &rows))?
+        );
     } else {
         let hyperlinks = spawn_blocking(terminal_hyperlinks_enabled)
             .await
@@ -884,12 +908,12 @@ fn render_summary(rows: &[OwnershipRow]) {
     }
 }
 
-fn render_json(
-    network: Network,
-    config_path: &std::path::Path,
-    rows: &[OwnershipRow],
-) -> Result<()> {
-    let output = json!({
+/// The ownership rows and their summary, as data.
+///
+/// Shared by `--json` and the MCP server so both front ends report exactly
+/// the same shape and cannot drift apart.
+fn ownership_json(network: Network, config_path: &std::path::Path, rows: &[OwnershipRow]) -> Value {
+    json!({
         "network": network.to_string(),
         "config": config_path.display().to_string(),
         "rows": rows.iter().map(row_json).collect::<Vec<_>>(),
@@ -901,9 +925,7 @@ fn render_json(
             "stellar": count_kind(rows, ItsChainKind::Stellar),
             "governance": governance_summary_json(rows),
         },
-    });
-    println!("{}", serde_json::to_string_pretty(&output)?);
-    Ok(())
+    })
 }
 
 fn row_json(row: &OwnershipRow) -> Value {

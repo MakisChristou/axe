@@ -332,6 +332,59 @@ fn axe_targets(network: Network) -> Vec<ChainTarget> {
     }
 }
 
+/// Probe every wallet without printing anything.
+async fn probe_all(network: Network, config: &ChainsConfig) -> Vec<BalanceRow> {
+    let native = chain_targets(network);
+    let axe = axe_targets(network);
+    let mut rows = Vec::with_capacity(native.len() + axe.len());
+    for target in &native {
+        rows.push(probe_row(config, target, network, Asset::Native).await);
+    }
+    for target in &axe {
+        rows.push(probe_row(config, target, network, Asset::Axe).await);
+    }
+    rows
+}
+
+/// The wallet balance check as data.
+///
+/// Unlike the CLI, this reports shortfalls rather than failing: an agent needs
+/// to see which wallet is short so it can say why a flow would fail, and an
+/// error carrying only a count cannot express that.
+pub(crate) async fn resolve(network: Network) -> Result<serde_json::Value> {
+    let config_path = config_source::resolve(network, None).await?.into_path();
+    let config = ChainsConfig::load(&config_path).await?;
+    let rows = probe_all(network, &config).await;
+
+    let underfunded: Vec<&BalanceRow> = rows.iter().filter(|r| r.is_fatal()).collect();
+
+    Ok(serde_json::json!({
+        "network": network.to_string(),
+        "config": config_path.display().to_string(),
+        "wallets": rows.iter().map(balance_row_json).collect::<Vec<_>>(),
+        "summary": {
+            "checked": rows.len(),
+            "underfunded": underfunded.len(),
+            "ready": underfunded.is_empty(),
+        },
+    }))
+}
+
+/// One wallet row, with the verdicts an agent would otherwise have to derive.
+fn balance_row_json(row: &BalanceRow) -> serde_json::Value {
+    serde_json::json!({
+        "chain": row.chain_key,
+        "chain_type": row.kind.label(),
+        "asset": row.token_symbol,
+        "address": row.address,
+        "balance": row.balance,
+        "threshold": row.threshold,
+        "underfunded": row.is_underfunded(),
+        "blocking": row.is_fatal(),
+        "note": row.note,
+    })
+}
+
 pub async fn run(network: Network) -> Result<()> {
     let config_path = config_source::resolve(network, None).await?.into_path();
     let config = ChainsConfig::load(&config_path).await?;
@@ -339,15 +392,7 @@ pub async fn run(network: Network) -> Result<()> {
     ui::section(&format!("wallet balance check: {network}"));
     ui::kv("config", &config_path.display().to_string());
 
-    let native = chain_targets(network);
-    let axe = axe_targets(network);
-    let mut rows = Vec::with_capacity(native.len() + axe.len());
-    for target in &native {
-        rows.push(probe_row(&config, target, network, Asset::Native).await);
-    }
-    for target in &axe {
-        rows.push(probe_row(&config, target, network, Asset::Axe).await);
-    }
+    let rows = probe_all(network, &config).await;
 
     render_table(&rows);
 

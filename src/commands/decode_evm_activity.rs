@@ -112,7 +112,7 @@ async fn discover_contracts(
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
-struct EvmActivityEntry {
+pub(crate) struct EvmActivityEntry {
     network: String,
     chain: String,
     contract: String,
@@ -162,13 +162,13 @@ fn print_event_line(block: u64, event_name: &str, params: &str, transaction_hash
 // Main entry point
 // ---------------------------------------------------------------------------
 
-pub async fn run(
+async fn collect(
     contract_filter: Option<EvmContract>,
     network: Network,
     chain: String,
     limit: usize,
     json_mode: bool,
-) -> Result<()> {
+) -> Result<Vec<EvmActivityEntry>> {
     let config_path = config_source::resolve(network, None).await?.into_path();
     let contracts = discover_contracts(network, &config_path, &chain, contract_filter).await;
 
@@ -266,6 +266,31 @@ pub async fn run(
             });
         }
     }
+
+    Ok(all_entries)
+}
+
+/// Scan recent contract events without printing anything.
+///
+/// The scan prints each event as it walks the logs, so quiet mode is what
+/// makes the same code usable by a caller that wants the data.
+pub(crate) async fn resolve(
+    contract_filter: Option<EvmContract>,
+    network: Network,
+    chain: String,
+    limit: usize,
+) -> Result<Vec<EvmActivityEntry>> {
+    collect(contract_filter, network, chain, limit, true).await
+}
+
+pub async fn run(
+    contract_filter: Option<EvmContract>,
+    network: Network,
+    chain: String,
+    limit: usize,
+    json_mode: bool,
+) -> Result<()> {
+    let all_entries = collect(contract_filter, network, chain, limit, json_mode).await?;
 
     if json_mode {
         println!("{}", serde_json::to_string_pretty(&all_entries)?);
@@ -367,7 +392,12 @@ fn params_to_json(params: &[(String, DynSolValue)]) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
-fn sol_value_to_json(value: &DynSolValue) -> serde_json::Value {
+/// Convert a decoded ABI value to JSON.
+///
+/// Shared with the calldata decoder: this is the leaf case of a decoded
+/// argument tree, and having one converter keeps the two front ends agreeing
+/// on how a uint or a byte string is represented.
+pub(crate) fn sol_value_to_json(value: &DynSolValue) -> serde_json::Value {
     match value {
         DynSolValue::Bool(b) => json!(b),
         DynSolValue::Uint(u, _) => json!(format!("{u}")),

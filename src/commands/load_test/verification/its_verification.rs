@@ -234,5 +234,5 @@ async fn finish_sustained(
         num_keys,
     );
     session.finish(&mut report, args.network).await?;
-    finish_report(&mut report, test_start).await
+    finish_report(&mut report, test_start, args.run_id.as_deref()).await
 }

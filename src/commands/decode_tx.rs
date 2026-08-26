@@ -364,3 +364,115 @@ async fn solana_rpcs_from_configs(
     }
     rpcs
 }
+
+/// One decoded event from a transaction receipt.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct DecodedLog {
+    pub address: String,
+    /// The event signature when its topic0 is in the embedded ABI database.
+    pub event: Option<String>,
+    pub params: Vec<super::decode::DecodedArgument>,
+}
+
+/// An EVM transaction, decoded.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct DecodedTransaction {
+    /// Which chain the transaction was found on. axe searches every configured
+    /// EVM chain, so this is a result rather than an input.
+    pub chain: String,
+    pub tx_hash: String,
+    pub block: Option<u64>,
+    pub from: String,
+    pub to: Option<String>,
+    pub value_wei: String,
+    /// Absent when the receipt could not be fetched, which is not the same as
+    /// a failed transaction.
+    pub succeeded: Option<bool>,
+    /// The decoded call, when the transaction carried input.
+    pub input: Option<super::decode::DecodedPayload>,
+    pub logs: Vec<DecodedLog>,
+}
+
+fn decode_logs(receipt: &TransactionReceipt) -> Vec<DecodedLog> {
+    receipt
+        .inner
+        .logs()
+        .iter()
+        .map(|log| {
+            let topics: Vec<B256> = log.topics().to_vec();
+            let data = log.data().data.as_ref();
+
+            match decode::decode_log(&topics, data) {
+                Some((signature, params)) => DecodedLog {
+                    address: format!("{:#x}", log.address()),
+                    event: Some(signature),
+                    params: params
+                        .iter()
+                        .map(|(name, value)| super::decode::DecodedArgument {
+                            name: name.clone(),
+                            ty: String::new(),
+                            value: super::decode_evm_activity::sol_value_to_json(value),
+                        })
+                        .collect(),
+                },
+                None => DecodedLog {
+                    address: format!("{:#x}", log.address()),
+                    event: None,
+                    params: Vec::new(),
+                },
+            }
+        })
+        .collect()
+}
+
+/// Fetch and decode an EVM transaction without printing.
+///
+/// Solana signatures are not handled: `decode_sol_tx` only exposes a printing
+/// entry point, so structuring that path is separate work. Callers should
+/// reject non-EVM input before calling this.
+pub(crate) async fn resolve_evm(
+    txid: &str,
+    config: Option<&Path>,
+    chain_filter: Option<&str>,
+) -> Result<DecodedTransaction> {
+    let tx_hash: TxHash = txid.parse().map_err(|_| eyre::eyre!("invalid tx hash"))?;
+
+    let configs: Vec<PathBuf> = match config {
+        Some(c) => vec![c.to_path_buf()],
+        None => resolve_all_configs().await?,
+    };
+
+    let mut rpcs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for cfg in &configs {
+        for chain in load_evm_rpcs(cfg, chain_filter).await? {
+            if seen.insert(chain.rpc.clone()) {
+                rpcs.push(chain);
+            }
+        }
+    }
+    if rpcs.is_empty() {
+        bail!("no EVM chains found in config(s)");
+    }
+
+    let (chain, tx, receipt) = fetch_tx(&rpcs, tx_hash).await?;
+
+    let input = tx.inner.input();
+    let decoded_input = if input.is_empty() {
+        None
+    } else {
+        decode::decode_payload(input).ok()
+    };
+
+    Ok(DecodedTransaction {
+        chain,
+        tx_hash: format!("{tx_hash:#x}"),
+        block: tx.block_number,
+        from: format!("{:#x}", tx.inner.signer()),
+        to: tx.inner.to().map(|to| format!("{to:#x}")),
+        value_wei: tx.inner.value().to_string(),
+        succeeded: receipt.as_ref().map(TransactionReceipt::status),
+        input: decoded_input,
+        logs: receipt.as_ref().map(decode_logs).unwrap_or_default(),
+    })
+}

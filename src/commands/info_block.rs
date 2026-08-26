@@ -56,13 +56,35 @@ fn print_times(time: DateTime<Utc>) {
     );
 }
 
-pub async fn run(network: Network, number: Option<u64>, at_time: Option<String>) -> Result<()> {
+/// What a block lookup resolved to, independent of how it is rendered.
+///
+/// `run` prints this for the CLI and the MCP server serializes it, so the
+/// query runs once and both front ends agree on the answer.
+#[derive(Debug, serde::Serialize)]
+pub struct BlockInfo {
+    pub network: Network,
+    pub height: u64,
+    pub time: DateTime<Utc>,
+    /// True when the height or the time was extrapolated from the current
+    /// block rate rather than read from a block that already exists.
+    pub predicted: bool,
+    /// Seconds per block used to extrapolate, absent when not predicting.
+    pub rate_secs_per_block: Option<f64>,
+}
+
+/// Resolve a block lookup without printing anything.
+///
+/// With no arguments this reports the head. A past height reports that
+/// block's real timestamp. A future height, or `at_time`, extrapolates from
+/// the rate measured over [`RATE_SAMPLE_WINDOW`] blocks.
+pub async fn resolve(
+    network: Network,
+    number: Option<u64>,
+    at_time: Option<String>,
+) -> Result<BlockInfo> {
     let config_path = config_source::resolve(network, None).await?.into_path();
     let rpc = read_axelar_rpc_from(&config_path).await?;
 
-    ui::section(&format!("Info: block ({network})"));
-
-    let spinner = ui::wait_spinner("querying Tendermint RPC...");
     let (head_height, head_time_raw) = rpc_block_info(&rpc, None).await?;
     let head_time = parse_block_time(&head_time_raw)?;
 
@@ -71,47 +93,28 @@ pub async fn run(network: Network, number: Option<u64>, at_time: Option<String>)
         && n <= head_height
     {
         let (h, t_raw) = rpc_block_info(&rpc, Some(n)).await?;
-        let t = parse_block_time(&t_raw)?;
-        spinner.finish_and_clear();
-        ui::kv("Block", &h.to_string());
-        print_times(t);
-        return Ok(());
+        return Ok(BlockInfo {
+            network,
+            height: h,
+            time: parse_block_time(&t_raw)?,
+            predicted: false,
+            rate_secs_per_block: None,
+        });
     }
 
-    // Either future block or --at-time: need rate from a sample window.
+    // Either future block or an explicit time: both need a measured rate.
     if number.is_some() || at_time.is_some() {
-        let sample_window = RATE_SAMPLE_WINDOW.min(head_height.saturating_sub(1));
-        if sample_window == 0 {
-            spinner.finish_and_clear();
-            return Err(eyre::eyre!(
-                "chain has too few blocks ({head_height}) to sample a block rate"
-            ));
-        }
-        let sample_height = head_height - sample_window;
-        let (_, sample_time_raw) = rpc_block_info(&rpc, Some(sample_height)).await?;
-        let sample_time = parse_block_time(&sample_time_raw)?;
-        spinner.finish_and_clear();
-
-        let elapsed_secs = (head_time - sample_time).num_milliseconds() as f64 / 1000.0;
-        let rate_secs_per_block = elapsed_secs / sample_window as f64;
-        if rate_secs_per_block <= 0.0 {
-            return Err(eyre::eyre!(
-                "computed non-positive block rate ({rate_secs_per_block:.3}s); RPC may have returned out-of-order timestamps"
-            ));
-        }
+        let rate = measure_block_rate(&rpc, head_height, head_time).await?;
 
         if let Some(n) = number {
-            let delta_blocks = n - head_height;
-            let delta_secs = delta_blocks as f64 * rate_secs_per_block;
-            let predicted =
-                head_time + chrono::Duration::milliseconds((delta_secs * 1000.0) as i64);
-            ui::kv("Block", &n.to_string());
-            print_times(predicted);
-            ui::kv(
-                "Note",
-                &format!("prediction using {rate_secs_per_block:.2}s / block"),
-            );
-            return Ok(());
+            let delta_secs = (n - head_height) as f64 * rate;
+            return Ok(BlockInfo {
+                network,
+                height: n,
+                time: head_time + chrono::Duration::milliseconds((delta_secs * 1000.0) as i64),
+                predicted: true,
+                rate_secs_per_block: Some(rate),
+            });
         }
 
         let target = parse_at_time(
@@ -119,26 +122,65 @@ pub async fn run(network: Network, number: Option<u64>, at_time: Option<String>)
                 .as_deref()
                 .ok_or_else(|| eyre::eyre!("missing --at-time value"))?,
         )?;
-        let delta_secs = (target - head_time).num_milliseconds() as f64 / 1000.0;
-        let delta_blocks = delta_secs / rate_secs_per_block;
+        let delta_blocks = (target - head_time).num_milliseconds() as f64 / 1000.0 / rate;
         let predicted_height = head_height as f64 + delta_blocks;
         if predicted_height < 1.0 {
             return Err(eyre::eyre!(
                 "target time predates the chain genesis at the current rate"
             ));
         }
-        ui::kv("Block", &format!("{}", predicted_height.round() as u64));
-        print_times(target);
-        ui::kv(
-            "Note",
-            &format!("prediction using {rate_secs_per_block:.2}s / block"),
-        );
-        return Ok(());
+        return Ok(BlockInfo {
+            network,
+            height: predicted_height.round() as u64,
+            time: target,
+            predicted: true,
+            rate_secs_per_block: Some(rate),
+        });
     }
 
-    // No args: show the head.
+    Ok(BlockInfo {
+        network,
+        height: head_height,
+        time: head_time,
+        predicted: false,
+        rate_secs_per_block: None,
+    })
+}
+
+/// Seconds per block, averaged over the sample window behind the head.
+async fn measure_block_rate(rpc: &str, head_height: u64, head_time: DateTime<Utc>) -> Result<f64> {
+    let sample_window = RATE_SAMPLE_WINDOW.min(head_height.saturating_sub(1));
+    if sample_window == 0 {
+        return Err(eyre::eyre!(
+            "chain has too few blocks ({head_height}) to sample a block rate"
+        ));
+    }
+
+    let (_, sample_time_raw) = rpc_block_info(rpc, Some(head_height - sample_window)).await?;
+    let sample_time = parse_block_time(&sample_time_raw)?;
+
+    let elapsed_secs = (head_time - sample_time).num_milliseconds() as f64 / 1000.0;
+    let rate = elapsed_secs / sample_window as f64;
+    if rate <= 0.0 {
+        return Err(eyre::eyre!(
+            "computed non-positive block rate ({rate:.3}s); RPC may have returned out-of-order timestamps"
+        ));
+    }
+    Ok(rate)
+}
+
+pub async fn run(network: Network, number: Option<u64>, at_time: Option<String>) -> Result<()> {
+    ui::section(&format!("Info: block ({network})"));
+
+    let spinner = ui::wait_spinner("querying Tendermint RPC...");
+    let info = resolve(network, number, at_time).await;
     spinner.finish_and_clear();
-    ui::kv("Block", &head_height.to_string());
-    print_times(head_time);
+    let info = info?;
+
+    ui::kv("Block", &info.height.to_string());
+    print_times(info.time);
+    if let Some(rate) = info.rate_secs_per_block {
+        ui::kv("Note", &format!("prediction using {rate:.2}s / block"));
+    }
     Ok(())
 }

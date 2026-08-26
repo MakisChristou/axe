@@ -46,6 +46,178 @@ pub fn run(calldata_hex: &str) -> Result<()> {
     decode_bytes(&data, "")
 }
 
+/// A decoded function call: what it is, and its named arguments.
+///
+/// Only the function-selector branch of the decoder is represented here. The
+/// exotic payload shapes -- ITS hub frames, governance proposals, plain ITS
+/// payloads and the fallback patterns -- are still printer-only, and giving
+/// them structure is the remainder of the decoder restructuring work.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct DecodedCall {
+    /// The full solidity signature, for example `transfer(address,uint256)`.
+    pub signature: String,
+    pub arguments: Vec<DecodedArgument>,
+}
+
+/// One argument of a decoded call.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct DecodedArgument {
+    /// The parameter name, or `argN` when the ABI does not name it.
+    pub name: String,
+    /// The solidity type, for example `uint256`.
+    #[serde(rename = "type")]
+    pub ty: String,
+    pub value: serde_json::Value,
+}
+
+/// Decode calldata as a known function call, without printing.
+///
+/// Returns `None` when the leading four bytes are not a selector in the
+/// embedded ABI database, which is also the case for every non-call payload
+/// shape. A caller that gets `None` has learned that this is not a plain
+/// function call, not that the bytes are undecodable.
+///
+/// Deliberately additive: the printer above is untouched, so the CLI's output
+/// cannot change as a result of this existing.
+pub(crate) fn decode_call(data: &[u8]) -> Result<Option<DecodedCall>> {
+    if data.len() < 4 {
+        return Ok(None);
+    }
+
+    let selector = <[u8; 4]>::try_from(&data[..4])?;
+    let Some(func) = function_db()?.get(&selector) else {
+        return Ok(None);
+    };
+
+    let values = func.abi_decode_input(&data[4..])?;
+    let arguments = func
+        .inputs
+        .iter()
+        .zip(values.iter())
+        .enumerate()
+        .map(|(i, (param, value))| DecodedArgument {
+            name: if param.name.is_empty() {
+                format!("arg{i}")
+            } else {
+                param.name.clone()
+            },
+            ty: param.ty.clone(),
+            value: super::decode_evm_activity::sol_value_to_json(value),
+        })
+        .collect();
+
+    Ok(Some(DecodedCall {
+        signature: func.signature(),
+        arguments,
+    }))
+}
+
+/// What a payload turned out to be.
+///
+/// The variants mirror the shapes the printer recognises, and are tried in the
+/// same order it tries them, so a structured answer always agrees with what
+/// the CLI would print for the same bytes.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub(crate) enum DecodedPayload {
+    /// A call whose selector is in the embedded ABI database.
+    FunctionCall(DecodedCall),
+    /// An Interchain Token Service message. Hub frames are ITS message types
+    /// 3 and 4, so they land here too.
+    ItsMessage {
+        name: &'static str,
+        fields: Vec<DecodedArgument>,
+    },
+    /// An AxelarServiceGovernance proposal payload.
+    GovernanceProposal {
+        command: u64,
+        command_name: &'static str,
+        target: String,
+        native_value: String,
+        eta: u64,
+        /// The inner call, when its selector is known.
+        call: Option<DecodedCall>,
+    },
+    /// Printable text.
+    Text { text: String },
+    /// Recognised by none of the above. The CLI has further fallback patterns
+    /// that are still printer-only, so `axe decode` may still say something
+    /// useful about these bytes.
+    Unrecognised { reason: &'static str },
+}
+
+/// Decode a payload without printing, trying the shapes in the printer's order.
+pub(crate) fn decode_payload(data: &[u8]) -> Result<DecodedPayload> {
+    if let Some(call) = decode_call(data)? {
+        return Ok(DecodedPayload::FunctionCall(call));
+    }
+
+    // Hub frames first: a hub frame's bytes offset also lands at 0xa0, so
+    // governance would otherwise claim it.
+    let is_hub_frame = matches!(its_message_type(data), Some(3 | 4));
+    if is_hub_frame && let Some(its) = decode_its(data) {
+        return Ok(its);
+    }
+
+    // Governance before plain ITS: command 0 collides with ITS msgType 0.
+    if let Some(proposal) = parse_governance(data) {
+        return Ok(DecodedPayload::GovernanceProposal {
+            command: proposal.command,
+            command_name: proposal.command_name,
+            target: format!("0x{:x}", proposal.target),
+            native_value: proposal.native_value.to_string(),
+            eta: proposal.eta.saturating_to(),
+            call: decode_call(&proposal.call_data)?,
+        });
+    }
+
+    if let Some(its) = decode_its(data) {
+        return Ok(its);
+    }
+
+    if let Ok(text) = std::str::from_utf8(data)
+        && !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace())
+    {
+        return Ok(DecodedPayload::Text {
+            text: text.to_string(),
+        });
+    }
+
+    Ok(DecodedPayload::Unrecognised {
+        reason: "not a known selector, ITS message, governance proposal or text",
+    })
+}
+
+/// An ITS message as structured fields, reusing the printer's own parser.
+fn decode_its(data: &[u8]) -> Option<DecodedPayload> {
+    let ItsMessage {
+        name,
+        types,
+        labels,
+        values,
+    } = parse_its(data)?;
+
+    let fields = values
+        .iter()
+        .zip(labels.iter().zip(types.iter()))
+        .map(|(value, (label, ty))| DecodedArgument {
+            name: (*label).to_string(),
+            ty: ty.to_string(),
+            value: super::decode_evm_activity::sol_value_to_json(value),
+        })
+        .collect();
+
+    Some(DecodedPayload::ItsMessage { name, fields })
+}
+
+/// Parse a hex string and decode whatever shape it turns out to be.
+pub(crate) fn decode_payload_hex(payload_hex: &str) -> Result<DecodedPayload> {
+    decode_payload(&parse_hex(payload_hex)?)
+}
+
 pub(crate) fn decode_bytes(data: &[u8], indent: &str) -> Result<()> {
     // Try as function call (4-byte selector lookup)
     if data.len() >= 4

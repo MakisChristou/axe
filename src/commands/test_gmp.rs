@@ -248,7 +248,7 @@ async fn execute_config_destination(
     network: crate::types::Network,
     sent: &source::SentGmp,
     execute_data_hex: &str,
-) -> Result<()> {
+) -> Result<destination::SubmittedTransactions> {
     let rpc = destination_config
         .rpc
         .as_deref()
@@ -387,7 +387,7 @@ pub async fn run_config(
     destination_chain: Option<String>,
     destination_address: Option<String>,
     mnemonic_override: Option<String>,
-) -> Result<()> {
+) -> Result<destination::SubmittedTransactions> {
     let cfg = ChainsConfig::load(&config).await?;
 
     let src = source_chain.ok_or_else(|| eyre::eyre!("--source-chain required with --config"))?;
@@ -485,7 +485,7 @@ pub async fn run_config(
     };
     let execute_data_hex =
         relay::run_full_sequence(&ctx, &signing_key, &gmp_msg, &src, &sent.message_id, 8).await?;
-    execute_config_destination(
+    let submitted = execute_config_destination(
         dst_type,
         dst_cfg,
         &src,
@@ -497,5 +497,5 @@ pub async fn run_config(
     .await?;
 
     print_gmp_completion(gmp_start);
-    Ok(())
+    Ok(submitted)
 }

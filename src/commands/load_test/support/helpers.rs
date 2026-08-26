@@ -262,7 +262,11 @@ fn hint_persist_sender_receiver(chain: &str, addr: Address) {
     ));
 }
 
-pub(crate) async fn finish_report(report: &mut LoadTestReport, run_start: Instant) -> Result<()> {
+pub(crate) async fn finish_report(
+    report: &mut LoadTestReport,
+    run_start: Instant,
+    run_id: Option<&str>,
+) -> Result<()> {
     // Scrub any URLs that upstream-crate errors may have folded into
     // per-tx error strings. Belt-and-suspenders alongside the error-template
     // refactor: private RPC URLs (from repo secrets) must not appear in the
@@ -277,10 +281,17 @@ pub(crate) async fn finish_report(report: &mut LoadTestReport, run_start: Instan
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let log_dir = Path::new("axe-load-test-logs");
-    let log_path = log_dir.join(format!("axe-load-test-{ts}.json"));
+    let log_dir = super::resolve::report_dir();
+    // A caller that started this run in the background named it, and needs
+    // that name back to find the report. Without one, keep the historical
+    // timestamp filename that existing scripts glob for.
+    let log_name = run_id.map_or_else(
+        || format!("axe-load-test-{ts}.json"),
+        |id| format!("{id}.json"),
+    );
+    let log_path = log_dir.join(log_name);
     let mut report_written = false;
-    match fs::create_dir_all(log_dir).await {
+    match fs::create_dir_all(&log_dir).await {
         Ok(()) => match serde_json::to_string_pretty(report) {
             Ok(json) => match fs::write(&log_path, &json).await {
                 Ok(()) => {
