@@ -70,6 +70,23 @@ const BASE_FEE_DEPLOY: u32 = 200_000;
 /// real failures.
 const VALIDATE_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// Outcome of waiting on a submitted classic tx.
+enum ClassicOutcome {
+    /// Validated with SUCCESS.
+    Validated,
+    /// Validated but FAILED on chain.
+    Failed,
+    /// `VALIDATE_TIMEOUT` passed and the funder's sequence never advanced:
+    /// the tx was evicted from the queue (usually an underpriced inclusion
+    /// bid during surge - no TxInsufficientFee is ever returned for this).
+    /// A higher-fee rebuild at the same sequence cannot double-send.
+    Dropped,
+    /// `VALIDATE_TIMEOUT` passed but the sequence advanced - some tx from
+    /// this account landed (possibly ours, not yet visible on this RPC), so
+    /// resubmitting risks a double-send. Callers must stop.
+    SequenceAdvanced,
+}
+
 #[derive(Clone)]
 pub struct StellarClient {
     pub rpc: RpcClient,
@@ -156,46 +173,20 @@ impl StellarClient {
         }
     }
 
-    /// Activate `destination` by submitting a classic `CreateAccount` op
-    /// signed by `funder`. Used on mainnet (where Friendbot doesn't exist)
-    /// to bootstrap derived ephemeral signing keys from the main wallet.
-    ///
-    /// `starting_balance_stroops` is the initial XLM transferred (1e7 stroops =
-    /// 1 XLM). Stellar requires at least the base reserve (1 XLM today) — the
-    /// caller should pick a value above that with enough headroom for the
-    /// derived key's expected fees + Soroban auth costs.
-    pub async fn create_account_classic(
+    /// Submit `ops` as a classic tx at `seq + 1`, climbing the fee ladder
+    /// from `start_tier` on explicit `TxInsufficientFee` rejections (a
+    /// rejected submission never entered the queue, so a rebuilt higher-fee
+    /// envelope at the same sequence cannot double-send). Returns the tx
+    /// hash and the tier that was accepted.
+    async fn submit_classic_with_ladder(
         &self,
         funder: &StellarWallet,
-        destination_pubkey: &[u8; 32],
-        starting_balance_stroops: i64,
-    ) -> Result<String> {
-        let seq = self
-            .account_sequence(&funder.address())
-            .await?
-            .ok_or_else(|| {
-                eyre!(
-                    "funder Stellar account {} is not activated",
-                    funder.address()
-                )
-            })?;
-
-        let destination = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
-            *destination_pubkey,
-        )));
-        let op = Operation {
-            source_account: None,
-            body: OperationBody::CreateAccount(CreateAccountOp {
-                destination,
-                starting_balance: starting_balance_stroops,
-            }),
-        };
-        let ops: VecM<Operation, 100> = vec![op].try_into().map_err(|e| eyre!("ops: {e}"))?;
-        // Climb the fee ladder on TxInsufficientFee (surge pricing): a
-        // rejected submission never entered the queue, so a rebuilt
-        // higher-fee envelope at the same sequence cannot double-send.
-        let mut hash = None;
-        for (tier, &fee) in CLASSIC_FEE_LADDER.iter().enumerate() {
+        ops: &VecM<Operation, 100>,
+        seq: i64,
+        start_tier: usize,
+        label: &str,
+    ) -> Result<(Hash, usize)> {
+        for (tier, &fee) in CLASSIC_FEE_LADDER.iter().enumerate().skip(start_tier) {
             let tx = Transaction {
                 source_account: funder.muxed_account(),
                 fee,
@@ -207,7 +198,7 @@ impl StellarClient {
             };
             let signed = self.sign(funder, tx)?;
             // Rebroadcasting the identical signed envelope is idempotent
-            // (fixed sequence — at most one copy lands), so transient
+            // (fixed sequence - at most one copy lands), so transient
             // transport errors safely retry the same envelope. Never re-sign
             // inside the retry.
             let sent = crate::retry::retry_async(
@@ -218,45 +209,117 @@ impl StellarClient {
             )
             .await;
             match sent {
-                Ok(sent_hash) => {
-                    hash = Some(sent_hash);
-                    break;
-                }
+                Ok(hash) => return Ok((hash, tier)),
                 Err(error)
                     if is_insufficient_fee(&error) && tier + 1 < CLASSIC_FEE_LADDER.len() =>
                 {
                     crate::ui::warn(&format!(
-                        "stellar create_account: TxInsufficientFee at {fee} stroops — \
-                         resubmitting at {}",
+                        "stellar {label}: TxInsufficientFee at {fee} stroops - resubmitting \
+                         at {}",
                         CLASSIC_FEE_LADDER[tier + 1]
                     ));
                 }
                 Err(error) => return Err(eyre!("send_transaction: {error}")),
             }
         }
-        let hash = hash.ok_or_else(|| eyre!("create_account: fee ladder exhausted"))?;
-        let tx_hash_hex = hex::encode(hash.0);
+        Err(eyre!("{label}: fee ladder exhausted"))
+    }
 
+    /// Activate `destination` by submitting a classic `CreateAccount` op
+    /// signed by `funder`. Used on mainnet (where Friendbot doesn't exist)
+    /// to bootstrap derived ephemeral signing keys from the main wallet.
+    ///
+    /// `starting_balance_stroops` is the initial XLM transferred (1e7 stroops =
+    /// 1 XLM). Stellar requires at least the base reserve (1 XLM today) - the
+    /// caller should pick a value above that with enough headroom for the
+    /// derived key's expected fees + Soroban auth costs.
+    /// Poll `hash` until validated or `VALIDATE_TIMEOUT`, then classify a
+    /// timeout as dropped-vs-landed via the funder's sequence (`seq_used` is
+    /// the sequence the tx consumed, i.e. the pre-submit value + 1).
+    async fn classic_outcome(
+        &self,
+        funder_addr: &str,
+        hash: &Hash,
+        seq_used: i64,
+    ) -> ClassicOutcome {
         let start = Instant::now();
-        loop {
-            if let Ok(resp) = self.rpc.get_transaction(&hash).await
+        while start.elapsed() < VALIDATE_TIMEOUT {
+            if let Ok(resp) = self.rpc.get_transaction(hash).await
                 && let Some(status) = extract_status(&resp)
             {
                 match status.as_str() {
-                    "SUCCESS" => return Ok(tx_hash_hex),
-                    "FAILED" => {
-                        return Err(eyre!("create_account tx {tx_hash_hex} failed on chain"));
-                    }
+                    "SUCCESS" => return ClassicOutcome::Validated,
+                    "FAILED" => return ClassicOutcome::Failed,
                     _ => {}
                 }
             }
-            if start.elapsed() >= VALIDATE_TIMEOUT {
-                return Err(eyre!(
-                    "create_account tx {tx_hash_hex} not validated within {:?}",
-                    VALIDATE_TIMEOUT
-                ));
-            }
             tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        match self.account_sequence(funder_addr).await {
+            Ok(Some(seq_now)) if seq_now < seq_used => ClassicOutcome::Dropped,
+            // Sequence advanced, or unreadable - do not risk a resubmit.
+            _ => ClassicOutcome::SequenceAdvanced,
+        }
+    }
+
+    pub async fn create_account_classic(
+        &self,
+        funder: &StellarWallet,
+        destination_pubkey: &[u8; 32],
+        starting_balance_stroops: i64,
+    ) -> Result<String> {
+        let destination = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+            *destination_pubkey,
+        )));
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::CreateAccount(CreateAccountOp {
+                destination,
+                starting_balance: starting_balance_stroops,
+            }),
+        };
+        let ops: VecM<Operation, 100> = vec![op].try_into().map_err(|e| eyre!("ops: {e}"))?;
+        // Fee tier persists across dropped-tx resubmits: a silently dropped
+        // classic tx is the surge-priced twin of TxInsufficientFee, so the
+        // resubmit climbs the same ladder (a different, better-bidding tx).
+        let mut start_tier = 0;
+        loop {
+            let seq = self
+                .account_sequence(&funder.address())
+                .await?
+                .ok_or_else(|| {
+                    eyre!(
+                        "funder Stellar account {} is not activated",
+                        funder.address()
+                    )
+                })?;
+            let (hash, tier_used) = self
+                .submit_classic_with_ladder(funder, &ops, seq, start_tier, "create_account")
+                .await?;
+            let tx_hash_hex = hex::encode(hash.0);
+            match self
+                .classic_outcome(&funder.address(), &hash, seq + 1)
+                .await
+            {
+                ClassicOutcome::Validated => return Ok(tx_hash_hex),
+                ClassicOutcome::Failed => {
+                    return Err(eyre!("create_account tx {tx_hash_hex} failed on chain"));
+                }
+                ClassicOutcome::Dropped if tier_used + 1 < CLASSIC_FEE_LADDER.len() => {
+                    start_tier = tier_used + 1;
+                    crate::ui::warn(&format!(
+                        "stellar create_account: tx {tx_hash_hex} dropped (not validated in \
+                         {:?}, sequence unchanged) — resubmitting at {} stroops",
+                        VALIDATE_TIMEOUT, CLASSIC_FEE_LADDER[start_tier],
+                    ));
+                }
+                ClassicOutcome::Dropped | ClassicOutcome::SequenceAdvanced => {
+                    return Err(eyre!(
+                        "create_account tx {tx_hash_hex} not validated within {:?}",
+                        VALIDATE_TIMEOUT
+                    ));
+                }
+            }
         }
     }
 
@@ -301,98 +364,110 @@ impl StellarClient {
         // colliding tx has either settled or been dropped.
         const MAX_SEQ_RETRIES: u8 = 6;
         let mut attempt: u8 = 0;
+        // Fee tier persists across dropped-tx resubmits: a silently dropped
+        // classic tx is the surge-priced twin of TxInsufficientFee, so the
+        // resubmit climbs the same ladder (a different, better-bidding tx).
         let mut fee_tier: usize = 0;
-        let hash = loop {
-            let seq = self
-                .account_sequence(&funder.address())
-                .await?
-                .ok_or_else(|| {
-                    eyre!(
-                        "funder Stellar account {} is not activated",
-                        funder.address()
-                    )
-                })?;
-
-            let destination = MuxedAccount::Ed25519(Uint256(*destination_pubkey));
-            let op = Operation {
-                source_account: None,
-                body: OperationBody::Payment(PaymentOp {
-                    destination,
-                    asset: Asset::Native,
-                    amount: amount_stroops,
-                }),
-            };
-            let ops: VecM<Operation, 100> = vec![op].try_into().map_err(|e| eyre!("ops: {e}"))?;
-            let tx = Transaction {
-                source_account: funder.muxed_account(),
-                fee: CLASSIC_FEE_LADDER[fee_tier],
-                seq_num: SequenceNumber(seq + 1),
-                cond: Preconditions::None,
-                memo: Memo::None,
-                operations: ops,
-                ext: TransactionExt::V0,
-            };
-            let signed = self.sign(funder, tx)?;
-            // Transient transport errors rebroadcast the identical signed
-            // envelope (idempotent: fixed sequence, at most one copy lands).
-            // TxBadSeq is not transient, so it bails out of the retry and
-            // falls through to the re-fetch recovery below.
-            let sent = crate::retry::retry_async(
-                "stellar.send_transaction",
-                crate::retry::FALLBACK_ATTEMPTS,
-                crate::retry::is_transient_default,
-                || async { self.rpc.send_transaction(&signed).await },
-            )
-            .await;
-            match sent {
-                Ok(hash) => break hash,
-                Err(e) if attempt + 1 < MAX_SEQ_RETRIES && format!("{e}").contains("TxBadSeq") => {
-                    crate::ui::warn(&format!(
-                        "stellar pay_native_classic: TxBadSeq on attempt {} \
-                         (concurrent funder use? re-fetching sequence)",
-                        attempt + 1,
-                    ));
-                    // Jittered backoff so the colliding tx settles - and so two
-                    // racing runs do not wake together and collide again.
-                    tokio::time::sleep(crate::retry::backoff_for_attempt(u32::from(attempt))).await;
-                    attempt += 1;
-                    continue;
-                }
-                Err(e) if is_insufficient_fee(&e) && fee_tier + 1 < CLASSIC_FEE_LADDER.len() => {
-                    crate::ui::warn(&format!(
-                        "stellar pay_native_classic: TxInsufficientFee at {} stroops — \
-                         resubmitting at {}",
-                        CLASSIC_FEE_LADDER[fee_tier],
-                        CLASSIC_FEE_LADDER[fee_tier + 1],
-                    ));
-                    fee_tier += 1;
-                    continue;
-                }
-                Err(e) => return Err(eyre!("send_transaction: {e}")),
-            }
-        };
-        let tx_hash_hex = hex::encode(hash.0);
-
-        let start = Instant::now();
         loop {
-            if let Ok(resp) = self.rpc.get_transaction(&hash).await
-                && let Some(status) = extract_status(&resp)
-            {
-                match status.as_str() {
-                    "SUCCESS" => return Ok(tx_hash_hex),
-                    "FAILED" => {
-                        return Err(eyre!("payment tx {tx_hash_hex} failed on chain"));
+            let (hash, seq_used) = loop {
+                let seq = self
+                    .account_sequence(&funder.address())
+                    .await?
+                    .ok_or_else(|| {
+                        eyre!(
+                            "funder Stellar account {} is not activated",
+                            funder.address()
+                        )
+                    })?;
+
+                let destination = MuxedAccount::Ed25519(Uint256(*destination_pubkey));
+                let op = Operation {
+                    source_account: None,
+                    body: OperationBody::Payment(PaymentOp {
+                        destination,
+                        asset: Asset::Native,
+                        amount: amount_stroops,
+                    }),
+                };
+                let ops: VecM<Operation, 100> =
+                    vec![op].try_into().map_err(|e| eyre!("ops: {e}"))?;
+                let tx = Transaction {
+                    source_account: funder.muxed_account(),
+                    fee: CLASSIC_FEE_LADDER[fee_tier],
+                    seq_num: SequenceNumber(seq + 1),
+                    cond: Preconditions::None,
+                    memo: Memo::None,
+                    operations: ops,
+                    ext: TransactionExt::V0,
+                };
+                let signed = self.sign(funder, tx)?;
+                // Transient transport errors rebroadcast the identical signed
+                // envelope (idempotent: fixed sequence, at most one copy lands).
+                // TxBadSeq is not transient, so it bails out of the retry and
+                // falls through to the re-fetch recovery below.
+                let sent = crate::retry::retry_async(
+                    "stellar.send_transaction",
+                    crate::retry::FALLBACK_ATTEMPTS,
+                    crate::retry::is_transient_default,
+                    || async { self.rpc.send_transaction(&signed).await },
+                )
+                .await;
+                match sent {
+                    Ok(hash) => break (hash, seq + 1),
+                    Err(e)
+                        if attempt + 1 < MAX_SEQ_RETRIES && format!("{e}").contains("TxBadSeq") =>
+                    {
+                        crate::ui::warn(&format!(
+                            "stellar pay_native_classic: TxBadSeq on attempt {} \
+                         (concurrent funder use? re-fetching sequence)",
+                            attempt + 1,
+                        ));
+                        // Jittered backoff so the colliding tx settles - and so two
+                        // racing runs do not wake together and collide again.
+                        tokio::time::sleep(crate::retry::backoff_for_attempt(u32::from(attempt)))
+                            .await;
+                        attempt += 1;
+                        continue;
                     }
-                    _ => {}
+                    Err(e)
+                        if is_insufficient_fee(&e) && fee_tier + 1 < CLASSIC_FEE_LADDER.len() =>
+                    {
+                        crate::ui::warn(&format!(
+                            "stellar pay_native_classic: TxInsufficientFee at {} stroops — \
+                         resubmitting at {}",
+                            CLASSIC_FEE_LADDER[fee_tier],
+                            CLASSIC_FEE_LADDER[fee_tier + 1],
+                        ));
+                        fee_tier += 1;
+                        continue;
+                    }
+                    Err(e) => return Err(eyre!("send_transaction: {e}")),
+                }
+            };
+            let tx_hash_hex = hex::encode(hash.0);
+            match self
+                .classic_outcome(&funder.address(), &hash, seq_used)
+                .await
+            {
+                ClassicOutcome::Validated => return Ok(tx_hash_hex),
+                ClassicOutcome::Failed => {
+                    return Err(eyre!("payment tx {tx_hash_hex} failed on chain"));
+                }
+                ClassicOutcome::Dropped if fee_tier + 1 < CLASSIC_FEE_LADDER.len() => {
+                    fee_tier += 1;
+                    crate::ui::warn(&format!(
+                        "stellar pay_native_classic: tx {tx_hash_hex} dropped (not validated \
+                         in {:?}, sequence unchanged) — resubmitting at {} stroops",
+                        VALIDATE_TIMEOUT, CLASSIC_FEE_LADDER[fee_tier],
+                    ));
+                }
+                ClassicOutcome::Dropped | ClassicOutcome::SequenceAdvanced => {
+                    return Err(eyre!(
+                        "payment tx {tx_hash_hex} not validated within {:?}",
+                        VALIDATE_TIMEOUT
+                    ));
                 }
             }
-            if start.elapsed() >= VALIDATE_TIMEOUT {
-                return Err(eyre!(
-                    "payment tx {tx_hash_hex} not validated within {:?}",
-                    VALIDATE_TIMEOUT
-                ));
-            }
-            tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
 
