@@ -80,6 +80,15 @@ pub(crate) fn is_blockhash_expired<E: std::fmt::Display>(err: &E) -> bool {
     msg.contains("blockhash not found") || msg.contains("block height exceeded")
 }
 
+/// A resend of already-landed bytes fails preflight with this phrasing: the
+/// signature is in the status cache, so an earlier broadcast whose response
+/// was lost DID land (the Solana twin of EVM's "nonce too low" after a lost
+/// response). The on-chain result must then be resolved by signature.
+fn is_already_processed<E: std::fmt::Display>(err: &E) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("already been processed") || msg.contains("alreadyprocessed")
+}
+
 /// Rebuild-on-expiry rounds in [`sign_send_confirm`]. Each round waits out
 /// send_and_confirm's own blockhash-validity window (~2 min), so a few
 /// rounds already spans several minutes of congestion.
@@ -131,6 +140,33 @@ pub(crate) fn sign_send_confirm(
                 ));
             }
             Err(e) => {
+                if is_already_processed(&e)
+                    && let Some(signature) = transaction.signatures.first().copied()
+                {
+                    // Lost-response landing: resolve the result by signature
+                    // instead of reporting a failure for a landed tx. The
+                    // retry ladder rides out finalization lag.
+                    let landed = retry_blocking(
+                        "solana get_signature_status",
+                        |_| true,
+                        || match rpc_client.get_signature_status(&signature) {
+                            Ok(Some(result)) => Ok(result),
+                            Ok(None) => Err("signature not yet visible".to_string()),
+                            Err(fetch_err) => Err(fetch_err.to_string()),
+                        },
+                    );
+                    match landed {
+                        Ok(Ok(())) => return Ok(signature),
+                        Ok(Err(tx_err)) => {
+                            return Err(eyre!(
+                                "{label}: transaction landed but failed on chain: {tx_err}"
+                            ));
+                        }
+                        // Status never became visible - fall through to the
+                        // generic diagnostics path below.
+                        Err(_) => {}
+                    }
+                }
                 let diagnostics = simulation_diagnostics(rpc_client, &transaction);
                 return Err(eyre!("{label}: {e}\n  -> {diagnostics}"));
             }
@@ -215,4 +251,19 @@ pub(super) fn fetch_confirmed_tx(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod already_processed_tests {
+    use super::is_already_processed;
+
+    #[test]
+    fn lost_response_landing_is_detected() {
+        assert!(is_already_processed(
+            &"Transaction simulation failed: This transaction has already been processed"
+        ));
+        assert!(is_already_processed(&"TransactionError::AlreadyProcessed"));
+        assert!(!is_already_processed(&"Account already borrowed"));
+        assert!(!is_already_processed(&"blockhash not found"));
+    }
 }
