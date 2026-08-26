@@ -247,9 +247,10 @@ impl EvmEndpoints {
             tx.nonce = Some(nonce);
         }
         if tx.gas.is_none() {
-            let estimate = crate::retry::retry_with_fallback_all(
+            let estimate = crate::retry::retry_with_fallback(
                 "estimate gas (latest block)",
                 &self.providers,
+                |e| !deterministic_view_failure(e),
                 |provider| {
                     let tx = tx.clone();
                     async move { provider.estimate_gas(tx).block(BlockId::latest()).await }
@@ -282,6 +283,16 @@ impl EvmEndpoints {
         )
         .await
     }
+}
+
+/// Deterministic EVM view/estimate failures - not endpoint flakiness, so
+/// every retry on every endpoint answers the same, and the 4-64s ladder
+/// turns doomed retries into minutes of dead time. Two shapes: a call to an
+/// address with no deployed code returns empty data, and a revert (the
+/// estimate of a would-revert tx included).
+pub fn deterministic_view_failure<E: std::fmt::Display>(err: &E) -> bool {
+    let msg = err.to_string();
+    msg.contains("returned no data") || msg.contains("execution reverted")
 }
 
 /// Avalanche's coreth rejection when a node cannot serve pending-block state

@@ -26,8 +26,10 @@ use crate::config::AxelarChainContract;
 use crate::config::ChainContract;
 use crate::config::ChainsConfig;
 use crate::cosmos::lcd_cosmwasm_smart_query;
-use crate::evm::{EvmEndpoints, InterchainTokenService, connect_evm_signed};
-use crate::retry::retry_with_fallback_all;
+use crate::evm::{
+    EvmEndpoints, InterchainTokenService, connect_evm_signed, deterministic_view_failure,
+};
+use crate::retry::{retry_with_fallback, retry_with_fallback_all};
 use crate::types::Network;
 use crate::ui;
 use crate::xrpl::{XrplClient, faucet_url_for_network, parse_address};
@@ -255,9 +257,10 @@ async fn verify_token_on_its(
 ) -> eyre::Result<Address> {
     let endpoints = EvmEndpoints::connect(rpc_urls)?;
     let its_proxy = evm_src.its_proxy_addr;
-    let token_addr = retry_with_fallback_all(
+    let token_addr = retry_with_fallback(
         "token address lookup",
         endpoints.providers(),
+        |e| !deterministic_view_failure(e),
         |p| async move {
             InterchainTokenService::new(its_proxy, p)
                 .interchainTokenAddress(token_id)
