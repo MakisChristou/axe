@@ -18,7 +18,6 @@ use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
-use solana_sdk::transaction::Transaction;
 use tokio::sync::mpsc;
 use tokio::task::spawn_blocking;
 
@@ -43,7 +42,9 @@ use crate::evm::{
     send_tx_robust,
 };
 use crate::retry::retry_with_fallback_all;
-use crate::solana::{find_interchain_token_pda, find_its_root_pda, load_keypair};
+use crate::solana::{
+    find_interchain_token_pda, find_its_root_pda, load_keypair, sign_send_confirm,
+};
 use crate::ui;
 
 /// How long to wait for an EVM tx receipt before giving up.
@@ -507,16 +508,14 @@ fn ensure_extra_account_ata(
             ],
             data: vec![1], // CreateIdempotent
         };
-        let blockhash = sol_rpc.get_latest_blockhash()?;
-        let tx = Transaction::new_signed_with_payer(
+        sign_send_confirm(
+            &sol_rpc,
+            "solana create ATA",
             &[create_ata_ix],
-            Some(&sol_keypair.pubkey()),
-            &[&sol_keypair],
-            blockhash,
-        );
-        sol_rpc
-            .send_and_confirm_transaction(&tx)
-            .map_err(|e| eyre!("failed to create ATA: {e}"))?;
+            &sol_keypair.pubkey(),
+            &sol_keypair,
+        )
+        .map_err(|e| eyre!("failed to create ATA: {e}"))?;
         ui::success("ATA created");
     } else {
         ui::info("ATA already exists");
