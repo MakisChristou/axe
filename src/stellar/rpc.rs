@@ -233,6 +233,18 @@ impl StellarClient {
     /// 1 XLM). Stellar requires at least the base reserve (1 XLM today) - the
     /// caller should pick a value above that with enough headroom for the
     /// derived key's expected fees + Soroban auth costs.
+    /// One-shot: has `hash` validated with SUCCESS? Used immediately before a
+    /// drop-resubmit to close the landed-late race: a "dropped" tx can still
+    /// validate between the sequence check and the rebuild, and on a wallet
+    /// shared by parallel cron jobs the sequence alone cannot distinguish
+    /// "ours landed" from "another run's tx landed".
+    async fn landed_successfully(&self, hash: &Hash) -> bool {
+        matches!(
+            self.rpc.get_transaction(hash).await,
+            Ok(resp) if extract_status(&resp).as_deref() == Some("SUCCESS")
+        )
+    }
+
     /// Poll `hash` until validated or `VALIDATE_TIMEOUT`, then classify a
     /// timeout as dropped-vs-landed via the funder's sequence (`seq_used` is
     /// the sequence the tx consumed, i.e. the pre-submit value + 1).
@@ -724,6 +736,17 @@ impl StellarClient {
                     "Stellar tx {tx_hash_hex} not validated within {:?}",
                     VALIDATE_TIMEOUT
                 ));
+            }
+            // Landed-late guard: one last look right before rebuilding, so a
+            // tx that validated after the poll gave up is returned instead of
+            // resubmitted (the rebuild takes a fresh sequence and WOULD land
+            // a second time).
+            if self.landed_successfully(&hash).await
+                && let Some(tx) = self
+                    .poll_tx_validation(&hash, tx_hash_hex.clone(), event_filter.as_ref())
+                    .await?
+            {
+                return Ok(tx);
             }
             fee = fee.saturating_mul(10).min(MAX_SOROBAN_INCLUSION_FEE);
             crate::ui::warn(&format!(
