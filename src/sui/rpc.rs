@@ -14,7 +14,8 @@ use crate::retry::{FALLBACK_ATTEMPTS, is_transient_default, retry_async};
 /// Mainnet and testnet share keys; we pick by URL hint.
 const TESTNET_FALLBACKS: &[&str] = &[
     "https://fullnode.testnet.sui.io:443",
-    "https://sui-testnet-endpoint.blockvision.org",
+    // blockvision.org's public testnet endpoint was retired (permanent 404,
+    // caught by fallback_endpoints_are_alive).
     "https://sui-testnet-rpc.publicnode.com",
 ];
 const MAINNET_FALLBACKS: &[&str] = &[
@@ -540,4 +541,29 @@ fn parse_sui_digest(s: &str) -> Result<Digest> {
     let mut a = [0u8; 32];
     a.copy_from_slice(&bytes);
     Digest::from_bytes(a).map_err(|e| eyre!("digest parse: {e:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAINNET_FALLBACKS, TESTNET_FALLBACKS};
+
+    /// Network probe for the hardcoded fallback RPCs. Run on demand with
+    /// `cargo test -- --ignored` when a cron run smells like a dead
+    /// endpoint - a retired hostname here fails preflight for every route
+    /// (observed: sui-mainnet-rpc.publicnode.com, cron run 32793045257).
+    #[tokio::test]
+    #[ignore = "hits live public endpoints"]
+    async fn fallback_endpoints_are_alive() {
+        let mut dead = Vec::new();
+        for url in MAINNET_FALLBACKS.iter().chain(TESTNET_FALLBACKS) {
+            if let Err(reason) = crate::http::probe_endpoint_alive(url).await {
+                dead.push(reason);
+            }
+        }
+        assert!(
+            dead.is_empty(),
+            "dead Sui fallback endpoints:\n{}",
+            dead.join("\n")
+        );
+    }
 }

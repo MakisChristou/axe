@@ -1076,3 +1076,34 @@ mod tests {
         assert!(!CosmwasmQueryError::Exhausted.is_pending(CosmwasmQueryPending::ExecutableMessage));
     }
 }
+
+#[cfg(test)]
+mod fallback_probes {
+    use super::{
+        LCD_FALLBACKS_MAINNET, LCD_FALLBACKS_TESTNET, RPC_FALLBACKS_MAINNET, RPC_FALLBACKS_TESTNET,
+    };
+
+    /// Network probe for the hardcoded Axelar LCD/RPC fallbacks. Run on
+    /// demand with `cargo test -- --ignored` - a retired hostname here
+    /// silently thins the failover list until the primary's next outage.
+    #[tokio::test]
+    #[ignore = "hits live public endpoints"]
+    async fn fallback_endpoints_are_alive() {
+        let mut dead = Vec::new();
+        for url in LCD_FALLBACKS_MAINNET
+            .iter()
+            .chain(LCD_FALLBACKS_TESTNET)
+            .chain(RPC_FALLBACKS_MAINNET)
+            .chain(RPC_FALLBACKS_TESTNET)
+        {
+            if let Err(reason) = crate::http::probe_endpoint_alive(url).await {
+                dead.push(reason);
+            }
+        }
+        assert!(
+            dead.is_empty(),
+            "dead Axelar fallback endpoints:\n{}",
+            dead.join("\n")
+        );
+    }
+}
