@@ -118,12 +118,18 @@ fn solana_cu() -> Result<()> {
 
     ui::section("Maps to global.toml");
     for line in [
+        "Take the `charged` column, never `consumed`: Solana prices the priority",
+        "fee on the compute-unit limit a transaction requests and never refunds",
+        "the remainder.",
+        "",
         "[cost.solana]",
-        "  execution_compute_units  = the destination `execute` CU rows",
+        "  execution_compute_units  = the destination `execute` rows, ATA-created",
+        "                             variant (the worst case a quote must cover)",
         "  source_compute_units     = the source `interchain_transfer` /",
-        "                             `call_contract` CU rows (opt-in source cost)",
-        "  approve_compute_units    = the per-verify_signature CU from the",
-        "                             gateway approval batch",
+        "                             `call_contract` rows (opt-in source cost)",
+        "  approve_compute_units    = the largest per-transaction budget in the",
+        "                             gateway approval workflow (verify_signature,",
+        "                             which the relayer hardcodes)",
         "  approve_verifier_signatures = the verify count in one approval batch",
         "                             (also = the mainnet verifier-set quorum)",
     ] {
