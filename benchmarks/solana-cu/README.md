@@ -58,6 +58,44 @@ so they do **not** stand in for the fee-api's own safety margin — the relayer'
 buffer absorbs contention between simulation and inclusion, the API's absorbs
 drift between the quote and the transaction.
 
+## This harness is not the calibration source
+
+`scripts/mainnet_cu_limits.py` is. It reads the compute-unit limits real mainnet
+transactions carry, per operation variant, and the fee-api's `[cost.solana]`
+budgets are read off its CHARGED max column:
+
+```
+python3 scripts/mainnet_cu_limits.py
+SOLANA_RPC_URL=<faster endpoint> python3 scripts/mainnet_cu_limits.py
+```
+
+The public endpoints are slow enough that the rarer variants (`Execute / ata+`,
+`Execute / withcall+ata+`) may not appear; the script says so when they are
+missing rather than letting you read a table with holes in it.
+
+This LiteSVM harness measures the same operations against the same deployed
+bytecode, but on minimal injected state, and it lands consistently **under** real
+mainnet:
+
+| Operation | Harness consumed | Mainnet consumed | Harness / mainnet |
+|---|---:|---:|---:|
+| destination `execute`, ATA exists | 86,318 | 114,522 | 0.75 |
+| destination `execute`, ATA created | 106,055 | 140,771 | 0.75 |
+| destination itsTransferWithCall | 158,268 | 169,293 | 0.93 |
+| source `interchain_transfer` | 56,540 | 74,121 | 0.76 |
+
+So use this harness to answer *why* a number is what it is — the per-CPI
+breakdown, the cost of one code path against another, and as a regression check
+when a program is redeployed. Do not copy its numbers into config. The one
+operation with no mainnet sample (destination itsDeployment) is the exception,
+and it carries the 0.75 scaling as an explicit correction.
+
+The cause of the 25% gap is not yet isolated. It is **not** Token-2022 extensions
+on the mainnet mint, which an earlier version of this file claimed: the real ITS
+mints are 82-byte base mints with no extensions, exactly what the harness
+injects. Remaining candidates are the real token manager's flow-limit accounting
+(injected here as `flow_limit: None`) and larger real-world message payloads.
+
 ## Results
 
 Values exclude the fixed 150 CU of the prepended `SetComputeUnitLimit`
@@ -77,7 +115,8 @@ instruction.
 | **destination itsTransferWithCall (WSOL unwrap), ATA created** | **158,268** | **197,835** | as above, plus the ATA the unwrapper then closes |
 | **destination itsDeployment** (inbound `DeployInterchainToken`) | **182,119** | **227,648** | token manager + Token-2022 mint + manager ATA + minter roles + Metaplex `CreateV1` CPI |
 
-The bolded rows are the ones the fee-api's `[cost.solana]` defaults take.
+The bolded rows are the variants the fee-api budgets for. Their *values* come from
+`mainnet_cu_limits.py`, not from this table.
 
 ### The destination ATA is not free
 
@@ -113,14 +152,17 @@ per-transaction budget above — 220,000, the hardcoded `verify_signature` — r
 than the ~199k it typically consumes. `gateway_approval_charged_budget` in the
 harness records this derivation.
 
-### Source transfer vs the ~67k target
+### Source transfer vs mainnet
 
 The measured 56.5k breaks down (from the CU logs) as roughly: gateway
-`call_contract` 10.1k, gas `pay_gas` 9.4k, Token-2022 burn 1.2k, and the rest
-ITS logic and event emission. The residual gap to the ~67k mainnet figure is
-consistent with the Token-2022 metadata extensions carried by the real mainnet
-interchain-token mint (this harness injects a base mint with no extensions) plus
-larger real-world payloads. The dominant cost structure is reproduced.
+`call_contract` 10.1k, gas `pay_gas` 9.4k, Token-2022 burn 1.2k, and the rest ITS
+logic and event emission. Real mainnet transfers consume ~74.1k, the same ~25%
+gap the destination paths show; the dominant cost structure is reproduced but the
+absolute number is not. See "This harness is not the calibration source" above.
+
+Note that consumption is not what a source transfer is charged either way: just
+over half of real ones set no compute-unit limit, so they pay Solana's 200k
+default allocation, and the largest explicit limit observed is also 200k.
 
 ### Source itsDeployment (canonical)
 

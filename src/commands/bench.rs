@@ -118,20 +118,15 @@ fn solana_cu() -> Result<()> {
 
     ui::section("Maps to global.toml");
     for line in [
-        "Take the `charged` column, never `consumed`: Solana prices the priority",
-        "fee on the compute-unit limit a transaction requests and never refunds",
-        "the remainder.",
+        "These numbers are NOT the config values. This harness runs on minimal",
+        "injected state and lands ~25% under real mainnet; use it for the per-CPI",
+        "breakdown and as a redeploy regression check.",
         "",
-        "[cost.solana]",
-        "  execution_compute_units  = the destination `execute` rows, ATA-created",
-        "                             variant (the worst case a quote must cover)",
-        "  source_compute_units     = the source `interchain_transfer` /",
-        "                             `call_contract` rows (opt-in source cost)",
-        "  approve_compute_units    = the largest per-transaction budget in the",
-        "                             gateway approval workflow (verify_signature,",
-        "                             which the relayer hardcodes)",
-        "  approve_verifier_signatures = the verify count in one approval batch",
-        "                             (also = the mainnet verifier-set quorum)",
+        "For the fee-api's [cost.solana] budgets, read the CHARGED max column of:",
+        "  python3 benchmarks/solana-cu/scripts/mainnet_cu_limits.py",
+        "",
+        "which reports the compute-unit limits real mainnet transactions carry —",
+        "what Solana actually charges, since unused units are never refunded.",
     ] {
         println!("  {line}");
     }
