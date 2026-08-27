@@ -119,7 +119,10 @@ struct Injector<'a> {
 
 impl Injector<'_> {
     fn put(&mut self, key: Pubkey, owner: Pubkey, data: Vec<u8>) {
-        let lamports = self.svm.minimum_balance_for_rent_exemption(data.len()).max(1);
+        let lamports = self
+            .svm
+            .minimum_balance_for_rent_exemption(data.len())
+            .max(1);
         self.put_with_lamports(key, owner, data, lamports);
     }
 
@@ -262,7 +265,10 @@ fn gateway_approval_charged_budget() {
     println!("  approve_message                                simulated {approve:>9}");
     let per_tx = init.max(verify).max(approve);
     println!("  fee-api approve_compute_units -> {per_tx}  (max across the workflow)");
-    assert_eq!(per_tx, verify, "verify_signature should dominate the workflow");
+    assert_eq!(
+        per_tx, verify,
+        "verify_signature should dominate the workflow"
+    );
 }
 
 // ── measurements ─────────────────────────────────────────────────────────────
@@ -281,7 +287,8 @@ fn measure_source_transfer(data: Option<Vec<u8>>) -> u64 {
 
     let payer = Keypair::new();
     let authority = Keypair::new();
-    svm.airdrop(&payer.pubkey(), 100 * LAMPORTS_PER_SOL).unwrap();
+    svm.airdrop(&payer.pubkey(), 100 * LAMPORTS_PER_SOL)
+        .unwrap();
     svm.airdrop(&authority.pubkey(), LAMPORTS_PER_SOL).unwrap();
 
     let token_id = [7u8; 32];
@@ -352,7 +359,11 @@ fn measure_source_transfer(data: Option<Vec<u8>>) -> u64 {
         },
         bump: tm_bump,
     };
-    inj.put(accts.token_manager_pda, ITS_ID, borsh_account(&token_manager));
+    inj.put(
+        accts.token_manager_pda,
+        ITS_ID,
+        borsh_account(&token_manager),
+    );
 
     // The Token-2022 mint (token manager is the mint authority, required for the
     // native/mint-burn manager type) and the two associated token accounts.
@@ -400,7 +411,8 @@ fn gmp_gateway_call_contract() {
 
     let mut svm = fresh_svm();
     let payer = Keypair::new();
-    svm.airdrop(&payer.pubkey(), 100 * LAMPORTS_PER_SOL).unwrap();
+    svm.airdrop(&payer.pubkey(), 100 * LAMPORTS_PER_SOL)
+        .unwrap();
 
     let (gateway_root, gw_bump) = GatewayConfig::find_pda();
     let mut gw_cfg: GatewayConfig = bytemuck::Zeroable::zeroed();
@@ -461,7 +473,8 @@ fn measure_destination_execute(destination_ata_exists: bool) -> u64 {
     let mut svm = fresh_svm();
 
     let payer = Keypair::new();
-    svm.airdrop(&payer.pubkey(), 100 * LAMPORTS_PER_SOL).unwrap();
+    svm.airdrop(&payer.pubkey(), 100 * LAMPORTS_PER_SOL)
+        .unwrap();
 
     let token_id = [9u8; 32];
     let amount = 1_000_000u64;
@@ -472,8 +485,11 @@ fn measure_destination_execute(destination_ata_exists: bool) -> u64 {
     let (its_root, its_bump) = InterchainTokenService::find_pda();
     let (token_manager_pda, tm_bump) = TokenManager::find_pda(token_id, its_root);
     let token_mint = TokenManager::find_token_mint(token_id, its_root).0;
-    let token_manager_ata =
-        get_associated_token_address_with_program_id(&token_manager_pda, &token_mint, &TOKEN_2022_ID);
+    let token_manager_ata = get_associated_token_address_with_program_id(
+        &token_manager_pda,
+        &token_mint,
+        &TOKEN_2022_ID,
+    );
     let destination_ata =
         get_associated_token_address_with_program_id(&receiver, &token_mint, &TOKEN_2022_ID);
     let (gateway_root, gw_bump) = GatewayConfig::find_pda();
@@ -518,7 +534,11 @@ fn measure_destination_execute(destination_ata_exists: bool) -> u64 {
     // Gateway root config + an already-approved incoming message.
     let mut gw_cfg: GatewayConfig = bytemuck::Zeroable::zeroed();
     gw_cfg.bump = gw_bump;
-    inj.put(gateway_root, solana_axelar_gateway::ID, zero_copy_account(&gw_cfg));
+    inj.put(
+        gateway_root,
+        solana_axelar_gateway::ID,
+        zero_copy_account(&gw_cfg),
+    );
 
     let mut incoming: solana_axelar_gateway::IncomingMessage = bytemuck::Zeroable::zeroed();
     incoming.bump = im_bump;
@@ -607,11 +627,7 @@ fn measure_destination_execute(destination_ata_exists: bool) -> u64 {
         AccountMeta::new(destination_ata, false),
     ]);
 
-    let data = solana_axelar_its::instruction::Execute {
-        message,
-        payload,
-    }
-    .data();
+    let data = solana_axelar_its::instruction::Execute { message, payload }.data();
     let ix = Instruction {
         program_id: ITS_ID,
         accounts: metas,
@@ -634,7 +650,10 @@ fn destination_execute_interchain_transfer() {
     println!("  (Niko's 2.08M target is the gateway verification flow, not this instruction)");
     report("recipient ATA already exists", existing);
     let charged = report("recipient ATA created (init_if_needed)", created);
-    println!("  ATA-create delta                               {:>18}", created - existing);
+    println!(
+        "  ATA-create delta                               {:>18}",
+        created - existing
+    );
     println!("  fee-api execution_compute_units.itsTransfer -> {charged}");
 }
 
@@ -659,7 +678,8 @@ fn destination_execute_deploy_interchain_token() {
         .expect("load mpl_token_metadata.so");
 
     let payer = Keypair::new();
-    svm.airdrop(&payer.pubkey(), 100 * LAMPORTS_PER_SOL).unwrap();
+    svm.airdrop(&payer.pubkey(), 100 * LAMPORTS_PER_SOL)
+        .unwrap();
 
     let token_id = [7u8; 32];
     let source_chain = "ethereum";
@@ -716,14 +736,22 @@ fn destination_execute_deploy_interchain_token() {
     // Gateway root config + an already-approved incoming message.
     let mut gw_cfg: GatewayConfig = bytemuck::Zeroable::zeroed();
     gw_cfg.bump = gw_bump;
-    inj.put(gateway_root, solana_axelar_gateway::ID, zero_copy_account(&gw_cfg));
+    inj.put(
+        gateway_root,
+        solana_axelar_gateway::ID,
+        zero_copy_account(&gw_cfg),
+    );
     let mut incoming: solana_axelar_gateway::IncomingMessage = bytemuck::Zeroable::zeroed();
     incoming.bump = im_bump;
     incoming.signing_pda_bump = signer_bump;
     incoming.status = solana_axelar_gateway::state::MessageStatus::approved();
     incoming.message_hash = message_hash;
     incoming.payload_hash = payload_hash;
-    inj.put(incoming_message_pda, solana_axelar_gateway::ID, zero_copy_account(&incoming));
+    inj.put(
+        incoming_message_pda,
+        solana_axelar_gateway::ID,
+        zero_copy_account(&incoming),
+    );
 
     // ITS root: unpaused, hub address matches the message source, source chain trusted.
     let its_root_state = InterchainTokenService {
@@ -817,7 +845,8 @@ fn source_its_deployment_canonical() {
 
     let mut svm = fresh_svm();
     let payer = Keypair::new();
-    svm.airdrop(&payer.pubkey(), 100 * LAMPORTS_PER_SOL).unwrap();
+    svm.airdrop(&payer.pubkey(), 100 * LAMPORTS_PER_SOL)
+        .unwrap();
 
     // A pre-existing canonical SPL token (classic SPL Token program, like USDC).
     let token_program = anchor_spl::token::ID;
@@ -828,7 +857,11 @@ fn source_its_deployment_canonical() {
 
     let mut inj = Injector { svm: &mut svm };
 
-    inj.put(mint, token_program, mint_data(Pubkey::new_unique(), 1_000_000_000, 6));
+    inj.put(
+        mint,
+        token_program,
+        mint_data(Pubkey::new_unique(), 1_000_000_000, 6),
+    );
 
     // MPL Metadata account for the mint (read, not CPI'd, by both instructions).
     let (metadata_pda, _) = mpl_token_metadata::accounts::Metadata::find_pda(&mint);
@@ -865,18 +898,31 @@ fn source_its_deployment_canonical() {
     inj.put(its_root, ITS_ID, borsh_account(&its_root_state));
     let mut gw_cfg: GatewayConfig = bytemuck::Zeroable::zeroed();
     gw_cfg.bump = gw_bump;
-    inj.put(gateway_root, solana_axelar_gateway::ID, zero_copy_account(&gw_cfg));
+    inj.put(
+        gateway_root,
+        solana_axelar_gateway::ID,
+        zero_copy_account(&gw_cfg),
+    );
     let mut treasury: Treasury = bytemuck::Zeroable::zeroed();
     treasury.bump = treasury_bump;
-    inj.put(gas_treasury, solana_axelar_gas_service::ID, zero_copy_account(&treasury));
+    inj.put(
+        gas_treasury,
+        solana_axelar_gas_service::ID,
+        zero_copy_account(&treasury),
+    );
 
     // 1. Local registration (creates the token manager).
-    let (ix_reg, _) = make_register_canonical_token_instruction(payer.pubkey(), mint, token_program);
+    let (ix_reg, _) =
+        make_register_canonical_token_instruction(payer.pubkey(), mint, token_program);
     let cu_reg = measure(&mut svm, ix_reg, &[&payer]);
 
     // 2. Remote deploy (emits the GMP message).
-    let (ix_dep, _) =
-        make_deploy_remote_canonical_token_instruction(payer.pubkey(), mint, "ethereum".to_string(), 5_000);
+    let (ix_dep, _) = make_deploy_remote_canonical_token_instruction(
+        payer.pubkey(),
+        mint,
+        "ethereum".to_string(),
+        5_000,
+    );
     let cu_dep = measure(&mut svm, ix_dep, &[&payer]);
 
     let reg = cu_reg - 150;
@@ -910,8 +956,12 @@ fn measure_destination_execute_with_call(destination_ata_exists: bool) -> u64 {
     use solana_axelar_gateway::payload::{AxelarMessagePayload, EncodingScheme};
     use solana_axelar_std::hasher::LeafHash;
 
-    let nu_id: Pubkey = "unw1CzbeMFnmPH4fAYfNqCCZwBsWYPEGLeDtmaRsXEq".parse().unwrap();
-    let rent_treasury: Pubkey = "unwsnr2WXUFJFVf1cue2cxPmHty7is6GwT6EpDWuqML".parse().unwrap();
+    let nu_id: Pubkey = "unw1CzbeMFnmPH4fAYfNqCCZwBsWYPEGLeDtmaRsXEq"
+        .parse()
+        .unwrap();
+    let rent_treasury: Pubkey = "unwsnr2WXUFJFVf1cue2cxPmHty7is6GwT6EpDWuqML"
+        .parse()
+        .unwrap();
     let native_mint = anchor_spl::token::spl_token::native_mint::ID;
     let token_program = anchor_spl::token::ID;
 
@@ -920,7 +970,8 @@ fn measure_destination_execute_with_call(destination_ata_exists: bool) -> u64 {
         .expect("load native_unwrapper.so");
 
     let payer = Keypair::new();
-    svm.airdrop(&payer.pubkey(), 100 * LAMPORTS_PER_SOL).unwrap();
+    svm.airdrop(&payer.pubkey(), 100 * LAMPORTS_PER_SOL)
+        .unwrap();
 
     let token_id = [8u8; 32];
     // Above the ATA rent reserve (~2.04M lamports) so the flow only succeeds if
@@ -933,8 +984,11 @@ fn measure_destination_execute_with_call(destination_ata_exists: bool) -> u64 {
 
     let (its_root, its_bump) = InterchainTokenService::find_pda();
     let (token_manager_pda, tm_bump) = TokenManager::find_pda(token_id, its_root);
-    let token_manager_ata =
-        get_associated_token_address_with_program_id(&token_manager_pda, &native_mint, &token_program);
+    let token_manager_ata = get_associated_token_address_with_program_id(
+        &token_manager_pda,
+        &native_mint,
+        &token_program,
+    );
     let (dta, _) = Pubkey::find_program_address(
         &[solana_axelar_its::seed_prefixes::ITS_TOKEN_AUTHORITY_SEED],
         &nu_id,
@@ -997,14 +1051,22 @@ fn measure_destination_execute_with_call(destination_ata_exists: bool) -> u64 {
     // Gateway root + approved incoming message.
     let mut gw_cfg: GatewayConfig = bytemuck::Zeroable::zeroed();
     gw_cfg.bump = gw_bump;
-    inj.put(gateway_root, solana_axelar_gateway::ID, zero_copy_account(&gw_cfg));
+    inj.put(
+        gateway_root,
+        solana_axelar_gateway::ID,
+        zero_copy_account(&gw_cfg),
+    );
     let mut incoming: solana_axelar_gateway::IncomingMessage = bytemuck::Zeroable::zeroed();
     incoming.bump = im_bump;
     incoming.signing_pda_bump = signer_bump;
     incoming.status = solana_axelar_gateway::state::MessageStatus::approved();
     incoming.message_hash = message_hash;
     incoming.payload_hash = payload_hash;
-    inj.put(incoming_message_pda, solana_axelar_gateway::ID, zero_copy_account(&incoming));
+    inj.put(
+        incoming_message_pda,
+        solana_axelar_gateway::ID,
+        zero_copy_account(&incoming),
+    );
 
     // ITS root + a lock/unlock token manager holding the WSOL to be delivered.
     let its_root_state = InterchainTokenService {
@@ -1020,7 +1082,12 @@ fn measure_destination_execute_with_call(destination_ata_exists: bool) -> u64 {
         token_id,
         token_address: native_mint,
         associated_token_account: token_manager_ata,
-        flow_slot: FlowState { flow_limit: None, flow_in: 0, flow_out: 0, epoch: 0 },
+        flow_slot: FlowState {
+            flow_limit: None,
+            flow_in: 0,
+            flow_out: 0,
+            epoch: 0,
+        },
         bump: tm_bump,
     };
     inj.put(token_manager_pda, ITS_ID, borsh_account(&token_manager));
@@ -1088,7 +1155,11 @@ fn measure_destination_execute_with_call(destination_ata_exists: bool) -> u64 {
     ]);
 
     let data = solana_axelar_its::instruction::Execute { message, payload }.data();
-    let ix = Instruction { program_id: ITS_ID, accounts: metas, data };
+    let ix = Instruction {
+        program_id: ITS_ID,
+        accounts: metas,
+        data,
+    };
 
     measure(&mut svm, ix, &[&payer]) - 150
 }
@@ -1101,6 +1172,9 @@ fn destination_execute_with_call_unwrap() {
     println!("  (ITS execute + give-token + unwrapper CPI)");
     report("unwrapper ATA already exists", existing);
     let charged = report("unwrapper ATA created (init_if_needed)", created);
-    println!("  ATA-create delta                               {:>18}", created - existing);
+    println!(
+        "  ATA-create delta                               {:>18}",
+        created - existing
+    );
     println!("  fee-api execution_compute_units.itsTransferWithCall -> {charged}");
 }
