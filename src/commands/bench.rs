@@ -86,14 +86,16 @@ fn solana_cu() -> Result<()> {
     let dir = benchmarks_dir()?.join("solana-cu");
     let testdata = dir.join("tests/testdata");
 
-    let has_so = std::fs::read_dir(&testdata).is_ok_and(|entries| {
-        entries.filter_map(std::result::Result::ok).any(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("so"))
-        })
-    });
-    if !has_so {
+    // Every program the harness loads, so adding one re-fetches for a checkout
+    // that already holds the older set.
+    const PROGRAMS: [&str; 5] = [
+        "its.so",
+        "gateway.so",
+        "gas_service.so",
+        "native_unwrapper.so",
+        "mpl_token_metadata.so",
+    ];
+    if !PROGRAMS.iter().all(|name| testdata.join(name).is_file()) {
         ui::info("Solana program binaries missing — fetching from mainnet...");
         let status = Command::new("bash")
             .arg(dir.join("scripts/fetch-testdata.sh"))

@@ -5,10 +5,10 @@ The Solana analog of the Foundry EVM `GasHarness.t.sol`. It measures
 compares them against the observed mainnet numbers.
 
 The programs under test are the real mainnet binaries (ITS, gateway, gas-service,
-and — for the WSOL-unwrap flow — native-unwrapper), run in-process under LiteSVM
-so the measured CU reflects the deployed bytecode rather than the calling crate.
-They are not committed (~2 MB, and they go stale on redeploy); fetch them from
-mainnet first. See "Fetching the testdata" below.
+Metaplex Token Metadata, and — for the WSOL-unwrap flow — native-unwrapper), run
+in-process under LiteSVM so the measured CU reflects the deployed bytecode rather
+than the calling crate. They are not committed (~2 MB, and they go stale on
+redeploy); fetch them from mainnet first. See "Fetching the testdata" below.
 
 ## Running
 
@@ -27,10 +27,11 @@ cargo test -p its-cu-harness -- --nocapture
 
 ### Fetching the testdata
 
-`scripts/fetch-testdata.sh` dumps the four mainnet programs (ITS, gateway,
-gas-service, native-unwrapper) into `tests/testdata/*.so` with `solana program
-dump`. Re-run it after a mainnet redeploy. Requires the `solana` CLI + network;
-override the RPC with `SOLANA_RPC_URL`.
+`scripts/fetch-testdata.sh` dumps the five mainnet programs (ITS, gateway,
+gas-service, native-unwrapper, Metaplex Token Metadata) into
+`tests/testdata/*.so` with `solana program dump`. Re-run it after a mainnet
+redeploy. Requires the `solana` CLI + network; override the RPC with
+`SOLANA_RPC_URL`.
 
 Set `CU_LOGS=1` to also print the per-CPI CU breakdown from the program logs:
 
@@ -42,21 +43,50 @@ This crate is a detached workspace (its own `[workspace]` table) so it can pin
 the `mainnet` network feature independently of the parent `native-unwrapper`
 program, which builds with `devnet-amplifier`.
 
-## Results
+## Consumed vs charged
 
-| Operation | Measured (CU) | Mainnet target | Notes |
-|---|---:|---:|---|
-| source `interchain_transfer` (itsTransfer, `data=None`) | 56,540 | ~67k | burn + gateway `call_contract` + gas `pay_gas` |
-| source `interchain_transfer` (itsTransferWithCall, `data=Some(128B)`) | 58,834 | ~67k | same instruction, payload also carries a keccak-hashed data blob |
-| source `register_canonical_interchain_token` | 48,192 | part of itsDeployment | local; creates the lock/unlock token manager, no GMP |
-| source `deploy_remote_canonical_interchain_token` | 49,456 | part of itsDeployment | the GMP-emitting deploy; the fee-api source cost for a deployment |
-| source itsDeployment (both, combined) | 97,648 | ~90k (old guess) | register + remote deploy |
-| source gmp: gateway `call_contract` | 8,803 | n/a | bare contract call from a wallet |
-| destination `execute` (inbound give-token) | 86,318 | see below | gateway `validate_message` (26,588) + ITS give-token/`MintTo` (30,294) |
-| destination itsTransferWithCall (WSOL unwrap) | 137,897 | replaces old guess | full ITS execute + give-token + `native-unwrapper` CPI |
+Solana charges the priority fee on the compute-unit **limit** a transaction
+requests, not on what it consumes — unused units are never refunded. So the
+number the fee-api prices is the budget the submitter sets, and every row below
+reports both.
+
+On the destination legs the submitter is the relayer, whose policy lives in
+`axelar-relayer-solana` `src/gas_calculator.rs`: `initialize_payload_verification_session`
+and `verify_signature` skip simulation and send a hardcoded constant, everything
+else simulates and adds 25%. Those 25% are charged whether or not they are used,
+so they do **not** stand in for the fee-api's own safety margin — the relayer's
+buffer absorbs contention between simulation and inclusion, the API's absorbs
+drift between the quote and the transaction.
+
+## Results
 
 Values exclude the fixed 150 CU of the prepended `SetComputeUnitLimit`
 instruction.
+
+| Operation | Consumed | Charged | Notes |
+|---|---:|---:|---|
+| source `interchain_transfer` (itsTransfer, `data=None`) | 56,540 | 70,675 | burn + gateway `call_contract` + gas `pay_gas`; mainnet target ~67k |
+| source `interchain_transfer` (itsTransferWithCall, `data=Some(128B)`) | 58,834 | 73,542 | same instruction, payload also carries a keccak-hashed data blob |
+| source `register_canonical_interchain_token` | 48,192 | 60,240 | local; creates the lock/unlock token manager, no GMP |
+| source `deploy_remote_canonical_interchain_token` | 49,456 | 61,820 | the GMP-emitting deploy |
+| source itsDeployment (both, combined) | 97,648 | 122,060 | two transactions, so two budgets |
+| source gmp: gateway `call_contract` | 8,803 | 11,003 | bare contract call from a wallet |
+| destination `execute`, recipient ATA exists | 86,318 | 107,897 | gateway `validate_message` + ITS give-token/`MintTo` |
+| **destination `execute`, recipient ATA created** | **106,055** | **132,568** | the `init_if_needed` branch; what a quote must budget for |
+| destination itsTransferWithCall (WSOL unwrap), ATA exists | 138,170 | 172,712 | ITS execute + give-token + `native-unwrapper` CPI |
+| **destination itsTransferWithCall (WSOL unwrap), ATA created** | **158,268** | **197,835** | as above, plus the ATA the unwrapper then closes |
+| **destination itsDeployment** (inbound `DeployInterchainToken`) | **182,119** | **227,648** | token manager + Token-2022 mint + manager ATA + minter roles + Metaplex `CreateV1` CPI |
+
+The bolded rows are the ones the fee-api's `[cost.solana]` defaults take.
+
+### The destination ATA is not free
+
+Both destination transfer paths run `init_if_needed` on the recipient ATA
+(`ExecuteInterchainTransfer::destination_ata`), so a first-time recipient makes
+the relayer create the account inside `execute`. That costs ~20k CU on top of the
+transfer itself, and a quote cannot know in advance which branch will run, so the
+created case is the one the fee-api budgets. (Its *rent* is separate and is
+already priced from the request-path ATA probe.)
 
 The gateway message-approval flow (Niko's ~3.1M) is measured separately from
 real mainnet transactions, not under LiteSVM, because it spans many
@@ -68,6 +98,20 @@ transactions (see below). Per-instruction mainnet medians:
 | `verify_signature` | ~198,900 | once per signer to reach threshold, per batch |
 | `approve_message` | ~49,800 | once per message |
 | **one full approval batch** (1 init + 12 verify + 1 approve) | **~2,449,000** | per batch |
+
+What the relayer *budgets* for those, though, is not the median it consumes:
+
+| Gateway approval instruction | Charged (CU) | How |
+|---|---:|---|
+| `initialize_payload_verification_session` | 30,000 | hardcoded |
+| `verify_signature` | 220,000 | hardcoded |
+| `approve_message` | 62,250 | simulated + 25% |
+
+The fee-api models the workflow as `approve_verifier_signatures + 2` transactions
+that all share one `approve_compute_units`, so that field takes the **largest**
+per-transaction budget above — 220,000, the hardcoded `verify_signature` — rather
+than the ~199k it typically consumes. `gateway_approval_charged_budget` in the
+harness records this derivation.
 
 ### Source transfer vs the ~67k target
 
@@ -94,11 +138,25 @@ The app's real with-call destination is the `native-unwrapper` program. ITS
 delivers WSOL to it (a lock/unlock canonical token), then CPIs into
 `execute_with_interchain_token`, which closes the WSOL ATA into a program escrow
 and splits the lamports (the `amount` to the recipient, the ATA rent to the rent
-treasury). Measured end-to-end at 137,897 CU, of which the gateway
-`validate_message` CPI is ~26.7k and the `native-unwrapper` CPI (close + split)
-is ~21.2k; the rest is ITS execute, the give-token transfer, and event emission.
-This replaces the conservative `execution_compute_units.itsTransferWithCall`
-guess.
+treasury). Measured end-to-end at 138,170 CU with the unwrapper's ATA already in
+place, of which the gateway `validate_message` CPI is ~26.7k and the
+`native-unwrapper` CPI (close + split) is ~21.2k; the rest is ITS execute, the
+give-token transfer, and event emission. Creating that ATA first adds ~20.1k, for
+158,268 CU. This replaces the conservative
+`execution_compute_units.itsTransferWithCall` guess.
+
+### Destination itsDeployment
+
+An inbound `DeployInterchainToken` is the most expensive destination operation:
+one `execute` creates the token manager, the Token-2022 mint, the token manager's
+ATA and the minter's `UserRoles` account, and CPIs Metaplex `CreateV1` for the
+mint's metadata. Measured at 182,119 CU — an order of magnitude under the 1.4M
+transaction cap the fee-api used as a placeholder for it. Measured with a minter
+present, since that deployment also creates the roles account.
+
+The rents for those accounts are priced separately, from
+`[cost.solana.account_bytes.deployment]`, and are the dominant lamport term; this
+number is only the compute budget.
 
 ### Destination execute and the 2.08M / 3.1M targets
 
@@ -136,12 +194,12 @@ The expensive part (`init` + N x `verify_signature`, about 2.4M CU) is charged
 amortized across every message approved under that root. Only `approve_message`
 (~50k) is per message, and the ITS `execute` (~86k) is per message.
 
-On current mainnet each batch carries exactly one message, so the full ~2.45M
-lands on that single message. The full inbound delivery of one ITS message today
-is therefore roughly:
+On current mainnet each batch carries exactly one message, so the full batch
+lands on that single message. In charged terms the full inbound delivery of one
+ITS message today is roughly:
 
 ```
-~2.45M (approval: init + 12 verify + approve)  +  ~86k (ITS execute)  ~=  2.54M CU
+30k (init) + 12 x 220k (verify) + 62k (approve)  +  133k (ITS execute)  ~=  2.87M CU
 ```
 
 split across ~15 transactions. If Axelar batched M messages under one root, the
@@ -160,16 +218,18 @@ which carries both the token transfer and an arbitrary payload.
 
 For each operation the harness:
 
-1. Loads the three mainnet `.so` binaries at their real program IDs.
+1. Loads the mainnet `.so` binaries at their real program IDs.
 2. Injects the prerequisite state directly with `set_account` rather than running
    the init/deploy instructions: the gateway root config, gas-service treasury,
    ITS root config, a native interchain token (token manager + Token-2022 mint +
    ATAs), and, for the inbound path, an already-approved `IncomingMessage` whose
-   stored hash matches `message.hash()` (Route B).
+   stored hash matches `message.hash()` (Route B). Accounts the instruction under
+   test is supposed to create are deliberately left out.
 3. Builds the single instruction under test (using the crate's own
    `make_interchain_transfer_instruction` helper where available) and sends it
    with a raised compute-unit limit.
-4. Reads `compute_units_consumed` from the transaction metadata.
+4. Reads `compute_units_consumed` from the transaction metadata and converts it
+   to the charged budget (see "Consumed vs charged").
 
 State structs are serialized with their real crate types (Anchor
 `AccountSerialize` for borsh accounts, `bytemuck` for zero-copy accounts) so the

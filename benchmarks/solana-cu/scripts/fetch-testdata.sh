@@ -28,4 +28,7 @@ dump itsAUdHnV2K99ppbM6d6WUDac8MD54RAE7dUKHnw1Eg its.so
 dump gtwqvLL93XK7pC2eMvfGamqokvs19AytzaVhrL2iKiz gateway.so
 dump gaszjG8797GGm8oACCzH2KLLifGp2nugKkLwaecwBjT gas_service.so
 dump unw1CzbeMFnmPH4fAYfNqCCZwBsWYPEGLeDtmaRsXEq native_unwrapper.so
+# Metaplex Token Metadata: the ITS deployment path CPIs into it to create the
+# new mint's metadata account.
+dump metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s mpl_token_metadata.so
 echo "Done."
