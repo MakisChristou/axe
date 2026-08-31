@@ -34,16 +34,21 @@
         let
           pkgs = import nixpkgs { inherit system; };
 
-          # rust-toolchain.toml is the source of truth for the component
-          # list. `fenix.stable` itself is pinned by the fenix flake input,
-          # so the toolchain only moves on `nix flake update` — no
-          # per-toolchain sha256 to babysit.
+          # rust-toolchain.toml is the source of truth for components needed
+          # outside the development environment. `fenix.stable` itself is
+          # pinned by the fenix flake input, so the toolchain only moves on
+          # `nix flake update` — no per-toolchain sha256 to babysit.
           toolchain = (pkgs.lib.importTOML ./rust-toolchain.toml).toolchain;
+          editorComponents = [
+            "rust-analyzer"
+            "rust-src"
+          ];
+          components = pkgs.lib.unique (toolchain.components ++ editorComponents);
 
           rustToolchain =
             assert pkgs.lib.assertMsg (toolchain.channel == "stable")
               "rust-toolchain.toml pins the '${toolchain.channel}' channel, but this flake only wires up fenix's stable channel.";
-            inputs.fenix.packages.${system}.stable.withComponents toolchain.components;
+            inputs.fenix.packages.${system}.stable.withComponents components;
         in
         {
           _module.args = {
