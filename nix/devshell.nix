@@ -31,7 +31,7 @@
       '';
     in
     {
-      devShells.default = pkgs.mkShell {
+      devShells.default = pkgs.mkShell ({
         packages = [ rustToolchain ] ++ devTools;
 
         inherit (envs)
@@ -41,13 +41,6 @@
           ;
 
         RUST_BACKTRACE = "0";
-
-        # rustc defaults to its bundled `rust-lld` on x86_64-linux, which
-        # skips nixpkgs' ld wrapper and so leaves the RPATH empty. Every
-        # binary that links openssl (reqwest -> native-tls) then dies at
-        # startup on `libssl.so.3` -- including the test binaries `cargo
-        # test` runs. Fall back to the wrapped system linker.
-        RUSTFLAGS = "-C linker-features=-lld";
 
         # Opt users entering from this checkout into its git hooks
         # (fmt + clippy + tests on commit and push, see .githooks/).
@@ -59,6 +52,13 @@
 
           ${devInfo}
         '';
-      };
+      } // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+        # rustc defaults to its bundled `rust-lld` on x86_64-linux, which
+        # skips nixpkgs' ld wrapper and so leaves the RPATH empty. Every
+        # binary that links openssl (reqwest -> native-tls) then dies at
+        # startup on `libssl.so.3` -- including the test binaries `cargo
+        # test` runs. Fall back to the wrapped system linker.
+        RUSTFLAGS = "-C linker-features=-lld";
+      });
     };
 }
