@@ -194,7 +194,7 @@ jobs:
   # time only to hit a confusing on-chain "tx failed" mid-test.
   preflight:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     env:
       # check-balances reaches the EVM RPCs via the chains-config's `rpc`
       # field by default; per-chain secret overrides apply the same way they
