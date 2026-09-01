@@ -167,11 +167,8 @@ pub enum BenchCommands {
 
 #[derive(Subcommand)]
 pub enum IntentsCommands {
-    /// Show chains or tokens advertised by the intent API
-    Catalog {
-        #[command(subcommand)]
-        subcommand: IntentCatalogCommands,
-    },
+    /// Show supported chains with their tokens
+    Catalog(IntentCatalogOptions),
 
     /// Discover funded routes that quote successfully in both directions
     Routes(IntentRoutesOptions),
@@ -215,27 +212,12 @@ pub struct IntentReadOptions {
     pub json: bool,
 }
 
-#[derive(Subcommand)]
-pub enum IntentCatalogCommands {
-    /// Show chains advertised by the intent API
-    Chains(IntentCatalogOptions),
-
-    /// Show tokens advertised by the intent API
-    Tokens(IntentTokensOptions),
-}
-
 #[derive(Args)]
 pub struct IntentCatalogOptions {
     #[command(flatten)]
     pub read: IntentReadOptions,
-}
 
-#[derive(Args)]
-pub struct IntentTokensOptions {
-    #[command(flatten)]
-    pub read: IntentReadOptions,
-
-    /// Limit results to one CAIP-2 chain ID.
+    /// Show only this CAIP-2 chain ID.
     #[arg(long)]
     pub chain: Option<String>,
 }
@@ -1012,7 +994,11 @@ mod tests {
         const ASSET: &str = "eip155:11155111/0x0000000000000000000000000000000000000000";
         const ADDRESS: &str = "0x0000000000000000000000000000000000000001";
 
-        assert!(Cli::try_parse_from(["axe", "intents", "catalog", "chains"]).is_ok());
+        assert!(Cli::try_parse_from(["axe", "intents", "catalog"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["axe", "intents", "catalog", "--chain", "eip155:11155111",])
+                .is_ok()
+        );
         assert!(
             Cli::try_parse_from(["axe", "intents", "routes", "--wallet-address", ADDRESS,]).is_ok()
         );
@@ -1035,6 +1021,12 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn intent_catalog_no_longer_has_nested_commands() {
+        assert!(Cli::try_parse_from(["axe", "intents", "catalog", "chains"]).is_err());
+        assert!(Cli::try_parse_from(["axe", "intents", "catalog", "tokens"]).is_err());
     }
 
     #[test]

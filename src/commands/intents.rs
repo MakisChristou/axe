@@ -30,8 +30,8 @@ use crate::ui;
 pub use self::types::{AssetSpec, HumanAmount, OrderType};
 pub use benchmark::{QuoteBenchmarkArgs, QuoteBenchmarkLimit, benchmark_quotes};
 pub use read::{
-    ApiArgs, CatalogArgs, QuoteArgs, QuoteRequestArgs, RoutesArgs, StatusArgs, catalog_chains,
-    catalog_tokens, quote, routes, status,
+    ApiArgs, CatalogArgs, QuoteArgs, QuoteRequestArgs, RoutesArgs, StatusArgs, catalog, quote,
+    routes, status,
 };
 
 pub struct IntentRuntimeArgs {

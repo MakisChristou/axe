@@ -36,6 +36,36 @@ pub struct TokenInfo {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct CatalogResponse {
+    pub chains: Vec<CatalogChain>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogChain {
+    #[serde(flatten)]
+    pub chain: ChainInfo,
+    pub tokens: Vec<CatalogToken>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CatalogToken {
+    pub address: String,
+    pub symbol: String,
+    pub decimals: u8,
+}
+
+impl From<TokenInfo> for CatalogToken {
+    fn from(token: TokenInfo) -> Self {
+        Self {
+            address: token.address,
+            symbol: token.symbol,
+            decimals: token.decimals,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteRequest {
     pub from_chain: String,

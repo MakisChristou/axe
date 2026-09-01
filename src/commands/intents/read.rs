@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -9,9 +10,9 @@ use serde_json::json;
 use super::client::RfqClient;
 use super::route::{DiscoveryFeedback, discover_wallet, plan_sweep, validate_quote_route};
 use super::types::{
-    AssetSpec, ChainInfo, EvmTransactionPayload, HumanAmount, OrderType, Quote, QuoteOutcome,
-    QuoteRequest, RoutePlan, StatusResponse, TokenInfo, TokensResponse, TransferState,
-    format_units, parse_amount,
+    AssetSpec, CatalogChain, CatalogResponse, CatalogToken, EvmTransactionPayload, HumanAmount,
+    OrderType, Quote, QuoteOutcome, QuoteRequest, RoutePlan, StatusResponse, TokenInfo,
+    TokensResponse, TransferState, format_units, parse_amount,
 };
 use crate::config::ChainsConfig;
 use crate::types::Network;
@@ -70,39 +71,64 @@ pub(super) struct PreparedQuote {
     pub order_type: OrderType,
 }
 
-pub async fn catalog_chains(args: CatalogArgs) -> Result<()> {
+pub async fn catalog(args: CatalogArgs) -> Result<()> {
     let client = api_client(&args.api)?;
-    let mut response = client.chains().await?;
-    response
-        .chains
-        .sort_by(|left, right| left.chain_id.cmp(&right.chain_id));
+    let (chains, tokens) = tokio::try_join!(client.chains(), client.tokens())?;
+    let response = merge_catalog(chains.chains, tokens.tokens, args.chain.as_deref())?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&response)?);
     } else {
-        render_chains(&response.chains);
+        render_catalog(&response);
     }
     Ok(())
 }
 
-pub async fn catalog_tokens(args: CatalogArgs) -> Result<()> {
-    let client = api_client(&args.api)?;
-    let mut response = client.tokens().await?;
-    if let Some(chain) = args.chain {
-        response.tokens.retain(|token| token.chain_id == chain);
+fn merge_catalog(
+    mut chains: Vec<super::types::ChainInfo>,
+    tokens: Vec<TokenInfo>,
+    chain_filter: Option<&str>,
+) -> Result<CatalogResponse> {
+    if let Some(chain_filter) = chain_filter {
+        chains.retain(|chain| chain.chain_id == chain_filter);
+        if chains.is_empty() {
+            bail!(
+                "Chain {chain_filter} is not in the intent catalog. Run without --chain to list available chains."
+            );
+        }
     }
-    response.tokens.sort_by(|left, right| {
-        (&left.chain_id, &left.symbol, &left.address).cmp(&(
-            &right.chain_id,
-            &right.symbol,
-            &right.address,
-        ))
+    chains.sort_by(|left, right| {
+        (&left.chain_label, &left.chain_id).cmp(&(&right.chain_label, &right.chain_id))
     });
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&response)?);
-    } else {
-        render_tokens(&response.tokens);
+    let mut tokens_by_chain = group_tokens(tokens);
+    let chains = chains
+        .into_iter()
+        .map(|chain| CatalogChain {
+            tokens: tokens_by_chain
+                .remove(&chain.chain_id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(CatalogToken::from)
+                .collect(),
+            chain,
+        })
+        .collect();
+    Ok(CatalogResponse { chains })
+}
+
+fn group_tokens(tokens: Vec<TokenInfo>) -> HashMap<String, Vec<TokenInfo>> {
+    let mut tokens_by_chain = HashMap::<String, Vec<TokenInfo>>::new();
+    for token in tokens {
+        tokens_by_chain
+            .entry(token.chain_id.clone())
+            .or_default()
+            .push(token);
     }
-    Ok(())
+    for tokens in tokens_by_chain.values_mut() {
+        tokens.sort_by(|left, right| {
+            (&left.symbol, &left.address).cmp(&(&right.symbol, &right.address))
+        });
+    }
+    tokens_by_chain
 }
 
 pub async fn routes(args: RoutesArgs) -> Result<()> {
@@ -218,7 +244,7 @@ fn find_token(tokens: &TokensResponse, asset: &AssetSpec) -> Result<TokenInfo> {
         .cloned()
         .ok_or_else(|| {
             eyre!(
-                "Asset {asset} is not in the intent token catalog. Run `axe intents catalog tokens` to list supported assets."
+                "Asset {asset} is not in the intent token catalog. Run `axe intents catalog` to list supported assets."
             )
         })
 }
@@ -279,25 +305,40 @@ fn ensure_watchable_status(status: &StatusResponse) -> Result<()> {
     Ok(())
 }
 
-fn render_chains(chains: &[ChainInfo]) {
-    ui::section("intent chains");
-    ui::kv("chains", &chains.len().to_string());
-    for chain in chains {
+fn render_catalog(catalog: &CatalogResponse) {
+    ui::section("intent catalog");
+    let token_count: usize = catalog.chains.iter().map(|chain| chain.tokens.len()).sum();
+    ui::kv("supported chains", &catalog.chains.len().to_string());
+    ui::kv("supported tokens", &token_count.to_string());
+    for entry in &catalog.chains {
+        println!();
+        println!("  {}", entry.chain.chain_label);
         println!(
-            "  {:<24} {:<10} {}",
-            chain.chain_id, chain.chain_type, chain.chain_label
+            "    {} · {}",
+            entry.chain.chain_id,
+            entry.chain.chain_type.to_ascii_uppercase()
         );
+        if entry.tokens.is_empty() {
+            println!("    tokens: none advertised");
+            continue;
+        }
+        println!("    tokens ({}):", entry.tokens.len());
+        for token in &entry.tokens {
+            println!(
+                "      {:<10} {:<42} {} decimals",
+                token.symbol,
+                token_address_label(token),
+                token.decimals
+            );
+        }
     }
 }
 
-fn render_tokens(tokens: &[TokenInfo]) {
-    ui::section("intent tokens");
-    ui::kv("tokens", &tokens.len().to_string());
-    for token in tokens {
-        println!(
-            "  {:<10} {:<18} {}  ({} decimals)",
-            token.symbol, token.chain_id, token.address, token.decimals
-        );
+fn token_address_label(token: &CatalogToken) -> &str {
+    if super::types::is_native_token(&token.address) {
+        "native token"
+    } else {
+        &token.address
     }
 }
 
@@ -442,6 +483,66 @@ fn duration_ms(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chain(id: &str, label: &str) -> super::super::types::ChainInfo {
+        super::super::types::ChainInfo {
+            chain_id: id.into(),
+            chain_label: label.into(),
+            chain_type: "evm".into(),
+        }
+    }
+
+    fn token(chain_id: &str, symbol: &str, address: &str) -> TokenInfo {
+        TokenInfo {
+            chain_id: chain_id.into(),
+            address: address.into(),
+            symbol: symbol.into(),
+            decimals: 6,
+        }
+    }
+
+    #[test]
+    fn catalog_nests_sorted_tokens_under_sorted_chains() {
+        let catalog = merge_catalog(
+            vec![chain("eip155:2", "Zulu"), chain("eip155:1", "Alpha")],
+            vec![
+                token("eip155:1", "USDC", "0x2"),
+                token("eip155:1", "ETH", "0x1"),
+                token("eip155:2", "USDC", "0x3"),
+            ],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(catalog.chains[0].chain.chain_label, "Alpha");
+        assert_eq!(catalog.chains[0].tokens[0].symbol, "ETH");
+        assert_eq!(catalog.chains[0].tokens[1].symbol, "USDC");
+        assert_eq!(catalog.chains[1].chain.chain_label, "Zulu");
+        assert_eq!(
+            serde_json::to_value(&catalog).unwrap()["chains"][0]["chainId"],
+            "eip155:1"
+        );
+        assert!(
+            serde_json::to_value(&catalog).unwrap()["chains"][0]["tokens"][0]
+                .get("chainId")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn catalog_filter_explains_how_to_find_a_valid_chain() {
+        let error = merge_catalog(
+            vec![chain("eip155:1", "Ethereum")],
+            Vec::new(),
+            Some("eip155:2"),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Chain eip155:2 is not in the intent catalog. Run without --chain to list available chains."
+        );
+    }
 
     #[test]
     fn empty_route_discovery_is_a_valid_result() {

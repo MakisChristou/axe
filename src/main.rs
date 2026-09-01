@@ -439,9 +439,7 @@ async fn run_intents(
     global: Option<types::Network>,
 ) -> Result<()> {
     match subcommand {
-        cli::IntentsCommands::Catalog { subcommand } => {
-            run_intent_catalog(subcommand, global).await
-        }
+        cli::IntentsCommands::Catalog(options) => run_intent_catalog(options, global).await,
         cli::IntentsCommands::Routes(options) => run_intent_routes(options, global).await,
         cli::IntentsCommands::Quote(options) => run_intent_quote(options, global).await,
         cli::IntentsCommands::Status(options) => run_intent_status(options, global).await,
@@ -488,29 +486,16 @@ async fn run_intents(
 }
 
 async fn run_intent_catalog(
-    subcommand: cli::IntentCatalogCommands,
+    options: cli::IntentCatalogOptions,
     global: Option<types::Network>,
 ) -> Result<()> {
-    match subcommand {
-        cli::IntentCatalogCommands::Chains(options) => {
-            let api = resolve_intent_api(options.read.api, global)?;
-            commands::intents::catalog_chains(commands::intents::CatalogArgs {
-                api,
-                chain: None,
-                json: options.read.json,
-            })
-            .await
-        }
-        cli::IntentCatalogCommands::Tokens(options) => {
-            let api = resolve_intent_api(options.read.api, global)?;
-            commands::intents::catalog_tokens(commands::intents::CatalogArgs {
-                api,
-                chain: options.chain,
-                json: options.read.json,
-            })
-            .await
-        }
-    }
+    let api = resolve_intent_api(options.read.api, global)?;
+    commands::intents::catalog(commands::intents::CatalogArgs {
+        api,
+        chain: options.chain,
+        json: options.read.json,
+    })
+    .await
 }
 
 async fn run_intent_routes(
