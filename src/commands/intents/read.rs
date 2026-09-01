@@ -4,15 +4,17 @@ use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, U256};
 use chrono::Utc;
+use comfy_table::{Cell, Color};
 use eyre::{Result, bail, eyre};
 use serde_json::json;
 
 use super::client::RfqClient;
+use super::presentation::asset_table;
 use super::route::{DiscoveryFeedback, discover_wallet, plan_sweep, validate_quote_route};
 use super::types::{
     AssetSpec, AssetType, CatalogChain, CatalogResponse, CatalogToken, EvmTransactionPayload,
     HumanAmount, OrderType, Quote, QuoteOutcome, QuoteRequest, RoutePlan, StatusResponse,
-    TokenInfo, TokensResponse, TransferState, format_units, parse_amount,
+    TokenInfo, TokensResponse, TransferState, format_units, is_native_token, parse_amount,
 };
 use crate::config::ChainsConfig;
 use crate::types::Network;
@@ -317,33 +319,28 @@ fn render_catalog(catalog: &CatalogResponse) {
     ui::kv("supported tokens", &token_count.to_string());
     for entry in &catalog.chains {
         println!();
-        println!("  {}", entry.chain.chain_label);
         println!(
-            "    {} · {}",
+            "  {}  ·  {}  ·  {} assets  ·  {}",
+            entry.chain.chain_label,
             entry.chain.chain_id,
+            entry.tokens.len(),
             entry.chain.chain_type.to_ascii_uppercase()
         );
         if entry.tokens.is_empty() {
-            println!("    tokens: none advertised");
+            ui::info("No assets advertised.");
             continue;
         }
-        println!("    tokens ({}):", entry.tokens.len());
+        let mut table = asset_table(&["Asset", "Kind", "Address", "Decimals"]);
         for token in &entry.tokens {
-            println!(
-                "      {:<10} {:<42} {} decimals",
-                token.symbol,
-                token_address_label(token),
-                token.decimals
-            );
+            let native = is_native_token(&token.address);
+            table.add_row(vec![
+                Cell::new(&token.symbol).fg(Color::Cyan),
+                Cell::new(if native { "native" } else { "token" }),
+                Cell::new(if native { "—" } else { &token.address }),
+                Cell::new(token.decimals),
+            ]);
         }
-    }
-}
-
-fn token_address_label(token: &CatalogToken) -> &str {
-    if super::types::is_native_token(&token.address) {
-        "native token"
-    } else {
-        &token.address
+        println!("{table}");
     }
 }
 
