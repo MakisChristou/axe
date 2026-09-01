@@ -10,7 +10,8 @@ use super::client::RfqClient;
 use super::route::{DiscoveryFeedback, discover_wallet, plan_sweep, validate_quote_route};
 use super::types::{
     AssetSpec, ChainInfo, EvmTransactionPayload, HumanAmount, OrderType, Quote, QuoteOutcome,
-    QuoteRequest, RoutePlan, StatusResponse, TokenInfo, TokensResponse, format_units, parse_amount,
+    QuoteRequest, RoutePlan, StatusResponse, TokenInfo, TokensResponse, TransferState,
+    format_units, parse_amount,
 };
 use crate::config::ChainsConfig;
 use crate::types::Network;
@@ -126,11 +127,6 @@ pub async fn routes(args: RoutesArgs) -> Result<()> {
         args.order_type,
     )
     .await;
-    if plans.is_empty() {
-        bail!(
-            "No funded round-trip routes returned quotes. Check the wallet balances and route liquidity."
-        );
-    }
     if args.json {
         println!("{}", serde_json::to_string_pretty(&routes_json(&plans))?);
     } else {
@@ -252,6 +248,7 @@ async fn watch_status(client: &RfqClient, args: StatusArgs) -> Result<()> {
     let mut last_state = None;
     loop {
         let response = checked_status(client, &args.quote_id).await?;
+        ensure_watchable_status(&response)?;
         if last_state != Some(response.state) {
             if !args.json {
                 ui::kv("status", response.state.label());
@@ -270,6 +267,16 @@ async fn watch_status(client: &RfqClient, args: StatusArgs) -> Result<()> {
         }
         tokio::time::sleep(args.poll_interval).await;
     }
+}
+
+fn ensure_watchable_status(status: &StatusResponse) -> Result<()> {
+    if status.state == TransferState::NotFound {
+        bail!(
+            "Quote {} was not found. Check the quote ID and selected network.",
+            status.quote_id
+        );
+    }
+    Ok(())
 }
 
 fn render_chains(chains: &[ChainInfo]) {
@@ -430,4 +437,30 @@ fn render_status(status: &StatusResponse, json: bool) -> Result<()> {
 
 fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_route_discovery_is_a_valid_result() {
+        assert_eq!(routes_json(&[]), json!({ "routes": [] }));
+    }
+
+    #[test]
+    fn watching_an_unknown_quote_fails_immediately() {
+        let status = StatusResponse {
+            quote_id: "missing-quote".into(),
+            state: TransferState::NotFound,
+            destination: None,
+            output: None,
+            refund: None,
+        };
+
+        assert_eq!(
+            ensure_watchable_status(&status).unwrap_err().to_string(),
+            "Quote missing-quote was not found. Check the quote ID and selected network."
+        );
+    }
 }
