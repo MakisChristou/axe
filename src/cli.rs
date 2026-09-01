@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use alloy::primitives::Address;
+use clap::{Args, Parser, Subcommand};
 use eyre::Result;
 
+use crate::commands::intents::{AssetSpec, HumanAmount, OrderType};
 use crate::commands::load_test::{Protocol, TestType};
 use crate::commands::propose::ProposeArgs;
 use crate::types::Network;
@@ -51,6 +53,12 @@ pub fn network_or_default(arg: Option<Network>, global: Option<Network>) -> Resu
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Test Axelar intent routes through the public RFQ API
+    Intents {
+        #[command(subcommand)]
+        subcommand: IntentsCommands,
+    },
+
     /// Deploy and manage chain deployments
     Deploy {
         #[command(subcommand)]
@@ -155,6 +163,108 @@ pub enum BenchCommands {
     SolanaCu,
     /// Run both benchmarks.
     All,
+}
+
+#[derive(Subcommand)]
+pub enum IntentsCommands {
+    /// Send one intent over a random or explicit route
+    Send(IntentSendOptions),
+
+    /// Send one intent in each direction over the same asset pair
+    Roundtrip(IntentRoundtripOptions),
+
+    /// Run round trips across every currently executable wallet route
+    Sweep(IntentSweepOptions),
+}
+
+#[derive(Args)]
+pub struct IntentRuntimeOptions {
+    /// Path to chains config JSON. Omit to resolve from --network.
+    #[arg(long, env = "CHAINS_CONFIG")]
+    pub config: Option<PathBuf>,
+
+    /// EVM key for the axe wallet (prefer EVM_PRIVATE_KEY).
+    #[arg(long, env = "EVM_PRIVATE_KEY", hide_env_values = true)]
+    pub private_key: String,
+
+    /// Seconds between RFQ status requests.
+    #[arg(long, default_value = "2", value_parser = clap::value_parser!(u64).range(1..))]
+    pub poll_interval_secs: u64,
+
+    /// Maximum seconds to wait for one intent fulfillment.
+    #[arg(long, default_value = "1200", value_parser = clap::value_parser!(u64).range(1..))]
+    pub fulfillment_timeout_secs: u64,
+
+    /// Execute without an interactive confirmation.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(Args)]
+pub struct IntentRouteOptions {
+    /// Source asset as <CAIP-2 chain>/<token address>. Requires --to.
+    #[arg(long, requires = "to")]
+    pub from: Option<AssetSpec>,
+
+    /// Destination asset as <CAIP-2 chain>/<token address>. Requires --from.
+    #[arg(long, requires = "from")]
+    pub to: Option<AssetSpec>,
+
+    /// Human-readable fixed amount: source for exact-input, destination for exact-output.
+    #[arg(long, requires_all = ["from", "to"])]
+    pub amount: Option<HumanAmount>,
+
+    /// Fix the source input or destination output amount.
+    #[arg(long, value_enum, default_value_t)]
+    pub order_type: OrderType,
+
+    /// Basis points of spendable source balance when --amount is omitted.
+    #[arg(long, default_value = "100", value_parser = clap::value_parser!(u16).range(1..=10_000))]
+    pub wallet_bps: u16,
+}
+
+#[derive(Args)]
+pub struct IntentSendOptions {
+    #[command(flatten)]
+    pub runtime: IntentRuntimeOptions,
+
+    #[command(flatten)]
+    pub route: IntentRouteOptions,
+
+    /// Destination recipient. Defaults to the axe wallet.
+    #[arg(long)]
+    pub recipient: Option<Address>,
+}
+
+#[derive(Args)]
+pub struct IntentRoundtripOptions {
+    #[command(flatten)]
+    pub runtime: IntentRuntimeOptions,
+
+    #[command(flatten)]
+    pub route: IntentRouteOptions,
+}
+
+#[derive(Args)]
+pub struct IntentSweepOptions {
+    #[command(flatten)]
+    pub runtime: IntentRuntimeOptions,
+
+    /// Complete passes over every currently executable route.
+    #[arg(long, conflicts_with = "continuous", value_parser = clap::value_parser!(u64).range(1..))]
+    pub sweeps: Option<u64>,
+
+    /// Rediscover and sweep routes until Ctrl-C.
+    #[arg(long)]
+    pub continuous: bool,
+
+    /// Basis points of each source asset's spendable balance per route.
+    #[arg(long, default_value = "100", value_parser = clap::value_parser!(u16).range(1..=10_000))]
+    pub wallet_bps: u16,
+
+    /// Fix the source input or destination output amount.
+    #[arg(long, value_enum, default_value_t)]
+    pub order_type: OrderType,
 }
 
 #[derive(Subcommand)]
@@ -563,6 +673,15 @@ mod tests {
     fn all_subcommands_parse_with_global_network_flag() {
         let cases: &[&[&str]] = &[
             &["axe", "--network", "testnet", "deploy", "status"],
+            &[
+                "axe",
+                "--network",
+                "testnet",
+                "intents",
+                "send",
+                "--private-key",
+                "00",
+            ],
             &["axe", "--network", "testnet", "test", "gmp"],
             &["axe", "--network", "testnet", "decode", "calldata", "0x00"],
             &["axe", "--network", "testnet", "decode", "tx", "0xabc"],
@@ -631,5 +750,127 @@ mod tests {
             panic!("expected info block");
         };
         assert_eq!(network, Network::Testnet);
+    }
+
+    #[test]
+    fn intent_send_and_roundtrip_accept_automatic_routes() {
+        let cli = Cli::try_parse_from(["axe", "intents", "send", "--private-key", "00"]).unwrap();
+        let Commands::Intents {
+            subcommand: IntentsCommands::Send(options),
+        } = cli.command
+        else {
+            panic!("expected intents send");
+        };
+        assert!(options.route.from.is_none());
+        assert!(options.route.to.is_none());
+
+        assert!(
+            Cli::try_parse_from(["axe", "intents", "roundtrip", "--private-key", "00"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn intent_send_accepts_an_explicit_route_and_human_amount() {
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "send",
+                "--private-key",
+                "00",
+                "--from",
+                "eip155:11155111/0x0000000000000000000000000000000000000000",
+                "--to",
+                "eip155:43113/0x0000000000000000000000000000000000000000",
+                "--amount",
+                "0.01",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn intent_commands_accept_exact_output() {
+        let cli = Cli::try_parse_from([
+            "axe",
+            "intents",
+            "send",
+            "--private-key",
+            "00",
+            "--order-type",
+            "exact-output",
+        ])
+        .unwrap();
+        let Commands::Intents {
+            subcommand: IntentsCommands::Send(options),
+        } = cli.command
+        else {
+            panic!("expected intents send");
+        };
+        assert_eq!(options.route.order_type, OrderType::ExactOutput);
+
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "sweep",
+                "--private-key",
+                "00",
+                "--order-type",
+                "exact-output",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn intent_route_requires_both_assets() {
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "send",
+                "--private-key",
+                "00",
+                "--from",
+                "eip155:11155111/0x0000000000000000000000000000000000000000",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn intent_sweep_modes_conflict_only_when_both_are_explicit() {
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "sweep",
+                "--private-key",
+                "00",
+                "--continuous",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "sweep",
+                "--private-key",
+                "00",
+                "--continuous",
+                "--sweeps",
+                "2",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn exercise_was_renamed_to_sweep() {
+        assert!(
+            Cli::try_parse_from(["axe", "intents", "exercise", "--private-key", "00"]).is_err()
+        );
     }
 }

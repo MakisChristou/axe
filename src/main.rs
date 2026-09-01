@@ -390,6 +390,7 @@ async fn run_cli() -> Result<()> {
     let cli = cli::Cli::parse();
 
     match cli.command {
+        cli::Commands::Intents { subcommand } => run_intents(subcommand, cli.network).await,
         cli::Commands::Deploy { subcommand } => run_deploy(subcommand, cli.network).await,
         cli::Commands::Decode { subcommand } => run_decode(subcommand, cli.network).await,
         cli::Commands::Info { subcommand } => match subcommand {
@@ -431,4 +432,69 @@ async fn run_cli() -> Result<()> {
         cli::Commands::Test { subcommand } => run_test(subcommand, cli.network).await,
         cli::Commands::Bench { subcommand } => commands::bench::run(subcommand).await,
     }
+}
+
+async fn run_intents(
+    subcommand: cli::IntentsCommands,
+    global: Option<types::Network>,
+) -> Result<()> {
+    match subcommand {
+        cli::IntentsCommands::Send(options) => {
+            let runtime = resolve_intent_runtime(options.runtime, global).await?;
+            let route = commands::intents::RouteChoice::new(
+                options.route.from,
+                options.route.to,
+                options.route.amount,
+                options.route.wallet_bps,
+                options.route.order_type,
+            )?;
+            commands::intents::send(commands::intents::SendArgs {
+                runtime,
+                route,
+                recipient: options.recipient,
+            })
+            .await
+        }
+        cli::IntentsCommands::Roundtrip(options) => {
+            let runtime = resolve_intent_runtime(options.runtime, global).await?;
+            let route = commands::intents::RouteChoice::new(
+                options.route.from,
+                options.route.to,
+                options.route.amount,
+                options.route.wallet_bps,
+                options.route.order_type,
+            )?;
+            commands::intents::roundtrip(commands::intents::RoundtripArgs { runtime, route }).await
+        }
+        cli::IntentsCommands::Sweep(options) => {
+            let runtime = resolve_intent_runtime(options.runtime, global).await?;
+            commands::intents::sweep(commands::intents::SweepArgs {
+                runtime,
+                sweeps: options.sweeps.unwrap_or(1),
+                continuous: options.continuous,
+                wallet_bps: options.wallet_bps,
+                order_type: options.order_type,
+            })
+            .await
+        }
+    }
+}
+
+async fn resolve_intent_runtime(
+    options: cli::IntentRuntimeOptions,
+    global: Option<types::Network>,
+) -> Result<commands::intents::IntentRuntimeArgs> {
+    let network = cli::resolve_network(global, options.config.as_deref())?;
+    let config = match options.config {
+        Some(path) => path,
+        None => config_source::resolve(network, None).await?.into_path(),
+    };
+    Ok(commands::intents::IntentRuntimeArgs {
+        network,
+        config,
+        private_key: options.private_key,
+        poll_interval_secs: options.poll_interval_secs,
+        fulfillment_timeout_secs: options.fulfillment_timeout_secs,
+        yes: options.yes,
+    })
 }
