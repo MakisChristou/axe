@@ -297,6 +297,11 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     env:
+      # Keep axe's verification window under the 30-min job timeout: a stall
+      # then ends as an honest failure with a written report, phase counts,
+      # and the GMP-API final recheck - instead of a SIGKILLed "cancelled"
+      # job with no diagnostics (see engine.rs inactivity_timeout).
+      AXE_VERIFY_INACTIVITY_SECS: "1200"
       # Per-chain private RPC overrides (same block as the other workflows).
       # Pattern: <CHAIN_DISPLAY_UPPER>_<NETWORK_UPPER>_RPC.
       ARBITRUM_MAINNET_RPC:        ${{ secrets.ARBITRUM_MAINNET_RPC }}

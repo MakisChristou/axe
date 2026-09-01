@@ -1,5 +1,6 @@
 //! Load test verification engine.
 
+use std::env;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -34,7 +35,20 @@ pub type StreamingTimings = Vec<(super::identifiers::MessageId, AmplifierTiming)
 // `timed out`. 7200s gives ~2.2x headroom over the worst observed latency
 // while still surfacing a truly stuck route within a couple of hours. Resets on
 // any per-phase progress, so large batches naturally get more time.
-const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(7200);
+//
+// Overridable via `AXE_VERIFY_INACTIVITY_SECS`: CI route jobs run under a
+// hard job timeout, and a window longer than the job budget means the runner
+// SIGKILLs axe mid-wait - conclusion "cancelled", no report, no phases, no
+// GMP-API final recheck (observed: the hedera testnet pipeline was down for
+// days behind silently cancelled jobs, run 33455835970). A window just under
+// the job budget turns the same stall into an honest failure that runs the
+// API backstop and names the stuck phase.
+fn inactivity_timeout() -> Duration {
+    env::var("AXE_VERIFY_INACTIVITY_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(Duration::from_secs(7200), Duration::from_secs)
+}
 /// Delay between poll attempts.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
