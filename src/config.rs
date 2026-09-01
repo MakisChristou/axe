@@ -62,6 +62,9 @@ pub struct ChainConfig {
     #[serde(rename = "axelarId")]
     pub axelar_id: Option<String>,
     pub name: Option<String>,
+    /// Numeric EVM chain ID. Non-EVM entries omit this field.
+    #[serde(rename = "chainId")]
+    pub evm_chain_id: Option<u64>,
     pub rpc: Option<String>,
     #[serde(rename = "wssRpc")]
     pub wss_rpc: Option<String>,
@@ -311,6 +314,7 @@ mod tests {
       "chains": {
         "hedera": {
           "axelarId": "hedera",
+          "chainId": 296,
           "name": "Hedera",
           "rpc": "https://testnet.hashio.io/api",
           "wssRpc": "wss://testnet.hashio.io/ws",
@@ -372,6 +376,7 @@ mod tests {
 
         let hedera = cfg.chains.get("hedera").expect("hedera present");
         assert_eq!(hedera.axelar_id.as_deref(), Some("hedera"));
+        assert_eq!(hedera.evm_chain_id, Some(296));
         assert_eq!(hedera.chain_type.as_deref(), Some("evm"));
         assert_eq!(hedera.token_symbol.as_deref(), Some("HBAR"));
         assert_eq!(
