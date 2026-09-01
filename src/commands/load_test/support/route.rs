@@ -133,6 +133,22 @@ impl SupportedRoute {
     }
 }
 
+/// Whether a protocol and route pairing can be attempted, without exposing
+/// the resolved route itself.
+///
+/// The MCP server answers route questions through this, so an agent gets the
+/// same verdict the load test would reach rather than a second opinion that
+/// could drift. Deliberately narrow: the resolved `SupportedRoute` and its
+/// per-protocol enums stay private to this module.
+pub(crate) fn is_supported(
+    protocol: Protocol,
+    test_type: TestType,
+    source_chain: &str,
+    destination_chain: &str,
+) -> Result<()> {
+    SupportedRoute::resolve(protocol, test_type, source_chain, destination_chain).map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{GmpRoute, ItsRoute, ItsWithDataRoute, SupportedRoute};

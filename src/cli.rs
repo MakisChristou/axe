@@ -127,6 +127,17 @@ pub enum Commands {
 
     /// Submit an AxelarServiceGovernance proposal to an edge chain's ASG
     Propose(ProposeArgs),
+
+    /// Serve axe over the Model Context Protocol on stdio, so an LLM can
+    /// drive it. The network is fixed for the life of the server: pass
+    /// `--network` or set `AXE_NETWORK`.
+    Mcp {
+        /// Allow the server to be pinned to mainnet. Without this, starting
+        /// against mainnet is refused: the flows spend real funds, so that
+        /// decision is made once by a human outside the conversation.
+        #[arg(long)]
+        allow_mainnet: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -517,7 +528,8 @@ pub enum DecodeCommands {
     },
 }
 
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, clap::ValueEnum, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
 pub enum SolProgram {
     Gateway,
     Its,
@@ -525,7 +537,8 @@ pub enum SolProgram {
     Memo,
 }
 
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, clap::ValueEnum, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
 pub enum EvmContract {
     Gateway,
     Its,

@@ -80,6 +80,8 @@ sui-sdk-types = { version = "0.3", features = ["serde", "hash"] }
 bech32 = "0.11"
 bcs = "0.1"
 blake2 = "0.10"
+rmcp = { version = "3.1.4", features = ["transport-io"] }
+schemars = "1.2.2"
 
 [dev-dependencies]
 # `test-util` enables `#[tokio::test(start_paused = true)]` so retry/backoff

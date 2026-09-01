@@ -20,3 +20,10 @@ axelar1*.txt
 
 # Nix build output symlink
 /result
+
+# Personal agent configuration, deliberately not shared: AGENTS.local.md and
+# its CLAUDE.local.md pointer, plus the docs/agents/ files they reference.
+# Preferences only — key material still belongs outside the repo entirely, see
+# the note above and AGENTS.md 6.
+*.local.md
+docs/agents/

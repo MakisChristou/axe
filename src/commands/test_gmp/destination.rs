@@ -34,9 +34,21 @@ pub struct EvmExecutionRequest<'a, P> {
     pub total_steps: usize,
 }
 
+/// What a destination execution actually submitted on chain.
+///
+/// Returned rather than printed and discarded, so a caller that fails partway
+/// through can say what already landed. Each is optional because the approve
+/// can land while the execute reverts, which is a normal outcome worth
+/// reporting precisely.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct SubmittedTransactions {
+    pub approve_tx: Option<String>,
+    pub execute_tx: Option<String>,
+}
+
 pub async fn approve_and_execute_evm<P: Provider>(
     request: EvmExecutionRequest<'_, P>,
-) -> Result<()> {
+) -> Result<SubmittedTransactions> {
     let EvmExecutionRequest {
         provider,
         gateway,
@@ -58,7 +70,8 @@ pub async fn approve_and_execute_evm<P: Provider>(
         .to(gateway)
         .input(Bytes::from(execute_data).into());
     let pending_approve = provider.send_transaction(approve_tx).await?;
-    let _approve_receipt = crate::evm::broadcast_and_log(pending_approve, "tx").await?;
+    let approve_receipt = crate::evm::broadcast_and_log(pending_approve, "tx").await?;
+    let approve_tx_hash = format!("{:#x}", approve_receipt.transaction_hash);
 
     // Use the modern Amplifier `isMessageApproved` view — keyed on
     // (sourceChain, messageId, sourceAddress, contractAddress, payloadHash)
@@ -107,14 +120,21 @@ pub async fn approve_and_execute_evm<P: Provider>(
         source_address.to_string(),
         Bytes::from(payload_bytes.to_vec()),
     );
+    // Execute is best-effort: a revert here is reported, not fatal, because
+    // the approve above already landed and is worth knowing about. That is
+    // exactly why the hash is captured rather than discarded.
+    let mut execute_tx_hash = None;
     match exec_call.send().await {
         Ok(pending_exec) => match crate::evm::broadcast_and_log(pending_exec, "tx").await {
-            Ok(_) => match sr_contract.message().call().await {
-                Ok(stored_message) => {
-                    ui::kv("stored message", &format!("\"{stored_message}\""));
+            Ok(receipt) => {
+                execute_tx_hash = Some(format!("{:#x}", receipt.transaction_hash));
+                match sr_contract.message().call().await {
+                    Ok(stored_message) => {
+                        ui::kv("stored message", &format!("\"{stored_message}\""));
+                    }
+                    Err(e) => ui::warn(&format!("could not read stored message: {e}")),
                 }
-                Err(e) => ui::warn(&format!("could not read stored message: {e}")),
-            },
+            }
             Err(e) => ui::warn(&format!(
                 "execute() reverted (likely commandId-derivation mismatch on this gateway version): {e}",
             )),
@@ -122,7 +142,10 @@ pub async fn approve_and_execute_evm<P: Provider>(
         Err(e) => ui::warn(&format!("execute() submission failed: {e}")),
     }
 
-    Ok(())
+    Ok(SubmittedTransactions {
+        approve_tx: Some(approve_tx_hash),
+        execute_tx: execute_tx_hash,
+    })
 }
 
 /// Submit the Amplifier-built `execute_data` to the Solana gateway, then
@@ -145,7 +168,9 @@ pub struct SvmExecutionRequest<'a> {
     pub total_steps: usize,
 }
 
-pub async fn approve_and_execute_svm(request: SvmExecutionRequest<'_>) -> Result<()> {
+pub async fn approve_and_execute_svm(
+    request: SvmExecutionRequest<'_>,
+) -> Result<SubmittedTransactions> {
     let SvmExecutionRequest {
         dst_rpc,
         network,
@@ -199,5 +224,10 @@ pub async fn approve_and_execute_svm(request: SvmExecutionRequest<'_>) -> Result
     .await??;
     ui::tx_hash("execute", &memo_sig.to_string());
 
-    Ok(())
+    Ok(SubmittedTransactions {
+        // The Solana approve spans several transactions internally and returns
+        // no single signature, so there is nothing honest to report for it.
+        approve_tx: None,
+        execute_tx: Some(memo_sig.to_string()),
+    })
 }

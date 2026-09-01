@@ -54,7 +54,7 @@ pub(super) async fn finish_batch<T: BatchTarget>(
     test_start: Instant,
 ) -> Result<()> {
     attach_batch(args, target, report).await?;
-    finish_report(report, test_start).await
+    finish_report(report, test_start, args.run_id.as_deref()).await
 }
 
 /// How a timing's message id maps back to the source transaction that

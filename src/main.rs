@@ -8,6 +8,7 @@ mod evm;
 mod gmp_api;
 mod http;
 mod hyperliquid;
+mod mcp;
 mod preflight;
 mod retry;
 mod solana;
@@ -204,6 +205,9 @@ async fn run_gmp_test(
             mnemonic,
         )
         .await
+        // The CLI reports through its printed output; the submitted
+        // transactions matter to a caller that has to report a failure.
+        .map(|_submitted| ())
     } else {
         commands::test_gmp::run(axelar_id).await
     }
@@ -306,6 +310,8 @@ async fn run_load_test(
         duration_secs,
         key_cycle,
         extra_accounts,
+        // The CLI keeps the historical timestamp filename.
+        run_id: None,
     })
     .await
 }
@@ -414,6 +420,14 @@ async fn run_cli() -> Result<()> {
             json,
         } => commands::verifier_votes::run(network, chain, verifier, limit, json).await,
         cli::Commands::Propose(args) => commands::propose::run(args).await,
+        cli::Commands::Mcp { allow_mainnet } => {
+            // The pin is explicit on purpose: falling back to testnet would
+            // let a long-lived server serve a network nobody chose.
+            let network = cli.network.ok_or_else(|| {
+                eyre::eyre!("axe mcp needs a network: pass --network or set AXE_NETWORK")
+            })?;
+            mcp::serve(network, allow_mainnet).await
+        }
         cli::Commands::Test { subcommand } => run_test(subcommand, cli.network).await,
         cli::Commands::Bench { subcommand } => commands::bench::run(subcommand).await,
     }

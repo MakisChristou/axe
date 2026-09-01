@@ -620,6 +620,29 @@ pub(crate) fn detect_network_from_config(config: &Path) -> Option<Network> {
         .find(|network| name == network.as_str())
 }
 
+/// Where the JSON report artifact is written.
+///
+/// Unset means the CLI's historical location, relative to the working
+/// directory, which existing scripts glob. The MCP server sets this at startup
+/// because a server launched by a client inherits whatever directory the
+/// client chose, so a relative path would land somewhere unpredictable.
+///
+/// Set-once for the same reason as [`ITS_CACHE_NETWORK`]: one process serves
+/// one configuration, decided at the entrypoint.
+static REPORT_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Record where reports should be written. Later calls are no-ops.
+pub(crate) fn set_report_dir(dir: PathBuf) {
+    let _ = REPORT_DIR.set(dir);
+}
+
+/// The directory to write a report artifact into.
+pub(crate) fn report_dir() -> PathBuf {
+    REPORT_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("axe-load-test-logs"))
+}
 #[cfg(test)]
 mod tests {
     use std::env;

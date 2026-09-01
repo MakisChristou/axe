@@ -277,3 +277,89 @@ fn amount_check_failure(check: Option<&AmountCheck>) -> Option<String> {
         _ => None,
     }
 }
+
+/// One express transfer's two phases, as data.
+///
+/// Built from the record's own `phase_status` classification rather than by
+/// re-reading the raw API shape, so the tool and the printed report agree on
+/// whether a transfer was fronted and whether the executor was paid back.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct ExpressPhases {
+    pub source_chain: Option<String>,
+    pub destination_chain: Option<String>,
+    pub message_id: Option<String>,
+    pub command_id: Option<String>,
+    pub status: Option<String>,
+    pub symbol: Option<String>,
+    /// executed when the express executor fronted the funds, otherwise
+    /// not_observed.
+    pub phase1: &'static str,
+    pub express_tx: Option<String>,
+    pub executor: Option<String>,
+    /// reimbursed once the canonical execute landed, pending while it has not,
+    /// not_applicable when phase 1 never happened.
+    pub phase2: &'static str,
+    pub execute_tx: Option<String>,
+}
+
+fn express_phases(record: &ExpressRecord) -> ExpressPhases {
+    let (phase1, phase2) = record.phase_status();
+
+    let (phase1_label, express_tx, executor) = match &phase1 {
+        Phase1::Executed {
+            executor_eoa,
+            executor_contract,
+            express_tx,
+        } => (
+            "executed",
+            express_tx.clone(),
+            executor_eoa.clone().or_else(|| executor_contract.clone()),
+        ),
+        Phase1::NotObserved => ("not_observed", None, None),
+    };
+
+    let (phase2_label, execute_tx) = match &phase2 {
+        Phase2::Reimbursed { execute_tx } => ("reimbursed", execute_tx.clone()),
+        Phase2::Pending => ("pending", None),
+        Phase2::NotApplicable => ("not_applicable", None),
+    };
+
+    ExpressPhases {
+        source_chain: record.source_chain().map(str::to_string),
+        destination_chain: record.destination_chain().map(str::to_string),
+        message_id: record.message_id.clone(),
+        command_id: record.command_id.clone(),
+        status: record.status.clone(),
+        symbol: record.symbol.clone(),
+        phase1: phase1_label,
+        express_tx,
+        executor,
+        phase2: phase2_label,
+        execute_tx,
+    }
+}
+
+/// Scan recent express transfers on one or more chains, without printing.
+///
+/// Observe-only: this reads the Axelarscan GMP API and spends nothing, which
+/// is why it belongs with the read-only tools rather than behind a spend gate.
+pub(crate) async fn resolve_scan(
+    network: Network,
+    chains: &[String],
+    recent: usize,
+) -> Result<Vec<ExpressPhases>> {
+    let base = gmp_api::base_url(network).ok_or_else(|| {
+        eyre::eyre!(
+            "network {} has no Axelarscan GMP API deployment",
+            network.as_str()
+        )
+    })?;
+
+    let recent = if recent == 0 { DEFAULT_RECENT } else { recent };
+    let mut out = Vec::new();
+    for chain in chains {
+        let records = gmp_api::search_recent_express(base, Some(chain), recent).await?;
+        out.extend(records.iter().map(express_phases));
+    }
+    Ok(out)
+}

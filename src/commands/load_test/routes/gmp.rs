@@ -279,7 +279,7 @@ pub(super) async fn run_sol_to_evm(args: LoadTestArgs, sizing: RunSizing) -> Res
         report
     };
 
-    finish_report(&mut report, test_start).await
+    finish_report(&mut report, test_start, args.run_id.as_deref()).await
 }
 
 pub(super) async fn run_evm_to_sol(args: LoadTestArgs, sizing: RunSizing) -> Result<()> {
@@ -386,7 +386,7 @@ pub(super) async fn run_evm_to_sol(args: LoadTestArgs, sizing: RunSizing) -> Res
         report
     };
 
-    finish_report(&mut report, test_start).await
+    finish_report(&mut report, test_start, args.run_id.as_deref()).await
 }
 
 #[derive(Clone, Copy)]
@@ -573,7 +573,7 @@ pub(super) async fn run_evm_to_evm(args: LoadTestArgs, sizing: RunSizing) -> Res
         report
     };
 
-    finish_report(&mut report, test_start).await
+    finish_report(&mut report, test_start, args.run_id.as_deref()).await
 }
 
 pub(super) async fn run_sol_to_sol(args: LoadTestArgs, sizing: RunSizing) -> Result<()> {
@@ -639,7 +639,7 @@ pub(super) async fn run_sol_to_sol(args: LoadTestArgs, sizing: RunSizing) -> Res
         report
     };
 
-    finish_report(&mut report, test_start).await
+    finish_report(&mut report, test_start, args.run_id.as_deref()).await
 }
 
 // ---------------------------------------------------------------------------
@@ -914,7 +914,7 @@ pub(super) async fn run_stellar_to_evm(args: LoadTestArgs, run_sizing: RunSizing
         .await?
     };
 
-    finish_report(&mut report, test_start).await
+    finish_report(&mut report, test_start, args.run_id.as_deref()).await
 }
 
 // ===========================================================================
@@ -1018,7 +1018,7 @@ pub(super) async fn run_evm_to_stellar(args: LoadTestArgs, sizing: RunSizing) ->
     )
     .await?;
 
-    finish_report(&mut report, test_start).await
+    finish_report(&mut report, test_start, args.run_id.as_deref()).await
 }
 
 pub(super) async fn run_stellar_to_sol(args: LoadTestArgs, sizing: RunSizing) -> Result<()> {
@@ -1118,7 +1118,7 @@ pub(super) async fn run_stellar_to_sol(args: LoadTestArgs, sizing: RunSizing) ->
     )
     .await?;
 
-    finish_report(&mut report, test_start).await
+    finish_report(&mut report, test_start, args.run_id.as_deref()).await
 }
 
 pub(super) async fn run_sol_to_stellar(args: LoadTestArgs, sizing: RunSizing) -> Result<()> {
@@ -1174,7 +1174,7 @@ pub(super) async fn run_sol_to_stellar(args: LoadTestArgs, sizing: RunSizing) ->
     )
     .await?;
 
-    finish_report(&mut report, test_start).await
+    finish_report(&mut report, test_start, args.run_id.as_deref()).await
 }
 
 // ===========================================================================
@@ -1323,7 +1323,7 @@ pub(super) async fn run_sui_to_evm(args: LoadTestArgs, sizing: RunSizing) -> Res
     )
     .await?;
 
-    finish_report(&mut report, test_start).await
+    finish_report(&mut report, test_start, args.run_id.as_deref()).await
 }
 
 // ===========================================================================
@@ -1458,5 +1458,5 @@ pub(super) async fn run_sui_to_sol(args: LoadTestArgs, sizing: RunSizing) -> Res
     )
     .await?;
 
-    finish_report(&mut report, test_start).await
+    finish_report(&mut report, test_start, args.run_id.as_deref()).await
 }

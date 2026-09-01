@@ -316,11 +316,12 @@ fn sorted_verifiers<'a>(known_verifiers: &[(&'a str, &'a str)]) -> Vec<(&'a str,
     sorted
 }
 
-fn print_verifiers_json(
-    known_verifiers: &[(&str, &str)],
-    verifier_set: &VerifierSet,
-) -> Result<()> {
-    let entries = sorted_verifiers(known_verifiers)
+/// The verifier rows as data.
+///
+/// Shared by `--json` and the MCP server so both front ends report exactly
+/// the same shape and cannot drift apart.
+fn verifiers_json(known_verifiers: &[(&str, &str)], verifier_set: &VerifierSet) -> Vec<Value> {
+    sorted_verifiers(known_verifiers)
         .into_iter()
         .map(|(address, name)| {
             let active = verifier_set
@@ -340,9 +341,7 @@ fn print_verifiers_json(
                 "pre_registration_only": verifier_set.pre_registration_only,
             })
         })
-        .collect::<Vec<_>>();
-    println!("{}", serde_json::to_string_pretty(&entries)?);
-    Ok(())
+        .collect::<Vec<_>>()
 }
 
 fn verifier_status(
@@ -432,19 +431,20 @@ fn print_verifiers_table(
     }
 }
 
-pub async fn run(network: Network, chain: String, json_mode: bool) -> Result<()> {
+/// Query the verifier set for a chain, resolving the chain's axelar id on the
+/// way. Prints nothing, so both front ends can share it.
+async fn query(
+    network: Network,
+    chain: &str,
+) -> Result<(String, &'static [(&'static str, &'static str)], VerifierSet)> {
     let known_verifiers = verifiers_for_network(network)?;
     let config_path = config_source::resolve(network, None).await?.into_path();
-    let chain_axelar_id = resolve_chain_axelar_id(&config_path, &chain).await?;
+    let chain_axelar_id = resolve_chain_axelar_id(&config_path, chain).await?;
 
     let (lcd, _chain_id, _fee_denom, _gas_price) = read_axelar_config(&config_path).await?;
     let service_registry_addr =
         read_axelar_contract_field(&config_path, "/axelar/contracts/ServiceRegistry/address")
             .await?;
-
-    if !json_mode {
-        ui::section(&format!("Verifiers: {} / {}", network, chain_axelar_id));
-    }
 
     let verifier_set = query_verifier_set(
         &lcd,
@@ -453,6 +453,7 @@ pub async fn run(network: Network, chain: String, json_mode: bool) -> Result<()>
         known_verifiers,
     )
     .await?;
+
     if verifier_set.pre_registration_only && verifier_set.pre_registered.is_empty() {
         return Err(eyre::eyre!(
             "no verifiers found for chain '{chain_axelar_id}' on {network}. \
@@ -460,9 +461,34 @@ pub async fn run(network: Network, chain: String, json_mode: bool) -> Result<()>
         ));
     }
 
-    if json_mode {
-        return print_verifiers_json(known_verifiers, &verifier_set);
+    Ok((chain_axelar_id, known_verifiers, verifier_set))
+}
+
+/// The active verifier set for a chain, as data.
+pub(crate) async fn resolve(network: Network, chain: &str) -> Result<Value> {
+    let (chain_axelar_id, known_verifiers, verifier_set) = query(network, chain).await?;
+    Ok(json!({
+        "network": network.to_string(),
+        "chain": chain_axelar_id,
+        "verifiers": verifiers_json(known_verifiers, &verifier_set),
+    }))
+}
+
+pub async fn run(network: Network, chain: String, json_mode: bool) -> Result<()> {
+    let (chain_axelar_id, known_verifiers, verifier_set) = query(network, &chain).await?;
+
+    // Printed after the query rather than before it, so the shared query can
+    // stay silent. Same text as before, just emitted once the answer is in.
+    if !json_mode {
+        ui::section(&format!("Verifiers: {network} / {chain_axelar_id}"));
     }
+
+    if json_mode {
+        let entries = verifiers_json(known_verifiers, &verifier_set);
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+        return Ok(());
+    }
+
     print_verifiers_table(&chain_axelar_id, known_verifiers, &verifier_set);
     Ok(())
 }
