@@ -1,5 +1,5 @@
 use std::io::{self, IsTerminal, Write};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
@@ -118,18 +118,41 @@ fn confirm_blocking(prompt: &str) -> bool {
     matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
-/// Format elapsed duration as human-readable
-pub fn format_elapsed(start: Instant) -> String {
-    let elapsed = start.elapsed();
-    if elapsed.as_secs() >= 60 {
-        format!(
-            "{}m{:.1}s",
-            elapsed.as_secs() / 60,
-            elapsed.as_secs_f64() % 60.0
-        )
-    } else {
-        format!("{:.1}s", elapsed.as_secs_f64())
+/// Format a duration for compact human-readable terminal output.
+pub fn format_duration(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis < 1_000 {
+        return format!("{millis} ms");
     }
+
+    let seconds = duration.as_secs_f64();
+    if seconds < 10.0 {
+        return format!("{seconds:.2} s");
+    }
+    if seconds < 60.0 {
+        return format!("{seconds:.1} s");
+    }
+
+    let total_seconds = duration.as_secs();
+    let minutes = total_seconds / 60;
+    let remaining_seconds = total_seconds % 60;
+    if minutes < 60 {
+        return format!("{minutes}m {remaining_seconds:02}s");
+    }
+
+    let hours = minutes / 60;
+    let remaining_minutes = minutes % 60;
+    format!("{hours}h {remaining_minutes:02}m")
+}
+
+/// Format a millisecond metric for human-readable terminal output.
+pub fn format_millis(milliseconds: u64) -> String {
+    format_duration(Duration::from_millis(milliseconds))
+}
+
+/// Format elapsed time from an instant for human-readable terminal output.
+pub fn format_elapsed(start: Instant) -> String {
+    format_duration(start.elapsed())
 }
 
 /// Truncate large JSON strings to first/last N lines
@@ -176,4 +199,29 @@ pub fn scrub_urls(input: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_subsecond_durations_as_milliseconds() {
+        assert_eq!(format_duration(Duration::ZERO), "0 ms");
+        assert_eq!(format_duration(Duration::from_millis(181)), "181 ms");
+        assert_eq!(format_duration(Duration::from_millis(999)), "999 ms");
+    }
+
+    #[test]
+    fn formats_seconds_with_scale_appropriate_precision() {
+        assert_eq!(format_millis(2_924), "2.92 s");
+        assert_eq!(format_millis(8_823), "8.82 s");
+        assert_eq!(format_millis(11_929), "11.9 s");
+    }
+
+    #[test]
+    fn formats_long_durations_compactly() {
+        assert_eq!(format_duration(Duration::from_secs(72)), "1m 12s");
+        assert_eq!(format_duration(Duration::from_secs(3_780)), "1h 03m");
+    }
 }

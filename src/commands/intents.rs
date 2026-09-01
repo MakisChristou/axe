@@ -370,37 +370,29 @@ fn render_summary(results: &[LegResult], planned: usize) {
         .map(|result| result.end_to_end_latency_ms)
         .collect();
     ui::kv(
-        "quote latency p50/p95",
-        &format!(
-            "{}/{} ms",
-            percentile(&quote_latencies, 50),
-            percentile(&quote_latencies, 95)
-        ),
+        "quote latency",
+        &format_latency_percentiles(&quote_latencies),
     );
     ui::kv(
-        "deposit confirmation p50/p95",
-        &format!(
-            "{}/{} ms",
-            percentile(&deposit_latencies, 50),
-            percentile(&deposit_latencies, 95)
-        ),
+        "deposit confirmation",
+        &format_latency_percentiles(&deposit_latencies),
     );
     ui::kv(
-        "fulfillment latency p50/p95",
-        &format!(
-            "{}/{} ms",
-            percentile(&fulfillment_latencies, 50),
-            percentile(&fulfillment_latencies, 95)
-        ),
+        "fulfillment latency",
+        &format_latency_percentiles(&fulfillment_latencies),
     );
     ui::kv(
-        "end-to-end latency p50/p95",
-        &format!(
-            "{}/{} ms",
-            percentile(&end_to_end_latencies, 50),
-            percentile(&end_to_end_latencies, 95)
-        ),
+        "end-to-end latency",
+        &format_latency_percentiles(&end_to_end_latencies),
     );
+}
+
+fn format_latency_percentiles(values: &[u64]) -> String {
+    format!(
+        "p50 {} │ p95 {}",
+        ui::format_millis(percentile(values, 50)),
+        ui::format_millis(percentile(values, 95))
+    )
 }
 
 fn completion_percentage(completed: usize, planned: usize) -> f64 {
@@ -437,5 +429,13 @@ mod tests {
     fn completion_percentage_handles_empty_and_partial_runs() {
         assert_eq!(completion_percentage(0, 0), 0.0);
         assert_eq!(completion_percentage(3, 4), 75.0);
+    }
+
+    #[test]
+    fn latency_percentiles_are_labeled_and_human_readable() {
+        assert_eq!(
+            format_latency_percentiles(&[181, 2_924, 8_823]),
+            "p50 2.92 s │ p95 8.82 s"
+        );
     }
 }
