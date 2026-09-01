@@ -167,6 +167,21 @@ pub enum BenchCommands {
 
 #[derive(Subcommand)]
 pub enum IntentsCommands {
+    /// Show chains or tokens advertised by the intent API
+    Catalog {
+        #[command(subcommand)]
+        subcommand: IntentCatalogCommands,
+    },
+
+    /// Discover funded routes that quote successfully in both directions
+    Routes(IntentRoutesOptions),
+
+    /// Request and inspect one quote without executing it
+    Quote(IntentQuoteOptions),
+
+    /// Show or watch the status of a quote
+    Status(IntentStatusOptions),
+
     /// Send one intent over a random or explicit route
     Send(IntentSendOptions),
 
@@ -182,6 +197,120 @@ pub struct IntentApiOptions {
     /// RFQ API base URL. Defaults to the selected network's public endpoint.
     #[arg(long, env = "INTENTS_API_URL")]
     pub api_url: Option<String>,
+}
+
+#[derive(Args)]
+pub struct IntentReadOptions {
+    #[command(flatten)]
+    pub api: IntentApiOptions,
+
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Subcommand)]
+pub enum IntentCatalogCommands {
+    /// Show chains advertised by the intent API
+    Chains(IntentCatalogOptions),
+
+    /// Show tokens advertised by the intent API
+    Tokens(IntentTokensOptions),
+}
+
+#[derive(Args)]
+pub struct IntentCatalogOptions {
+    #[command(flatten)]
+    pub read: IntentReadOptions,
+}
+
+#[derive(Args)]
+pub struct IntentTokensOptions {
+    #[command(flatten)]
+    pub read: IntentReadOptions,
+
+    /// Limit results to one CAIP-2 chain ID.
+    #[arg(long)]
+    pub chain: Option<String>,
+}
+
+#[derive(Args)]
+pub struct IntentRoutesOptions {
+    #[command(flatten)]
+    pub read: IntentReadOptions,
+
+    /// Path to chains config JSON. Omit to resolve from --network.
+    #[arg(long, env = "CHAINS_CONFIG")]
+    pub config: Option<PathBuf>,
+
+    /// EVM address whose balances determine executable routes.
+    #[arg(long)]
+    pub wallet_address: Address,
+
+    /// Basis points of each source asset's spendable balance to quote.
+    #[arg(long, default_value = "100", value_parser = clap::value_parser!(u16).range(1..=10_000))]
+    pub wallet_bps: u16,
+
+    /// Fix the source input or destination output amount.
+    #[arg(long, value_enum, default_value_t)]
+    pub order_type: OrderType,
+}
+
+#[derive(Args)]
+pub struct IntentQuoteRequestOptions {
+    /// Source asset as <CAIP-2 chain>/<token address>.
+    #[arg(long)]
+    pub from: AssetSpec,
+
+    /// Destination asset as <CAIP-2 chain>/<token address>.
+    #[arg(long)]
+    pub to: AssetSpec,
+
+    /// Human-readable source amount for exact-input or output amount for exact-output.
+    #[arg(long)]
+    pub amount: HumanAmount,
+
+    /// Address used to construct approval and deposit actions.
+    #[arg(long)]
+    pub sender: Address,
+
+    /// Destination recipient. Defaults to --sender.
+    #[arg(long)]
+    pub recipient: Option<Address>,
+
+    /// Fix the source input or destination output amount.
+    #[arg(long, value_enum, default_value_t)]
+    pub order_type: OrderType,
+}
+
+#[derive(Args)]
+pub struct IntentQuoteOptions {
+    #[command(flatten)]
+    pub read: IntentReadOptions,
+
+    #[command(flatten)]
+    pub request: IntentQuoteRequestOptions,
+}
+
+#[derive(Args)]
+pub struct IntentStatusOptions {
+    #[command(flatten)]
+    pub read: IntentReadOptions,
+
+    /// Quote ID returned by the intent API.
+    pub quote_id: String,
+
+    /// Poll until the quote completes, refunds, fails, or times out.
+    #[arg(long)]
+    pub watch: bool,
+
+    /// Seconds between status requests in watch mode.
+    #[arg(long, default_value = "2", value_parser = clap::value_parser!(u64).range(1..))]
+    pub poll_interval_secs: u64,
+
+    /// Maximum seconds to watch before returning an error.
+    #[arg(long, default_value = "1200", value_parser = clap::value_parser!(u64).range(1..))]
+    pub timeout_secs: u64,
 }
 
 #[derive(Args)]
@@ -830,6 +959,49 @@ mod tests {
                 "exact-output",
             ])
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn intent_read_commands_parse_without_a_private_key() {
+        const ASSET: &str = "eip155:11155111/0x0000000000000000000000000000000000000000";
+        const ADDRESS: &str = "0x0000000000000000000000000000000000000001";
+
+        assert!(Cli::try_parse_from(["axe", "intents", "catalog", "chains"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["axe", "intents", "routes", "--wallet-address", ADDRESS,]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "axe", "intents", "quote", "--from", ASSET, "--to", ASSET, "--amount", "1",
+                "--sender", ADDRESS,
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "status",
+                "quote-id",
+                "--watch",
+                "--timeout-secs",
+                "30",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn intent_read_commands_require_route_context() {
+        const ASSET: &str = "eip155:11155111/0x0000000000000000000000000000000000000000";
+
+        assert!(Cli::try_parse_from(["axe", "intents", "routes"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "axe", "intents", "quote", "--from", ASSET, "--to", ASSET, "--amount", "1",
+            ])
+            .is_err()
         );
     }
 

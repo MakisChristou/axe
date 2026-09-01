@@ -8,12 +8,12 @@ use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use serde::{Deserialize, Deserializer, Serialize};
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChainsResponse {
     pub chains: Vec<ChainInfo>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChainInfo {
     pub chain_id: String,
@@ -21,12 +21,12 @@ pub struct ChainInfo {
     pub chain_type: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TokensResponse {
     pub tokens: Vec<TokenInfo>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenInfo {
     pub chain_id: String,
@@ -56,12 +56,12 @@ pub enum OrderType {
     ExactOutput,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct QuoteResponse {
     pub quotes: Vec<Quote>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Quote {
     pub quote_id: String,
@@ -72,7 +72,7 @@ pub struct Quote {
     pub actions: Vec<Action>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Backend {
     #[serde(rename = "type")]
     pub kind: String,
@@ -80,13 +80,13 @@ pub struct Backend {
     pub tracking: BackendTracking,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendTracking {
     pub swap_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Validity {
     #[serde(deserialize_with = "deserialize_datetime")]
@@ -117,14 +117,14 @@ where
         .map_err(serde::de::Error::custom)
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct QuoteAmount {
     pub chain: String,
     pub token: String,
     pub amount: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Action {
     pub id: String,
     #[serde(rename = "type")]
@@ -133,7 +133,7 @@ pub struct Action {
     pub payload: serde_json::Value,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EvmTransactionPayload {
     #[serde(rename = "type")]
@@ -144,7 +144,7 @@ pub struct EvmTransactionPayload {
     pub value: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusResponse {
     pub quote_id: String,
@@ -154,7 +154,7 @@ pub struct StatusResponse {
     pub refund: Option<Refund>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TransferState {
     AwaitingDeposit,
@@ -176,22 +176,26 @@ impl TransferState {
             Self::NotFound => "not found",
         }
     }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Refunded | Self::Failed)
+    }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChainDelivery {
     pub tx_hash: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StatusOutput {
     pub chain: String,
     pub token: String,
     pub amount: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Refund {
     pub chain: String,
@@ -510,5 +514,15 @@ mod tests {
             serde_json::to_string(&OrderType::ExactOutput).unwrap(),
             "\"EXACT_OUTPUT\""
         );
+    }
+
+    #[test]
+    fn only_final_transfer_states_are_terminal() {
+        assert!(TransferState::Done.is_terminal());
+        assert!(TransferState::Refunded.is_terminal());
+        assert!(TransferState::Failed.is_terminal());
+        assert!(!TransferState::AwaitingDeposit.is_terminal());
+        assert!(!TransferState::Pending.is_terminal());
+        assert!(!TransferState::NotFound.is_terminal());
     }
 }

@@ -1,5 +1,6 @@
 mod client;
 mod execution;
+mod read;
 mod route;
 mod types;
 
@@ -24,6 +25,10 @@ use crate::types::Network;
 use crate::ui;
 
 pub use self::types::{AssetSpec, HumanAmount, OrderType};
+pub use read::{
+    ApiArgs, CatalogArgs, QuoteArgs, QuoteRequestArgs, RoutesArgs, StatusArgs, catalog_chains,
+    catalog_tokens, quote, routes, status,
+};
 
 pub struct IntentRuntimeArgs {
     pub network: Network,
@@ -108,7 +113,7 @@ pub async fn send(args: SendArgs) -> Result<()> {
     let discovery = discover_wallet(
         &runtime.client,
         &runtime.config,
-        &runtime.signer,
+        runtime.signer.address(),
         DiscoveryFeedback::Detailed,
     )
     .await?;
@@ -149,7 +154,7 @@ pub async fn roundtrip(args: RoundtripArgs) -> Result<()> {
     let discovery = discover_wallet(
         &runtime.client,
         &runtime.config,
-        &runtime.signer,
+        runtime.signer.address(),
         DiscoveryFeedback::Detailed,
     )
     .await?;
@@ -192,7 +197,7 @@ pub async fn sweep(args: SweepArgs) -> Result<()> {
         let discovery = discover_wallet(
             &runtime.client,
             &runtime.config,
-            &runtime.signer,
+            runtime.signer.address(),
             DiscoveryFeedback::Quiet,
         )
         .await?;

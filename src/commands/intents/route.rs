@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
-use alloy::signers::local::PrivateKeySigner;
 use eyre::{Result, WrapErr, eyre};
 use rand::seq::SliceRandom;
 
@@ -35,20 +34,20 @@ pub enum DiscoveryFeedback {
 pub async fn discover_wallet(
     client: &RfqClient,
     config: &ChainsConfig,
-    signer: &PrivateKeySigner,
+    wallet: Address,
     feedback: DiscoveryFeedback,
 ) -> Result<RouteDiscovery> {
     let catalog_chains = client.chains().await?.chains;
     let catalog_tokens = client.tokens().await?.tokens;
     let chains = resolve_evm_chains(config, catalog_chains).await?;
-    let assets = read_wallet_assets(&chains, catalog_tokens, signer.address()).await;
+    let assets = read_wallet_assets(&chains, catalog_tokens, wallet).await;
     if assets.is_empty() {
         return Err(eyre!(
             "RFQ catalog has no EVM tokens whose chains resolve through the axe config"
         ));
     }
     if matches!(feedback, DiscoveryFeedback::Detailed) {
-        render_wallet_stats(signer.address(), &chains, &assets);
+        render_wallet_stats(wallet, &chains, &assets);
     }
     Ok(RouteDiscovery { chains, assets })
 }
@@ -699,28 +698,8 @@ pub fn validate_quote(
     order_type: OrderType,
     requested_amount: U256,
 ) -> Result<()> {
+    validate_quote_route(quote, &from.id, &to.id, order_type, requested_amount)?;
     let input_amount = parse_amount(&quote.input.amount)?;
-    let fixed_amount = match order_type {
-        OrderType::ExactInput => input_amount,
-        OrderType::ExactOutput => parse_amount(&quote.output.amount)?,
-    };
-    if quote.backend.kind != "intent"
-        || quote.input.chain != from.id.chain_id
-        || !quote
-            .input
-            .token
-            .eq_ignore_ascii_case(&from.id.token_address)
-        || quote.output.chain != to.id.chain_id
-        || !quote
-            .output
-            .token
-            .eq_ignore_ascii_case(&to.id.token_address)
-        || fixed_amount != requested_amount
-    {
-        return Err(eyre!(
-            "RFQ returned a quote that does not match the requested route"
-        ));
-    }
     ensure_input_is_spendable(from, input_amount).wrap_err_with(|| {
         format!(
             "quote requires {} {} of input",
@@ -728,6 +707,31 @@ pub fn validate_quote(
             from.symbol
         )
     })?;
+    Ok(())
+}
+
+pub fn validate_quote_route(
+    quote: &Quote,
+    from: &AssetId,
+    to: &AssetId,
+    order_type: OrderType,
+    requested_amount: U256,
+) -> Result<()> {
+    let fixed_amount = match order_type {
+        OrderType::ExactInput => parse_amount(&quote.input.amount)?,
+        OrderType::ExactOutput => parse_amount(&quote.output.amount)?,
+    };
+    if quote.backend.kind != "intent"
+        || quote.input.chain != from.chain_id
+        || !quote.input.token.eq_ignore_ascii_case(&from.token_address)
+        || quote.output.chain != to.chain_id
+        || !quote.output.token.eq_ignore_ascii_case(&to.token_address)
+        || fixed_amount != requested_amount
+    {
+        return Err(eyre!(
+            "RFQ returned a quote that does not match the requested route"
+        ));
+    }
     Ok(())
 }
 
