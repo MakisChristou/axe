@@ -440,6 +440,7 @@ async fn run_intents(
 ) -> Result<()> {
     match subcommand {
         cli::IntentsCommands::Catalog(options) => run_intent_catalog(options, global).await,
+        cli::IntentsCommands::Inventory(options) => run_intent_inventory(options, global).await,
         cli::IntentsCommands::Routes(options) => run_intent_routes(options, global).await,
         cli::IntentsCommands::Quote(options) => run_intent_quote(options, global).await,
         cli::IntentsCommands::Status(options) => run_intent_status(options, global).await,
@@ -486,6 +487,20 @@ async fn run_intents(
             .await
         }
     }
+}
+
+async fn run_intent_inventory(
+    options: cli::IntentInventoryOptions,
+    global: Option<types::Network>,
+) -> Result<()> {
+    let (api, config) =
+        resolve_intent_read_config(options.read.api, options.config, global).await?;
+    commands::intents::inventory(commands::intents::InventoryArgs {
+        api,
+        config,
+        json: options.read.json,
+    })
+    .await
 }
 
 async fn run_intent_catalog(

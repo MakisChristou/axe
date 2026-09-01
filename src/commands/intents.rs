@@ -1,6 +1,8 @@
 mod benchmark;
 mod client;
 mod execution;
+mod inventory;
+mod presentation;
 mod read;
 mod route;
 mod stats;
@@ -29,6 +31,7 @@ use crate::ui;
 
 pub use self::types::{AssetSpec, AssetType, HumanAmount, OrderType};
 pub use benchmark::{QuoteBenchmarkArgs, QuoteBenchmarkLimit, benchmark_quotes};
+pub use inventory::{InventoryArgs, inventory};
 pub use read::{
     ApiArgs, CatalogArgs, QuoteArgs, QuoteRequestArgs, RoutesArgs, StatusArgs, catalog, quote,
     routes, status,

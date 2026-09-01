@@ -31,6 +31,14 @@ pub enum DiscoveryFeedback {
     Quiet,
 }
 
+impl DiscoveryFeedback {
+    fn warn(self, message: &str) {
+        if matches!(self, Self::Detailed) {
+            ui::warn(message);
+        }
+    }
+}
+
 pub async fn discover_wallet(
     client: &RfqClient,
     config: &ChainsConfig,
@@ -39,8 +47,8 @@ pub async fn discover_wallet(
 ) -> Result<RouteDiscovery> {
     let catalog_chains = client.chains().await?.chains;
     let catalog_tokens = client.tokens().await?.tokens;
-    let chains = resolve_evm_chains(config, catalog_chains).await?;
-    let assets = read_wallet_assets(&chains, catalog_tokens, wallet).await;
+    let chains = resolve_evm_chains(config, catalog_chains, feedback).await?;
+    let assets = read_wallet_assets(&chains, catalog_tokens, wallet, feedback).await;
     if assets.is_empty() {
         return Err(eyre!(
             "RFQ catalog has no EVM tokens whose chains resolve through the axe config"
@@ -52,9 +60,10 @@ pub async fn discover_wallet(
     Ok(RouteDiscovery { chains, assets })
 }
 
-async fn resolve_evm_chains(
+pub(super) async fn resolve_evm_chains(
     config: &ChainsConfig,
     catalog: Vec<ChainInfo>,
+    feedback: DiscoveryFeedback,
 ) -> Result<HashMap<String, ChainRuntime>> {
     let mut resolved = HashMap::new();
     for chain in catalog
@@ -65,7 +74,7 @@ async fn resolve_evm_chains(
             continue;
         };
         let Ok(chain_id) = reference.parse::<u64>() else {
-            ui::warn(&format!(
+            feedback.warn(&format!(
                 "skipping malformed RFQ chain ID {}",
                 chain.chain_id
             ));
@@ -73,14 +82,14 @@ async fn resolve_evm_chains(
         };
         let candidates = evm_chain_candidates(config, chain_id, &chain.chain_label);
         if candidates.is_empty() {
-            ui::warn(&format!(
+            feedback.warn(&format!(
                 "{} is advertised by RFQ but absent from the axe chains config",
                 chain.chain_id
             ));
             continue;
         }
-        let Some(rpc_url) = first_working_rpc(&chain, chain_id, candidates).await else {
-            ui::warn(&format!(
+        let Some(rpc_url) = first_working_rpc(&chain, chain_id, candidates, feedback).await else {
+            feedback.warn(&format!(
                 "{} has no usable RPC in the axe chains config",
                 chain.chain_id
             ));
@@ -126,6 +135,7 @@ async fn first_working_rpc(
     chain: &ChainInfo,
     expected_chain_id: u64,
     candidates: Vec<(&str, &ChainConfig)>,
+    feedback: DiscoveryFeedback,
 ) -> Option<String> {
     for (key, configured) in candidates {
         let Some(rpc_url) = configured.rpc.clone() else {
@@ -134,7 +144,7 @@ async fn first_working_rpc(
         let endpoints = match EvmEndpoints::connect(std::slice::from_ref(&rpc_url)) {
             Ok(endpoints) => endpoints,
             Err(error) => {
-                ui::warn(&format!(
+                feedback.warn(&format!(
                     "skipping RPC config {key} for {}: {}",
                     chain.chain_id,
                     ui::scrub_urls(&error.to_string())
@@ -147,11 +157,11 @@ async fn first_working_rpc(
         };
         match provider.get_chain_id().await {
             Ok(actual_chain_id) if actual_chain_id == expected_chain_id => return Some(rpc_url),
-            Ok(actual_chain_id) => ui::warn(&format!(
+            Ok(actual_chain_id) => feedback.warn(&format!(
                 "skipping RPC config {key}: expected {}, got eip155:{actual_chain_id}",
                 chain.chain_id
             )),
-            Err(error) => ui::warn(&format!(
+            Err(error) => feedback.warn(&format!(
                 "skipping RPC config {key} for {}: {}",
                 chain.chain_id,
                 ui::scrub_urls(&error.to_string())
@@ -169,10 +179,11 @@ fn normalize_chain_name(value: &str) -> String {
         .collect()
 }
 
-async fn read_wallet_assets(
+pub(super) async fn read_wallet_assets(
     chains: &HashMap<String, ChainRuntime>,
     tokens: Vec<TokenInfo>,
     wallet: Address,
+    feedback: DiscoveryFeedback,
 ) -> Vec<WalletAsset> {
     let mut assets = Vec::new();
     for token in tokens {
@@ -191,7 +202,7 @@ async fn read_wallet_assets(
                 balance,
                 native: is_native_token(&token.address),
             }),
-            Err(error) => ui::warn(&format!(
+            Err(error) => feedback.warn(&format!(
                 "could not read {}/{}: {}",
                 chain.label,
                 token.symbol,

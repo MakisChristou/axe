@@ -84,7 +84,7 @@ pub async fn catalog(args: CatalogArgs) -> Result<()> {
     Ok(())
 }
 
-fn merge_catalog(
+pub(super) fn merge_catalog(
     mut chains: Vec<super::types::ChainInfo>,
     tokens: Vec<TokenInfo>,
     chain_filter: Option<&str>,

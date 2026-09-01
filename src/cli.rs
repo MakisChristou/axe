@@ -170,6 +170,9 @@ pub enum IntentsCommands {
     /// Show supported chains with their tokens
     Catalog(IntentCatalogOptions),
 
+    /// Show the solver's catalog-backed token inventory and USD value
+    Inventory(IntentInventoryOptions),
+
     /// Discover funded routes that quote successfully in both directions
     Routes(IntentRoutesOptions),
 
@@ -220,6 +223,16 @@ pub struct IntentCatalogOptions {
     /// Show only this CAIP-2 chain ID.
     #[arg(long)]
     pub chain: Option<String>,
+}
+
+#[derive(Args)]
+pub struct IntentInventoryOptions {
+    #[command(flatten)]
+    pub read: IntentReadOptions,
+
+    /// Path to chains config JSON. Omit to resolve from --network.
+    #[arg(long, env = "CHAINS_CONFIG")]
+    pub config: Option<PathBuf>,
 }
 
 #[derive(Args)]
