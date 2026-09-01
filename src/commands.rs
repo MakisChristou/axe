@@ -11,6 +11,7 @@ pub mod event_extractors;
 pub mod express_originate;
 pub mod info_block;
 pub mod init;
+pub mod intents;
 pub mod its_ownership;
 pub mod load_test;
 pub mod propose;
