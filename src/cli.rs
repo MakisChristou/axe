@@ -178,7 +178,17 @@ pub enum IntentsCommands {
 }
 
 #[derive(Args)]
+pub struct IntentApiOptions {
+    /// RFQ API base URL. Defaults to the selected network's public endpoint.
+    #[arg(long, env = "INTENTS_API_URL")]
+    pub api_url: Option<String>,
+}
+
+#[derive(Args)]
 pub struct IntentRuntimeOptions {
+    #[command(flatten)]
+    pub api: IntentApiOptions,
+
     /// Path to chains config JSON. Omit to resolve from --network.
     #[arg(long, env = "CHAINS_CONFIG")]
     pub config: Option<PathBuf>,

@@ -491,6 +491,7 @@ async fn resolve_intent_runtime(
     };
     Ok(commands::intents::IntentRuntimeArgs {
         network,
+        api_url: options.api.api_url,
         config,
         private_key: options.private_key,
         poll_interval_secs: options.poll_interval_secs,

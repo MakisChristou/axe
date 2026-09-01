@@ -27,6 +27,7 @@ pub use self::types::{AssetSpec, HumanAmount, OrderType};
 
 pub struct IntentRuntimeArgs {
     pub network: Network,
+    pub api_url: Option<String>,
     pub config: PathBuf,
     pub private_key: String,
     pub poll_interval_secs: u64,
@@ -304,7 +305,7 @@ async fn prepare_runtime(args: IntentRuntimeArgs) -> Result<IntentRuntime> {
         .parse()
         .wrap_err("EVM_PRIVATE_KEY is not a valid hex private key")?;
     let config = ChainsConfig::load(&args.config).await?;
-    let client = RfqClient::for_network(args.network)?;
+    let client = RfqClient::new(args.network, args.api_url.as_deref())?;
     let limits = RunLimits {
         poll_interval: Duration::from_secs(args.poll_interval_secs),
         fulfillment_timeout: Duration::from_secs(args.fulfillment_timeout_secs),

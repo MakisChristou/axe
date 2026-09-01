@@ -1,6 +1,6 @@
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use eyre::{Result, WrapErr, eyre};
+use eyre::{Result, WrapErr, bail, eyre};
 use reqwest::StatusCode;
 
 use super::types::{
@@ -43,18 +43,20 @@ impl TryFrom<Network> for RfqEnvironment {
 
 #[derive(Clone, Debug)]
 pub struct RfqClient {
-    base_url: &'static str,
+    base_url: String,
     client: reqwest::Client,
 }
 
 impl RfqClient {
-    pub fn for_network(network: Network) -> Result<Self> {
-        let base_url = RfqEnvironment::try_from(network)?.base_url();
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()?;
-        Ok(Self { base_url, client })
+    pub fn new(network: Network, base_url: Option<&str>) -> Result<Self> {
+        let base_url = match base_url {
+            Some(base_url) => normalize_base_url(base_url)?,
+            None => RfqEnvironment::try_from(network)?.base_url().to_owned(),
+        };
+        Ok(Self {
+            base_url,
+            client: crate::http::client().clone(),
+        })
     }
 
     pub async fn chains(&self) -> Result<ChainsResponse> {
@@ -171,6 +173,19 @@ fn http_error(method: &str, url: &str, status: StatusCode, message: &str) -> eyr
     eyre!("RFQ {method} {url} returned HTTP {status}: {message}")
 }
 
+fn normalize_base_url(value: &str) -> Result<String> {
+    let value = value.trim_end_matches('/');
+    let parsed = reqwest::Url::parse(value)
+        .wrap_err("INTENTS_API_URL must be an absolute HTTP or HTTPS URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("INTENTS_API_URL must use HTTP or HTTPS");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        bail!("INTENTS_API_URL must not contain a query or fragment");
+    }
+    Ok(value.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,5 +224,15 @@ mod tests {
             error.to_string(),
             "RFQ GET https://testnet.api.axelar.network/rfq/v1/chains returned HTTP 404 Not Found: 404 page not found"
         );
+    }
+
+    #[test]
+    fn accepts_and_normalizes_custom_base_urls() {
+        let client =
+            RfqClient::new(Network::Stagenet, Some("http://127.0.0.1:8080/solver/v1/")).unwrap();
+
+        assert_eq!(client.base_url, "http://127.0.0.1:8080/solver/v1");
+        assert!(RfqClient::new(Network::Testnet, Some("ftp://example.com")).is_err());
+        assert!(RfqClient::new(Network::Testnet, Some("example.com/rfq/v1")).is_err());
     }
 }
