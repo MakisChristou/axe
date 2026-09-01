@@ -61,12 +61,12 @@ pub struct StatusArgs {
     pub json: bool,
 }
 
-struct PreparedQuote {
-    request: QuoteRequest,
-    from: TokenInfo,
-    to: TokenInfo,
-    requested_amount: U256,
-    order_type: OrderType,
+pub(super) struct PreparedQuote {
+    pub request: QuoteRequest,
+    pub from: TokenInfo,
+    pub to: TokenInfo,
+    pub requested_amount: U256,
+    pub order_type: OrderType,
 }
 
 pub async fn catalog_chains(args: CatalogArgs) -> Result<()> {
@@ -171,11 +171,14 @@ pub async fn status(args: StatusArgs) -> Result<()> {
     watch_status(&client, args).await
 }
 
-fn api_client(args: &ApiArgs) -> Result<RfqClient> {
+pub(super) fn api_client(args: &ApiArgs) -> Result<RfqClient> {
     RfqClient::new(args.network, args.api_url.as_deref())
 }
 
-async fn prepare_quote(client: &RfqClient, args: &QuoteRequestArgs) -> Result<PreparedQuote> {
+pub(super) async fn prepare_quote(
+    client: &RfqClient,
+    args: &QuoteRequestArgs,
+) -> Result<PreparedQuote> {
     let tokens = client.tokens().await?;
     let from = find_token(&tokens, &args.from)?;
     let to = find_token(&tokens, &args.to)?;

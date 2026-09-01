@@ -1,7 +1,9 @@
+mod benchmark;
 mod client;
 mod execution;
 mod read;
 mod route;
+mod stats;
 mod types;
 
 use std::path::PathBuf;
@@ -19,12 +21,14 @@ use self::execution::{ExecutionFeedback, execute_leg, execute_round_trip};
 use self::route::{
     DiscoveryFeedback, RouteDiscovery, discover_wallet, plan_roundtrip, plan_send, plan_sweep,
 };
+use self::stats::percentile;
 use self::types::{LegExecution, LegResult, RoutePlan, RunLimits};
 use crate::config::ChainsConfig;
 use crate::types::Network;
 use crate::ui;
 
 pub use self::types::{AssetSpec, HumanAmount, OrderType};
+pub use benchmark::{QuoteBenchmarkArgs, QuoteBenchmarkLimit, benchmark_quotes};
 pub use read::{
     ApiArgs, CatalogArgs, QuoteArgs, QuoteRequestArgs, RoutesArgs, StatusArgs, catalog_chains,
     catalog_tokens, quote, routes, status,
@@ -406,18 +410,6 @@ fn completion_percentage(completed: usize, planned: usize) -> f64 {
         return 0.0;
     }
     completed as f64 / planned as f64 * 100.0
-}
-
-fn percentile(values: &[u64], percent: usize) -> u64 {
-    if values.is_empty() {
-        return 0;
-    }
-    let mut sorted = values.to_vec();
-    sorted.sort_unstable();
-    let rank = (sorted.len() * percent)
-        .div_ceil(100)
-        .clamp(1, sorted.len());
-    sorted[rank - 1]
 }
 
 #[cfg(test)]

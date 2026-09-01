@@ -445,6 +445,7 @@ async fn run_intents(
         cli::IntentsCommands::Routes(options) => run_intent_routes(options, global).await,
         cli::IntentsCommands::Quote(options) => run_intent_quote(options, global).await,
         cli::IntentsCommands::Status(options) => run_intent_status(options, global).await,
+        cli::IntentsCommands::Bench { subcommand } => run_intent_bench(subcommand, global).await,
         cli::IntentsCommands::Send(options) => {
             let runtime = resolve_intent_runtime(options.runtime, global).await?;
             let route = commands::intents::RouteChoice::new(
@@ -564,6 +565,48 @@ async fn run_intent_status(
         json: options.read.json,
     })
     .await
+}
+
+async fn run_intent_bench(
+    subcommand: cli::IntentBenchCommands,
+    global: Option<types::Network>,
+) -> Result<()> {
+    match subcommand {
+        cli::IntentBenchCommands::Quote(options) => {
+            let api = resolve_intent_api(options.read.api, global)?;
+            let recipient = options.request.recipient.unwrap_or(options.request.sender);
+            let limit = options.duration_secs.map_or_else(
+                || {
+                    commands::intents::QuoteBenchmarkLimit::Requests(
+                        options.requests.unwrap_or(100),
+                    )
+                },
+                |seconds| {
+                    commands::intents::QuoteBenchmarkLimit::Duration(
+                        std::time::Duration::from_secs(seconds),
+                    )
+                },
+            );
+            commands::intents::benchmark_quotes(commands::intents::QuoteBenchmarkArgs {
+                api,
+                request: commands::intents::QuoteRequestArgs {
+                    from: options.request.from,
+                    to: options.request.to,
+                    amount: options.request.amount,
+                    sender: options.request.sender,
+                    recipient,
+                    order_type: options.request.order_type,
+                },
+                limit,
+                concurrency: usize::from(options.concurrency),
+                warmup: options.warmup,
+                request_timeout: std::time::Duration::from_secs(options.request_timeout_secs),
+                max_rps: options.max_rps,
+                json: options.read.json,
+            })
+            .await
+        }
+    }
 }
 
 fn resolve_intent_api(

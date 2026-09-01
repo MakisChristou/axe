@@ -182,6 +182,12 @@ pub enum IntentsCommands {
     /// Show or watch the status of a quote
     Status(IntentStatusOptions),
 
+    /// Benchmark intent API operations
+    Bench {
+        #[command(subcommand)]
+        subcommand: IntentBenchCommands,
+    },
+
     /// Send one intent over a random or explicit route
     Send(IntentSendOptions),
 
@@ -311,6 +317,45 @@ pub struct IntentStatusOptions {
     /// Maximum seconds to watch before returning an error.
     #[arg(long, default_value = "1200", value_parser = clap::value_parser!(u64).range(1..))]
     pub timeout_secs: u64,
+}
+
+#[derive(Subcommand)]
+pub enum IntentBenchCommands {
+    /// Benchmark the solver quote path with parallel requests
+    Quote(IntentQuoteBenchOptions),
+}
+
+#[derive(Args)]
+pub struct IntentQuoteBenchOptions {
+    #[command(flatten)]
+    pub read: IntentReadOptions,
+
+    #[command(flatten)]
+    pub request: IntentQuoteRequestOptions,
+
+    /// Requests to measure. Defaults to 100 unless --duration-secs is set.
+    #[arg(long, conflicts_with = "duration_secs", value_parser = clap::value_parser!(u64).range(1..))]
+    pub requests: Option<u64>,
+
+    /// Run for this many seconds instead of a fixed request count.
+    #[arg(long, conflicts_with = "requests", value_parser = clap::value_parser!(u64).range(1..))]
+    pub duration_secs: Option<u64>,
+
+    /// Maximum number of in-flight quote requests.
+    #[arg(long, default_value = "8", value_parser = clap::value_parser!(u16).range(1..))]
+    pub concurrency: u16,
+
+    /// Unmeasured requests to run before the benchmark.
+    #[arg(long, default_value = "10")]
+    pub warmup: u64,
+
+    /// Maximum seconds to wait for each quote request.
+    #[arg(long, default_value = "10", value_parser = clap::value_parser!(u64).range(1..))]
+    pub request_timeout_secs: u64,
+
+    /// Limit aggregate request starts per second.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub max_rps: Option<u64>,
 }
 
 #[derive(Args)]
@@ -1003,6 +1048,38 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn intent_quote_benchmark_accepts_parallel_controls() {
+        const ASSET: &str = "eip155:11155111/0x0000000000000000000000000000000000000000";
+        const ADDRESS: &str = "0x0000000000000000000000000000000000000001";
+        let base = [
+            "axe", "intents", "bench", "quote", "--from", ASSET, "--to", ASSET, "--amount", "1",
+            "--sender", ADDRESS,
+        ];
+
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain([
+                "--requests",
+                "20",
+                "--concurrency",
+                "4",
+                "--warmup",
+                "2"
+            ]))
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain([
+                "--requests",
+                "20",
+                "--duration-secs",
+                "5"
+            ]))
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--concurrency", "0"])).is_err());
     }
 
     #[test]
