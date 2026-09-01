@@ -4,7 +4,7 @@ use alloy::primitives::Address;
 use clap::{Args, Parser, Subcommand};
 use eyre::Result;
 
-use crate::commands::intents::{AssetSpec, HumanAmount, OrderType};
+use crate::commands::intents::{AssetSpec, AssetType, HumanAmount, OrderType};
 use crate::commands::load_test::{Protocol, TestType};
 use crate::commands::propose::ProposeArgs;
 use crate::types::Network;
@@ -231,6 +231,9 @@ pub struct IntentRoutesOptions {
     #[arg(long, env = "CHAINS_CONFIG")]
     pub config: Option<PathBuf>,
 
+    #[command(flatten)]
+    pub assets: IntentAssetOptions,
+
     /// EVM address whose balances determine executable routes.
     #[arg(long)]
     pub wallet_address: Address,
@@ -242,6 +245,13 @@ pub struct IntentRoutesOptions {
     /// Fix the source input or destination output amount.
     #[arg(long, value_enum, default_value_t)]
     pub order_type: OrderType,
+}
+
+#[derive(Args)]
+pub struct IntentAssetOptions {
+    /// Use token-to-token or native-to-native routes.
+    #[arg(long, value_enum, default_value_t)]
+    pub asset_type: AssetType,
 }
 
 #[derive(Args)]
@@ -368,6 +378,9 @@ pub struct IntentRuntimeOptions {
 
 #[derive(Args)]
 pub struct IntentRouteOptions {
+    #[command(flatten)]
+    pub assets: IntentAssetOptions,
+
     /// Source asset as <CAIP-2 chain>/<token address>. Requires --to.
     #[arg(long, requires = "to")]
     pub from: Option<AssetSpec>,
@@ -415,6 +428,9 @@ pub struct IntentRoundtripOptions {
 pub struct IntentSweepOptions {
     #[command(flatten)]
     pub runtime: IntentRuntimeOptions,
+
+    #[command(flatten)]
+    pub assets: IntentAssetOptions,
 
     /// Complete passes over every currently executable route.
     #[arg(long, conflicts_with = "continuous", value_parser = clap::value_parser!(u64).range(1..))]
@@ -929,9 +945,19 @@ mod tests {
         };
         assert!(options.route.from.is_none());
         assert!(options.route.to.is_none());
+        assert_eq!(options.route.assets.asset_type, AssetType::Token);
 
         assert!(
-            Cli::try_parse_from(["axe", "intents", "roundtrip", "--private-key", "00"]).is_ok()
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "roundtrip",
+                "--private-key",
+                "00",
+                "--asset-type",
+                "native",
+            ])
+            .is_ok()
         );
     }
 
@@ -944,6 +970,8 @@ mod tests {
                 "send",
                 "--private-key",
                 "00",
+                "--asset-type",
+                "native",
                 "--from",
                 "eip155:11155111/0x0000000000000000000000000000000000000000",
                 "--to",
@@ -952,6 +980,48 @@ mod tests {
                 "0.01",
             ])
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn intent_route_discovery_and_sweep_accept_asset_types() {
+        const ADDRESS: &str = "0x0000000000000000000000000000000000000001";
+
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "routes",
+                "--wallet-address",
+                ADDRESS,
+                "--asset-type",
+                "native",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "sweep",
+                "--private-key",
+                "00",
+                "--asset-type",
+                "native",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "send",
+                "--private-key",
+                "00",
+                "--asset-type",
+                "anything",
+            ])
+            .is_err()
         );
     }
 

@@ -10,9 +10,9 @@ use serde_json::json;
 use super::client::RfqClient;
 use super::route::{DiscoveryFeedback, discover_wallet, plan_sweep, validate_quote_route};
 use super::types::{
-    AssetSpec, CatalogChain, CatalogResponse, CatalogToken, EvmTransactionPayload, HumanAmount,
-    OrderType, Quote, QuoteOutcome, QuoteRequest, RoutePlan, StatusResponse, TokenInfo,
-    TokensResponse, TransferState, format_units, parse_amount,
+    AssetSpec, AssetType, CatalogChain, CatalogResponse, CatalogToken, EvmTransactionPayload,
+    HumanAmount, OrderType, Quote, QuoteOutcome, QuoteRequest, RoutePlan, StatusResponse,
+    TokenInfo, TokensResponse, TransferState, format_units, parse_amount,
 };
 use crate::config::ChainsConfig;
 use crate::types::Network;
@@ -35,6 +35,7 @@ pub struct RoutesArgs {
     pub wallet: Address,
     pub wallet_bps: u16,
     pub order_type: OrderType,
+    pub asset_type: AssetType,
     pub json: bool,
 }
 
@@ -149,14 +150,18 @@ pub async fn routes(args: RoutesArgs) -> Result<()> {
         &client,
         &discovery,
         args.wallet,
+        args.asset_type,
         args.wallet_bps,
         args.order_type,
     )
     .await;
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&routes_json(&plans))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&routes_json(&plans, args.asset_type))?
+        );
     } else {
-        render_routes(&plans);
+        render_routes(&plans, args.asset_type);
     }
     Ok(())
 }
@@ -342,8 +347,9 @@ fn token_address_label(token: &CatalogToken) -> &str {
     }
 }
 
-fn render_routes(plans: &[RoutePlan]) {
+fn render_routes(plans: &[RoutePlan], asset_type: AssetType) {
     ui::section("intent routes");
+    ui::kv("asset type", asset_type.label());
     ui::kv("quotable round trips", &plans.len().to_string());
     for plan in plans {
         ui::kv(
@@ -375,7 +381,7 @@ fn render_routes(plans: &[RoutePlan]) {
     }
 }
 
-fn routes_json(plans: &[RoutePlan]) -> serde_json::Value {
+fn routes_json(plans: &[RoutePlan], asset_type: AssetType) -> serde_json::Value {
     let routes = plans
         .iter()
         .map(|plan| {
@@ -391,7 +397,7 @@ fn routes_json(plans: &[RoutePlan]) -> serde_json::Value {
             })
         })
         .collect::<Vec<_>>();
-    json!({ "routes": routes })
+    json!({ "assetType": asset_type, "routes": routes })
 }
 
 fn render_quote(quote: &Quote, latency: Duration, prepared: &PreparedQuote) -> Result<()> {
@@ -546,7 +552,10 @@ mod tests {
 
     #[test]
     fn empty_route_discovery_is_a_valid_result() {
-        assert_eq!(routes_json(&[]), json!({ "routes": [] }));
+        assert_eq!(
+            routes_json(&[], AssetType::Token),
+            json!({ "assetType": "token", "routes": [] })
+        );
     }
 
     #[test]

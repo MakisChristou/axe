@@ -86,6 +86,27 @@ pub enum OrderType {
     ExactOutput,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum AssetType {
+    #[default]
+    Token,
+    Native,
+}
+
+impl AssetType {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Token => "token",
+            Self::Native => "native",
+        }
+    }
+
+    pub const fn matches(self, asset: &WalletAsset) -> bool {
+        asset.native == matches!(self, Self::Native)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct QuoteResponse {
     pub quotes: Vec<Quote>,
@@ -543,6 +564,19 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&OrderType::ExactOutput).unwrap(),
             "\"EXACT_OUTPUT\""
+        );
+    }
+
+    #[test]
+    fn token_is_the_default_asset_type() {
+        assert_eq!(AssetType::default(), AssetType::Token);
+        assert_eq!(
+            serde_json::to_string(&AssetType::Token).unwrap(),
+            "\"token\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AssetType::Native).unwrap(),
+            "\"native\""
         );
     }
 

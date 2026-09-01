@@ -452,6 +452,7 @@ async fn run_intents(
                 options.route.amount,
                 options.route.wallet_bps,
                 options.route.order_type,
+                options.route.assets.asset_type,
             )?;
             commands::intents::send(commands::intents::SendArgs {
                 runtime,
@@ -468,6 +469,7 @@ async fn run_intents(
                 options.route.amount,
                 options.route.wallet_bps,
                 options.route.order_type,
+                options.route.assets.asset_type,
             )?;
             commands::intents::roundtrip(commands::intents::RoundtripArgs { runtime, route }).await
         }
@@ -479,6 +481,7 @@ async fn run_intents(
                 continuous: options.continuous,
                 wallet_bps: options.wallet_bps,
                 order_type: options.order_type,
+                asset_type: options.assets.asset_type,
             })
             .await
         }
@@ -510,6 +513,7 @@ async fn run_intent_routes(
         wallet: options.wallet_address,
         wallet_bps: options.wallet_bps,
         order_type: options.order_type,
+        asset_type: options.assets.asset_type,
         json: options.read.json,
     })
     .await

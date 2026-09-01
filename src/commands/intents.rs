@@ -27,7 +27,7 @@ use crate::config::ChainsConfig;
 use crate::types::Network;
 use crate::ui;
 
-pub use self::types::{AssetSpec, HumanAmount, OrderType};
+pub use self::types::{AssetSpec, AssetType, HumanAmount, OrderType};
 pub use benchmark::{QuoteBenchmarkArgs, QuoteBenchmarkLimit, benchmark_quotes};
 pub use read::{
     ApiArgs, CatalogArgs, QuoteArgs, QuoteRequestArgs, RoutesArgs, StatusArgs, catalog, quote,
@@ -49,6 +49,7 @@ pub enum RouteChoice {
     Random {
         wallet_bps: u16,
         order_type: OrderType,
+        asset_type: AssetType,
     },
     Explicit {
         from: AssetSpec,
@@ -56,6 +57,7 @@ pub enum RouteChoice {
         amount: Option<HumanAmount>,
         wallet_bps: u16,
         order_type: OrderType,
+        asset_type: AssetType,
     },
 }
 
@@ -66,11 +68,13 @@ impl RouteChoice {
         amount: Option<HumanAmount>,
         wallet_bps: u16,
         order_type: OrderType,
+        asset_type: AssetType,
     ) -> Result<Self> {
         match (from, to, amount) {
             (None, None, None) => Ok(Self::Random {
                 wallet_bps,
                 order_type,
+                asset_type,
             }),
             (Some(from), Some(to), amount) => Ok(Self::Explicit {
                 from,
@@ -78,6 +82,7 @@ impl RouteChoice {
                 amount,
                 wallet_bps,
                 order_type,
+                asset_type,
             }),
             (None, None, Some(_)) => Err(eyre!("--amount requires --from and --to")),
             _ => Err(eyre!("--from and --to must be provided together")),
@@ -102,6 +107,7 @@ pub struct SweepArgs {
     pub continuous: bool,
     pub wallet_bps: u16,
     pub order_type: OrderType,
+    pub asset_type: AssetType,
 }
 
 struct IntentRuntime {
@@ -209,6 +215,7 @@ pub async fn sweep(args: SweepArgs) -> Result<()> {
             &runtime.client,
             &discovery,
             runtime.signer.address(),
+            args.asset_type,
             args.wallet_bps,
             args.order_type,
         )
@@ -216,14 +223,17 @@ pub async fn sweep(args: SweepArgs) -> Result<()> {
         if plans.is_empty() {
             render_summary(&results, planned_intents);
             return Err(eyre!(
-                "no bidirectionally quotable routes are funded by the axe wallet"
+                "No {}-to-{} round-trip routes are funded and quoted. Fund matching assets or choose a different --asset-type.",
+                args.asset_type.label(),
+                args.asset_type.label()
             ));
         }
         let pass_intents = plans.len() * 2;
         planned_intents += pass_intents;
         ui::info(&format!(
-            "sweep {sweep}: {} round trips, {pass_intents} intents",
-            plans.len()
+            "sweep {sweep}: {} {} round trips, {pass_intents} intents",
+            plans.len(),
+            args.asset_type.label()
         ));
         if !confirmed {
             confirm_execution(false, "Execute this intent route sweep?").await?;

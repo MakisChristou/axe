@@ -8,7 +8,7 @@ use rand::seq::SliceRandom;
 use super::RouteChoice;
 use super::client::RfqClient;
 use super::types::{
-    AssetId, AssetSpec, ChainInfo, ChainRuntime, HumanAmount, LegPlan, OrderType, Quote,
+    AssetId, AssetSpec, AssetType, ChainInfo, ChainRuntime, HumanAmount, LegPlan, OrderType, Quote,
     QuoteOutcome, QuoteRequest, RoutePlan, TokenInfo, WalletAsset, format_units, is_native_token,
     parse_amount,
 };
@@ -242,12 +242,14 @@ pub async fn plan_send(
         RouteChoice::Random {
             wallet_bps,
             order_type,
+            asset_type,
         } => {
             random_send_plan(
                 client,
                 discovery,
                 signer,
                 recipient,
+                *asset_type,
                 *wallet_bps,
                 *order_type,
             )
@@ -259,8 +261,9 @@ pub async fn plan_send(
             amount,
             wallet_bps,
             order_type,
+            asset_type,
         } => {
-            let (from, to) = explicit_assets(discovery, from, to)?;
+            let (from, to) = explicit_assets(discovery, from, to, *asset_type)?;
             ensure_source_ready(discovery, from)?;
             let amount = selected_amount(from, to, *order_type, amount.as_ref(), *wallet_bps)?;
             preflight_leg(client, from, to, signer, recipient, *order_type, amount)
@@ -282,15 +285,27 @@ pub async fn plan_roundtrip(
         RouteChoice::Random {
             wallet_bps,
             order_type,
-        } => random_roundtrip_plan(client, discovery, signer, *wallet_bps, *order_type).await?,
+            asset_type,
+        } => {
+            random_roundtrip_plan(
+                client,
+                discovery,
+                signer,
+                *asset_type,
+                *wallet_bps,
+                *order_type,
+            )
+            .await?
+        }
         RouteChoice::Explicit {
             from,
             to,
             amount,
             wallet_bps,
             order_type,
+            asset_type,
         } => {
-            let (from, to) = explicit_assets(discovery, from, to)?;
+            let (from, to) = explicit_assets(discovery, from, to, *asset_type)?;
             ensure_roundtrip_ready(discovery, from, to)?;
             let amount = selected_amount(from, to, *order_type, amount.as_ref(), *wallet_bps)?;
             preflight_pair(client, from, to, signer, *order_type, amount)
@@ -306,12 +321,13 @@ pub async fn plan_sweep(
     client: &RfqClient,
     discovery: &RouteDiscovery,
     signer: Address,
+    asset_type: AssetType,
     wallet_bps: u16,
     order_type: OrderType,
 ) -> Vec<RoutePlan> {
     let mut plans = Vec::new();
     let mut seen = HashSet::new();
-    let pairs = unordered_cross_chain_pairs(&discovery.assets);
+    let pairs = unordered_cross_chain_pairs(&discovery.assets, asset_type);
     let spinner = ui::wait_spinner(&format!("preflighting {} asset pairs", pairs.len()));
     for (left, right) in pairs {
         let (from, to) = choose_start(left, right);
@@ -342,10 +358,11 @@ async fn random_send_plan(
     discovery: &RouteDiscovery,
     signer: Address,
     recipient: Address,
+    asset_type: AssetType,
     wallet_bps: u16,
     order_type: OrderType,
 ) -> Result<LegPlan> {
-    let mut pairs = directed_cross_chain_pairs(&discovery.assets);
+    let mut pairs = directed_cross_chain_pairs(&discovery.assets, asset_type);
     pairs.shuffle(&mut rand::thread_rng());
     for (from, to) in pairs {
         if ensure_source_ready(discovery, from).is_err() {
@@ -366,7 +383,9 @@ async fn random_send_plan(
         }
     }
     Err(eyre!(
-        "no one-way route is both funded by the axe wallet and quoted by the solver"
+        "No {}-to-{} route is both funded and quoted. Fund matching assets or choose a different --asset-type.",
+        asset_type.label(),
+        asset_type.label()
     ))
 }
 
@@ -374,10 +393,11 @@ async fn random_roundtrip_plan(
     client: &RfqClient,
     discovery: &RouteDiscovery,
     signer: Address,
+    asset_type: AssetType,
     wallet_bps: u16,
     order_type: OrderType,
 ) -> Result<RoutePlan> {
-    let mut pairs = directed_cross_chain_pairs(&discovery.assets);
+    let mut pairs = directed_cross_chain_pairs(&discovery.assets, asset_type);
     pairs.shuffle(&mut rand::thread_rng());
     for (from, to) in pairs {
         if ensure_roundtrip_ready(discovery, from, to).is_err() {
@@ -399,17 +419,27 @@ async fn random_roundtrip_plan(
         }
     }
     Err(eyre!(
-        "no round-trip route is both funded by the axe wallet and quoted by the solver"
+        "No {}-to-{} round-trip route is both funded and quoted. Fund matching assets or choose a different --asset-type.",
+        asset_type.label(),
+        asset_type.label()
     ))
 }
 
-fn directed_cross_chain_pairs(assets: &[WalletAsset]) -> Vec<(&WalletAsset, &WalletAsset)> {
+fn directed_cross_chain_pairs(
+    assets: &[WalletAsset],
+    asset_type: AssetType,
+) -> Vec<(&WalletAsset, &WalletAsset)> {
     assets
         .iter()
         .flat_map(|from| {
             assets
                 .iter()
-                .filter(move |to| from.id.chain_id != to.id.chain_id && !from.balance.is_zero())
+                .filter(move |to| {
+                    asset_type.matches(from)
+                        && asset_type.matches(to)
+                        && from.id.chain_id != to.id.chain_id
+                        && !from.balance.is_zero()
+                })
                 .map(move |to| (from, to))
         })
         .collect()
@@ -419,6 +449,7 @@ fn explicit_assets<'a>(
     discovery: &'a RouteDiscovery,
     from: &AssetSpec,
     to: &AssetSpec,
+    asset_type: AssetType,
 ) -> Result<(&'a WalletAsset, &'a WalletAsset)> {
     if from.id().chain_id == to.id().chain_id {
         return Err(eyre!("intent routes must cross chains"));
@@ -430,7 +461,15 @@ fn explicit_assets<'a>(
             .find(|candidate| &candidate.id == asset.id())
             .ok_or_else(|| eyre!("asset {asset} is not in the resolved RFQ catalog"))
     };
-    Ok((find(from)?, find(to)?))
+    let (from, to) = (find(from)?, find(to)?);
+    if !asset_type.matches(from) || !asset_type.matches(to) {
+        return Err(eyre!(
+            "--asset-type {} requires {} assets for both --from and --to. Run `axe intents catalog` to choose matching assets.",
+            asset_type.label(),
+            asset_type.label()
+        ));
+    }
+    Ok((from, to))
 }
 
 fn selected_amount(
@@ -493,11 +532,16 @@ fn ensure_roundtrip_ready(
     Ok(())
 }
 
-fn unordered_cross_chain_pairs(assets: &[WalletAsset]) -> Vec<(&WalletAsset, &WalletAsset)> {
+fn unordered_cross_chain_pairs(
+    assets: &[WalletAsset],
+    asset_type: AssetType,
+) -> Vec<(&WalletAsset, &WalletAsset)> {
     let mut pairs = Vec::new();
     for (index, left) in assets.iter().enumerate() {
         for right in &assets[index + 1..] {
             if left.id.chain_id != right.id.chain_id
+                && asset_type.matches(left)
+                && asset_type.matches(right)
                 && (!left.balance.is_zero() || !right.balance.is_zero())
             {
                 pairs.push((left, right));
@@ -772,6 +816,10 @@ fn render_plans(plans: &[RoutePlan]) {
     ui::kv("quotable round trips", &plans.len().to_string());
     if let [plan] = plans {
         ui::kv(
+            "asset type",
+            if plan.from.native { "native" } else { "token" },
+        );
+        ui::kv(
             "route",
             &format!(
                 "{} -> {} -> {}",
@@ -798,6 +846,10 @@ fn render_plans(plans: &[RoutePlan]) {
 
 fn render_leg_plan(plan: &LegPlan) {
     ui::section("intent preflight");
+    ui::kv(
+        "asset type",
+        if plan.from.native { "native" } else { "token" },
+    );
     ui::kv(
         "route",
         &format!("{} -> {}", plan.from.label(), plan.to.label()),
@@ -856,7 +908,7 @@ mod tests {
             asset("eip155:1", "b", 1, false),
             asset("eip155:2", "c", 1, false),
         ];
-        let pairs = unordered_cross_chain_pairs(&assets);
+        let pairs = unordered_cross_chain_pairs(&assets, AssetType::Token);
         assert_eq!(pairs.len(), 2);
     }
 
@@ -868,7 +920,70 @@ mod tests {
             asset("eip155:2", "c", 1, false),
         ];
 
-        assert_eq!(directed_cross_chain_pairs(&assets).len(), 4);
+        assert_eq!(
+            directed_cross_chain_pairs(&assets, AssetType::Token).len(),
+            4
+        );
+    }
+
+    #[test]
+    fn asset_type_filters_both_ends_of_automatic_routes() {
+        let assets = vec![
+            asset("eip155:1", "USDC", 1, false),
+            asset("eip155:1", "ETH", 1, true),
+            asset("eip155:2", "USDC", 1, false),
+            asset("eip155:2", "AVAX", 1, true),
+        ];
+
+        let token_pairs = unordered_cross_chain_pairs(&assets, AssetType::Token);
+        let native_pairs = unordered_cross_chain_pairs(&assets, AssetType::Native);
+        assert_eq!(token_pairs.len(), 1);
+        assert!(
+            token_pairs
+                .iter()
+                .all(|(left, right)| !left.native && !right.native)
+        );
+        assert_eq!(native_pairs.len(), 1);
+        assert!(
+            native_pairs
+                .iter()
+                .all(|(left, right)| left.native && right.native)
+        );
+    }
+
+    #[test]
+    fn explicit_routes_must_match_the_selected_asset_type() {
+        let discovery = RouteDiscovery {
+            chains: HashMap::new(),
+            assets: vec![
+                asset(
+                    "eip155:1",
+                    "0x0000000000000000000000000000000000000000",
+                    1,
+                    true,
+                ),
+                asset(
+                    "eip155:2",
+                    "0x0000000000000000000000000000000000000000",
+                    1,
+                    true,
+                ),
+            ],
+        };
+        let from = "eip155:1/0x0000000000000000000000000000000000000000"
+            .parse::<AssetSpec>()
+            .unwrap();
+        let to = "eip155:2/0x0000000000000000000000000000000000000000"
+            .parse::<AssetSpec>()
+            .unwrap();
+
+        assert!(explicit_assets(&discovery, &from, &to, AssetType::Native).is_ok());
+        assert_eq!(
+            explicit_assets(&discovery, &from, &to, AssetType::Token)
+                .unwrap_err()
+                .to_string(),
+            "--asset-type token requires token assets for both --from and --to. Run `axe intents catalog` to choose matching assets."
+        );
     }
 
     #[test]
