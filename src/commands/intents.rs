@@ -172,6 +172,7 @@ pub async fn send(args: SendArgs) -> Result<()> {
             order_type: plan.order_type,
             amount: plan.requested_amount,
             recipient,
+            max_input_amount: None,
         },
         runtime.limits,
         &ExecutionFeedback::Detailed,

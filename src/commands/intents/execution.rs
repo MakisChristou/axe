@@ -13,8 +13,8 @@ use super::client::RfqClient;
 use super::route::{quote_request, validate_quote};
 use super::types::{
     Action, ChainRuntime, EvmTransactionPayload, LegExecution, LegResult, Quote, QuoteOutcome,
-    QuoteRequest, RoutePlan, RunLimits, StatusOutput, TimedQuote, TransferState, WalletAsset,
-    parse_amount,
+    QuoteRequest, RoundTripInputBudget, RoutePlan, RunLimits, StatusOutput, TimedQuote,
+    TransferState, WalletAsset, parse_amount,
 };
 use crate::evm::{ERC20, EvmEndpoints, send_tx_robust};
 use crate::retry::retry_with_fallback_all;
@@ -66,6 +66,10 @@ pub async fn execute_round_trip(
     if feedback.is_detailed() {
         ui::section(&format!("{} -> {}", plan.from.label(), plan.to.label()));
     }
+    let forward_input_limit = match plan.input_budget {
+        RoundTripInputBudget::SpendableBalance => None,
+        RoundTripInputBudget::Capped { forward, .. } => Some(forward),
+    };
     let forward = execute_leg(
         client,
         chains,
@@ -76,6 +80,7 @@ pub async fn execute_round_trip(
             order_type: plan.order_type,
             amount: plan.requested_amount,
             recipient: signer.address(),
+            max_input_amount: forward_input_limit,
         },
         limits,
         feedback,
@@ -90,6 +95,15 @@ pub async fn execute_round_trip(
         .balance
         .checked_add(forward.output_amount)
         .ok_or_else(|| eyre!("{} balance overflowed", reverse_source.label()))?;
+    let reverse_input_limit = match plan.input_budget {
+        RoundTripInputBudget::SpendableBalance => None,
+        RoundTripInputBudget::Capped { reverse_top_up, .. } => Some(
+            forward
+                .output_amount
+                .checked_add(reverse_top_up)
+                .ok_or_else(|| eyre!("{} input limit overflowed", reverse_source.label()))?,
+        ),
+    };
     results.push(forward);
     let reverse = execute_leg(
         client,
@@ -101,6 +115,7 @@ pub async fn execute_round_trip(
             order_type: plan.order_type,
             amount: reverse_amount,
             recipient: signer.address(),
+            max_input_amount: reverse_input_limit,
         },
         limits,
         feedback,
@@ -231,7 +246,17 @@ async fn quote_for_execution(
     )?;
     validate_quote_lifetime(&selected.quote)?;
     let input_amount = parse_amount(&selected.quote.input.amount)?;
+    validate_input_limit(input_amount, leg.max_input_amount)?;
     Ok((selected, input_amount))
+}
+
+fn validate_input_limit(input: U256, maximum: Option<U256>) -> Result<()> {
+    if maximum.is_some_and(|maximum| input > maximum) {
+        return Err(eyre!(
+            "quote requires more input than the route's wallet safety limit"
+        ));
+    }
+    Ok(())
 }
 
 async fn require_quote(client: &RfqClient, request: &QuoteRequest) -> Result<TimedQuote> {
@@ -643,5 +668,12 @@ mod tests {
         assert_eq!(progress.position(), 0);
         feedback.leg_completed("Fuji/USDC -> Base/USDC");
         assert_eq!(progress.position(), 1);
+    }
+
+    #[test]
+    fn automatic_execution_rejects_quotes_above_the_wallet_limit() {
+        assert!(validate_input_limit(U256::from(100), Some(U256::from(100))).is_ok());
+        assert!(validate_input_limit(U256::from(101), Some(U256::from(100))).is_err());
+        assert!(validate_input_limit(U256::MAX, None).is_ok());
     }
 }

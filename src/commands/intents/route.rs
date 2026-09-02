@@ -9,8 +9,8 @@ use super::RouteChoice;
 use super::client::RfqClient;
 use super::types::{
     AssetId, AssetSpec, AssetType, ChainInfo, ChainRuntime, HumanAmount, LegPlan, OrderType, Quote,
-    QuoteOutcome, QuoteRequest, RoutePlan, TokenInfo, WalletAsset, format_units, is_native_token,
-    parse_amount,
+    QuoteOutcome, QuoteRequest, RoundTripInputBudget, RoutePlan, TokenInfo, WalletAsset,
+    format_units, is_native_token, parse_amount,
 };
 use crate::config::{ChainConfig, ChainsConfig};
 use crate::evm::{ERC20, EvmEndpoints};
@@ -318,8 +318,14 @@ pub async fn plan_roundtrip(
         } => {
             let (from, to) = explicit_assets(discovery, from, to, *asset_type)?;
             ensure_roundtrip_ready(discovery, from, to)?;
+            let input_budget = if amount.is_some() {
+                RoundTripInputBudget::SpendableBalance
+            } else {
+                capped_input_budget(from, to, *wallet_bps)
+                    .ok_or_else(|| eyre!("{} has no balance after the gas reserve", from.label()))?
+            };
             let amount = selected_amount(from, to, *order_type, amount.as_ref(), *wallet_bps)?;
-            preflight_pair(client, from, to, signer, *order_type, amount)
+            preflight_pair(client, from, to, signer, *order_type, amount, input_budget)
                 .await?
                 .ok_or_else(|| eyre!("the solver returned no bidirectional quote for the route"))?
         }
@@ -349,10 +355,13 @@ pub async fn plan_sweep(
         let Some(amount) = candidate_quote_amount(from, to, order_type, wallet_bps) else {
             continue;
         };
+        let Some(input_budget) = capped_input_budget(from, to, wallet_bps) else {
+            continue;
+        };
         if !chains_have_gas(&discovery.assets, &from.id.chain_id, &to.id.chain_id) {
             continue;
         }
-        match preflight_pair(client, from, to, signer, order_type, amount).await {
+        match preflight_pair(client, from, to, signer, order_type, amount, input_budget).await {
             Ok(Some(plan)) => {
                 plans.push(plan);
             }
@@ -417,7 +426,10 @@ async fn random_roundtrip_plan(
         let Some(amount) = candidate_quote_amount(from, to, order_type, wallet_bps) else {
             continue;
         };
-        match preflight_pair(client, from, to, signer, order_type, amount).await {
+        let Some(input_budget) = capped_input_budget(from, to, wallet_bps) else {
+            continue;
+        };
+        match preflight_pair(client, from, to, signer, order_type, amount, input_budget).await {
             Ok(Some(plan)) => return Ok(plan),
             Ok(None) => {}
             Err(error) => ui::warn(&format!(
@@ -612,6 +624,17 @@ fn candidate_quote_amount(
     }
 }
 
+fn capped_input_budget(
+    source: &WalletAsset,
+    destination: &WalletAsset,
+    wallet_bps: u16,
+) -> Option<RoundTripInputBudget> {
+    Some(RoundTripInputBudget::Capped {
+        forward: candidate_amount(source, wallet_bps)?,
+        reverse_top_up: candidate_amount(destination, wallet_bps).unwrap_or_default(),
+    })
+}
+
 fn scale_decimals(amount: U256, from_decimals: u8, to_decimals: u8) -> Option<U256> {
     let difference = from_decimals.abs_diff(to_decimals);
     let mut scale = U256::from(1);
@@ -680,6 +703,7 @@ async fn preflight_pair(
     signer: Address,
     order_type: OrderType,
     requested_amount: U256,
+    input_budget: RoundTripInputBudget,
 ) -> Result<Option<RoutePlan>> {
     let forward = quote_request(from, to, signer, signer, order_type, requested_amount);
     let QuoteOutcome::Available(forward) = client.quote(&forward).await? else {
@@ -687,6 +711,9 @@ async fn preflight_pair(
     };
     validate_quote(&forward.quote, from, to, order_type, requested_amount)?;
     let forward_input = parse_amount(&forward.quote.input.amount)?;
+    if !forward_input_is_within_budget(forward_input, input_budget) {
+        return Ok(None);
+    }
     let forward_output = parse_amount(&forward.quote.output.amount)?;
     let reverse_amount = match order_type {
         OrderType::ExactInput => forward_output,
@@ -704,6 +731,10 @@ async fn preflight_pair(
         order_type,
         reverse_amount,
     )?;
+    let reverse_input = parse_amount(&reverse.quote.input.amount)?;
+    if !reverse_input_is_within_budget(reverse_input, forward_output, input_budget) {
+        return Ok(None);
+    }
     let expected_return = parse_amount(&reverse.quote.output.amount)?;
     Ok(Some(RoutePlan {
         from: from.clone(),
@@ -714,7 +745,28 @@ async fn preflight_pair(
         expected_return,
         forward_quote_ms: duration_ms(forward.latency),
         reverse_quote_ms: duration_ms(reverse.latency),
+        input_budget,
     }))
+}
+
+fn forward_input_is_within_budget(input: U256, budget: RoundTripInputBudget) -> bool {
+    match budget {
+        RoundTripInputBudget::SpendableBalance => true,
+        RoundTripInputBudget::Capped { forward, .. } => input <= forward,
+    }
+}
+
+fn reverse_input_is_within_budget(
+    input: U256,
+    received: U256,
+    budget: RoundTripInputBudget,
+) -> bool {
+    match budget {
+        RoundTripInputBudget::SpendableBalance => true,
+        RoundTripInputBudget::Capped { reverse_top_up, .. } => received
+            .checked_add(reverse_top_up)
+            .is_some_and(|maximum| input <= maximum),
+    }
 }
 
 fn with_received_balance(asset: &WalletAsset, received: U256) -> Result<WalletAsset> {
@@ -1154,10 +1206,32 @@ mod tests {
             expected_return: U256::from(1),
             forward_quote_ms: 10,
             reverse_quote_ms: 30,
+            input_budget: RoundTripInputBudget::SpendableBalance,
         }];
 
         assert_eq!(average_quote_ms(&plans), 20);
         assert_eq!(average_quote_ms(&[]), 0);
+    }
+
+    #[test]
+    fn automatic_round_trips_cap_forward_and_reverse_wallet_spend() {
+        let budget = RoundTripInputBudget::Capped {
+            forward: U256::from(100),
+            reverse_top_up: U256::from(10),
+        };
+
+        assert!(forward_input_is_within_budget(U256::from(100), budget));
+        assert!(!forward_input_is_within_budget(U256::from(101), budget));
+        assert!(reverse_input_is_within_budget(
+            U256::from(110),
+            U256::from(100),
+            budget
+        ));
+        assert!(!reverse_input_is_within_budget(
+            U256::from(111),
+            U256::from(100),
+            budget
+        ));
     }
 
     #[test]

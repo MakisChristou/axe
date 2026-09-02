@@ -412,6 +412,13 @@ pub struct RoutePlan {
     pub expected_return: U256,
     pub forward_quote_ms: u64,
     pub reverse_quote_ms: u64,
+    pub input_budget: RoundTripInputBudget,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum RoundTripInputBudget {
+    SpendableBalance,
+    Capped { forward: U256, reverse_top_up: U256 },
 }
 
 #[derive(Clone, Debug)]
@@ -432,6 +439,7 @@ pub struct LegExecution {
     pub order_type: OrderType,
     pub amount: U256,
     pub recipient: Address,
+    pub max_input_amount: Option<U256>,
 }
 
 #[derive(Clone, Debug)]
