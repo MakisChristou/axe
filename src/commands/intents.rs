@@ -6,6 +6,7 @@ mod presentation;
 mod read;
 mod route;
 mod stats;
+mod traffic;
 mod types;
 
 use std::path::PathBuf;
@@ -38,6 +39,7 @@ pub use inventory::{InventoryArgs, inventory};
 pub use read::{
     ApiArgs, CatalogArgs, QuoteArgs, QuoteRequestArgs, StatusArgs, catalog, quote, status,
 };
+pub use traffic::{TrafficArgs, run as traffic};
 
 pub fn resolve_quote_sender(
     sender: Option<Address>,

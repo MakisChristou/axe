@@ -486,6 +486,14 @@ async fn run_intents(
             })
             .await
         }
+        cli::IntentsCommands::Traffic(options) => {
+            let runtime = resolve_intent_runtime(options.runtime, global).await?;
+            commands::intents::traffic(commands::intents::TrafficArgs {
+                runtime,
+                wallet_bps: options.wallet_bps,
+            })
+            .await
+        }
     }
 }
 

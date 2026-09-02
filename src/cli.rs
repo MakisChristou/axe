@@ -193,6 +193,9 @@ pub enum IntentsCommands {
 
     /// Run round trips across every currently executable wallet route
     Sweep(IntentSweepOptions),
+
+    /// Continuously simulate users across all executable intent routes
+    Traffic(IntentTrafficOptions),
 }
 
 #[derive(Args)]
@@ -464,6 +467,16 @@ pub struct IntentSweepOptions {
     /// Fix the source input or destination output amount.
     #[arg(long, value_enum, default_value_t)]
     pub order_type: OrderType,
+}
+
+#[derive(Args)]
+pub struct IntentTrafficOptions {
+    #[command(flatten)]
+    pub runtime: IntentRuntimeOptions,
+
+    /// Maximum basis points of a source balance used by one route.
+    #[arg(long, default_value = "10", value_parser = clap::value_parser!(u16).range(1..=1_000))]
+    pub wallet_bps: u16,
 }
 
 #[derive(Subcommand)]
@@ -1023,6 +1036,39 @@ mod tests {
                 "00",
                 "--asset-type",
                 "anything",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn intent_traffic_is_continuous_and_balance_capped() {
+        let cli = Cli::try_parse_from([
+            "axe",
+            "intents",
+            "traffic",
+            "--private-key",
+            "00",
+            "--wallet-bps",
+            "25",
+        ])
+        .unwrap();
+        let Commands::Intents {
+            subcommand: IntentsCommands::Traffic(options),
+        } = cli.command
+        else {
+            panic!("expected intents traffic");
+        };
+        assert_eq!(options.wallet_bps, 25);
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "traffic",
+                "--private-key",
+                "00",
+                "--wallet-bps",
+                "1001",
             ])
             .is_err()
         );
