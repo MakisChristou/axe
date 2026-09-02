@@ -173,7 +173,7 @@ pub enum IntentsCommands {
     /// Show the solver's catalog-backed token inventory and USD value
     Inventory(IntentInventoryOptions),
 
-    /// Request and inspect one quote without executing it
+    /// Request a quote, then optionally deposit and watch it to fulfillment
     Quote(IntentQuoteOptions),
 
     /// Show or watch the status of a quote
@@ -243,39 +243,24 @@ pub struct IntentAssetOptions {
 }
 
 #[derive(Args)]
-pub struct IntentQuoteRequestOptions {
-    /// Source asset as <CAIP-2 chain>/<token address>.
-    #[arg(long)]
-    pub from: AssetSpec,
+pub struct IntentQuoteOptions {
+    #[command(flatten)]
+    pub runtime: IntentRuntimeConfigOptions,
 
-    /// Destination asset as <CAIP-2 chain>/<token address>.
-    #[arg(long)]
-    pub to: AssetSpec,
+    #[command(flatten)]
+    pub route: IntentRouteOptions,
 
-    /// Human-readable source amount for exact-input or output amount for exact-output.
+    /// Quote sender override. Defaults to the axe wallet.
     #[arg(long)]
-    pub amount: HumanAmount,
+    pub sender: Option<Address>,
 
-    /// Address used to construct approval and deposit actions.
-    #[arg(long)]
-    pub sender: Address,
-
-    /// Destination recipient. Defaults to --sender.
+    /// Destination recipient. Defaults to the quote sender.
     #[arg(long)]
     pub recipient: Option<Address>,
 
-    /// Fix the source input or destination output amount.
-    #[arg(long, value_enum, default_value_t)]
-    pub order_type: OrderType,
-}
-
-#[derive(Args)]
-pub struct IntentQuoteOptions {
-    #[command(flatten)]
-    pub read: IntentReadOptions,
-
-    #[command(flatten)]
-    pub request: IntentQuoteRequestOptions,
+    /// Print the selected quote as JSON without offering to deposit it.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -1173,14 +1158,15 @@ mod tests {
     }
 
     #[test]
-    fn intent_quotes_require_sender_context() {
+    fn intent_quotes_accept_random_defaults_and_optional_overrides() {
         const ASSET: &str = "eip155:11155111/0x0000000000000000000000000000000000000000";
 
+        assert!(Cli::try_parse_from(["axe", "intents", "quote"]).is_ok());
         assert!(
             Cli::try_parse_from([
                 "axe", "intents", "quote", "--from", ASSET, "--to", ASSET, "--amount", "1",
             ])
-            .is_err()
+            .is_ok()
         );
     }
 

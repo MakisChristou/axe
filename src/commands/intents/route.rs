@@ -339,6 +339,7 @@ pub async fn plan_send(
     signer: Address,
     recipient: Address,
     choice: &RouteChoice,
+    feedback: PlanningFeedback,
 ) -> Result<LegPlan> {
     let plan = match choice {
         RouteChoice::Random {
@@ -373,7 +374,9 @@ pub async fn plan_send(
                 .ok_or_else(|| eyre!("the solver returned no quote for the explicit route"))?
         }
     };
-    render_leg_plan(&plan);
+    if matches!(feedback, PlanningFeedback::Visible) {
+        render_leg_plan(&plan);
+    }
     Ok(plan)
 }
 
@@ -784,14 +787,19 @@ async fn preflight_leg(
         return Ok(None);
     };
     validate_quote(&quote.quote, from, to, order_type, requested_amount)?;
+    let input_amount = parse_amount(&quote.quote.input.amount)?;
+    let expected_output = parse_amount(&quote.quote.output.amount)?;
+    let quote_ms = duration_ms(quote.latency);
     Ok(Some(LegPlan {
         from: from.clone(),
         to: to.clone(),
         order_type,
         requested_amount,
-        input_amount: parse_amount(&quote.quote.input.amount)?,
-        expected_output: parse_amount(&quote.quote.output.amount)?,
-        quote_ms: duration_ms(quote.latency),
+        input_amount,
+        expected_output,
+        quote_ms,
+        request,
+        quote: *quote,
     }))
 }
 

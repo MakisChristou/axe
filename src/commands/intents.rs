@@ -18,7 +18,7 @@ use eyre::{Result, WrapErr, eyre};
 use indicatif::ProgressBar;
 
 use self::client::RfqClient;
-use self::execution::{ExecutionFeedback, execute_leg, execute_round_trip};
+use self::execution::{ExecutionFeedback, execute_leg, execute_planned_leg, execute_round_trip};
 use self::route::{
     DiscoveryFeedback, PlanningFeedback, RouteDiscovery, discover_wallet, plan_roundtrip,
     plan_send, plan_sweep, render_plans,
@@ -36,9 +36,7 @@ pub use benchmark::{
     benchmark_quotes,
 };
 pub use inventory::{InventoryArgs, inventory};
-pub use read::{
-    ApiArgs, CatalogArgs, QuoteArgs, QuoteRequestArgs, StatusArgs, catalog, quote, status,
-};
+pub use read::{ApiArgs, CatalogArgs, StatusArgs, catalog, status};
 pub use traffic::{TrafficArgs, run as traffic};
 
 pub fn resolve_quote_sender(
@@ -135,6 +133,14 @@ pub struct SendArgs {
     pub recipient: Option<Address>,
 }
 
+pub struct QuoteArgs {
+    pub runtime: IntentRuntimeArgs,
+    pub route: RouteChoice,
+    pub sender: Option<Address>,
+    pub recipient: Option<Address>,
+    pub json: bool,
+}
+
 pub struct RoundtripArgs {
     pub runtime: IntentRuntimeArgs,
     pub route: RouteChoice,
@@ -158,6 +164,58 @@ struct IntentRuntime {
     auto_confirm: bool,
 }
 
+pub async fn quote(args: QuoteArgs) -> Result<()> {
+    let runtime = prepare_runtime(args.runtime).await?;
+    let wallet = runtime.signer.address();
+    let sender = args.sender.unwrap_or(wallet);
+    let recipient = args.recipient.unwrap_or(sender);
+    let discovery_feedback = if args.json {
+        DiscoveryFeedback::Quiet
+    } else {
+        DiscoveryFeedback::Detailed
+    };
+    let discovery =
+        discover_wallet(&runtime.client, &runtime.config, sender, discovery_feedback).await?;
+    let plan = plan_send(
+        &runtime.client,
+        &discovery,
+        sender,
+        recipient,
+        &args.route,
+        PlanningFeedback::Hidden,
+    )
+    .await?;
+    read::render_planned_quote(&plan, args.json)?;
+    if args.json {
+        return Ok(());
+    }
+    if sender != wallet {
+        ui::warn(
+            "The quote sender differs from the axe wallet, so this quote cannot be deposited.",
+        );
+        return Ok(());
+    }
+    if !ui::confirm("Deposit this quote and watch it to fulfillment?").await {
+        ui::info("Quote not deposited.");
+        return Ok(());
+    }
+
+    let quote_id = plan.quote.quote.quote_id.clone();
+    let _shutdown = Shutdown::install(DrainTarget::Intent);
+    let result = execute_planned_leg(
+        &runtime.client,
+        &discovery.chains,
+        &runtime.signer,
+        plan,
+        runtime.limits,
+        &ExecutionFeedback::Debugger,
+    )
+    .await?;
+    render_summary(std::slice::from_ref(&result), 1);
+    ui::success(&format!("Intent {quote_id} fulfilled successfully."));
+    Ok(())
+}
+
 pub async fn send(args: SendArgs) -> Result<()> {
     let runtime = prepare_runtime(args.runtime).await?;
     let discovery = discover_wallet(
@@ -174,6 +232,7 @@ pub async fn send(args: SendArgs) -> Result<()> {
         runtime.signer.address(),
         recipient,
         &args.route,
+        PlanningFeedback::Visible,
     )
     .await?;
     ui::kv("mode", "one intent");

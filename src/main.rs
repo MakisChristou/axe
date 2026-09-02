@@ -529,19 +529,21 @@ async fn run_intent_quote(
     options: cli::IntentQuoteOptions,
     global: Option<types::Network>,
 ) -> Result<()> {
-    let api = resolve_intent_api(options.read.api, global)?;
-    let recipient = options.request.recipient.unwrap_or(options.request.sender);
+    let runtime = resolve_intent_runtime_config(options.runtime, global, false).await?;
+    let route = commands::intents::RouteChoice::new(
+        options.route.from,
+        options.route.to,
+        options.route.amount,
+        options.route.wallet_bps,
+        options.route.order_type,
+        options.route.assets.asset_type,
+    )?;
     commands::intents::quote(commands::intents::QuoteArgs {
-        api,
-        request: commands::intents::QuoteRequestArgs {
-            from: options.request.from,
-            to: options.request.to,
-            amount: options.request.amount,
-            sender: options.request.sender,
-            recipient,
-            order_type: options.request.order_type,
-        },
-        json: options.read.json,
+        runtime,
+        route,
+        sender: options.sender,
+        recipient: options.recipient,
+        json: options.json,
     })
     .await
 }

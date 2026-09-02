@@ -9,10 +9,9 @@ use serde_json::json;
 
 use super::client::RfqClient;
 use super::presentation::asset_table;
-use super::route::validate_quote_route;
 use super::types::{
     AssetSpec, CatalogChain, CatalogResponse, CatalogToken, EvmTransactionPayload, HumanAmount,
-    OrderType, Quote, QuoteOutcome, QuoteRequest, StatusResponse, TokenInfo, TokensResponse,
+    LegPlan, OrderType, Quote, QuoteRequest, StatusResponse, TokenInfo, TokensResponse,
     TransferState, format_units, is_native_token, parse_amount,
 };
 use crate::types::Network;
@@ -37,12 +36,6 @@ pub struct QuoteRequestArgs {
     pub sender: Address,
     pub recipient: Address,
     pub order_type: OrderType,
-}
-
-pub struct QuoteArgs {
-    pub api: ApiArgs,
-    pub request: QuoteRequestArgs,
-    pub json: bool,
 }
 
 pub struct StatusArgs {
@@ -122,26 +115,35 @@ fn group_tokens(tokens: Vec<TokenInfo>) -> HashMap<String, Vec<TokenInfo>> {
     tokens_by_chain
 }
 
-pub async fn quote(args: QuoteArgs) -> Result<()> {
-    let client = api_client(&args.api)?;
-    let prepared = prepare_quote(&client, &args.request).await?;
-    let timed = require_quote(&client, &prepared.request).await?;
-    validate_quote_route(
-        &timed.quote,
-        args.request.from.id(),
-        args.request.to.id(),
-        prepared.order_type,
-        prepared.requested_amount,
-    )?;
-    if args.json {
-        let value = json!({
-            "latencyMs": duration_ms(timed.latency),
-            "quote": timed.quote,
+pub(super) fn render_planned_quote(plan: &LegPlan, json: bool) -> Result<()> {
+    let response = json!({ "quotes": [&plan.quote.quote] });
+    if json {
+        let output = json!({
+            "request": &plan.request,
+            "response": response,
+            "latencyMs": duration_ms(plan.quote.latency),
         });
-        println!("{}", serde_json::to_string_pretty(&value)?);
-    } else {
-        render_quote(&timed.quote, timed.latency, &prepared)?;
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
     }
+
+    let from = TokenInfo {
+        chain_id: plan.from.id.chain_id.clone(),
+        address: plan.from.id.token_address.clone(),
+        symbol: plan.from.symbol.clone(),
+        decimals: plan.from.decimals,
+    };
+    let to = TokenInfo {
+        chain_id: plan.to.id.chain_id.clone(),
+        address: plan.to.id.token_address.clone(),
+        symbol: plan.to.symbol.clone(),
+        decimals: plan.to.decimals,
+    };
+    render_quote(&plan.quote.quote, plan.quote.latency, &from, &to)?;
+    ui::section("quote request");
+    println!("{}", serde_json::to_string_pretty(&plan.request)?);
+    ui::section("quote response");
+    println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
 
@@ -156,14 +158,6 @@ pub async fn status(args: StatusArgs) -> Result<()> {
 
 pub(super) fn api_client(args: &ApiArgs) -> Result<RfqClient> {
     RfqClient::new(args.network, args.api_url.as_deref())
-}
-
-pub(super) async fn prepare_quote(
-    client: &RfqClient,
-    args: &QuoteRequestArgs,
-) -> Result<PreparedQuote> {
-    let tokens = client.tokens().await?;
-    prepare_quote_from_tokens(&tokens, args)
 }
 
 pub(super) fn prepare_quote_from_tokens(
@@ -215,18 +209,6 @@ fn find_token(tokens: &TokensResponse, asset: &AssetSpec) -> Result<TokenInfo> {
                 "Asset {asset} is not in the intent token catalog. Run `axe intents catalog` to list supported assets."
             )
         })
-}
-
-async fn require_quote(
-    client: &RfqClient,
-    request: &QuoteRequest,
-) -> Result<super::types::TimedQuote> {
-    match client.quote(request).await? {
-        QuoteOutcome::Available(quote) => Ok(*quote),
-        QuoteOutcome::Unavailable(reason) => Err(eyre!(
-            "No intent quote is available: {reason}. Check the route, amount, and solver liquidity."
-        )),
-    }
 }
 
 async fn checked_status(client: &RfqClient, quote_id: &str) -> Result<StatusResponse> {
@@ -305,7 +287,7 @@ fn render_catalog(catalog: &CatalogResponse) {
     }
 }
 
-fn render_quote(quote: &Quote, latency: Duration, prepared: &PreparedQuote) -> Result<()> {
+fn render_quote(quote: &Quote, latency: Duration, from: &TokenInfo, to: &TokenInfo) -> Result<()> {
     ui::section("intent quote");
     ui::kv("quote ID", &quote.quote_id);
     if let Some(swap_id) = quote.backend.tracking.swap_id.as_deref() {
@@ -313,22 +295,25 @@ fn render_quote(quote: &Quote, latency: Duration, prepared: &PreparedQuote) -> R
     }
     ui::kv(
         "route",
-        &format!("{} -> {}", prepared.from.symbol, prepared.to.symbol),
+        &format!(
+            "{}/{} -> {}/{}",
+            from.chain_id, from.symbol, to.chain_id, to.symbol
+        ),
     );
     ui::kv(
         "input",
         &format!(
             "{} {}",
-            format_units(parse_amount(&quote.input.amount)?, prepared.from.decimals),
-            prepared.from.symbol
+            format_units(parse_amount(&quote.input.amount)?, from.decimals),
+            from.symbol
         ),
     );
     ui::kv(
         "output",
         &format!(
             "{} {}",
-            format_units(parse_amount(&quote.output.amount)?, prepared.to.decimals),
-            prepared.to.symbol
+            format_units(parse_amount(&quote.output.amount)?, to.decimals),
+            to.symbol
         ),
     );
     ui::kv("quote latency", &ui::format_duration(latency));

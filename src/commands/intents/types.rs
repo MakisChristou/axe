@@ -430,6 +430,8 @@ pub struct LegPlan {
     pub input_amount: U256,
     pub expected_output: U256,
     pub quote_ms: u64,
+    pub request: QuoteRequest,
+    pub quote: TimedQuote,
 }
 
 #[derive(Clone, Debug)]

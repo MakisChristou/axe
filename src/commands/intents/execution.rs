@@ -14,9 +14,9 @@ use super::client::RfqClient;
 use super::presentation::set_intent_traffic_message;
 use super::route::{quote_request, validate_quote};
 use super::types::{
-    Action, ChainRuntime, EvmTransactionPayload, LegExecution, LegResult, Quote, QuoteOutcome,
-    QuoteRequest, RoundTripInputBudget, RoutePlan, RunLimits, StatusOutput, TimedQuote,
-    TransferState, WalletAsset, parse_amount,
+    Action, ChainRuntime, EvmTransactionPayload, LegExecution, LegPlan, LegResult, Quote,
+    QuoteOutcome, QuoteRequest, RoundTripInputBudget, RoutePlan, RunLimits, StatusOutput,
+    TimedQuote, TransferState, WalletAsset, parse_amount,
 };
 use crate::evm::{ERC20, EvmEndpoints, send_tx_robust_with_warning};
 use crate::retry::retry_with_fallback_all;
@@ -34,6 +34,7 @@ struct ApprovalRequirement {
 #[derive(Clone)]
 pub enum ExecutionFeedback {
     Detailed,
+    Debugger,
     Progress(ProgressBar),
     Traffic {
         progress: ProgressBar,
@@ -43,7 +44,11 @@ pub enum ExecutionFeedback {
 
 impl ExecutionFeedback {
     fn is_detailed(&self) -> bool {
-        matches!(self, Self::Detailed)
+        matches!(self, Self::Detailed | Self::Debugger)
+    }
+
+    fn is_debugger(&self) -> bool {
+        matches!(self, Self::Debugger)
     }
 
     fn stage(&self, route: &str, stage: &str) {
@@ -57,7 +62,7 @@ impl ExecutionFeedback {
                     compact_traffic_stage(stage)
                 ),
             ),
-            Self::Detailed => {}
+            Self::Detailed | Self::Debugger => {}
         }
     }
 
@@ -74,13 +79,13 @@ impl ExecutionFeedback {
                     &format!("{} intents · {context} · fulfilled", progress.position()),
                 );
             }
-            Self::Detailed => {}
+            Self::Detailed | Self::Debugger => {}
         }
     }
 
     fn warn(&self, message: &str) {
         match self {
-            Self::Detailed => ui::warn(message),
+            Self::Detailed | Self::Debugger => ui::warn(message),
             Self::Progress(progress) => progress.println(ui::warning_line(message)),
             Self::Traffic { progress, context } => set_intent_traffic_message(
                 progress,
@@ -184,17 +189,87 @@ pub async fn execute_leg(
     limits: RunLimits,
     feedback: &ExecutionFeedback,
 ) -> Result<LegResult> {
-    let end_to_end_started = Instant::now();
+    let started = Instant::now();
     let route = format!("{} -> {}", leg.from.label(), leg.to.label());
     feedback.stage(&route, "requesting quote");
     let (selected, input_amount) = quote_for_execution(client, signer.address(), &leg).await?;
+    execute_selected_leg(
+        client,
+        chains,
+        signer,
+        SelectedLegExecution {
+            from: leg.from,
+            to: leg.to,
+            selected,
+            input_amount,
+            started,
+        },
+        limits,
+        feedback,
+    )
+    .await
+}
+
+pub async fn execute_planned_leg(
+    client: &RfqClient,
+    chains: &std::collections::HashMap<String, ChainRuntime>,
+    signer: &PrivateKeySigner,
+    plan: LegPlan,
+    limits: RunLimits,
+    feedback: &ExecutionFeedback,
+) -> Result<LegResult> {
+    validate_quote(
+        &plan.quote.quote,
+        &plan.from,
+        &plan.to,
+        plan.order_type,
+        plan.requested_amount,
+    )?;
+    validate_quote_lifetime(&plan.quote.quote)?;
+    let input_amount = parse_amount(&plan.quote.quote.input.amount)?;
+    validate_input_limit(input_amount, None)?;
+    execute_selected_leg(
+        client,
+        chains,
+        signer,
+        SelectedLegExecution {
+            from: plan.from,
+            to: plan.to,
+            selected: plan.quote,
+            input_amount,
+            started: Instant::now(),
+        },
+        limits,
+        feedback,
+    )
+    .await
+}
+
+struct SelectedLegExecution {
+    from: WalletAsset,
+    to: WalletAsset,
+    selected: TimedQuote,
+    input_amount: U256,
+    started: Instant,
+}
+
+async fn execute_selected_leg(
+    client: &RfqClient,
+    chains: &std::collections::HashMap<String, ChainRuntime>,
+    signer: &PrivateKeySigner,
+    execution: SelectedLegExecution,
+    limits: RunLimits,
+    feedback: &ExecutionFeedback,
+) -> Result<LegResult> {
+    let route = format!("{} -> {}", execution.from.label(), execution.to.label());
+    let selected = execution.selected;
 
     ensure_input_approval(
         chains,
         signer,
-        &leg.from,
+        &execution.from,
         &selected,
-        input_amount,
+        execution.input_amount,
         feedback,
         &route,
     )
@@ -217,7 +292,7 @@ pub async fn execute_leg(
     let deposit = deposits
         .first()
         .ok_or_else(|| eyre!("intent quote had no deposit transaction"))?;
-    validate_deposit_action(deposit, &leg.from, input_amount)?;
+    validate_deposit_action(deposit, &execution.from, execution.input_amount)?;
     if feedback.is_detailed() {
         ui::kv("quote", &selected.quote.quote_id);
         if let Some(swap_id) = selected.quote.backend.tracking.swap_id.as_deref() {
@@ -229,7 +304,7 @@ pub async fn execute_leg(
     let deposit_hash = execute_actions(
         chains,
         signer,
-        &leg.from,
+        &execution.from,
         &deposits,
         "intent deposit",
         feedback,
@@ -243,20 +318,27 @@ pub async fn execute_leg(
 
     feedback.stage(&route, "awaiting fulfillment");
     let fulfillment_started = Instant::now();
-    let status_output =
-        wait_for_fulfillment(client, &selected.quote, &leg.to, limits, feedback, &route).await?;
+    let status_output = wait_for_fulfillment(
+        client,
+        &selected.quote,
+        &execution.to,
+        limits,
+        feedback,
+        &route,
+    )
+    .await?;
     let fulfillment_latency_ms = elapsed_ms(fulfillment_started.elapsed());
-    let end_to_end_latency_ms = elapsed_ms(end_to_end_started.elapsed());
+    let end_to_end_latency_ms = elapsed_ms(execution.started.elapsed());
     let output_amount = parse_amount(&status_output.amount)?;
     if feedback.is_detailed() {
         ui::success(&format!(
             "fulfilled {route} in {:.1}s",
-            end_to_end_started.elapsed().as_secs_f64()
+            execution.started.elapsed().as_secs_f64()
         ));
     }
     feedback.leg_completed(&route);
     Ok(LegResult {
-        input_amount,
+        input_amount: execution.input_amount,
         output_amount,
         quote_latency_ms: elapsed_ms(selected.latency),
         deposit_confirmation_latency_ms,
@@ -585,7 +667,10 @@ async fn wait_for_fulfillment(
             }
             Ok(status) => {
                 if last_state != Some(status.state) {
-                    if feedback.is_detailed() {
+                    if feedback.is_debugger() {
+                        ui::section("intent status response");
+                        println!("{}", serde_json::to_string_pretty(&status)?);
+                    } else if feedback.is_detailed() {
                         ui::kv(
                             "status",
                             &format!("{} ({})", status.state.label(), quote.quote_id),
