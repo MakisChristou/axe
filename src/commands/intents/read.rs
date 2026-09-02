@@ -163,8 +163,15 @@ pub(super) async fn prepare_quote(
     args: &QuoteRequestArgs,
 ) -> Result<PreparedQuote> {
     let tokens = client.tokens().await?;
-    let from = find_token(&tokens, &args.from)?;
-    let to = find_token(&tokens, &args.to)?;
+    prepare_quote_from_tokens(&tokens, args)
+}
+
+pub(super) fn prepare_quote_from_tokens(
+    tokens: &TokensResponse,
+    args: &QuoteRequestArgs,
+) -> Result<PreparedQuote> {
+    let from = find_token(tokens, &args.from)?;
+    let to = find_token(tokens, &args.to)?;
     let decimals = match args.order_type {
         OrderType::ExactInput => from.decimals,
         OrderType::ExactOutput => to.decimals,

@@ -31,11 +31,29 @@ use crate::types::Network;
 use crate::ui;
 
 pub use self::types::{AssetSpec, AssetType, HumanAmount, OrderType};
-pub use benchmark::{QuoteBenchmarkArgs, QuoteBenchmarkLimit, benchmark_quotes};
+pub use benchmark::{
+    QuoteBenchmarkArgs, QuoteBenchmarkLimit, QuoteBenchmarkTarget, benchmark_quotes,
+};
 pub use inventory::{InventoryArgs, inventory};
 pub use read::{
     ApiArgs, CatalogArgs, QuoteArgs, QuoteRequestArgs, StatusArgs, catalog, quote, status,
 };
+
+pub fn resolve_quote_sender(
+    sender: Option<Address>,
+    private_key: Option<String>,
+) -> Result<Address> {
+    if let Some(sender) = sender {
+        return Ok(sender);
+    }
+    let Some(private_key) = private_key else {
+        return Ok(Address::ZERO);
+    };
+    let signer: PrivateKeySigner = private_key
+        .parse()
+        .wrap_err("EVM_PRIVATE_KEY is not a valid hex private key")?;
+    Ok(signer.address())
+}
 
 pub struct IntentRuntimeArgs {
     pub network: Network,
@@ -453,5 +471,21 @@ mod tests {
             format_latency_percentiles(&[181, 2_924, 8_823]),
             "p50 2.92 s │ p95 8.82 s"
         );
+    }
+
+    #[test]
+    fn resolves_quote_sender_from_override_key_or_zero() {
+        let signer = PrivateKeySigner::random();
+        let address = signer.address();
+
+        assert_eq!(
+            resolve_quote_sender(Some(address), Some("ignored".to_owned())).unwrap(),
+            address
+        );
+        assert_eq!(
+            resolve_quote_sender(None, Some(signer.to_bytes().to_string())).unwrap(),
+            address
+        );
+        assert_eq!(resolve_quote_sender(None, None).unwrap(), Address::ZERO);
     }
 }

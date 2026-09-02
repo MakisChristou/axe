@@ -560,7 +560,9 @@ async fn run_intent_bench(
     match subcommand {
         cli::IntentBenchCommands::Quote(options) => {
             let api = resolve_intent_api(options.read.api, global)?;
-            let recipient = options.request.recipient.unwrap_or(options.request.sender);
+            let sender =
+                commands::intents::resolve_quote_sender(options.sender, options.private_key)?;
+            let recipient = options.recipient.unwrap_or(sender);
             let limit = options.duration_secs.map_or_else(
                 || {
                     commands::intents::QuoteBenchmarkLimit::Requests(
@@ -575,13 +577,14 @@ async fn run_intent_bench(
             );
             commands::intents::benchmark_quotes(commands::intents::QuoteBenchmarkArgs {
                 api,
-                request: commands::intents::QuoteRequestArgs {
-                    from: options.request.from,
-                    to: options.request.to,
-                    amount: options.request.amount,
-                    sender: options.request.sender,
+                target: commands::intents::QuoteBenchmarkTarget {
+                    from: options.from,
+                    to: options.to,
+                    amount: options.amount,
+                    sender,
                     recipient,
-                    order_type: options.request.order_type,
+                    order_type: options.order_type,
+                    asset_type: options.assets.asset_type,
                 },
                 limit,
                 concurrency: usize::from(options.concurrency),

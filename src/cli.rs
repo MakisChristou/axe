@@ -308,7 +308,35 @@ pub struct IntentQuoteBenchOptions {
     pub read: IntentReadOptions,
 
     #[command(flatten)]
-    pub request: IntentQuoteRequestOptions,
+    pub assets: IntentAssetOptions,
+
+    /// Restrict automatic discovery to this source asset.
+    #[arg(long)]
+    pub from: Option<AssetSpec>,
+
+    /// Restrict automatic discovery to this destination asset.
+    #[arg(long)]
+    pub to: Option<AssetSpec>,
+
+    /// Human-readable amount. Defaults to 1 source or destination token.
+    #[arg(long)]
+    pub amount: Option<HumanAmount>,
+
+    /// Quote sender. Defaults to EVM_PRIVATE_KEY's address, then the zero address.
+    #[arg(long)]
+    pub sender: Option<Address>,
+
+    /// Key used only to derive the quote sender when --sender is omitted.
+    #[arg(long, env = "EVM_PRIVATE_KEY", hide_env_values = true)]
+    pub private_key: Option<String>,
+
+    /// Destination recipient. Defaults to the resolved sender.
+    #[arg(long)]
+    pub recipient: Option<Address>,
+
+    /// Fix the source input or destination output amount.
+    #[arg(long, value_enum, default_value_t)]
+    pub order_type: OrderType,
 
     /// Requests to measure. Defaults to 100 unless --duration-secs is set.
     #[arg(long, conflicts_with = "duration_secs", value_parser = clap::value_parser!(u64).range(1..))]
@@ -1091,6 +1119,7 @@ mod tests {
             "axe", "intents", "bench", "quote", "--from", ASSET, "--to", ASSET, "--amount", "1",
             "--sender", ADDRESS,
         ];
+        assert!(Cli::try_parse_from(["axe", "intents", "bench", "quote"]).is_ok());
 
         assert!(
             Cli::try_parse_from(base.into_iter().chain([

@@ -29,6 +29,18 @@ pub(super) fn render_report(
 ) {
     let counts = outcome_counts(&report.samples);
     ui::section("intent quote benchmark");
+    ui::kv(
+        "route",
+        &format!("{} -> {}", report.from_label, report.to_label),
+    );
+    ui::kv(
+        "amount",
+        &format!(
+            "{} {}",
+            format_units(report.requested_amount, report.requested_decimals),
+            report.requested_symbol
+        ),
+    );
     ui::kv("requests", &report.samples.len().to_string());
     ui::kv("elapsed", &ui::format_duration(report.elapsed));
     ui::kv(
@@ -90,6 +102,12 @@ pub(super) fn report_json(report: &BenchmarkReport) -> Value {
     let outputs = output_values(&report.samples);
     let validity = validity_values(&report.samples);
     json!({
+        "target": {
+            "from": report.from_label,
+            "to": report.to_label,
+            "requestedAmount": report.requested_amount.to_string(),
+            "requestedSymbol": report.requested_symbol,
+        },
         "requests": {
             "attempted": report.samples.len(),
             "available": counts.available,
