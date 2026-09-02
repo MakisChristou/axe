@@ -4,7 +4,7 @@ use eyre::{Result, WrapErr};
 use indicatif::ProgressBar;
 
 use super::execution::{ExecutionFeedback, execute_round_trip};
-use super::route::{DiscoveryFeedback, discover_wallet, plan_sweep};
+use super::route::{DiscoveryFeedback, PlanningFeedback, discover_wallet, plan_sweep};
 use super::types::{AssetType, OrderType};
 use super::{IntentRuntime, IntentRuntimeArgs, prepare_runtime};
 use crate::shutdown::{DrainTarget, Shutdown};
@@ -56,23 +56,29 @@ pub async fn run(args: TrafficArgs) -> Result<()> {
     render_strategy(args.wallet_bps);
     let shutdown = Shutdown::install(DrainTarget::RoundTrip);
     let mut stats = TrafficStats::default();
+    let progress = traffic_progress();
+    set_traffic_status(&progress, &stats, "starting");
     while !shutdown.requested() {
         stats.cycles += 1;
-        match run_cycle(&runtime, args.wallet_bps, &shutdown, &mut stats).await {
+        match run_cycle(&runtime, args.wallet_bps, &shutdown, &mut stats, &progress).await {
             Ok(true) => {}
-            Ok(false) => wait_before_retry(&shutdown).await,
+            Ok(false) => {
+                set_traffic_status(&progress, &stats, "no quotable routes · retrying in 5s");
+                wait_before_retry(&shutdown).await;
+            }
             Err(error) => {
                 stats.failures += 1;
-                ui::warn(&format!(
-                    "traffic cycle {} will restart after an error: {}",
-                    stats.cycles,
-                    format_error(&error)
-                ));
+                set_traffic_status(
+                    &progress,
+                    &stats,
+                    &format!("retrying in 5s · {}", format_error(&error)),
+                );
                 wait_before_retry(&shutdown).await;
             }
         }
     }
 
+    progress.finish_and_clear();
     render_stats(&stats);
     Ok(())
 }
@@ -82,12 +88,18 @@ async fn run_cycle(
     wallet_bps: u16,
     shutdown: &Shutdown,
     stats: &mut TrafficStats,
+    progress: &ProgressBar,
 ) -> Result<bool> {
     let mut found_routes = false;
     for (mode_index, mode) in TRAFFIC_MODES.into_iter().enumerate() {
         if shutdown.requested() {
             break;
         }
+        set_traffic_status(
+            progress,
+            stats,
+            &format!("{} · discovering routes", mode.short_label()),
+        );
         let discovery = discover_wallet(
             &runtime.client,
             &runtime.config,
@@ -102,36 +114,28 @@ async fn run_cycle(
             mode.asset_type,
             wallet_bps,
             mode.order_type,
+            PlanningFeedback::Hidden,
         )
         .await;
         if shutdown.requested() {
             return Ok(true);
         }
         if plans.is_empty() {
-            ui::warn(&format!(
-                "no quotable {} routes for {}",
-                mode.asset_label(),
-                mode.order_label()
-            ));
+            set_traffic_status(
+                progress,
+                stats,
+                &format!("{} · no quotable routes", mode.short_label()),
+            );
             continue;
         }
         found_routes = true;
         let plan_index = next_plan_index(stats.route_cursors[mode_index], plans.len());
         stats.route_cursors[mode_index] = stats.route_cursors[mode_index].wrapping_add(1);
         let plan = &plans[plan_index];
-        ui::info(&format!(
-            "traffic cycle {}: {} route {}/{} using {} · {} -> {}",
-            stats.cycles,
-            mode.asset_label(),
-            plan_index + 1,
-            plans.len(),
-            mode.order_label(),
-            plan.from.label(),
-            plan.to.label()
-        ));
-
-        let progress = traffic_progress(2);
-        let feedback = ExecutionFeedback::Progress(progress.clone());
+        let feedback = ExecutionFeedback::Traffic {
+            progress: progress.clone(),
+            context: traffic_context(stats, mode, plan_index, plans.len()),
+        };
         let mut results = Vec::with_capacity(2);
         let result = execute_round_trip(
             &runtime.client,
@@ -144,8 +148,8 @@ async fn run_cycle(
         )
         .await;
         stats.intents += results.len() as u64;
+        progress.set_position(stats.intents);
         if let Err(error) = result {
-            progress.finish_and_clear();
             return Err(error).wrap_err_with(|| {
                 format!(
                     "round trip {} -> {} did not complete",
@@ -155,7 +159,7 @@ async fn run_cycle(
             });
         }
         stats.round_trips += 1;
-        progress.finish_and_clear();
+        set_traffic_status(progress, stats, "round trip complete");
     }
     Ok(found_routes)
 }
@@ -165,14 +169,12 @@ const fn next_plan_index(cursor: usize, available: usize) -> usize {
 }
 
 impl TrafficMode {
-    const fn asset_label(self) -> &'static str {
-        self.asset_type.label()
-    }
-
-    const fn order_label(self) -> &'static str {
-        match self.order_type {
-            OrderType::ExactInput => "exact input",
-            OrderType::ExactOutput => "exact output",
+    const fn short_label(self) -> &'static str {
+        match (self.asset_type, self.order_type) {
+            (AssetType::Token, OrderType::ExactInput) => "token/exact-in",
+            (AssetType::Token, OrderType::ExactOutput) => "token/exact-out",
+            (AssetType::Native, OrderType::ExactInput) => "native/exact-in",
+            (AssetType::Native, OrderType::ExactOutput) => "native/exact-out",
         }
     }
 }
@@ -199,8 +201,33 @@ fn render_stats(stats: &TrafficStats) {
     ui::kv("route failures", &stats.failures.to_string());
 }
 
-fn traffic_progress(total: usize) -> ProgressBar {
-    super::presentation::intent_progress_bar(total as u64, "simulating intent traffic")
+fn traffic_progress() -> ProgressBar {
+    super::presentation::intent_traffic_bar()
+}
+
+fn traffic_context(
+    stats: &TrafficStats,
+    mode: TrafficMode,
+    plan_index: usize,
+    plan_count: usize,
+) -> String {
+    format!(
+        "trips {} · errors {} · cycle {} · {} {}/{}",
+        stats.round_trips,
+        stats.failures,
+        stats.cycles,
+        mode.short_label(),
+        plan_index + 1,
+        plan_count
+    )
+}
+
+fn set_traffic_status(progress: &ProgressBar, stats: &TrafficStats, status: &str) {
+    progress.set_position(stats.intents);
+    progress.set_message(format!(
+        "intents {} · trips {} · errors {} · cycle {} · {status}",
+        stats.intents, stats.round_trips, stats.failures, stats.cycles
+    ));
 }
 
 async fn wait_before_retry(shutdown: &Shutdown) {
@@ -251,5 +278,18 @@ mod tests {
             .wrap_err("round trip failed")
             .unwrap_err();
         assert_eq!(format_error(&error), "round trip failed: deposit rejected");
+    }
+
+    #[test]
+    fn traffic_context_contains_the_live_summary() {
+        let stats = TrafficStats {
+            cycles: 3,
+            round_trips: 4,
+            failures: 1,
+            ..TrafficStats::default()
+        };
+        let context = traffic_context(&stats, TRAFFIC_MODES[0], 1, 3);
+
+        assert_eq!(context, "trips 4 · errors 1 · cycle 3 · token/exact-in 2/3");
     }
 }

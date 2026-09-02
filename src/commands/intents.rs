@@ -20,8 +20,8 @@ use indicatif::ProgressBar;
 use self::client::RfqClient;
 use self::execution::{ExecutionFeedback, execute_leg, execute_round_trip};
 use self::route::{
-    DiscoveryFeedback, RouteDiscovery, discover_wallet, plan_roundtrip, plan_send, plan_sweep,
-    render_plans,
+    DiscoveryFeedback, PlanningFeedback, RouteDiscovery, discover_wallet, plan_roundtrip,
+    plan_send, plan_sweep, render_plans,
 };
 use self::stats::percentile;
 use self::types::{LegExecution, LegResult, RoutePlan, RunLimits};
@@ -259,6 +259,7 @@ pub async fn sweep(args: SweepArgs) -> Result<()> {
             args.asset_type,
             args.wallet_bps,
             args.order_type,
+            PlanningFeedback::Visible,
         )
         .await;
         if plans.is_empty() {

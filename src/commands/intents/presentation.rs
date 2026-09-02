@@ -43,6 +43,16 @@ pub fn intent_activity_bar(message: &str) -> ProgressBar {
     progress
 }
 
+pub fn intent_traffic_bar() -> ProgressBar {
+    let progress = ProgressBar::new_spinner();
+    progress.set_style(
+        ui::progress_spinner_style("  [{spinner:.cyan}] {elapsed_precise} · {wide_msg}")
+            .tick_strings(INTENT_ACTIVITY_FRAMES),
+    );
+    progress.enable_steady_tick(Duration::from_millis(100));
+    progress
+}
+
 pub fn asset_table(headers: &[&str]) -> Table {
     let mut table = Table::new();
     table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);

@@ -28,6 +28,12 @@ pub struct RouteDiscovery {
 }
 
 #[derive(Clone, Copy)]
+pub enum PlanningFeedback {
+    Visible,
+    Hidden,
+}
+
+#[derive(Clone, Copy)]
 pub enum DiscoveryFeedback {
     Detailed,
     Quiet,
@@ -343,14 +349,17 @@ pub async fn plan_sweep(
     asset_type: AssetType,
     wallet_bps: u16,
     order_type: OrderType,
+    planning_feedback: PlanningFeedback,
 ) -> Vec<RoutePlan> {
     let mut plans = Vec::new();
     let mut seen = HashSet::new();
     let pairs = unordered_cross_chain_pairs(&discovery.assets, asset_type);
-    let spinner = super::presentation::intent_activity_bar(&format!(
-        "preflighting {} asset pairs",
-        pairs.len()
-    ));
+    let spinner = matches!(planning_feedback, PlanningFeedback::Visible).then(|| {
+        super::presentation::intent_activity_bar(&format!(
+            "preflighting {} asset pairs",
+            pairs.len()
+        ))
+    });
     for (left, right) in pairs {
         let (from, to) = choose_start(left, right);
         let pair_key = canonical_pair(&from.id, &to.id);
@@ -374,7 +383,9 @@ pub async fn plan_sweep(
             Err(_) => {}
         }
     }
-    spinner.finish_and_clear();
+    if let Some(spinner) = spinner {
+        spinner.finish_and_clear();
+    }
     plans
 }
 

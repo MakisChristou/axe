@@ -34,6 +34,10 @@ struct ApprovalRequirement {
 pub enum ExecutionFeedback {
     Detailed,
     Progress(ProgressBar),
+    Traffic {
+        progress: ProgressBar,
+        context: String,
+    },
 }
 
 impl ExecutionFeedback {
@@ -42,15 +46,33 @@ impl ExecutionFeedback {
     }
 
     fn stage(&self, route: &str, stage: &str) {
-        if let Self::Progress(progress) = self {
-            progress.set_message(format!("{route} · {stage}"));
+        match self {
+            Self::Progress(progress) => progress.set_message(format!("{route} · {stage}")),
+            Self::Traffic { progress, context } => progress.set_message(format!(
+                "intents {} · {context} · {} · {}",
+                progress.position(),
+                compact_traffic_route(route),
+                compact_traffic_stage(stage)
+            )),
+            Self::Detailed => {}
         }
     }
 
     fn leg_completed(&self, route: &str) {
-        if let Self::Progress(progress) = self {
-            progress.inc(1);
-            progress.set_message(format!("{route} · fulfilled"));
+        match self {
+            Self::Progress(progress) => {
+                progress.inc(1);
+                progress.set_message(format!("{route} · fulfilled"));
+            }
+            Self::Traffic { progress, context } => {
+                progress.inc(1);
+                progress.set_message(format!(
+                    "intents {} · {context} · {} · fulfilled",
+                    progress.position(),
+                    compact_traffic_route(route)
+                ));
+            }
+            Self::Detailed => {}
         }
     }
 
@@ -58,7 +80,30 @@ impl ExecutionFeedback {
         match self {
             Self::Detailed => ui::warn(message),
             Self::Progress(progress) => progress.println(ui::warning_line(message)),
+            Self::Traffic { progress, context } => progress.set_message(format!(
+                "intents {} · {context} · warning: {}",
+                progress.position(),
+                ui::scrub_urls(message)
+            )),
         }
+    }
+}
+
+fn compact_traffic_route(route: &str) -> String {
+    route
+        .replace(" Sepolia", "")
+        .replace(" Fuji", "")
+        .replace(" -> ", " → ")
+}
+
+fn compact_traffic_stage(stage: &str) -> &str {
+    match stage {
+        "requesting quote" => "quote",
+        "checking allowance" => "allowance",
+        "approving token" => "approval",
+        "submitting deposit" => "deposit",
+        "awaiting fulfillment" => "fulfillment",
+        other => other,
     }
 }
 
@@ -772,6 +817,28 @@ mod tests {
         assert_eq!(progress.position(), 0);
         feedback.leg_completed("Fuji/USDC -> Base/USDC");
         assert_eq!(progress.position(), 1);
+    }
+
+    #[test]
+    fn traffic_feedback_keeps_compact_status_on_one_line() {
+        let progress = ProgressBar::hidden();
+        let feedback = ExecutionFeedback::Traffic {
+            progress: progress.clone(),
+            context: "trips 4 · errors 1 · cycle 3 · native/exact-in 1/3".to_owned(),
+        };
+
+        feedback.stage(
+            "Arbitrum Sepolia/ETH -> Base Sepolia/ETH",
+            "submitting deposit",
+        );
+        assert_eq!(
+            progress.message(),
+            "intents 0 · trips 4 · errors 1 · cycle 3 · native/exact-in 1/3 · Arbitrum/ETH → Base/ETH · deposit"
+        );
+
+        feedback.leg_completed("Arbitrum Sepolia/ETH -> Base Sepolia/ETH");
+        assert_eq!(progress.position(), 1);
+        assert!(progress.message().starts_with("intents 1 · trips 4"));
     }
 
     #[test]
