@@ -162,6 +162,7 @@ pub(super) struct Sample {
 pub(super) struct BenchmarkReport {
     pub mode: QuoteBenchmarkMode,
     pub interrupted: bool,
+    pub selection: BenchmarkSelection,
     pub counts: SampleCounts,
     pub samples: Vec<Sample>,
     pub elapsed: Duration,
@@ -172,6 +173,16 @@ pub(super) struct BenchmarkReport {
     pub requested_amount: U256,
     pub requested_symbol: String,
     pub requested_decimals: u8,
+}
+
+#[derive(Clone)]
+pub(super) enum BenchmarkSelection {
+    Fixed,
+    Randomized {
+        bidirectional_routes: usize,
+        amount: String,
+        asset_type: AssetType,
+    },
 }
 
 #[derive(Clone, Copy, Default)]

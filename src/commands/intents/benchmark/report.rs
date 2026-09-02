@@ -3,7 +3,7 @@ use std::time::Duration;
 use alloy::primitives::U256;
 use serde_json::{Value, json};
 
-use super::types::{BenchmarkReport, Sample, SampleOutcome};
+use super::types::{BenchmarkReport, BenchmarkSelection, Sample, SampleOutcome};
 use crate::commands::intents::stats::percentile;
 use crate::commands::intents::types::format_units;
 use crate::ui;
@@ -17,10 +17,7 @@ pub(super) fn render_report(
     let counts = report.counts;
     let retained_samples = u64::try_from(report.samples.len()).unwrap_or(u64::MAX);
     ui::section("intent quote benchmark");
-    ui::kv(
-        "route",
-        &format!("{} -> {}", report.from_label, report.to_label),
-    );
+    render_target(report);
     ui::kv("mode", report.mode.label());
     if report.interrupted {
         ui::kv(
@@ -28,14 +25,6 @@ pub(super) fn render_report(
             "stopped gracefully after draining in-flight requests",
         );
     }
-    ui::kv(
-        "amount",
-        &format!(
-            "{} {}",
-            format_units(report.requested_amount, report.requested_decimals),
-            report.requested_symbol
-        ),
-    );
     ui::kv("requests", &counts.attempted.to_string());
     if retained_samples < counts.attempted {
         ui::kv(
@@ -73,15 +62,54 @@ pub(super) fn render_report(
         render_failures(report);
     }
     ui::kv("request latency", &latency_summary(&report.samples));
-    if let Some(output) = output_summary(
-        &report.samples,
-        report.output_decimals,
-        &report.output_symbol,
-    ) {
+    if matches!(&report.selection, BenchmarkSelection::Fixed)
+        && let Some(output) = output_summary(
+            &report.samples,
+            report.output_decimals,
+            &report.output_symbol,
+        )
+    {
         ui::kv("output amount", &output);
     }
     if let Some(validity) = validity_summary(&report.samples) {
         ui::kv("quote validity", &validity);
+    }
+}
+
+fn render_target(report: &BenchmarkReport) {
+    match &report.selection {
+        BenchmarkSelection::Fixed => {
+            ui::kv(
+                "route",
+                &format!("{} -> {}", report.from_label, report.to_label),
+            );
+            ui::kv(
+                "amount",
+                &format!(
+                    "{} {}",
+                    format_units(report.requested_amount, report.requested_decimals),
+                    report.requested_symbol
+                ),
+            );
+        }
+        BenchmarkSelection::Randomized {
+            bidirectional_routes,
+            amount,
+            asset_type,
+        } => {
+            ui::kv(
+                "routes",
+                &format!(
+                    "{bidirectional_routes} bidirectional · {} quote directions",
+                    bidirectional_routes * 2
+                ),
+            );
+            ui::kv("selection", "shuffled round trips (quote-only)");
+            ui::kv(
+                "amount",
+                &format!("{amount} {} per request", asset_type.label()),
+            );
+        }
     }
 }
 
@@ -102,15 +130,35 @@ pub(super) fn report_json(report: &BenchmarkReport) -> Value {
     let latency = latency_values(&report.samples);
     let outputs = output_values(&report.samples);
     let validity = validity_values(&report.samples);
-    json!({
-        "mode": report.mode.label(),
-        "interrupted": report.interrupted,
-        "target": {
+    let output_amount = if matches!(&report.selection, BenchmarkSelection::Fixed) {
+        amount_summary(&outputs)
+    } else {
+        Value::Null
+    };
+    let target = match &report.selection {
+        BenchmarkSelection::Fixed => json!({
+            "selection": "fixed",
             "from": report.from_label,
             "to": report.to_label,
             "requestedAmount": report.requested_amount.to_string(),
             "requestedSymbol": report.requested_symbol,
-        },
+        }),
+        BenchmarkSelection::Randomized {
+            bidirectional_routes,
+            amount,
+            asset_type,
+        } => json!({
+            "selection": "randomized-bidirectional",
+            "bidirectionalRoutes": bidirectional_routes,
+            "directedRoutes": bidirectional_routes * 2,
+            "humanAmount": amount,
+            "assetType": asset_type.label(),
+        }),
+    };
+    json!({
+        "mode": report.mode.label(),
+        "interrupted": report.interrupted,
+        "target": target,
         "requests": {
             "attempted": counts.attempted,
             "statisticsSampled": report.samples.len(),
@@ -127,7 +175,7 @@ pub(super) fn report_json(report: &BenchmarkReport) -> Value {
         "elapsedMs": duration_ms(report.elapsed),
         "throughputRps": throughput(report),
         "latencyMs": numeric_summary(&latency),
-        "outputAmountBaseUnits": amount_summary(&outputs),
+        "outputAmountBaseUnits": output_amount,
         "quoteValidityMs": numeric_summary(&validity),
     })
 }

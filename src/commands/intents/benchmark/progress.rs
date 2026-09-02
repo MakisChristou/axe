@@ -10,6 +10,7 @@ pub(super) struct BenchmarkProgress {
     bar: ProgressBar,
     limit: QuoteBenchmarkLimit,
     phase: &'static str,
+    coverage: String,
     started: Instant,
     attempted: AtomicU64,
     available: AtomicU64,
@@ -22,7 +23,12 @@ pub(super) struct BenchmarkProgress {
 }
 
 impl BenchmarkProgress {
-    pub fn new(limit: QuoteBenchmarkLimit, phase: &'static str, visible: bool) -> Self {
+    pub fn new(
+        limit: QuoteBenchmarkLimit,
+        phase: &'static str,
+        coverage: String,
+        visible: bool,
+    ) -> Self {
         let bar = if visible {
             progress_bar(limit)
         } else {
@@ -32,6 +38,7 @@ impl BenchmarkProgress {
             bar,
             limit,
             phase,
+            coverage,
             started: Instant::now(),
             attempted: AtomicU64::new(0),
             available: AtomicU64::new(0),
@@ -103,8 +110,8 @@ impl BenchmarkProgress {
         }
         let rps = completed as f64 / self.started.elapsed().as_secs_f64().max(f64::EPSILON);
         self.bar.set_message(format!(
-            "{} · {available} available · {unavailable} unavailable · {failed} failed · {timed_out} timed out · {rps:.1} req/s",
-            self.phase
+            "{} · {} · {available} available · {unavailable} unavailable · {failed} failed · {timed_out} timed out · {rps:.1} req/s",
+            self.phase, self.coverage
         ));
     }
 }
@@ -125,7 +132,12 @@ mod tests {
 
     #[test]
     fn progress_counts_all_outcomes_and_failure_kinds() {
-        let progress = BenchmarkProgress::new(QuoteBenchmarkLimit::Continuous, "test", false);
+        let progress = BenchmarkProgress::new(
+            QuoteBenchmarkLimit::Continuous,
+            "test",
+            "3 routes ↔".to_owned(),
+            false,
+        );
         let outcomes = [
             SampleOutcome::Available {
                 output_amount: alloy::primitives::U256::from(1),

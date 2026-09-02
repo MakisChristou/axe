@@ -301,7 +301,7 @@ pub struct IntentStatusOptions {
 
 #[derive(Subcommand)]
 pub enum IntentBenchCommands {
-    /// Benchmark the solver quote path with parallel requests
+    /// Benchmark the solver quote path across randomized bidirectional routes
     Quote(IntentQuoteBenchOptions),
 }
 
@@ -313,11 +313,11 @@ pub struct IntentQuoteBenchOptions {
     #[command(flatten)]
     pub assets: IntentAssetOptions,
 
-    /// Restrict automatic discovery to this source asset.
+    /// Use a fixed source asset instead of randomized route coverage.
     #[arg(long)]
     pub from: Option<AssetSpec>,
 
-    /// Restrict automatic discovery to this destination asset.
+    /// Use a fixed destination asset instead of randomized route coverage.
     #[arg(long)]
     pub to: Option<AssetSpec>,
 
