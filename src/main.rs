@@ -608,7 +608,7 @@ fn resolve_intent_api(
 ) -> Result<commands::intents::ApiArgs> {
     Ok(commands::intents::ApiArgs {
         network: cli::network_or_default(None, global)?,
-        api_url: options.api_url,
+        rfq_url: options.rfq_url,
     })
 }
 
@@ -625,7 +625,7 @@ async fn resolve_intent_read_config(
     Ok((
         commands::intents::ApiArgs {
             network,
-            api_url: options.api_url,
+            rfq_url: options.rfq_url,
         },
         config,
     ))
@@ -655,7 +655,7 @@ async fn resolve_intent_runtime_config(
     };
     Ok(commands::intents::IntentRuntimeArgs {
         network,
-        api_url: options.api.api_url,
+        rfq_url: options.api.rfq_url,
         config,
         private_key,
         poll_interval_secs: options.poll_interval_secs,

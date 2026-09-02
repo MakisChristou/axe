@@ -49,7 +49,7 @@ pub struct RfqClient {
 
 impl RfqClient {
     pub fn new(network: Network, base_url: Option<&str>) -> Result<Self> {
-        let base_url = match base_url {
+        let base_url = match base_url.filter(|value| !value.trim().is_empty()) {
             Some(base_url) => normalize_base_url(base_url)?,
             None => RfqEnvironment::try_from(network)?.base_url().to_owned(),
         };
@@ -174,7 +174,7 @@ fn http_error(method: &str, url: &str, status: StatusCode, message: &str) -> eyr
 }
 
 fn normalize_base_url(value: &str) -> Result<String> {
-    let value = value.trim_end_matches('/');
+    let value = value.trim().trim_end_matches('/');
     let parsed = reqwest::Url::parse(value)
         .wrap_err("INTENTS_API_URL must be an absolute HTTP or HTTPS URL")?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -234,5 +234,13 @@ mod tests {
         assert_eq!(client.base_url, "http://127.0.0.1:8080/solver/v1");
         assert!(RfqClient::new(Network::Testnet, Some("ftp://example.com")).is_err());
         assert!(RfqClient::new(Network::Testnet, Some("example.com/rfq/v1")).is_err());
+    }
+
+    #[test]
+    fn empty_overrides_use_the_selected_network_default() {
+        for empty in ["", "   "] {
+            let client = RfqClient::new(Network::Testnet, Some(empty)).unwrap();
+            assert_eq!(client.base_url, RfqEnvironment::Testnet.base_url());
+        }
     }
 }

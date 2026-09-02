@@ -202,7 +202,7 @@ pub enum IntentsCommands {
 pub struct IntentApiOptions {
     /// RFQ API base URL. Defaults to the selected network's public endpoint.
     #[arg(long, env = "INTENTS_API_URL")]
-    pub api_url: Option<String>,
+    pub rfq_url: Option<String>,
 }
 
 #[derive(Args)]
@@ -1149,6 +1149,31 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn every_intent_command_accepts_the_rfq_url_override() {
+        const URL: &str = "http://127.0.0.1:8080/rfq/v1";
+        let commands: &[&[&str]] = &[
+            &["axe", "intents", "catalog", "--rfq-url", URL],
+            &["axe", "intents", "inventory", "--rfq-url", URL],
+            &["axe", "intents", "quote", "--rfq-url", URL],
+            &["axe", "intents", "status", "quote-id", "--rfq-url", URL],
+            &["axe", "intents", "bench", "quote", "--rfq-url", URL],
+            &["axe", "intents", "send", "--rfq-url", URL],
+            &["axe", "intents", "roundtrip", "--rfq-url", URL],
+            &["axe", "intents", "sweep", "--rfq-url", URL],
+            &["axe", "intents", "traffic", "--rfq-url", URL],
+        ];
+
+        for args in commands {
+            assert!(
+                Cli::try_parse_from(*args).is_ok(),
+                "{} should accept --rfq-url",
+                args.join(" ")
+            );
+        }
+        assert!(Cli::try_parse_from(["axe", "intents", "quote", "--api-url", URL]).is_err());
     }
 
     #[test]

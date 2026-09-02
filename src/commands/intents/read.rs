@@ -19,7 +19,7 @@ use crate::ui;
 
 pub struct ApiArgs {
     pub network: Network,
-    pub api_url: Option<String>,
+    pub rfq_url: Option<String>,
 }
 
 pub struct CatalogArgs {
@@ -157,7 +157,7 @@ pub async fn status(args: StatusArgs) -> Result<()> {
 }
 
 pub(super) fn api_client(args: &ApiArgs) -> Result<RfqClient> {
-    RfqClient::new(args.network, args.api_url.as_deref())
+    RfqClient::new(args.network, args.rfq_url.as_deref())
 }
 
 pub(super) fn prepare_quote_from_tokens(

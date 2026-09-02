@@ -73,7 +73,7 @@ pub fn resolve_private_key(
 
 pub struct IntentRuntimeArgs {
     pub network: Network,
-    pub api_url: Option<String>,
+    pub rfq_url: Option<String>,
     pub config: PathBuf,
     pub private_key: String,
     pub poll_interval_secs: u64,
@@ -416,7 +416,7 @@ async fn prepare_runtime(args: IntentRuntimeArgs) -> Result<IntentRuntime> {
         .parse()
         .wrap_err("intent EVM private key is not valid hex")?;
     let config = ChainsConfig::load(&args.config).await?;
-    let client = RfqClient::new(args.network, args.api_url.as_deref())?;
+    let client = RfqClient::new(args.network, args.rfq_url.as_deref())?;
     let limits = RunLimits {
         poll_interval: Duration::from_secs(args.poll_interval_secs),
         fulfillment_timeout: Duration::from_secs(args.fulfillment_timeout_secs),
