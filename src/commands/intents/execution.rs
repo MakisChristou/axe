@@ -5,6 +5,7 @@ use alloy::hex;
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
+use alloy::sol_types::SolCall;
 use chrono::Utc;
 use eyre::{Result, WrapErr, eyre};
 use indicatif::ProgressBar;
@@ -437,12 +438,35 @@ async fn required_approvals(
         .await
         .map_err(|error| eyre!("could not read intent token allowance: {error}"))?;
         if allowance < requirement.amount {
-            required.push(action.clone());
+            required.push(maximum_approval_action(action, requirement)?);
+            if feedback.is_detailed() {
+                ui::info("Token allowance is insufficient; approving the maximum amount.");
+            }
         } else if feedback.is_detailed() {
             ui::success("Token allowance is already sufficient; skipping approval.");
         }
     }
     Ok(required)
+}
+
+fn maximum_approval_action(action: &Action, requirement: ApprovalRequirement) -> Result<Action> {
+    let mut payload = action_payload(action)?;
+    payload.data = format!(
+        "0x{}",
+        hex::encode(
+            ERC20::approveCall {
+                spender: requirement.spender,
+                amount: U256::MAX,
+            }
+            .abi_encode()
+        )
+    );
+    Ok(Action {
+        id: action.id.clone(),
+        kind: action.kind.clone(),
+        chain: action.chain.clone(),
+        payload: serde_json::to_value(payload).wrap_err("could not encode maximum approval")?,
+    })
 }
 
 fn approval_requirement(
@@ -631,7 +655,6 @@ impl Quote {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::sol_types::SolCall;
     use serde_json::json;
 
     use super::super::types::AssetId;
@@ -703,6 +726,41 @@ mod tests {
             ApprovalRequirement { spender, amount }
         );
         assert!(approval_requirement(&action, &source, amount + U256::from(1u8)).is_err());
+    }
+
+    #[test]
+    fn rewrites_a_validated_approval_to_the_maximum_amount() {
+        let token = Address::from([1u8; 20]);
+        let spender = Address::from([2u8; 20]);
+        let amount = U256::from(1_000_000u64);
+        let action = Action {
+            id: "approve".into(),
+            kind: "approval".into(),
+            chain: "eip155:1".into(),
+            payload: json!({
+                "type": "evm_transaction",
+                "from": Address::ZERO.to_string(),
+                "to": token.to_string(),
+                "data": format!(
+                    "0x{}",
+                    hex::encode(ERC20::approveCall { spender, amount }.abi_encode())
+                ),
+                "value": "0"
+            }),
+        };
+        let requirement = ApprovalRequirement { spender, amount };
+
+        let maximum = maximum_approval_action(&action, requirement).unwrap();
+        let payload = action_payload(&maximum).unwrap();
+        let calldata = ERC20::approveCall::abi_decode(
+            &hex::decode(payload.data.strip_prefix("0x").unwrap()).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(calldata.spender, spender);
+        assert_eq!(calldata.amount, U256::MAX);
+        assert_eq!(payload.to, token.to_string());
+        assert_eq!(maximum.chain, action.chain);
     }
 
     #[test]
