@@ -22,6 +22,46 @@ const EXACT_OUTPUT_HEADROOM_BPS: u64 = 9_500;
 const EXACT_OUTPUT_CALIBRATION_ATTEMPTS: usize = 3;
 const GAS_RESERVE_WEI: u64 = 1_000_000_000_000_000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IntentRpcOverride {
+    EthereumSepolia,
+    ArbitrumSepolia,
+    BaseSepolia,
+    AvalancheFuji,
+}
+
+struct IntentRpcCandidate {
+    source: String,
+    url: String,
+}
+
+impl IntentRpcOverride {
+    const fn for_chain_id(chain_id: u64) -> Option<Self> {
+        match chain_id {
+            11_155_111 => Some(Self::EthereumSepolia),
+            421_614 => Some(Self::ArbitrumSepolia),
+            84_532 => Some(Self::BaseSepolia),
+            43_113 => Some(Self::AvalancheFuji),
+            _ => None,
+        }
+    }
+
+    const fn env_name(self) -> &'static str {
+        match self {
+            Self::EthereumSepolia => "SEP_RPC_URL",
+            Self::ArbitrumSepolia => "ARB_SEPOLIA_RPC_URL",
+            Self::BaseSepolia => "BASE_SEPOLIA_RPC_URL",
+            Self::AvalancheFuji => "FUJI_RPC_URL",
+        }
+    }
+
+    fn url(self) -> Option<String> {
+        std::env::var(self.env_name())
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+    }
+}
+
 pub struct RouteDiscovery {
     pub chains: HashMap<String, ChainRuntime>,
     pub assets: Vec<WalletAsset>,
@@ -145,38 +185,81 @@ async fn first_working_rpc(
     candidates: Vec<(&str, &ChainConfig)>,
     feedback: DiscoveryFeedback,
 ) -> Option<String> {
-    for (key, configured) in candidates {
-        let Some(rpc_url) = configured.rpc.clone() else {
-            continue;
-        };
-        let endpoints = match EvmEndpoints::connect(std::slice::from_ref(&rpc_url)) {
-            Ok(endpoints) => endpoints,
-            Err(error) => {
-                feedback.warn(&format!(
-                    "skipping RPC config {key} for {}: {}",
-                    chain.chain_id,
-                    ui::scrub_urls(&error.to_string())
-                ));
-                continue;
-            }
-        };
-        let Some(provider) = endpoints.providers().first() else {
-            continue;
-        };
-        match provider.get_chain_id().await {
-            Ok(actual_chain_id) if actual_chain_id == expected_chain_id => return Some(rpc_url),
-            Ok(actual_chain_id) => feedback.warn(&format!(
-                "skipping RPC config {key}: expected {}, got eip155:{actual_chain_id}",
-                chain.chain_id
-            )),
-            Err(error) => feedback.warn(&format!(
-                "skipping RPC config {key} for {}: {}",
-                chain.chain_id,
-                ui::scrub_urls(&error.to_string())
-            )),
+    let rpc_override = IntentRpcOverride::for_chain_id(expected_chain_id)
+        .and_then(|kind| kind.url().map(|url| (kind, url)));
+    for candidate in intent_rpc_candidates(candidates, rpc_override) {
+        if let Some(rpc_url) = validate_rpc_candidate(
+            chain,
+            expected_chain_id,
+            &candidate.source,
+            candidate.url,
+            feedback,
+        )
+        .await
+        {
+            return Some(rpc_url);
         }
     }
     None
+}
+
+fn intent_rpc_candidates(
+    configured: Vec<(&str, &ChainConfig)>,
+    rpc_override: Option<(IntentRpcOverride, String)>,
+) -> Vec<IntentRpcCandidate> {
+    let mut candidates = Vec::new();
+    if let Some((kind, url)) = rpc_override {
+        candidates.push(IntentRpcCandidate {
+            source: format!("override {}", kind.env_name()),
+            url,
+        });
+    }
+    candidates.extend(configured.into_iter().filter_map(|(key, chain)| {
+        chain.rpc.clone().map(|url| IntentRpcCandidate {
+            source: format!("config {key}"),
+            url,
+        })
+    }));
+    candidates
+}
+
+async fn validate_rpc_candidate(
+    chain: &ChainInfo,
+    expected_chain_id: u64,
+    source: &str,
+    rpc_url: String,
+    feedback: DiscoveryFeedback,
+) -> Option<String> {
+    let endpoints = match EvmEndpoints::connect(std::slice::from_ref(&rpc_url)) {
+        Ok(endpoints) => endpoints,
+        Err(error) => {
+            feedback.warn(&format!(
+                "skipping RPC {source} for {}: {}",
+                chain.chain_id,
+                ui::scrub_urls(&error.to_string())
+            ));
+            return None;
+        }
+    };
+    let provider = endpoints.providers().first()?;
+    match provider.get_chain_id().await {
+        Ok(actual_chain_id) if actual_chain_id == expected_chain_id => Some(rpc_url),
+        Ok(actual_chain_id) => {
+            feedback.warn(&format!(
+                "skipping RPC {source}: expected {}, got eip155:{actual_chain_id}",
+                chain.chain_id
+            ));
+            None
+        }
+        Err(error) => {
+            feedback.warn(&format!(
+                "skipping RPC {source} for {}: {}",
+                chain.chain_id,
+                ui::scrub_urls(&error.to_string())
+            ));
+            None
+        }
+    }
 }
 
 fn normalize_chain_name(value: &str) -> String {
@@ -1356,5 +1439,51 @@ mod tests {
             candidates.first().map(|(key, _)| *key),
             Some("ethereum-sepolia")
         );
+    }
+
+    #[test]
+    fn intent_rpc_overrides_map_to_their_testnet_chain_ids() {
+        let mappings = [
+            (11_155_111, IntentRpcOverride::EthereumSepolia),
+            (421_614, IntentRpcOverride::ArbitrumSepolia),
+            (84_532, IntentRpcOverride::BaseSepolia),
+            (43_113, IntentRpcOverride::AvalancheFuji),
+        ];
+
+        for (chain_id, expected) in mappings {
+            assert_eq!(IntentRpcOverride::for_chain_id(chain_id), Some(expected));
+        }
+        assert_eq!(IntentRpcOverride::for_chain_id(1), None);
+    }
+
+    #[test]
+    fn intent_rpc_override_precedes_config_without_removing_fallbacks() {
+        let config = ChainsConfig::from_json_str(
+            r#"{
+                "chains": {
+                    "ethereum-sepolia": {
+                        "chainId": 11155111,
+                        "name": "Ethereum-Sepolia",
+                        "rpc": "https://config.example"
+                    }
+                },
+                "axelar": {}
+            }"#,
+        )
+        .unwrap();
+        let configured = evm_chain_candidates(&config, 11_155_111, "Ethereum Sepolia");
+        let candidates = intent_rpc_candidates(
+            configured,
+            Some((
+                IntentRpcOverride::EthereumSepolia,
+                "https://override.example".to_owned(),
+            )),
+        );
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].source, "override SEP_RPC_URL");
+        assert_eq!(candidates[0].url, "https://override.example");
+        assert_eq!(candidates[1].source, "config ethereum-sepolia");
+        assert_eq!(candidates[1].url, "https://config.example");
     }
 }
