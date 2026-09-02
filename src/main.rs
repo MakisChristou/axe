@@ -11,6 +11,7 @@ mod hyperliquid;
 mod mcp;
 mod preflight;
 mod retry;
+mod shutdown;
 mod solana;
 mod state;
 mod stellar;
@@ -571,18 +572,11 @@ async fn run_intent_bench(
             let sender =
                 commands::intents::resolve_quote_sender(options.sender, options.private_key)?;
             let recipient = options.recipient.unwrap_or(sender);
-            let limit = options.duration_secs.map_or_else(
-                || {
-                    commands::intents::QuoteBenchmarkLimit::Requests(
-                        options.requests.unwrap_or(100),
-                    )
-                },
-                |seconds| {
-                    commands::intents::QuoteBenchmarkLimit::Duration(
-                        std::time::Duration::from_secs(seconds),
-                    )
-                },
-            );
+            let limit = commands::intents::QuoteBenchmarkLimit::resolve(
+                options.mode,
+                options.requests,
+                options.duration_secs.map(std::time::Duration::from_secs),
+            )?;
             commands::intents::benchmark_quotes(commands::intents::QuoteBenchmarkArgs {
                 api,
                 target: commands::intents::QuoteBenchmarkTarget {

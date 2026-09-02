@@ -80,8 +80,6 @@ mod stellar_sender;
 mod submitter;
 #[path = "load_test/scheduling/sustained.rs"]
 mod sustained;
-#[path = "load_test/scheduling/task_group.rs"]
-mod task_group;
 #[path = "load_test/support/units.rs"]
 mod units;
 #[path = "load_test/verification/verification_session.rs"]
@@ -133,6 +131,7 @@ use eyre::Result;
 use crate::config::AxelarChainContract;
 use crate::config::ChainsConfig;
 use crate::hyperliquid::{enable_big_blocks_from_key, env_for};
+use crate::shutdown::{DrainTarget, Shutdown};
 use crate::types::Network;
 use crate::ui;
 use chain_names::{AxelarChainId, ConfigChainId, RpcUrl};
@@ -283,6 +282,7 @@ pub(crate) struct LoadTestArgs {
 }
 
 pub async fn run(args: LoadTestArgs) -> Result<()> {
+    let _shutdown = Shutdown::install(DrainTarget::LoadTestSubmissions);
     // Scope the ITS/GMP cache files and the axe-tokens overlay lookups to the
     // network this invocation runs on (chain ids collide across networks).
     resolve::set_cache_network(args.network);

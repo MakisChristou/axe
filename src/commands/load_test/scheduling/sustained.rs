@@ -16,6 +16,7 @@ use super::metrics::{ComputeUnitSummary, LoadTestReport, ReportInput, RunIdentit
 use super::run_sizing::SustainedPlan;
 use super::submitter::TransactionSubmitter;
 use super::verify::PendingTx;
+use crate::shutdown::Shutdown;
 use crate::types::Network;
 use crate::ui;
 
@@ -208,10 +209,29 @@ fn warn_sustained_failures(metrics: &[TxMetrics]) {
 
 pub(super) async fn run_sustained_loop(
     plan: SustainedPlan,
+    nonces: Option<Vec<u64>>,
+    make_task: MakeTask,
+    send_done: Option<Arc<AtomicBool>>,
+    spinner: indicatif::ProgressBar,
+) -> Result<SustainedResult> {
+    run_sustained_loop_with_shutdown(
+        plan,
+        nonces,
+        make_task,
+        send_done,
+        spinner,
+        Shutdown::current(),
+    )
+    .await
+}
+
+async fn run_sustained_loop_with_shutdown(
+    plan: SustainedPlan,
     mut nonces: Option<Vec<u64>>,
     mut make_task: MakeTask,
     send_done: Option<Arc<AtomicBool>>,
     spinner: indicatif::ProgressBar,
+    shutdown: Option<Arc<Shutdown>>,
 ) -> Result<SustainedResult> {
     // `SustainedPlan` comes from `RunSizing`, which already rejected zeros and
     // overflowing products, so the schedule needs no re-validation here.
@@ -227,19 +247,33 @@ pub(super) async fn run_sustained_loop(
     let fired_ctr = Arc::new(AtomicU64::new(0));
 
     let test_start = Instant::now();
-
     let mut all_tasks = JoinSet::new();
     let mut interval = time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
     let mut tick: u64 = 0;
     loop {
-        interval.tick().await;
+        let tick_ready = match shutdown.as_deref() {
+            Some(shutdown) => tokio::select! {
+                _ = interval.tick() => true,
+                () = shutdown.cancelled() => false,
+            },
+            None => {
+                interval.tick().await;
+                true
+            }
+        };
+        if !tick_ready {
+            break;
+        }
         if tick >= duration_secs {
             break;
         }
 
         for i in 0..tps {
+            if shutdown.as_deref().is_some_and(Shutdown::requested) {
+                break;
+            }
             let key_idx = scheduled_key_index(tick, i, plan);
 
             let nonce = nonces.as_mut().map(|n| {
@@ -277,7 +311,7 @@ pub(super) async fn run_sustained_loop(
         tick += 1;
     }
 
-    let total_submitted = all_tasks.len() as u64;
+    let total_submitted = fired_ctr.load(Ordering::Relaxed);
 
     let metrics = collect_sustained_metrics(
         &mut all_tasks,
@@ -302,6 +336,12 @@ pub(super) async fn run_sustained_loop(
     spinner.finish_with_message(format!(
         "send phase complete: {confirmed_count}/{total_submitted} src-confirmed in {test_duration:.1}s"
     ));
+    let skipped = total_expected.saturating_sub(total_submitted);
+    if skipped > 0 {
+        ui::warn(&format!(
+            "skipped {skipped} scheduled transactions during graceful shutdown"
+        ));
+    }
 
     warn_sustained_failures(&metrics);
 
@@ -341,11 +381,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{
-        ItsPendingTxAdapter, MakeTask, SustainedPlan, run_sustained_loop, scheduled_key_index,
-        submission_tasks,
+        ItsPendingTxAdapter, MakeTask, SustainedPlan, run_sustained_loop,
+        run_sustained_loop_with_shutdown, scheduled_key_index, submission_tasks,
     };
     use crate::commands::load_test::metrics::{TxMetrics, TxOutcome};
     use crate::commands::load_test::submitter::TransactionSubmitter;
+    use crate::shutdown::{DrainTarget, Shutdown};
     use tokio::sync::mpsc;
 
     #[derive(Clone, Copy)]
@@ -476,6 +517,35 @@ mod tests {
 
         assert!(send_done.load(Ordering::Relaxed));
         assert!(error.to_string().contains("sustained send task failed"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_skips_future_ticks_and_signals_send_completion() {
+        let send_done = Arc::new(AtomicBool::new(false));
+        let shutdown = Shutdown::test_instance(DrainTarget::LoadTestSubmissions);
+        shutdown.request_for_test();
+        let make_task: MakeTask = Box::new(|_, _| {
+            Box::pin(async { TxMetrics::failed("", 0, "task should not have started") })
+        });
+
+        let result = run_sustained_loop_with_shutdown(
+            SustainedPlan {
+                tps: 2,
+                duration_secs: 5,
+                key_cycle: 1,
+            },
+            None,
+            make_task,
+            Some(Arc::clone(&send_done)),
+            indicatif::ProgressBar::hidden(),
+            Some(shutdown),
+        )
+        .await
+        .expect("cancelled sustained run should drain cleanly");
+
+        assert!(send_done.load(Ordering::Relaxed));
+        assert_eq!(result.total_submitted, 0);
+        assert!(result.metrics.is_empty());
     }
 
     #[test]

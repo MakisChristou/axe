@@ -4,7 +4,7 @@ use alloy::primitives::Address;
 use clap::{Args, Parser, Subcommand};
 use eyre::Result;
 
-use crate::commands::intents::{AssetSpec, AssetType, HumanAmount, OrderType};
+use crate::commands::intents::{AssetSpec, AssetType, HumanAmount, OrderType, QuoteBenchmarkMode};
 use crate::commands::load_test::{Protocol, TestType};
 use crate::commands::propose::ProposeArgs;
 use crate::types::Network;
@@ -341,11 +341,15 @@ pub struct IntentQuoteBenchOptions {
     #[arg(long, value_enum, default_value_t)]
     pub order_type: OrderType,
 
-    /// Requests to measure. Defaults to 100 unless --duration-secs is set.
+    /// Scheduling mode. Defaults to burst, or continuous when --duration-secs is set.
+    #[arg(long, value_enum)]
+    pub mode: Option<QuoteBenchmarkMode>,
+
+    /// Requests to measure in burst mode. Defaults to 100.
     #[arg(long, conflicts_with = "duration_secs", value_parser = clap::value_parser!(u64).range(1..))]
     pub requests: Option<u64>,
 
-    /// Run for this many seconds instead of a fixed request count.
+    /// Runtime for continuous mode. Defaults to 60 seconds.
     #[arg(long, conflicts_with = "requests", value_parser = clap::value_parser!(u64).range(1..))]
     pub duration_secs: Option<u64>,
 

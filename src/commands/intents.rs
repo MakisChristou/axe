@@ -5,7 +5,6 @@ mod inventory;
 mod presentation;
 mod read;
 mod route;
-mod shutdown;
 mod stats;
 mod traffic;
 mod types;
@@ -24,16 +23,17 @@ use self::route::{
     DiscoveryFeedback, RouteDiscovery, discover_wallet, plan_roundtrip, plan_send, plan_sweep,
     render_plans,
 };
-use self::shutdown::Shutdown;
 use self::stats::percentile;
 use self::types::{LegExecution, LegResult, RoutePlan, RunLimits};
 use crate::config::ChainsConfig;
+use crate::shutdown::{DrainTarget, Shutdown};
 use crate::types::Network;
 use crate::ui;
 
 pub use self::types::{AssetSpec, AssetType, HumanAmount, OrderType};
 pub use benchmark::{
-    QuoteBenchmarkArgs, QuoteBenchmarkLimit, QuoteBenchmarkTarget, benchmark_quotes,
+    QuoteBenchmarkArgs, QuoteBenchmarkLimit, QuoteBenchmarkMode, QuoteBenchmarkTarget,
+    benchmark_quotes,
 };
 pub use inventory::{InventoryArgs, inventory};
 pub use read::{
@@ -163,6 +163,7 @@ pub async fn send(args: SendArgs) -> Result<()> {
     ui::kv("mode", "one intent");
     ui::kv("intent deposits", "1");
     confirm_execution(runtime.auto_confirm, "Execute this intent?").await?;
+    let _shutdown = Shutdown::install(DrainTarget::Intent);
 
     let result = execute_leg(
         &runtime.client,
@@ -203,6 +204,7 @@ pub async fn roundtrip(args: RoundtripArgs) -> Result<()> {
     ui::kv("mode", "one round trip");
     ui::kv("intent deposits", "2");
     confirm_execution(runtime.auto_confirm, "Execute this intent round trip?").await?;
+    let _shutdown = Shutdown::install(DrainTarget::RoundTrip);
 
     let mut results = Vec::new();
     let executed = execute_round_trip(
@@ -221,7 +223,7 @@ pub async fn roundtrip(args: RoundtripArgs) -> Result<()> {
 
 pub async fn sweep(args: SweepArgs) -> Result<()> {
     let runtime = prepare_runtime(args.runtime).await?;
-    let shutdown = Shutdown::install();
+    let shutdown = Shutdown::install(DrainTarget::RoundTrip);
     let mut results = Vec::new();
     let mut planned_intents = 0usize;
     let mut sweep = 0u64;

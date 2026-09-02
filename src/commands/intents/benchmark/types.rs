@@ -1,13 +1,75 @@
 use std::time::Duration;
 
 use alloy::primitives::U256;
+use eyre::{Result, eyre};
 
 use super::super::read::{ApiArgs, PreparedQuote};
 use super::super::types::{AssetId, AssetSpec, AssetType, HumanAmount, OrderType, QuoteRequest};
 
+const DEFAULT_BURST_REQUESTS: u64 = 100;
+const DEFAULT_CONTINUOUS_DURATION: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum QuoteBenchmarkMode {
+    #[default]
+    Burst,
+    Continuous,
+}
+
+impl QuoteBenchmarkMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Burst => "burst",
+            Self::Continuous => "continuous",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 pub enum QuoteBenchmarkLimit {
     Requests(u64),
     Duration(Duration),
+}
+
+impl QuoteBenchmarkLimit {
+    pub fn resolve(
+        mode: Option<QuoteBenchmarkMode>,
+        requests: Option<u64>,
+        duration: Option<Duration>,
+    ) -> Result<Self> {
+        let mode = mode.unwrap_or_else(|| {
+            if duration.is_some() {
+                QuoteBenchmarkMode::Continuous
+            } else {
+                QuoteBenchmarkMode::Burst
+            }
+        });
+        match mode {
+            QuoteBenchmarkMode::Burst => {
+                if duration.is_some() {
+                    return Err(eyre!(
+                        "--duration-secs requires --mode continuous (or omit --mode)"
+                    ));
+                }
+                Ok(Self::Requests(requests.unwrap_or(DEFAULT_BURST_REQUESTS)))
+            }
+            QuoteBenchmarkMode::Continuous => {
+                if requests.is_some() {
+                    return Err(eyre!("--requests cannot be used with --mode continuous"));
+                }
+                Ok(Self::Duration(
+                    duration.unwrap_or(DEFAULT_CONTINUOUS_DURATION),
+                ))
+            }
+        }
+    }
+
+    pub const fn mode(self) -> QuoteBenchmarkMode {
+        match self {
+            Self::Requests(_) => QuoteBenchmarkMode::Burst,
+            Self::Duration(_) => QuoteBenchmarkMode::Continuous,
+        }
+    }
 }
 
 pub struct QuoteBenchmarkArgs {
@@ -29,12 +91,6 @@ pub struct QuoteBenchmarkTarget {
     pub recipient: alloy::primitives::Address,
     pub order_type: OrderType,
     pub asset_type: AssetType,
-}
-
-#[derive(Clone, Copy)]
-pub(super) enum RunLimit {
-    Requests(u64),
-    Duration(Duration),
 }
 
 pub(super) struct BenchmarkTarget {
@@ -104,6 +160,8 @@ pub(super) struct Sample {
 }
 
 pub(super) struct BenchmarkReport {
+    pub mode: QuoteBenchmarkMode,
+    pub interrupted: bool,
     pub samples: Vec<Sample>,
     pub elapsed: Duration,
     pub output_symbol: String,
@@ -113,4 +171,41 @@ pub(super) struct BenchmarkReport {
     pub requested_amount: U256,
     pub requested_symbol: String,
     pub requested_decimals: u8,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn benchmark_mode_resolves_legacy_and_explicit_inputs() {
+        assert!(matches!(
+            QuoteBenchmarkLimit::resolve(None, None, None),
+            Ok(QuoteBenchmarkLimit::Requests(100))
+        ));
+        assert!(matches!(
+            QuoteBenchmarkLimit::resolve(None, None, Some(Duration::from_secs(3))),
+            Ok(QuoteBenchmarkLimit::Duration(duration)) if duration == Duration::from_secs(3)
+        ));
+        assert!(matches!(
+            QuoteBenchmarkLimit::resolve(Some(QuoteBenchmarkMode::Continuous), None, None),
+            Ok(QuoteBenchmarkLimit::Duration(duration)) if duration == Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn benchmark_mode_rejects_mismatched_limit_flags() {
+        assert!(
+            QuoteBenchmarkLimit::resolve(
+                Some(QuoteBenchmarkMode::Burst),
+                None,
+                Some(Duration::from_secs(1))
+            )
+            .is_err()
+        );
+        assert!(
+            QuoteBenchmarkLimit::resolve(Some(QuoteBenchmarkMode::Continuous), Some(1), None)
+                .is_err()
+        );
+    }
 }

@@ -36,6 +36,11 @@ pub fn warn(msg: &str) {
     println!("  {} {}", "!".yellow(), msg.yellow());
 }
 
+/// Print a warning to stderr so structured stdout remains machine-readable.
+pub fn warn_stderr(msg: &str) {
+    eprintln!("  {} {}", "!".yellow(), msg.yellow());
+}
+
 /// Print error: "  x {msg}" in red
 pub fn error(msg: &str) {
     println!("  {} {}", "x".red(), msg.red());

@@ -33,6 +33,13 @@ pub(super) fn render_report(
         "route",
         &format!("{} -> {}", report.from_label, report.to_label),
     );
+    ui::kv("mode", report.mode.label());
+    if report.interrupted {
+        ui::kv(
+            "status",
+            "stopped gracefully after draining in-flight requests",
+        );
+    }
     ui::kv(
         "amount",
         &format!(
@@ -102,6 +109,8 @@ pub(super) fn report_json(report: &BenchmarkReport) -> Value {
     let outputs = output_values(&report.samples);
     let validity = validity_values(&report.samples);
     json!({
+        "mode": report.mode.label(),
+        "interrupted": report.interrupted,
         "target": {
             "from": report.from_label,
             "to": report.to_label,

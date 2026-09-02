@@ -5,9 +5,9 @@ use indicatif::ProgressBar;
 
 use super::execution::{ExecutionFeedback, execute_round_trip};
 use super::route::{DiscoveryFeedback, discover_wallet, plan_sweep};
-use super::shutdown::Shutdown;
 use super::types::{AssetType, OrderType};
 use super::{IntentRuntime, IntentRuntimeArgs, confirm_execution, prepare_runtime};
+use crate::shutdown::{DrainTarget, Shutdown};
 use crate::ui;
 
 const RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -60,7 +60,7 @@ pub async fn run(args: TrafficArgs) -> Result<()> {
     )
     .await?;
 
-    let shutdown = Shutdown::install();
+    let shutdown = Shutdown::install(DrainTarget::RoundTrip);
     let mut stats = TrafficStats::default();
     while !shutdown.requested() {
         stats.cycles += 1;

@@ -1,3 +1,4 @@
+mod progress;
 mod report;
 mod types;
 
@@ -11,29 +12,39 @@ use futures::future::join_all;
 use tokio::sync::Mutex;
 use tokio::time::{Interval, MissedTickBehavior};
 
+use self::progress::BenchmarkProgress;
 use self::report::{duration_ms, render_report, report_json};
-use self::types::{BenchmarkReport, BenchmarkTarget, FailureKind, RunLimit, Sample, SampleOutcome};
+use self::types::{BenchmarkReport, BenchmarkTarget, FailureKind, Sample, SampleOutcome};
 use super::client::RfqClient;
 use super::read::{PreparedQuote, QuoteRequestArgs, api_client, prepare_quote_from_tokens};
 use super::route::validate_quote_route;
 use super::types::{
     AssetSpec, QuoteOutcome, TokenInfo, TokensResponse, is_native_token, parse_amount,
 };
+use crate::shutdown::{DrainTarget, Shutdown};
 
-pub use self::types::{QuoteBenchmarkArgs, QuoteBenchmarkLimit, QuoteBenchmarkTarget};
+pub use self::types::{
+    QuoteBenchmarkArgs, QuoteBenchmarkLimit, QuoteBenchmarkMode, QuoteBenchmarkTarget,
+};
 
 pub async fn benchmark_quotes(args: QuoteBenchmarkArgs) -> eyre::Result<()> {
     let client = api_client(&args.api)?;
     let prepared = resolve_benchmark_target(&client, &args.target).await?;
     let target = Arc::new(BenchmarkTarget::from(prepared));
-    run_warmup(&client, &target, &args).await;
+    let shutdown = Shutdown::install(DrainTarget::QuoteRequests);
+    run_warmup(&client, &target, &args, Arc::clone(&shutdown)).await;
     let report = run_benchmark(
         client,
         target,
-        measured_limit(&args.limit),
-        args.concurrency,
-        args.request_timeout,
-        args.max_rps,
+        shutdown,
+        BenchmarkRunArgs {
+            limit: args.limit,
+            concurrency: args.concurrency,
+            request_timeout: args.request_timeout,
+            max_rps: args.max_rps,
+            phase: "benchmark",
+            show_progress: !args.json,
+        },
     )
     .await;
     if args.json {
@@ -44,52 +55,72 @@ pub async fn benchmark_quotes(args: QuoteBenchmarkArgs) -> eyre::Result<()> {
     Ok(())
 }
 
-async fn run_warmup(client: &RfqClient, target: &Arc<BenchmarkTarget>, args: &QuoteBenchmarkArgs) {
+async fn run_warmup(
+    client: &RfqClient,
+    target: &Arc<BenchmarkTarget>,
+    args: &QuoteBenchmarkArgs,
+    shutdown: Arc<Shutdown>,
+) {
     if args.warmup == 0 {
         return;
     }
     run_benchmark(
         client.clone(),
         Arc::clone(target),
-        RunLimit::Requests(args.warmup),
-        args.concurrency,
-        args.request_timeout,
-        args.max_rps,
+        shutdown,
+        BenchmarkRunArgs {
+            limit: QuoteBenchmarkLimit::Requests(args.warmup),
+            concurrency: args.concurrency,
+            request_timeout: args.request_timeout,
+            max_rps: args.max_rps,
+            phase: "warmup",
+            show_progress: !args.json,
+        },
     )
     .await;
 }
 
-const fn measured_limit(limit: &QuoteBenchmarkLimit) -> RunLimit {
-    match limit {
-        QuoteBenchmarkLimit::Requests(requests) => RunLimit::Requests(*requests),
-        QuoteBenchmarkLimit::Duration(duration) => RunLimit::Duration(*duration),
-    }
+struct BenchmarkRunArgs {
+    limit: QuoteBenchmarkLimit,
+    concurrency: usize,
+    request_timeout: Duration,
+    max_rps: Option<u64>,
+    phase: &'static str,
+    show_progress: bool,
 }
 
 async fn run_benchmark(
     client: RfqClient,
     target: Arc<BenchmarkTarget>,
-    limit: RunLimit,
-    concurrency: usize,
-    request_timeout: Duration,
-    max_rps: Option<u64>,
+    shutdown: Arc<Shutdown>,
+    args: BenchmarkRunArgs,
 ) -> BenchmarkReport {
     let started = Instant::now();
     let next_request = Arc::new(AtomicU64::new(0));
-    let rate_limit = rate_limiter(max_rps);
-    let workers = (0..concurrency).map(|_| {
-        benchmark_worker(
-            client.clone(),
-            Arc::clone(&target),
-            limit,
+    let rate_limit = rate_limiter(args.max_rps);
+    let progress = Arc::new(BenchmarkProgress::new(
+        args.limit,
+        args.phase,
+        args.show_progress,
+    ));
+    let workers = (0..args.concurrency).map(|_| {
+        benchmark_worker(BenchmarkWorker {
+            client: client.clone(),
+            target: Arc::clone(&target),
+            limit: args.limit,
             started,
-            request_timeout,
-            Arc::clone(&next_request),
-            rate_limit.clone(),
-        )
+            request_timeout: args.request_timeout,
+            next_request: Arc::clone(&next_request),
+            rate_limit: rate_limit.clone(),
+            shutdown: Arc::clone(&shutdown),
+            progress: Arc::clone(&progress),
+        })
     });
     let samples = join_all(workers).await.into_iter().flatten().collect();
+    progress.finish();
     BenchmarkReport {
+        mode: args.limit.mode(),
+        interrupted: shutdown.requested(),
         samples,
         elapsed: started.elapsed(),
         output_symbol: target.output_symbol.clone(),
@@ -100,6 +131,18 @@ async fn run_benchmark(
         requested_symbol: target.requested_symbol.clone(),
         requested_decimals: target.requested_decimals,
     }
+}
+
+struct BenchmarkWorker {
+    client: RfqClient,
+    target: Arc<BenchmarkTarget>,
+    limit: QuoteBenchmarkLimit,
+    started: Instant,
+    request_timeout: Duration,
+    next_request: Arc<AtomicU64>,
+    rate_limit: Option<Arc<Mutex<Interval>>>,
+    shutdown: Arc<Shutdown>,
+    progress: Arc<BenchmarkProgress>,
 }
 
 async fn resolve_benchmark_target(
@@ -222,38 +265,37 @@ fn token_spec(token: &TokenInfo) -> Result<AssetSpec> {
         .map_err(eyre::Report::msg)
 }
 
-async fn benchmark_worker(
-    client: RfqClient,
-    target: Arc<BenchmarkTarget>,
-    limit: RunLimit,
-    started: Instant,
-    request_timeout: Duration,
-    next_request: Arc<AtomicU64>,
-    rate_limit: Option<Arc<Mutex<Interval>>>,
-) -> Vec<Sample> {
+async fn benchmark_worker(worker: BenchmarkWorker) -> Vec<Sample> {
     let mut samples = Vec::new();
     loop {
-        let request_index = next_request.fetch_add(1, Ordering::Relaxed);
-        if !should_start(limit, request_index, started.elapsed()) {
+        if worker.shutdown.requested() {
+            break;
+        }
+        let request_index = worker.next_request.fetch_add(1, Ordering::Relaxed);
+        if !should_start(worker.limit, request_index, worker.started.elapsed()) {
             break;
         }
         if !wait_for_rate_limit(
-            rate_limit.as_ref(),
-            remaining_duration(limit, started.elapsed()),
+            worker.rate_limit.as_ref(),
+            remaining_duration(worker.limit, worker.started.elapsed()),
+            &worker.shutdown,
         )
         .await
         {
             break;
         }
-        samples.push(benchmark_request(&client, &target, request_timeout).await);
+        let sample =
+            benchmark_request(&worker.client, &worker.target, worker.request_timeout).await;
+        worker.progress.record(&sample);
+        samples.push(sample);
     }
     samples
 }
 
-fn should_start(limit: RunLimit, request_index: u64, elapsed: Duration) -> bool {
+fn should_start(limit: QuoteBenchmarkLimit, request_index: u64, elapsed: Duration) -> bool {
     match limit {
-        RunLimit::Requests(requests) => request_index < requests,
-        RunLimit::Duration(duration) => elapsed < duration,
+        QuoteBenchmarkLimit::Requests(requests) => request_index < requests,
+        QuoteBenchmarkLimit::Duration(duration) => elapsed < duration,
     }
 }
 
@@ -270,26 +312,36 @@ fn rate_limiter(max_rps: Option<u64>) -> Option<Arc<Mutex<Interval>>> {
 async fn wait_for_rate_limit(
     rate_limit: Option<&Arc<Mutex<Interval>>>,
     remaining: Option<Duration>,
+    shutdown: &Shutdown,
 ) -> bool {
+    if shutdown.requested() {
+        return false;
+    }
     let Some(rate_limit) = rate_limit else {
         return remaining.is_none_or(|remaining| !remaining.is_zero());
     };
     let wait = async {
         rate_limit.lock().await.tick().await;
     };
-    match remaining {
-        Some(remaining) => tokio::time::timeout(remaining, wait).await.is_ok(),
-        None => {
-            wait.await;
-            true
+    let rate_ready = async {
+        match remaining {
+            Some(remaining) => tokio::time::timeout(remaining, wait).await.is_ok(),
+            None => {
+                wait.await;
+                true
+            }
         }
+    };
+    tokio::select! {
+        ready = rate_ready => ready,
+        () = shutdown.cancelled() => false,
     }
 }
 
-fn remaining_duration(limit: RunLimit, elapsed: Duration) -> Option<Duration> {
+fn remaining_duration(limit: QuoteBenchmarkLimit, elapsed: Duration) -> Option<Duration> {
     match limit {
-        RunLimit::Requests(_) => None,
-        RunLimit::Duration(duration) => Some(duration.saturating_sub(elapsed)),
+        QuoteBenchmarkLimit::Requests(_) => None,
+        QuoteBenchmarkLimit::Duration(duration) => Some(duration.saturating_sub(elapsed)),
     }
 }
 
@@ -365,27 +417,35 @@ mod tests {
 
     #[test]
     fn fixed_and_duration_limits_stop_scheduling() {
-        assert!(should_start(RunLimit::Requests(100), 99, Duration::ZERO));
-        assert!(!should_start(RunLimit::Requests(100), 100, Duration::ZERO));
         assert!(should_start(
-            RunLimit::Duration(Duration::from_secs(1)),
+            QuoteBenchmarkLimit::Requests(100),
+            99,
+            Duration::ZERO
+        ));
+        assert!(!should_start(
+            QuoteBenchmarkLimit::Requests(100),
+            100,
+            Duration::ZERO
+        ));
+        assert!(should_start(
+            QuoteBenchmarkLimit::Duration(Duration::from_secs(1)),
             1_000,
             Duration::from_millis(999)
         ));
         assert!(!should_start(
-            RunLimit::Duration(Duration::from_secs(1)),
+            QuoteBenchmarkLimit::Duration(Duration::from_secs(1)),
             1_000,
             Duration::from_secs(1)
         ));
         assert_eq!(
             remaining_duration(
-                RunLimit::Duration(Duration::from_secs(1)),
+                QuoteBenchmarkLimit::Duration(Duration::from_secs(1)),
                 Duration::from_millis(750)
             ),
             Some(Duration::from_millis(250))
         );
         assert_eq!(
-            remaining_duration(RunLimit::Requests(100), Duration::from_secs(10)),
+            remaining_duration(QuoteBenchmarkLimit::Requests(100), Duration::from_secs(10)),
             None
         );
     }
