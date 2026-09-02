@@ -74,7 +74,7 @@ pub async fn run(args: TrafficArgs) -> Result<()> {
                 ui::warn(&format!(
                     "traffic cycle {} will restart after an error: {}",
                     stats.cycles,
-                    ui::scrub_urls(&error.to_string())
+                    format_error(&error)
                 ));
                 wait_before_retry(&stop).await;
             }
@@ -224,6 +224,10 @@ async fn wait_before_retry(stop: &AtomicBool) {
     }
 }
 
+fn format_error(error: &eyre::Report) -> String {
+    ui::scrub_urls(&format!("{error:#}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,5 +257,13 @@ mod tests {
     fn traffic_rotates_through_available_routes() {
         let indexes: Vec<usize> = (0..5).map(|cursor| next_plan_index(cursor, 3)).collect();
         assert_eq!(indexes, [0, 1, 2, 0, 1]);
+    }
+
+    #[test]
+    fn traffic_errors_include_the_complete_cause_chain() {
+        let error = Err::<(), _>(eyre::eyre!("deposit rejected"))
+            .wrap_err("round trip failed")
+            .unwrap_err();
+        assert_eq!(format_error(&error), "round trip failed: deposit rejected");
     }
 }
