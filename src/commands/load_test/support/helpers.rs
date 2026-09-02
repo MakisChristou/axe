@@ -183,6 +183,18 @@ pub(crate) async fn deploy_or_reuse_sender_receiver<R: Provider, W: Provider>(
     gas_service_addr: Address,
     label: &str,
 ) -> Result<Address> {
+    // A SenderReceiver is only as good as the gateway it points at: a stale
+    // chains-config entry (a gateway address with no code - xrpl-evm-devnet,
+    // run 33434429985) makes every send revert AND makes a fresh deploy
+    // pointless. Fail fast with the real cause instead of a bare revert.
+    let gateway_code = get_code_with_retry(read_provider, gateway_addr).await?;
+    if gateway_code.is_empty() {
+        eyre::bail!(
+            "AxelarGateway at {gateway_addr} has no deployed code on the {label} chain's RPC. \
+             The chains-config entry is stale or its RPC points at the wrong network - GMP \
+             cannot run against this chain until the upstream config is fixed"
+        );
+    }
     // Committed overlay first: deployed-once helpers recorded in
     // axe-tokens/<network>.json survive fresh CI checkouts, unlike the local
     // GmpCache.

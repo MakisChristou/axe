@@ -560,10 +560,9 @@ async fn probe_axe_stellar(
     let key = std::env::var("STELLAR_PRIVATE_KEY").wrap_err("STELLAR_PRIVATE_KEY env not set")?;
     let wallet = StellarWallet::from_secret_str(&key)?;
     let pk = wallet.public_key_bytes;
-    let raw = crate::retry::retry_all("probe_axe_stellar.balance", || async {
-        client.token_balance_view(&pk, token_addr, &pk).await
-    })
-    .await?;
+    // No outer retry: `token_balance_view` -> `simulate_view` retries
+    // internally.
+    let raw = client.token_balance_view(&pk, token_addr, &pk).await?;
     Ok((wallet.address(), raw as f64 / 10f64.powi(decimals as i32)))
 }
 
@@ -697,13 +696,12 @@ async fn probe_sui(rpc_url: &str) -> Result<(String, f64)> {
     let key = std::env::var("SUI_PRIVATE_KEY").wrap_err("SUI_PRIVATE_KEY env not set")?;
     let wallet = SuiWallet::from_secret_str(&key)?;
     let client = SuiClient::new(rpc_url);
-    // SuiClient already iterates endpoint fallbacks; the time-axis retry
-    // layered on top handles the "429 from every endpoint" case we hit
-    // when the cron runs preflight concurrently across mainnet+testnet.
-    let mist = crate::retry::retry_all("probe_sui.get_balance", || async {
-        client.get_balance(&wallet.address).await
-    })
-    .await?;
+    // No outer retry: `SuiClient::call` already runs the full retry ladder
+    // across its endpoint fallbacks. Wrapping it again multiplies the
+    // ladders (6x6 = ~13 min against a dead endpoint - observed blowing the
+    // preflight timeout in run 33412443275 on the XRPL twin of this probe).
+    // The candidates loop in `probe_balance` is the failover axis instead.
+    let mist = client.get_balance(&wallet.address).await?;
     Ok((wallet.address_hex(), mist as f64 / 1_000_000_000.0))
 }
 
@@ -717,11 +715,11 @@ async fn probe_stellar(
     let key = std::env::var("STELLAR_PRIVATE_KEY").wrap_err("STELLAR_PRIVATE_KEY env not set")?;
     let wallet = StellarWallet::from_secret_str(&key)?;
     let address = wallet.address();
-    let stroops = crate::retry::retry_all("probe_stellar.native_balance_stroops", || async {
-        client.native_balance_stroops(&address).await
-    })
-    .await?
-    .ok_or_else(|| eyre!("account {address} not found on Stellar"))?;
+    // No outer retry: `native_balance_stroops` retries internally.
+    let stroops = client
+        .native_balance_stroops(&address)
+        .await?
+        .ok_or_else(|| eyre!("account {address} not found on Stellar"))?;
     // 1 XLM = 10^7 stroops
     Ok((address, stroops as f64 / 10_000_000.0))
 }
@@ -731,11 +729,11 @@ async fn probe_xrpl(rpc_url: &str) -> Result<(String, f64)> {
     let wallet = XrplWallet::from_secret_str(&key)?;
     let address = wallet.address();
     let client = XrplClient::new(rpc_url);
-    let info = crate::retry::retry_all("probe_xrpl.account_info", || async {
-        client.account_info(&address).await
-    })
-    .await?
-    .ok_or_else(|| eyre!("account {address} not activated on XRPL"))?;
+    // No outer retry: `account_info` retries internally.
+    let info = client
+        .account_info(&address)
+        .await?
+        .ok_or_else(|| eyre!("account {address} not activated on XRPL"))?;
     // 1 XRP = 10^6 drops
     Ok((address, info.balance_drops as f64 / 1_000_000.0))
 }

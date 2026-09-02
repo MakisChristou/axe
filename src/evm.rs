@@ -267,18 +267,39 @@ impl EvmEndpoints {
     /// Broadcast a signed envelope's raw bytes, retrying across endpoints.
     /// Safe to call repeatedly with the same envelope: identical bytes hash to
     /// the same transaction, so re-broadcast can never double-send.
+    /// Broadcast the signed envelope to EVERY endpoint, not just the first
+    /// acceptor. Identical bytes hash to the same tx, so multi-submission can
+    /// never double-send - and a sick node that accepts into an isolated
+    /// mempool (observed: the avalanche primary swallowing a tx for 120s+
+    /// while erroring "state not available for pending block", cron run
+    /// 33455835970) no longer decides the tx's fate alone. Succeeds if any
+    /// endpoint accepts. When all reject, it surfaces a classifiable rejection
+    /// (nonce/landed) over a generic transport failure so the caller's
+    /// recovery arms can fire.
     pub async fn broadcast_raw(&self, envelope: &TxEnvelope) -> Result<TxHash> {
         let raw = envelope.encoded_2718();
-        crate::retry::retry_with_fallback(
+        let tx_hash = *envelope.tx_hash();
+        crate::retry::retry_async(
             "broadcast evm tx",
-            &self.providers,
+            crate::retry::FALLBACK_ATTEMPTS,
             |e: &eyre::Report| crate::retry::is_transient_default(e) || is_pending_state_error(e),
-            move |provider| {
-                let raw = raw.clone();
-                async move {
-                    let pending = provider.send_raw_transaction(&raw).await?;
-                    Ok(*pending.tx_hash())
+            || async {
+                let mut errors: Vec<eyre::Report> = Vec::new();
+                let mut accepted = false;
+                for provider in self.providers() {
+                    match provider.send_raw_transaction(&raw).await {
+                        Ok(_) => accepted = true,
+                        Err(e) => errors.push(e.into()),
+                    }
                 }
+                if accepted {
+                    return Ok(tx_hash);
+                }
+                let pick = errors
+                    .iter()
+                    .position(|e| send_error_may_mean_landed(e) || nonce_held_by_pooled_tx(e))
+                    .unwrap_or(0);
+                Err(errors.swap_remove(pick))
             },
         )
         .await
@@ -445,6 +466,26 @@ impl ReplacementFees {
 ///
 /// Returns the mined receipt — reverted (status 0x0) receipts are returned,
 /// not errors, so callers keep their own status handling.
+/// Build the request for the next broadcast round: pinned nonce, and - on a
+/// replacement round - the original gas limit plus doubled fees, so nothing
+/// is re-estimated against state still holding the pending original.
+fn round_request(
+    tx: &TransactionRequest,
+    nonce_override: Option<u64>,
+    gas_override: Option<u64>,
+    replacement_fees: Option<&ReplacementFees>,
+) -> TransactionRequest {
+    let mut request = tx.clone();
+    request.nonce = nonce_override;
+    if let Some(gas) = gas_override {
+        request.gas = Some(gas);
+    }
+    if let Some(fees) = replacement_fees {
+        fees.apply(&mut request);
+    }
+    request
+}
+
 pub async fn send_tx_robust(
     endpoints: &EvmEndpoints,
     signer: &PrivateKeySigner,
@@ -459,6 +500,12 @@ pub async fn send_tx_robust(
     // bytes cannot change that. The floor doubles the previous envelope's
     // fees so the re-signed tx (same nonce) cleanly replaces the pooled one.
     let mut replacement_fees: Option<ReplacementFees> = None;
+    // Replacement rounds reuse the original envelope's gas limit: the deal
+    // is fee-only, and a fresh estimate runs against state where the
+    // original is still pending at this nonce - which nodes answer with
+    // deterministic nonsense ("exceeds block gas limit" on coreth, run
+    // 33455835970) or which burns the retry ladder on a sick endpoint.
+    let mut gas_override: Option<u64> = None;
     let mut sent_hashes: Vec<TxHash> = Vec::new();
     let mut last_hash: Option<TxHash> = None;
     // Broadcast rounds and nonce-contention attempts are budgeted separately:
@@ -475,11 +522,8 @@ pub async fn send_tx_robust(
         let env = match envelope.clone() {
             Some(env) => env,
             None => {
-                let mut request = tx.clone();
-                request.nonce = nonce_override;
-                if let Some(fees) = &replacement_fees {
-                    fees.apply(&mut request);
-                }
+                let request =
+                    round_request(&tx, nonce_override, gas_override, replacement_fees.as_ref());
                 let env = pool.fill_and_sign(signer, request).await?;
                 envelope = Some(env.clone());
                 env
@@ -506,6 +550,7 @@ pub async fn send_tx_robust(
                     nonce_override = parse_expected_nonce(&error.to_string());
                     envelope = None;
                     replacement_fees = None;
+                    gas_override = None;
                     ui::warn(&format!(
                         "{label}: nonce conflict ({error}); re-signing at {}",
                         match nonce_override {
@@ -545,6 +590,7 @@ pub async fn send_tx_robust(
                 nonce_override = None;
                 envelope = None;
                 replacement_fees = None;
+                gas_override = None;
                 continue;
             }
             Err(error) => return Err(error),
@@ -560,6 +606,7 @@ pub async fn send_tx_robust(
                 // one of the two can ever mine.
                 if let Some(env) = envelope.take() {
                     nonce_override = Some(env.nonce());
+                    gas_override = Some(env.gas_limit());
                     replacement_fees = Some(ReplacementFees::doubled_from(&env));
                 }
                 ui::warn(&format!(
