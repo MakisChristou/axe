@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use eyre::{Result, WrapErr};
@@ -6,10 +5,9 @@ use indicatif::ProgressBar;
 
 use super::execution::{ExecutionFeedback, execute_round_trip};
 use super::route::{DiscoveryFeedback, discover_wallet, plan_sweep};
+use super::shutdown::Shutdown;
 use super::types::{AssetType, OrderType};
-use super::{
-    IntentRuntime, IntentRuntimeArgs, confirm_execution, graceful_stop_flag, prepare_runtime,
-};
+use super::{IntentRuntime, IntentRuntimeArgs, confirm_execution, prepare_runtime};
 use crate::ui;
 
 const RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -62,13 +60,13 @@ pub async fn run(args: TrafficArgs) -> Result<()> {
     )
     .await?;
 
-    let stop = graceful_stop_flag();
+    let shutdown = Shutdown::install();
     let mut stats = TrafficStats::default();
-    while !stop.load(Ordering::Relaxed) {
+    while !shutdown.requested() {
         stats.cycles += 1;
-        match run_cycle(&runtime, args.wallet_bps, &stop, &mut stats).await {
+        match run_cycle(&runtime, args.wallet_bps, &shutdown, &mut stats).await {
             Ok(true) => {}
-            Ok(false) => wait_before_retry(&stop).await,
+            Ok(false) => wait_before_retry(&shutdown).await,
             Err(error) => {
                 stats.failures += 1;
                 ui::warn(&format!(
@@ -76,7 +74,7 @@ pub async fn run(args: TrafficArgs) -> Result<()> {
                     stats.cycles,
                     format_error(&error)
                 ));
-                wait_before_retry(&stop).await;
+                wait_before_retry(&shutdown).await;
             }
         }
     }
@@ -88,12 +86,12 @@ pub async fn run(args: TrafficArgs) -> Result<()> {
 async fn run_cycle(
     runtime: &IntentRuntime,
     wallet_bps: u16,
-    stop: &AtomicBool,
+    shutdown: &Shutdown,
     stats: &mut TrafficStats,
 ) -> Result<bool> {
     let mut found_routes = false;
     for (mode_index, mode) in TRAFFIC_MODES.into_iter().enumerate() {
-        if stop.load(Ordering::Relaxed) {
+        if shutdown.requested() {
             break;
         }
         let discovery = discover_wallet(
@@ -112,6 +110,9 @@ async fn run_cycle(
             mode.order_type,
         )
         .await;
+        if shutdown.requested() {
+            return Ok(true);
+        }
         if plans.is_empty() {
             ui::warn(&format!(
                 "no quotable {} routes for {}",
@@ -218,9 +219,10 @@ fn traffic_progress(total: usize) -> ProgressBar {
     progress
 }
 
-async fn wait_before_retry(stop: &AtomicBool) {
-    if !stop.load(Ordering::Relaxed) {
-        tokio::time::sleep(RETRY_DELAY).await;
+async fn wait_before_retry(shutdown: &Shutdown) {
+    tokio::select! {
+        () = tokio::time::sleep(RETRY_DELAY) => {}
+        () = shutdown.cancelled() => {}
     }
 }
 

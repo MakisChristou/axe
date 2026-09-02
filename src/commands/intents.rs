@@ -5,13 +5,12 @@ mod inventory;
 mod presentation;
 mod read;
 mod route;
+mod shutdown;
 mod stats;
 mod traffic;
 mod types;
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use alloy::primitives::Address;
@@ -25,6 +24,7 @@ use self::route::{
     DiscoveryFeedback, RouteDiscovery, discover_wallet, plan_roundtrip, plan_send, plan_sweep,
     render_plans,
 };
+use self::shutdown::Shutdown;
 use self::stats::percentile;
 use self::types::{LegExecution, LegResult, RoutePlan, RunLimits};
 use crate::config::ChainsConfig;
@@ -221,7 +221,7 @@ pub async fn roundtrip(args: RoundtripArgs) -> Result<()> {
 
 pub async fn sweep(args: SweepArgs) -> Result<()> {
     let runtime = prepare_runtime(args.runtime).await?;
-    let stop = graceful_stop_flag();
+    let shutdown = Shutdown::install();
     let mut results = Vec::new();
     let mut planned_intents = 0usize;
     let mut sweep = 0u64;
@@ -269,7 +269,8 @@ pub async fn sweep(args: SweepArgs) -> Result<()> {
             confirmed = true;
         }
 
-        let executed = execute_sweep_pass(&runtime, &discovery, &plans, &mut results, &stop).await;
+        let executed =
+            execute_sweep_pass(&runtime, &discovery, &plans, &mut results, &shutdown).await;
         match executed {
             Ok(true) => {}
             Ok(false) => {
@@ -285,7 +286,7 @@ pub async fn sweep(args: SweepArgs) -> Result<()> {
         if !args.continuous && sweep >= args.sweeps {
             break;
         }
-        if stop.load(Ordering::Relaxed) {
+        if shutdown.requested() {
             break;
         }
     }
@@ -299,12 +300,12 @@ async fn execute_sweep_pass(
     discovery: &RouteDiscovery,
     plans: &[RoutePlan],
     results: &mut Vec<LegResult>,
-    stop: &AtomicBool,
+    shutdown: &Shutdown,
 ) -> Result<bool> {
     let progress = sweep_progress(plans.len() * 2);
     let feedback = ExecutionFeedback::Progress(progress.clone());
     for plan in plans {
-        if stop.load(Ordering::Relaxed) {
+        if shutdown.requested() {
             progress.finish_and_clear();
             return Ok(false);
         }
@@ -374,18 +375,6 @@ async fn confirm_execution(auto_confirm: bool, prompt: &str) -> Result<()> {
     Err(eyre!(
         "execution not confirmed; pass --yes for non-interactive runs"
     ))
-}
-
-fn graceful_stop_flag() -> Arc<AtomicBool> {
-    let stop = Arc::new(AtomicBool::new(false));
-    let signal = Arc::clone(&stop);
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal.store(true, Ordering::Relaxed);
-            ui::warn("Ctrl-C received; finishing the current round trip before stopping");
-        }
-    });
-    stop
 }
 
 fn render_summary(results: &[LegResult], planned: usize) {
