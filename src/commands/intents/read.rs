@@ -227,12 +227,16 @@ async fn watch_status(client: &RfqClient, args: StatusArgs) -> Result<()> {
         ensure_watchable_status(&response)?;
         if last_state != Some(response.state) {
             if !args.json {
-                ui::kv("status", response.state.label());
+                render_status(&response, false)?;
             }
             last_state = Some(response.state);
         }
         if response.state.is_terminal() {
-            return render_status(&response, args.json);
+            return if args.json {
+                render_status(&response, true)
+            } else {
+                Ok(())
+            };
         }
         if started.elapsed() >= args.timeout {
             bail!(
@@ -346,8 +350,9 @@ fn remaining_until(deadline: chrono::DateTime<Utc>) -> String {
 }
 
 fn render_status(status: &StatusResponse, json: bool) -> Result<()> {
+    let response = serde_json::to_string_pretty(status)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(status)?);
+        println!("{response}");
         return Ok(());
     }
     ui::section("intent status");
@@ -369,6 +374,8 @@ fn render_status(status: &StatusResponse, json: bool) -> Result<()> {
         );
         ui::tx_hash("refund transaction", &refund.tx_hash);
     }
+    ui::section("status response");
+    println!("{response}");
     Ok(())
 }
 
