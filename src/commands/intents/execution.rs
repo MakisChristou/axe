@@ -81,7 +81,7 @@ impl ExecutionFeedback {
             Self::Detailed => ui::warn(message),
             Self::Progress(progress) => progress.println(ui::warning_line(message)),
             Self::Traffic { progress, context } => progress.set_message(format!(
-                "intents {} · {context} · warning: {}",
+                "intents {} · warning: {} · {context}",
                 progress.position(),
                 ui::scrub_urls(message)
             )),
@@ -839,6 +839,11 @@ mod tests {
         feedback.leg_completed("Arbitrum Sepolia/ETH -> Base Sepolia/ETH");
         assert_eq!(progress.position(), 1);
         assert!(progress.message().starts_with("intents 1 · trips 4"));
+
+        feedback.warn("pending state unavailable; using latest-pinned nonce+gas immediately");
+        assert!(progress.message().starts_with(
+            "intents 1 · warning: pending state unavailable; using latest-pinned nonce+gas immediately"
+        ));
     }
 
     #[test]

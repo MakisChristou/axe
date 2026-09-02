@@ -164,22 +164,19 @@ impl EvmEndpoints {
     ///
     /// alloy's nonce and gas fillers query the **pending** block, and some
     /// nodes (Avalanche coreth, recurringly) intermittently can't serve
-    /// pending state — for stretches longer than the whole retry budget. When
-    /// the retried fill dies on exactly that error, degrade once: pre-resolve
-    /// the nonce and gas against `latest` (which those nodes do serve), then
-    /// re-run the fill — only the fee/chain-id lookups remain, and those are
-    /// latest-based already.
+    /// pending state for stretches longer than the whole retry budget. On
+    /// that exact error, degrade immediately: pre-resolve the nonce and gas
+    /// against `latest` (which those nodes do serve), then re-run the fill.
+    /// only the fee/chain-id lookups remain, and those are latest-based already.
     pub async fn fill_and_sign(
         &self,
         signer: &PrivateKeySigner,
         tx: TransactionRequest,
+        on_warning: &impl Fn(&str),
     ) -> Result<TxEnvelope> {
         match self.fill_and_sign_once(signer, tx.clone()).await {
             Err(error) if is_pending_state_error(&error) => {
-                ui::warn(
-                    "fill kept hitting 'state not available for pending block' — \
-                     re-filling with nonce+gas pinned to the latest block",
-                );
+                on_warning("pending state unavailable; using latest-pinned nonce+gas immediately");
                 let pinned = self.prefill_from_latest(tx).await?;
                 self.fill_and_sign_once(signer, pinned).await
             }
@@ -188,7 +185,7 @@ impl EvmEndpoints {
             // tx with an explicit `gas_price`, which routes alloy's filler
             // through the legacy path and skips `eth_feeHistory` entirely.
             Err(error) if is_missing_base_fee_error(&error) => {
-                ui::warn(
+                on_warning(
                     "fill hit a pre-EIP-1559 fee history (null baseFeePerGas) — \
                      re-filling as a legacy type-0 tx with an explicit gas price",
                 );
@@ -210,7 +207,7 @@ impl EvmEndpoints {
         crate::retry::retry_with_fallback(
             "fill+sign evm tx",
             &self.urls,
-            |e: &eyre::Report| crate::retry::is_transient_default(e) || is_pending_state_error(e),
+            should_retry_fill,
             move |url| {
                 let signer = signer.clone();
                 let tx = tx.clone();
@@ -304,6 +301,13 @@ impl EvmEndpoints {
         )
         .await
     }
+}
+
+/// Pending-state failures need a different request, not another delayed copy
+/// of the same Alloy fill. The caller switches that request to latest-pinned
+/// nonce and gas immediately. Ordinary transient failures retain normal retry.
+fn should_retry_fill(error: &eyre::Report) -> bool {
+    !is_pending_state_error(error) && crate::retry::is_transient_default(error)
 }
 
 /// Deterministic EVM view/estimate failures - not endpoint flakiness, so
@@ -535,7 +539,7 @@ pub async fn send_tx_robust_with_warning(
             None => {
                 let request =
                     round_request(&tx, nonce_override, gas_override, replacement_fees.as_ref());
-                let env = pool.fill_and_sign(signer, request).await?;
+                let env = pool.fill_and_sign(signer, request, &on_warning).await?;
                 envelope = Some(env.clone());
                 env
             }
@@ -1144,7 +1148,7 @@ where
 mod tests {
     use super::{
         is_pending_state_error, nonce_contention_backoff, nonce_held_by_pooled_tx,
-        parse_expected_nonce, send_error_may_mean_landed,
+        parse_expected_nonce, send_error_may_mean_landed, should_retry_fill,
     };
 
     #[test]
@@ -1170,6 +1174,11 @@ mod tests {
         assert!(!is_pending_state_error(
             &"execution reverted: TakeTokenFailed"
         ));
+
+        let pending = eyre::eyre!("state not available for pending block");
+        assert!(!should_retry_fill(&pending));
+        let timeout = eyre::eyre!("request timeout");
+        assert!(should_retry_fill(&timeout));
     }
 
     #[test]
