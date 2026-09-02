@@ -16,7 +16,7 @@ use super::types::{
     QuoteRequest, RoundTripInputBudget, RoutePlan, RunLimits, StatusOutput, TimedQuote,
     TransferState, WalletAsset, parse_amount,
 };
-use crate::evm::{ERC20, EvmEndpoints, send_tx_robust};
+use crate::evm::{ERC20, EvmEndpoints, send_tx_robust_with_warning};
 use crate::retry::retry_with_fallback_all;
 use crate::ui;
 
@@ -50,6 +50,13 @@ impl ExecutionFeedback {
         if let Self::Progress(progress) = self {
             progress.inc(1);
             progress.set_message(format!("{route} · fulfilled"));
+        }
+    }
+
+    fn warn(&self, message: &str) {
+        match self {
+            Self::Detailed => ui::warn(message),
+            Self::Progress(progress) => progress.println(ui::warning_line(message)),
         }
     }
 }
@@ -138,32 +145,16 @@ pub async fn execute_leg(
     feedback.stage(&route, "requesting quote");
     let (selected, input_amount) = quote_for_execution(client, signer.address(), &leg).await?;
 
-    let approvals: Vec<Action> = selected
-        .quote
-        .actions
-        .iter()
-        .filter(|action| action.kind == "approval")
-        .cloned()
-        .collect();
-    if !approvals.is_empty() {
-        feedback.stage(&route, "checking allowance");
-        let required = required_approvals(
-            chains,
-            signer,
-            &leg.from,
-            &approvals,
-            input_amount,
-            feedback,
-        )
-        .await?;
-        if !required.is_empty() {
-            feedback.stage(&route, "approving token");
-            execute_actions(chains, signer, &leg.from, &required, "intent approval").await?;
-            validate_quote_lifetime(&selected.quote).wrap_err(
-                "intent quote no longer has enough validity remaining after token approval",
-            )?;
-        }
-    }
+    ensure_input_approval(
+        chains,
+        signer,
+        &leg.from,
+        &selected,
+        input_amount,
+        feedback,
+        &route,
+    )
+    .await?;
 
     let deposits: Vec<Action> = selected
         .quote
@@ -191,9 +182,16 @@ pub async fn execute_leg(
     }
     feedback.stage(&route, "submitting deposit");
     let deposit_started = Instant::now();
-    let deposit_hash = execute_actions(chains, signer, &leg.from, &deposits, "intent deposit")
-        .await?
-        .ok_or_else(|| eyre!("intent quote had no deposit transaction"))?;
+    let deposit_hash = execute_actions(
+        chains,
+        signer,
+        &leg.from,
+        &deposits,
+        "intent deposit",
+        feedback,
+    )
+    .await?
+    .ok_or_else(|| eyre!("intent quote had no deposit transaction"))?;
     let deposit_confirmation_latency_ms = elapsed_ms(deposit_started.elapsed());
     if feedback.is_detailed() {
         ui::tx_hash("deposit", &deposit_hash);
@@ -259,6 +257,45 @@ fn validate_input_limit(input: U256, maximum: Option<U256>) -> Result<()> {
     Ok(())
 }
 
+async fn ensure_input_approval(
+    chains: &std::collections::HashMap<String, ChainRuntime>,
+    signer: &PrivateKeySigner,
+    source: &WalletAsset,
+    selected: &TimedQuote,
+    input_amount: U256,
+    feedback: &ExecutionFeedback,
+    route: &str,
+) -> Result<()> {
+    let approvals = selected
+        .quote
+        .actions
+        .iter()
+        .filter(|action| action.kind == "approval")
+        .cloned()
+        .collect::<Vec<_>>();
+    if approvals.is_empty() {
+        return Ok(());
+    }
+    feedback.stage(route, "checking allowance");
+    let required =
+        required_approvals(chains, signer, source, &approvals, input_amount, feedback).await?;
+    if required.is_empty() {
+        return Ok(());
+    }
+    feedback.stage(route, "approving token");
+    execute_actions(
+        chains,
+        signer,
+        source,
+        &required,
+        "intent approval",
+        feedback,
+    )
+    .await?;
+    validate_quote_lifetime(&selected.quote)
+        .wrap_err("intent quote no longer has enough validity remaining after token approval")
+}
+
 async fn require_quote(client: &RfqClient, request: &QuoteRequest) -> Result<TimedQuote> {
     match client.quote(request).await? {
         QuoteOutcome::Available(quote) => Ok(*quote),
@@ -284,6 +321,7 @@ async fn execute_actions(
     source: &WalletAsset,
     actions: &[Action],
     label: &str,
+    feedback: &ExecutionFeedback,
 ) -> Result<Option<String>> {
     let chain = chains
         .get(&source.id.chain_id)
@@ -292,7 +330,15 @@ async fn execute_actions(
     let mut last_hash = None;
     for action in actions {
         let request = action_request(action, signer.address(), &source.id.chain_id)?;
-        let receipt = send_tx_robust(&endpoints, signer, request, label, RECEIPT_TIMEOUT).await?;
+        let receipt = send_tx_robust_with_warning(
+            &endpoints,
+            signer,
+            request,
+            label,
+            RECEIPT_TIMEOUT,
+            |message| feedback.warn(message),
+        )
+        .await?;
         if !receipt.status() {
             return Err(eyre!(
                 "{} action '{}' reverted in transaction {}",

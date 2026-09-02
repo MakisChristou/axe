@@ -33,12 +33,16 @@ pub fn info(msg: &str) {
 
 /// Print warning: "  ! {msg}" in yellow
 pub fn warn(msg: &str) {
-    println!("  {} {}", "!".yellow(), msg.yellow());
+    println!("{}", warning_line(msg));
 }
 
 /// Print a warning to stderr so structured stdout remains machine-readable.
 pub fn warn_stderr(msg: &str) {
-    eprintln!("  {} {}", "!".yellow(), msg.yellow());
+    eprintln!("{}", warning_line(msg));
+}
+
+pub fn warning_line(msg: &str) -> String {
+    format!("  {} {}", "!".yellow(), msg.yellow())
 }
 
 /// Print error: "  x {msg}" in red

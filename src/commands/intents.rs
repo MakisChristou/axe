@@ -337,17 +337,7 @@ async fn execute_sweep_pass(
 }
 
 fn sweep_progress(total: usize) -> ProgressBar {
-    let progress = ProgressBar::new(total as u64);
-    progress.set_style(
-        ui::progress_bar_style(
-            "  {spinner:.cyan} {bar:32.cyan/dim} {pos}/{len} {percent:>3}% {msg}",
-        )
-        .progress_chars("=> ")
-        .tick_strings(&["|", "/", "-", "\\", ""]),
-    );
-    progress.set_message("starting intent sweep");
-    progress.enable_steady_tick(Duration::from_millis(100));
-    progress
+    presentation::intent_progress_bar(total as u64, "starting intent sweep")
 }
 
 async fn prepare_runtime(args: IntentRuntimeArgs) -> Result<IntentRuntime> {

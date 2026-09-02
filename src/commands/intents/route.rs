@@ -347,7 +347,10 @@ pub async fn plan_sweep(
     let mut plans = Vec::new();
     let mut seen = HashSet::new();
     let pairs = unordered_cross_chain_pairs(&discovery.assets, asset_type);
-    let spinner = ui::wait_spinner(&format!("preflighting {} asset pairs", pairs.len()));
+    let spinner = super::presentation::intent_activity_bar(&format!(
+        "preflighting {} asset pairs",
+        pairs.len()
+    ));
     for (left, right) in pairs {
         let (from, to) = choose_start(left, right);
         let pair_key = canonical_pair(&from.id, &to.id);

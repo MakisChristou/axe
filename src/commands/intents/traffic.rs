@@ -200,17 +200,7 @@ fn render_stats(stats: &TrafficStats) {
 }
 
 fn traffic_progress(total: usize) -> ProgressBar {
-    let progress = ProgressBar::new(total as u64);
-    progress.set_style(
-        ui::progress_bar_style(
-            "  {spinner:.cyan} {bar:32.cyan/dim} {pos}/{len} {percent:>3}% {msg}",
-        )
-        .progress_chars("=> ")
-        .tick_strings(&["|", "/", "-", "\\", ""]),
-    );
-    progress.set_message("simulating intent traffic");
-    progress.enable_steady_tick(Duration::from_millis(100));
-    progress
+    super::presentation::intent_progress_bar(total as u64, "simulating intent traffic")
 }
 
 async fn wait_before_retry(shutdown: &Shutdown) {
