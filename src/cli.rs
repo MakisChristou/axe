@@ -444,7 +444,7 @@ pub struct IntentSendOptions {
 #[derive(Args)]
 pub struct IntentRoundtripOptions {
     #[command(flatten)]
-    pub runtime: IntentRuntimeOptions,
+    pub runtime: IntentRuntimeConfigOptions,
 
     #[command(flatten)]
     pub route: IntentRouteOptions,
@@ -1009,6 +1009,8 @@ mod tests {
                 "intents {command} should resolve its key after CLI parsing"
             );
         }
+        assert!(Cli::try_parse_from(["axe", "intents", "send", "--yes"]).is_ok());
+        assert!(Cli::try_parse_from(["axe", "intents", "roundtrip", "--yes"]).is_err());
         assert!(Cli::try_parse_from(["axe", "intents", "sweep", "--yes"]).is_err());
     }
 

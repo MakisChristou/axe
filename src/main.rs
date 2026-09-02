@@ -463,7 +463,7 @@ async fn run_intents(
             .await
         }
         cli::IntentsCommands::Roundtrip(options) => {
-            let runtime = resolve_intent_runtime(options.runtime, global).await?;
+            let runtime = resolve_intent_runtime_config(options.runtime, global, true).await?;
             let route = commands::intents::RouteChoice::new(
                 options.route.from,
                 options.route.to,

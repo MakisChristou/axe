@@ -219,7 +219,6 @@ pub async fn roundtrip(args: RoundtripArgs) -> Result<()> {
     .await?;
     ui::kv("mode", "one round trip");
     ui::kv("intent deposits", "2");
-    confirm_execution(runtime.auto_confirm, "Execute this intent round trip?").await?;
     let _shutdown = Shutdown::install(DrainTarget::RoundTrip);
 
     let mut results = Vec::new();

@@ -188,7 +188,6 @@ jobs:
 
           ARGS=(
             --network testnet intents roundtrip
-            --yes
             --wallet-bps 1
             --asset-type "$ASSET_TYPE"
             --order-type "$ORDER_TYPE"
