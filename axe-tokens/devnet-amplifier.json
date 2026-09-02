@@ -59,6 +59,20 @@
           "address": "0x15fe0F579f1127cC4240E35E2eadED7eA10a4819"
         }
       }
+    },
+    "core-avalanche": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x26134d6f3b2184b0c54ea76af6C0114c4bb08f77"
+        }
+      }
+    },
+    "core-ethereum": {
+      "contracts": {
+        "SenderReceiver": {
+          "address": "0x0FB386D2D740EA94364Ed7fe59E81bDa01aFA521"
+        }
+      }
     }
   }
 }
