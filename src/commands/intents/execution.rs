@@ -822,7 +822,7 @@ mod tests {
         let progress = ProgressBar::hidden();
         let feedback = ExecutionFeedback::Traffic {
             progress: progress.clone(),
-            context: "0.2 i/s · 1 err · avg 1m15s".to_owned(),
+            context: "1.5 i/m · 1 err · avg 1m15s".to_owned(),
         };
 
         feedback.stage(
@@ -831,7 +831,7 @@ mod tests {
         );
         assert_eq!(
             progress.message(),
-            "0 intents · 0.2 i/s · 1 err · avg 1m15s · deposit"
+            "0 intents · 1.5 i/m · 1 err · avg 1m15s · deposit"
         );
 
         feedback.leg_completed("Arbitrum Sepolia/ETH -> Base Sepolia/ETH");
@@ -839,7 +839,7 @@ mod tests {
         assert!(
             progress
                 .message()
-                .starts_with("1 intents · 0.2 i/s · 1 err")
+                .starts_with("1 intents · 1.5 i/m · 1 err")
         );
 
         feedback.warn("pending state unavailable; using latest-pinned nonce+gas immediately");

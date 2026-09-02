@@ -190,8 +190,8 @@ fn traffic_context(stats: &TrafficStats, elapsed: Duration) -> String {
         .map(|duration| format!(" · avg {}", compact_duration(duration)))
         .unwrap_or_default();
     format!(
-        "{:.1} i/s · {} err{average}",
-        intents_per_second(stats, elapsed),
+        "{:.1} i/m · {} err{average}",
+        intents_per_minute(stats, elapsed),
         stats.failures
     )
 }
@@ -223,11 +223,11 @@ fn average_intent_time(stats: &TrafficStats) -> Option<Duration> {
     (stats.intents > 0).then(|| Duration::from_millis(stats.intent_latency_ms / stats.intents))
 }
 
-fn intents_per_second(stats: &TrafficStats, elapsed: Duration) -> f64 {
+fn intents_per_minute(stats: &TrafficStats, elapsed: Duration) -> f64 {
     if elapsed.is_zero() {
         return 0.0;
     }
-    stats.intents as f64 / elapsed.as_secs_f64()
+    stats.intents as f64 * 60.0 / elapsed.as_secs_f64()
 }
 
 fn compact_duration(duration: Duration) -> String {
@@ -292,8 +292,8 @@ mod tests {
             intent_latency_ms: 300_000,
             ..TrafficStats::default()
         };
-        let context = traffic_context(&stats, Duration::from_secs(2));
+        let context = traffic_context(&stats, Duration::from_secs(120));
 
-        assert_eq!(context, "2.0 i/s · 1 err · avg 1m15s");
+        assert_eq!(context, "2.0 i/m · 1 err · avg 1m15s");
     }
 }
