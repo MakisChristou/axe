@@ -6,7 +6,7 @@ use indicatif::ProgressBar;
 use super::execution::{ExecutionFeedback, execute_round_trip};
 use super::route::{DiscoveryFeedback, discover_wallet, plan_sweep};
 use super::types::{AssetType, OrderType};
-use super::{IntentRuntime, IntentRuntimeArgs, confirm_execution, prepare_runtime};
+use super::{IntentRuntime, IntentRuntimeArgs, prepare_runtime};
 use crate::shutdown::{DrainTarget, Shutdown};
 use crate::ui;
 
@@ -54,12 +54,6 @@ struct TrafficStats {
 pub async fn run(args: TrafficArgs) -> Result<()> {
     let runtime = prepare_runtime(args.runtime).await?;
     render_strategy(args.wallet_bps);
-    confirm_execution(
-        runtime.auto_confirm,
-        "Start continuous intent traffic until Ctrl-C?",
-    )
-    .await?;
-
     let shutdown = Shutdown::install(DrainTarget::RoundTrip);
     let mut stats = TrafficStats::default();
     while !shutdown.requested() {

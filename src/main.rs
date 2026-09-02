@@ -488,7 +488,7 @@ async fn run_intents(
             .await
         }
         cli::IntentsCommands::Traffic(options) => {
-            let runtime = resolve_intent_runtime(options.runtime, global).await?;
+            let runtime = resolve_intent_runtime_config(options.runtime, global, true).await?;
             commands::intents::traffic(commands::intents::TrafficArgs {
                 runtime,
                 wallet_bps: options.wallet_bps,
@@ -633,6 +633,14 @@ async fn resolve_intent_runtime(
     options: cli::IntentRuntimeOptions,
     global: Option<types::Network>,
 ) -> Result<commands::intents::IntentRuntimeArgs> {
+    resolve_intent_runtime_config(options.config, global, options.yes).await
+}
+
+async fn resolve_intent_runtime_config(
+    options: cli::IntentRuntimeConfigOptions,
+    global: Option<types::Network>,
+    yes: bool,
+) -> Result<commands::intents::IntentRuntimeArgs> {
     let network = cli::resolve_network(global, options.config.as_deref())?;
     let config = match options.config {
         Some(path) => path,
@@ -645,6 +653,6 @@ async fn resolve_intent_runtime(
         private_key: options.private_key,
         poll_interval_secs: options.poll_interval_secs,
         fulfillment_timeout_secs: options.fulfillment_timeout_secs,
-        yes: options.yes,
+        yes,
     })
 }

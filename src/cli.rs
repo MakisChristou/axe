@@ -371,7 +371,7 @@ pub struct IntentQuoteBenchOptions {
 }
 
 #[derive(Args)]
-pub struct IntentRuntimeOptions {
+pub struct IntentRuntimeConfigOptions {
     #[command(flatten)]
     pub api: IntentApiOptions,
 
@@ -390,6 +390,12 @@ pub struct IntentRuntimeOptions {
     /// Maximum seconds to wait for one intent fulfillment.
     #[arg(long, default_value = "1200", value_parser = clap::value_parser!(u64).range(1..))]
     pub fulfillment_timeout_secs: u64,
+}
+
+#[derive(Args)]
+pub struct IntentRuntimeOptions {
+    #[command(flatten)]
+    pub config: IntentRuntimeConfigOptions,
 
     /// Execute without an interactive confirmation.
     #[arg(long)]
@@ -476,7 +482,7 @@ pub struct IntentSweepOptions {
 #[derive(Args)]
 pub struct IntentTrafficOptions {
     #[command(flatten)]
-    pub runtime: IntentRuntimeOptions,
+    pub runtime: IntentRuntimeConfigOptions,
 
     /// Maximum basis points of a source balance used by one route.
     #[arg(long, default_value = "10", value_parser = clap::value_parser!(u16).range(1..=1_000))]
@@ -1075,6 +1081,10 @@ mod tests {
                 "1001",
             ])
             .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["axe", "intents", "traffic", "--private-key", "00", "--yes",])
+                .is_err()
         );
     }
 
