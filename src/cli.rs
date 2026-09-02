@@ -453,7 +453,7 @@ pub struct IntentRoundtripOptions {
 #[derive(Args)]
 pub struct IntentSweepOptions {
     #[command(flatten)]
-    pub runtime: IntentRuntimeOptions,
+    pub runtime: IntentRuntimeConfigOptions,
 
     #[command(flatten)]
     pub assets: IntentAssetOptions,
@@ -467,7 +467,7 @@ pub struct IntentSweepOptions {
     pub continuous: bool,
 
     /// Print every executable round trip without submitting transactions.
-    #[arg(long, conflicts_with_all = ["continuous", "sweeps", "yes"])]
+    #[arg(long, conflicts_with_all = ["continuous", "sweeps"])]
     pub dry_run: bool,
 
     /// Basis points of each source asset's spendable balance per route.
@@ -1009,6 +1009,7 @@ mod tests {
                 "intents {command} should resolve its key after CLI parsing"
             );
         }
+        assert!(Cli::try_parse_from(["axe", "intents", "sweep", "--yes"]).is_err());
     }
 
     #[test]

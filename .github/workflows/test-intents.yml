@@ -258,7 +258,6 @@ jobs:
             for order_type in exact-input exact-output; do
               ./target/release/axe --network testnet intents sweep \
                 --sweeps 1 \
-                --yes \
                 --wallet-bps 1 \
                 --asset-type "$asset_type" \
                 --order-type "$order_type"

@@ -243,7 +243,6 @@ pub async fn sweep(args: SweepArgs) -> Result<()> {
     let mut results = Vec::new();
     let mut planned_intents = 0usize;
     let mut sweep = 0u64;
-    let mut confirmed = runtime.auto_confirm;
 
     loop {
         sweep += 1;
@@ -282,10 +281,6 @@ pub async fn sweep(args: SweepArgs) -> Result<()> {
             plans.len(),
             args.asset_type.label()
         ));
-        if !confirmed {
-            confirm_execution(false, "Execute this intent route sweep?").await?;
-            confirmed = true;
-        }
 
         let executed =
             execute_sweep_pass(&runtime, &discovery, &plans, &mut results, &shutdown).await;

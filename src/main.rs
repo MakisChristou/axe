@@ -475,7 +475,7 @@ async fn run_intents(
             commands::intents::roundtrip(commands::intents::RoundtripArgs { runtime, route }).await
         }
         cli::IntentsCommands::Sweep(options) => {
-            let runtime = resolve_intent_runtime(options.runtime, global).await?;
+            let runtime = resolve_intent_runtime_config(options.runtime, global, true).await?;
             commands::intents::sweep(commands::intents::SweepArgs {
                 runtime,
                 sweeps: options.sweeps.unwrap_or(1),
