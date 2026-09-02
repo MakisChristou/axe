@@ -57,6 +57,22 @@ pub fn resolve_quote_sender(
     Ok(signer.address())
 }
 
+pub fn resolve_private_key(
+    override_key: Option<String>,
+    evm_private_key: Option<String>,
+    default_private_key: Option<String>,
+) -> Result<String> {
+    [override_key, evm_private_key, default_private_key]
+        .into_iter()
+        .flatten()
+        .find(|key| !key.trim().is_empty())
+        .ok_or_else(|| {
+            eyre!(
+                "intent execution needs an EVM signing key; set EVM_PRIVATE_KEY or PRIVATE_KEY, or pass --private-key"
+            )
+        })
+}
+
 pub struct IntentRuntimeArgs {
     pub network: Network,
     pub api_url: Option<String>,
@@ -344,7 +360,7 @@ async fn prepare_runtime(args: IntentRuntimeArgs) -> Result<IntentRuntime> {
     let signer: PrivateKeySigner = args
         .private_key
         .parse()
-        .wrap_err("EVM_PRIVATE_KEY is not a valid hex private key")?;
+        .wrap_err("intent EVM private key is not valid hex")?;
     let config = ChainsConfig::load(&args.config).await?;
     let client = RfqClient::new(args.network, args.api_url.as_deref())?;
     let limits = RunLimits {
@@ -471,5 +487,27 @@ mod tests {
             address
         );
         assert_eq!(resolve_quote_sender(None, None).unwrap(), Address::ZERO);
+    }
+
+    #[test]
+    fn resolves_intent_key_by_precedence() {
+        assert_eq!(
+            resolve_private_key(
+                Some("override".to_owned()),
+                Some("evm".to_owned()),
+                Some("default".to_owned()),
+            )
+            .unwrap(),
+            "override"
+        );
+        assert_eq!(
+            resolve_private_key(None, Some("evm".to_owned()), Some("default".to_owned())).unwrap(),
+            "evm"
+        );
+        assert_eq!(
+            resolve_private_key(None, None, Some("default".to_owned())).unwrap(),
+            "default"
+        );
+        assert!(resolve_private_key(None, None, None).is_err());
     }
 }

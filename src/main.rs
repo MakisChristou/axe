@@ -642,6 +642,11 @@ async fn resolve_intent_runtime_config(
     yes: bool,
 ) -> Result<commands::intents::IntentRuntimeArgs> {
     let network = cli::resolve_network(global, options.config.as_deref())?;
+    let private_key = commands::intents::resolve_private_key(
+        options.private_key,
+        std::env::var("EVM_PRIVATE_KEY").ok(),
+        std::env::var("PRIVATE_KEY").ok(),
+    )?;
     let config = match options.config {
         Some(path) => path,
         None => config_source::resolve(network, None).await?.into_path(),
@@ -650,7 +655,7 @@ async fn resolve_intent_runtime_config(
         network,
         api_url: options.api.api_url,
         config,
-        private_key: options.private_key,
+        private_key,
         poll_interval_secs: options.poll_interval_secs,
         fulfillment_timeout_secs: options.fulfillment_timeout_secs,
         yes,

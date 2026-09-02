@@ -379,9 +379,9 @@ pub struct IntentRuntimeConfigOptions {
     #[arg(long, env = "CHAINS_CONFIG")]
     pub config: Option<PathBuf>,
 
-    /// EVM key for the axe wallet (prefer EVM_PRIVATE_KEY).
+    /// Optional EVM key override. Defaults to EVM_PRIVATE_KEY, then PRIVATE_KEY.
     #[arg(long, env = "EVM_PRIVATE_KEY", hide_env_values = true)]
-    pub private_key: String,
+    pub private_key: Option<String>,
 
     /// Seconds between RFQ status requests.
     #[arg(long, default_value = "2", value_parser = clap::value_parser!(u64).range(1..))]
@@ -999,6 +999,16 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn intent_execution_commands_do_not_require_private_key_flags() {
+        for command in ["send", "roundtrip", "sweep", "traffic"] {
+            assert!(
+                Cli::try_parse_from(["axe", "intents", command]).is_ok(),
+                "intents {command} should resolve its key after CLI parsing"
+            );
+        }
     }
 
     #[test]
