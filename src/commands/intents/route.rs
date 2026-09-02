@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, U256, U512};
 use alloy::providers::Provider;
 use eyre::{Result, WrapErr, eyre};
 use rand::seq::SliceRandom;
@@ -18,6 +18,8 @@ use crate::retry::retry_with_fallback_all;
 use crate::ui;
 
 const BPS_DENOMINATOR: u64 = 10_000;
+const EXACT_OUTPUT_HEADROOM_BPS: u64 = 9_500;
+const EXACT_OUTPUT_CALIBRATION_ATTEMPTS: usize = 3;
 const GAS_RESERVE_WEI: u64 = 1_000_000_000_000_000;
 
 pub struct RouteDiscovery {
@@ -705,25 +707,28 @@ async fn preflight_pair(
     requested_amount: U256,
     input_budget: RoundTripInputBudget,
 ) -> Result<Option<RoutePlan>> {
-    let forward = quote_request(from, to, signer, signer, order_type, requested_amount);
-    let QuoteOutcome::Available(forward) = client.quote(&forward).await? else {
+    let Some(forward) = preflight_forward(
+        client,
+        from,
+        to,
+        signer,
+        order_type,
+        requested_amount,
+        input_budget,
+    )
+    .await?
+    else {
         return Ok(None);
     };
-    validate_quote(&forward.quote, from, to, order_type, requested_amount)?;
-    let forward_input = parse_amount(&forward.quote.input.amount)?;
-    if !forward_input_is_within_budget(forward_input, input_budget) {
-        return Ok(None);
-    }
-    let forward_output = parse_amount(&forward.quote.output.amount)?;
     let reverse_amount = match order_type {
-        OrderType::ExactInput => forward_output,
-        OrderType::ExactOutput => forward_input,
+        OrderType::ExactInput => forward.output,
+        OrderType::ExactOutput => forward.input,
     };
     let reverse_request = quote_request(to, from, signer, signer, order_type, reverse_amount);
     let QuoteOutcome::Available(reverse) = client.quote(&reverse_request).await? else {
         return Ok(None);
     };
-    let reverse_source = with_received_balance(to, forward_output)?;
+    let reverse_source = with_received_balance(to, forward.output)?;
     validate_quote(
         &reverse.quote,
         &reverse_source,
@@ -732,7 +737,7 @@ async fn preflight_pair(
         reverse_amount,
     )?;
     let reverse_input = parse_amount(&reverse.quote.input.amount)?;
-    if !reverse_input_is_within_budget(reverse_input, forward_output, input_budget) {
+    if !reverse_input_is_within_budget(reverse_input, forward.output, input_budget) {
         return Ok(None);
     }
     let expected_return = parse_amount(&reverse.quote.output.amount)?;
@@ -740,13 +745,78 @@ async fn preflight_pair(
         from: from.clone(),
         to: to.clone(),
         order_type,
-        requested_amount,
-        input_amount: forward_input,
+        requested_amount: forward.requested,
+        input_amount: forward.input,
         expected_return,
-        forward_quote_ms: duration_ms(forward.latency),
+        forward_quote_ms: forward.quote_ms,
         reverse_quote_ms: duration_ms(reverse.latency),
         input_budget,
     }))
+}
+
+struct ForwardPreflight {
+    requested: U256,
+    input: U256,
+    output: U256,
+    quote_ms: u64,
+}
+
+async fn preflight_forward(
+    client: &RfqClient,
+    from: &WalletAsset,
+    to: &WalletAsset,
+    signer: Address,
+    order_type: OrderType,
+    initial_amount: U256,
+    input_budget: RoundTripInputBudget,
+) -> Result<Option<ForwardPreflight>> {
+    let mut requested = initial_amount;
+    for _ in 0..EXACT_OUTPUT_CALIBRATION_ATTEMPTS {
+        let request = quote_request(from, to, signer, signer, order_type, requested);
+        let QuoteOutcome::Available(quote) = client.quote(&request).await? else {
+            return Ok(None);
+        };
+        validate_quote_route(&quote.quote, &from.id, &to.id, order_type, requested)?;
+        let input = parse_amount(&quote.quote.input.amount)?;
+        if forward_input_is_within_budget(input, input_budget) {
+            validate_quote(&quote.quote, from, to, order_type, requested)?;
+            return Ok(Some(ForwardPreflight {
+                requested,
+                input,
+                output: parse_amount(&quote.quote.output.amount)?,
+                quote_ms: duration_ms(quote.latency),
+            }));
+        }
+        if order_type != OrderType::ExactOutput {
+            return Ok(None);
+        }
+        let Some(limit) = forward_input_limit(input_budget) else {
+            return Ok(None);
+        };
+        let Some(adjusted) = calibrate_exact_output(requested, input, limit) else {
+            return Ok(None);
+        };
+        requested = adjusted;
+    }
+    Ok(None)
+}
+
+fn forward_input_limit(budget: RoundTripInputBudget) -> Option<U256> {
+    match budget {
+        RoundTripInputBudget::SpendableBalance => None,
+        RoundTripInputBudget::Capped { forward, .. } => Some(forward),
+    }
+}
+
+fn calibrate_exact_output(requested: U256, quoted_input: U256, input_limit: U256) -> Option<U256> {
+    if quoted_input.is_zero() {
+        return None;
+    }
+    let target_input = U512::from(input_limit) * U512::from(EXACT_OUTPUT_HEADROOM_BPS)
+        / U512::from(BPS_DENOMINATOR);
+    let adjusted = U512::from(requested) * target_input / U512::from(quoted_input);
+    let adjusted = adjusted.saturating_to::<U256>();
+    (!adjusted.is_zero() && adjusted < requested).then_some(adjusted)
 }
 
 fn forward_input_is_within_budget(input: U256, budget: RoundTripInputBudget) -> bool {
@@ -1232,6 +1302,24 @@ mod tests {
             U256::from(100),
             budget
         ));
+    }
+
+    #[test]
+    fn exact_output_calibration_leaves_headroom_below_the_input_limit() {
+        assert_eq!(
+            calibrate_exact_output(
+                U256::from(1_000_000),
+                U256::from(1_010_000),
+                U256::from(1_000_000)
+            ),
+            Some(U256::from(940_594))
+        );
+        let large = calibrate_exact_output(U256::MAX, U256::MAX, U256::MAX).unwrap();
+        assert!(large < U256::MAX);
+        assert_eq!(
+            calibrate_exact_output(U256::from(1), U256::ZERO, U256::from(1)),
+            None
+        );
     }
 
     #[test]
