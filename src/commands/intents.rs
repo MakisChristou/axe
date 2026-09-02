@@ -37,6 +37,22 @@ pub use read::{
     routes, status,
 };
 
+pub fn resolve_wallet_address(
+    wallet_address: Option<Address>,
+    private_key: Option<String>,
+) -> Result<Address> {
+    if let Some(wallet_address) = wallet_address {
+        return Ok(wallet_address);
+    }
+    let private_key = private_key.ok_or_else(|| {
+        eyre!("Provide --wallet-address or set EVM_PRIVATE_KEY to discover executable routes")
+    })?;
+    let signer: PrivateKeySigner = private_key
+        .parse()
+        .wrap_err("EVM_PRIVATE_KEY is not a valid hex private key")?;
+    Ok(signer.address())
+}
+
 pub struct IntentRuntimeArgs {
     pub network: Network,
     pub api_url: Option<String>,
@@ -448,5 +464,21 @@ mod tests {
             format_latency_percentiles(&[181, 2_924, 8_823]),
             "p50 2.92 s │ p95 8.82 s"
         );
+    }
+
+    #[test]
+    fn resolves_wallet_from_an_address_or_private_key() {
+        let signer = PrivateKeySigner::random();
+        let address = signer.address();
+
+        assert_eq!(
+            resolve_wallet_address(Some(address), Some("ignored".to_owned())).unwrap(),
+            address
+        );
+        assert_eq!(
+            resolve_wallet_address(None, Some(signer.to_bytes().to_string())).unwrap(),
+            address
+        );
+        assert!(resolve_wallet_address(None, None).is_err());
     }
 }

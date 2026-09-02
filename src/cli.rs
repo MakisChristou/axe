@@ -247,9 +247,13 @@ pub struct IntentRoutesOptions {
     #[command(flatten)]
     pub assets: IntentAssetOptions,
 
-    /// EVM address whose balances determine executable routes.
+    /// EVM address whose balances determine executable routes. Overrides EVM_PRIVATE_KEY.
     #[arg(long)]
-    pub wallet_address: Address,
+    pub wallet_address: Option<Address>,
+
+    /// EVM key used only to derive the wallet address when --wallet-address is omitted.
+    #[arg(long, env = "EVM_PRIVATE_KEY", hide_env_values = true)]
+    pub private_key: Option<String>,
 
     /// Basis points of each source asset's spendable balance to quote.
     #[arg(long, default_value = "100", value_parser = clap::value_parser!(u16).range(1..=10_000))]
@@ -1085,6 +1089,7 @@ mod tests {
         assert!(
             Cli::try_parse_from(["axe", "intents", "routes", "--wallet-address", ADDRESS,]).is_ok()
         );
+        assert!(Cli::try_parse_from(["axe", "intents", "routes", "--private-key", "00",]).is_ok());
         assert!(
             Cli::try_parse_from([
                 "axe", "intents", "quote", "--from", ASSET, "--to", ASSET, "--amount", "1",
@@ -1113,10 +1118,10 @@ mod tests {
     }
 
     #[test]
-    fn intent_read_commands_require_route_context() {
+    fn routes_resolve_wallet_at_runtime_and_quotes_require_sender() {
         const ASSET: &str = "eip155:11155111/0x0000000000000000000000000000000000000000";
 
-        assert!(Cli::try_parse_from(["axe", "intents", "routes"]).is_err());
+        assert!(Cli::try_parse_from(["axe", "intents", "routes"]).is_ok());
         assert!(
             Cli::try_parse_from([
                 "axe", "intents", "quote", "--from", ASSET, "--to", ASSET, "--amount", "1",

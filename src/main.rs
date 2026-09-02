@@ -522,10 +522,12 @@ async fn run_intent_routes(
 ) -> Result<()> {
     let (api, config) =
         resolve_intent_read_config(options.read.api, options.config, global).await?;
+    let wallet =
+        commands::intents::resolve_wallet_address(options.wallet_address, options.private_key)?;
     commands::intents::routes(commands::intents::RoutesArgs {
         api,
         config,
-        wallet: options.wallet_address,
+        wallet,
         wallet_bps: options.wallet_bps,
         order_type: options.order_type,
         asset_type: options.assets.asset_type,
