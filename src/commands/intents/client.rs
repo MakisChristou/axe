@@ -4,8 +4,8 @@ use eyre::{Result, WrapErr, bail, eyre};
 use reqwest::StatusCode;
 
 use super::types::{
-    ChainsResponse, QuoteOutcome, QuoteRequest, QuoteResponse, StatusResponse, TimedQuote,
-    TokensResponse,
+    BackendType, ChainsResponse, QuoteOutcome, QuoteRequest, QuoteResponse, StatusResponse,
+    TimedQuote, TokensResponse,
 };
 use crate::types::Network;
 
@@ -97,7 +97,7 @@ impl RfqClient {
         let Some(quote) = body
             .quotes
             .into_iter()
-            .find(|quote| quote.backend.kind == "intent")
+            .find(|quote| quote.backend.kind == BackendType::Intent)
         else {
             return Ok(QuoteOutcome::Unavailable(
                 "no intent quote returned".to_owned(),

@@ -10,7 +10,7 @@ use serde_json::json;
 use super::client::RfqClient;
 use super::presentation::asset_table;
 use super::types::{
-    AssetSpec, CatalogChain, CatalogResponse, CatalogToken, EvmTransactionPayload, HumanAmount,
+    ActionPayload, AssetSpec, CatalogChain, CatalogResponse, CatalogToken, FeeEntry, HumanAmount,
     LegPlan, OrderType, Quote, QuoteRequest, StatusResponse, TokenInfo, TokensResponse,
     TransferState, format_units, is_native_token, parse_amount,
 };
@@ -294,9 +294,13 @@ fn render_catalog(catalog: &CatalogResponse) {
 fn render_quote(quote: &Quote, latency: Duration, from: &TokenInfo, to: &TokenInfo) -> Result<()> {
     ui::section("intent quote");
     ui::kv("quote ID", &quote.quote_id);
-    if let Some(swap_id) = quote.backend.tracking.swap_id.as_deref() {
+    if let Some(swap_id) = quote.backend.swap_id() {
         ui::kv("swap ID", swap_id);
     }
+    ui::kv(
+        "backend",
+        &format!("{} ({})", quote.backend.name, quote.backend.kind),
+    );
     ui::kv(
         "route",
         &format!(
@@ -306,20 +310,37 @@ fn render_quote(quote: &Quote, latency: Duration, from: &TokenInfo, to: &TokenIn
     );
     ui::kv(
         "input",
-        &format!(
-            "{} {}",
-            format_units(parse_amount(&quote.input.amount)?, from.decimals),
-            from.symbol
+        &with_usd(
+            &format_units(parse_amount(&quote.input.amount)?, from.decimals),
+            &from.symbol,
+            quote.input.amount_usd_approx.as_deref(),
         ),
     );
     ui::kv(
         "output",
-        &format!(
-            "{} {}",
-            format_units(parse_amount(&quote.output.amount)?, to.decimals),
-            to.symbol
+        &with_usd(
+            &format_units(parse_amount(&quote.output.amount)?, to.decimals),
+            &to.symbol,
+            quote.output.amount_usd_approx.as_deref(),
         ),
     );
+    if let Some(minimum) = quote.output.minimum_amount.as_deref() {
+        ui::kv(
+            "minimum output",
+            &format!(
+                "{} {}",
+                format_units(parse_amount(minimum)?, to.decimals),
+                to.symbol
+            ),
+        );
+    }
+    ui::kv(
+        "estimated completion",
+        &ui::format_duration(Duration::from_secs(quote.estimated_time_seconds)),
+    );
+    render_fee("gas fee", quote.fees.gas.as_ref());
+    render_fee("user fee", quote.fees.user.as_ref());
+    render_fee("integrator fee", quote.fees.integrator.as_ref());
     ui::kv("quote latency", &ui::format_duration(latency));
     ui::kv(
         "quote expires in",
@@ -335,11 +356,37 @@ fn render_quote(quote: &Quote, latency: Duration, from: &TokenInfo, to: &TokenIn
 fn render_actions(quote: &Quote) {
     ui::kv("actions", &quote.actions.len().to_string());
     for action in &quote.actions {
-        let target = serde_json::from_value::<EvmTransactionPayload>(action.payload.clone())
-            .map(|payload| payload.to)
-            .unwrap_or_else(|_| "unknown target".to_owned());
+        let target = match &action.payload {
+            ActionPayload::EvmTransaction(payload) => payload.to.as_str(),
+            ActionPayload::DepositAddress(payload) => payload.address.as_str(),
+            ActionPayload::SolanaInstructions(_) => "Solana instructions",
+        };
         println!("  {:<12} {:<18} {}", action.kind, action.chain, target);
     }
+}
+
+fn with_usd(amount: &str, symbol: &str, usd: Option<&str>) -> String {
+    let value = format!("{amount} {symbol}");
+    usd.map_or(value.clone(), |usd| format!("{value} (~${usd})"))
+}
+
+fn render_fee(label: &str, fee: Option<&FeeEntry>) {
+    let Some(fee) = fee else {
+        ui::kv(label, "none");
+        return;
+    };
+    let usd = fee
+        .amount_usd_approx
+        .as_deref()
+        .map(|value| format!(" · ~${value}"))
+        .unwrap_or_default();
+    ui::kv(
+        label,
+        &format!(
+            "{} {} base units{usd} · {} · {}",
+            fee.amount, fee.token.symbol, fee.payment_method, fee.quote_treatment
+        ),
+    );
 }
 
 fn remaining_until(deadline: chrono::DateTime<Utc>) -> String {
@@ -358,8 +405,26 @@ fn render_status(status: &StatusResponse, json: bool) -> Result<()> {
     ui::section("intent status");
     ui::kv("quote ID", &status.quote_id);
     ui::kv("status", status.state.label());
+    ui::kv(
+        "backend",
+        &format!("{} ({})", status.backend.name, status.backend.kind),
+    );
+    if let Some(source) = &status.source {
+        ui::kv("source chain", &source.chain);
+        ui::tx_hash("source transaction", &source.tx_hash);
+        ui::kv("message ID", &source.message_id);
+        ui::kv("source timestamp", &source.timestamp.to_rfc3339());
+    }
+    if let Some(input) = &status.input {
+        ui::kv(
+            "input",
+            &format!("{} {} on {}", input.amount, input.token, input.chain),
+        );
+    }
     if let Some(destination) = &status.destination {
-        ui::tx_hash("destination", &destination.tx_hash);
+        ui::kv("destination chain", &destination.chain);
+        ui::tx_hash("destination transaction", &destination.tx_hash);
+        ui::kv("destination timestamp", &destination.timestamp.to_rfc3339());
     }
     if let Some(output) = &status.output {
         ui::kv(
@@ -452,9 +517,18 @@ mod tests {
         let status = StatusResponse {
             quote_id: "missing-quote".into(),
             state: TransferState::NotFound,
+            backend: super::super::types::Backend {
+                kind: super::super::types::BackendType::Intent,
+                name: "Axelar Intents".into(),
+                tracking: json!({}),
+                metadata: json!({}),
+            },
+            source: None,
             destination: None,
+            input: None,
             output: None,
             refund: None,
+            details: json!({}),
         };
 
         assert_eq!(

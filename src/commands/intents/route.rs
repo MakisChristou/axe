@@ -1003,7 +1003,7 @@ pub fn validate_quote_route(
         OrderType::ExactInput => parse_amount(&quote.input.amount)?,
         OrderType::ExactOutput => parse_amount(&quote.output.amount)?,
     };
-    if quote.backend.kind != "intent"
+    if quote.backend.kind != super::types::BackendType::Intent
         || quote.input.chain != from.chain_id
         || !quote.input.token.eq_ignore_ascii_case(&from.token_address)
         || quote.output.chain != to.chain_id
@@ -1131,7 +1131,9 @@ fn average_quote_ms(plans: &[RoutePlan]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::intents::types::{Backend, QuoteAmount, Validity};
+    use crate::commands::intents::types::{
+        Backend, BackendType, Fees, QuoteInput, QuoteOutput, SelectionReason, Validity,
+    };
 
     fn asset(chain: &str, token: &str, balance: u64, native: bool) -> WalletAsset {
         WalletAsset {
@@ -1325,24 +1327,33 @@ mod tests {
         let to = asset("eip155:2", "b", 0, false);
         let quote = Quote {
             quote_id: "quote-id".into(),
+            selection_reason: SelectionReason::BestAvailable,
             backend: Backend {
-                kind: "intent".into(),
-                tracking: Default::default(),
+                kind: BackendType::Intent,
+                name: "Axelar Intents".into(),
+                tracking: serde_json::json!({}),
+                metadata: serde_json::json!({}),
             },
+            estimated_time_seconds: 60,
             validity: Validity {
+                kind: "expires_at".into(),
                 quote_expires_at: chrono::Utc::now() + chrono::Duration::minutes(1),
                 fulfillment_deadline: None,
             },
-            input: QuoteAmount {
+            input: QuoteInput {
                 chain: from.id.chain_id.clone(),
                 token: from.id.token_address.clone(),
                 amount: "1003514".into(),
+                amount_usd_approx: None,
             },
-            output: QuoteAmount {
+            output: QuoteOutput {
                 chain: to.id.chain_id.clone(),
                 token: to.id.token_address.clone(),
                 amount: "1000000".into(),
+                minimum_amount: Some("1000000".into()),
+                amount_usd_approx: None,
             },
+            fees: Fees::default(),
             actions: Vec::new(),
         };
 

@@ -14,9 +14,9 @@ use super::client::RfqClient;
 use super::presentation::set_intent_traffic_message;
 use super::route::{quote_request, validate_quote};
 use super::types::{
-    Action, ChainRuntime, EvmTransactionPayload, LegExecution, LegPlan, LegResult, Quote,
-    QuoteOutcome, QuoteRequest, RoundTripInputBudget, RoutePlan, RunLimits, StatusOutput,
-    TimedQuote, TransferState, WalletAsset, parse_amount,
+    Action, ActionKind, ActionPayload, ChainRuntime, EvmTransactionPayload, LegExecution, LegPlan,
+    LegResult, Quote, QuoteOutcome, QuoteRequest, RoundTripInputBudget, RoutePlan, RunLimits,
+    StatusOutput, TimedQuote, TransferState, WalletAsset, parse_amount,
 };
 use crate::evm::{ERC20, EvmEndpoints, send_tx_robust_with_warning};
 use crate::retry::retry_with_fallback_all;
@@ -279,7 +279,7 @@ async fn execute_selected_leg(
         .quote
         .actions
         .iter()
-        .filter(|action| action.kind == "transaction")
+        .filter(|action| action.kind == ActionKind::Transaction)
         .cloned()
         .collect();
     if deposits.len() != 1 {
@@ -295,7 +295,7 @@ async fn execute_selected_leg(
     validate_deposit_action(deposit, &execution.from, execution.input_amount)?;
     if feedback.is_detailed() {
         ui::kv("quote", &selected.quote.quote_id);
-        if let Some(swap_id) = selected.quote.backend.tracking.swap_id.as_deref() {
+        if let Some(swap_id) = selected.quote.backend.swap_id() {
             ui::kv("swap", swap_id);
         }
     }
@@ -396,7 +396,7 @@ async fn ensure_input_approval(
         .quote
         .actions
         .iter()
-        .filter(|action| action.kind == "approval")
+        .filter(|action| action.kind == ActionKind::Approval)
         .cloned()
         .collect::<Vec<_>>();
     if approvals.is_empty() {
@@ -491,14 +491,7 @@ fn action_request(
         ));
     }
     let payload = action_payload(action)?;
-    if payload.kind != "evm_transaction" {
-        return Err(eyre!(
-            "action '{}' has payload type '{}', expected evm_transaction",
-            action.id,
-            payload.kind
-        ));
-    }
-    if let Some(from) = payload.from {
+    if let Some(from) = &payload.from {
         let from: Address = from
             .parse()
             .wrap_err_with(|| format!("action '{}' has an invalid from address", action.id))?;
@@ -524,9 +517,13 @@ fn action_request(
         .value(value))
 }
 
-fn action_payload(action: &Action) -> Result<EvmTransactionPayload> {
-    serde_json::from_value(action.payload.clone())
-        .wrap_err_with(|| format!("action '{}' is not an EVM transaction", action.id))
+fn action_payload(action: &Action) -> Result<&EvmTransactionPayload> {
+    match &action.payload {
+        ActionPayload::EvmTransaction(payload) => Ok(payload),
+        ActionPayload::SolanaInstructions(_) | ActionPayload::DepositAddress(_) => {
+            Err(eyre!("action '{}' is not an EVM transaction", action.id))
+        }
+    }
 }
 
 async fn required_approvals(
@@ -575,7 +572,10 @@ async fn required_approvals(
 }
 
 fn maximum_approval_action(action: &Action, requirement: ApprovalRequirement) -> Result<Action> {
-    let mut payload = action_payload(action)?;
+    let mut maximum = action.clone();
+    let ActionPayload::EvmTransaction(payload) = &mut maximum.payload else {
+        return Err(eyre!("action '{}' is not an EVM transaction", action.id));
+    };
     payload.data = format!(
         "0x{}",
         hex::encode(
@@ -586,12 +586,7 @@ fn maximum_approval_action(action: &Action, requirement: ApprovalRequirement) ->
             .abi_encode()
         )
     );
-    Ok(Action {
-        id: action.id.clone(),
-        kind: action.kind.clone(),
-        chain: action.chain.clone(),
-        payload: serde_json::to_value(payload).wrap_err("could not encode maximum approval")?,
-    })
+    Ok(maximum)
 }
 
 fn approval_requirement(
@@ -783,18 +778,44 @@ impl Quote {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     use super::super::types::AssetId;
 
+    fn evm_action(
+        id: &str,
+        kind: ActionKind,
+        chain: &str,
+        from: Address,
+        to: Address,
+        data: String,
+    ) -> Action {
+        Action {
+            id: id.into(),
+            label: id.into(),
+            kind,
+            chain: chain.into(),
+            payload: ActionPayload::EvmTransaction(EvmTransactionPayload {
+                from: Some(from.to_string()),
+                to: to.to_string(),
+                data,
+                value: "0".into(),
+                gas_limit: None,
+                max_fee_per_gas: None,
+                max_priority_fee_per_gas: None,
+            }),
+        }
+    }
+
     #[test]
     fn rejects_an_action_for_another_chain() {
-        let action = Action {
-            id: "deposit".into(),
-            kind: "transaction".into(),
-            chain: "eip155:2".into(),
-            payload: json!({}),
-        };
+        let action = evm_action(
+            "deposit",
+            ActionKind::Transaction,
+            "eip155:2",
+            Address::ZERO,
+            Address::ZERO,
+            "0x".into(),
+        );
         let error = action_request(&action, Address::ZERO, "eip155:1").unwrap_err();
         assert!(error.to_string().contains("expected eip155:1"));
     }
@@ -804,18 +825,16 @@ mod tests {
         let signer = "0x0000000000000000000000000000000000000001"
             .parse::<Address>()
             .unwrap();
-        let action = Action {
-            id: "deposit".into(),
-            kind: "transaction".into(),
-            chain: "eip155:1".into(),
-            payload: json!({
-                "type": "evm_transaction",
-                "from": signer.to_string(),
-                "to": "0x0000000000000000000000000000000000000002",
-                "data": "0x1234",
-                "value": "0"
-            }),
-        };
+        let action = evm_action(
+            "deposit",
+            ActionKind::Transaction,
+            "eip155:1",
+            signer,
+            "0x0000000000000000000000000000000000000002"
+                .parse()
+                .unwrap(),
+            "0x1234".into(),
+        );
         assert!(action_request(&action, signer, "eip155:1").is_ok());
     }
 
@@ -825,18 +844,14 @@ mod tests {
         let spender = Address::from([2u8; 20]);
         let amount = U256::from(1_000_000u64);
         let data = ERC20::approveCall { spender, amount }.abi_encode();
-        let action = Action {
-            id: "approve".into(),
-            kind: "approval".into(),
-            chain: "eip155:1".into(),
-            payload: json!({
-                "type": "evm_transaction",
-                "from": Address::ZERO.to_string(),
-                "to": token.to_string(),
-                "data": format!("0x{}", hex::encode(data)),
-                "value": "0"
-            }),
-        };
+        let action = evm_action(
+            "approve",
+            ActionKind::Approval,
+            "eip155:1",
+            Address::ZERO,
+            token,
+            format!("0x{}", hex::encode(data)),
+        );
         let source = WalletAsset {
             id: AssetId {
                 chain_id: "eip155:1".into(),
@@ -861,21 +876,17 @@ mod tests {
         let token = Address::from([1u8; 20]);
         let spender = Address::from([2u8; 20]);
         let amount = U256::from(1_000_000u64);
-        let action = Action {
-            id: "approve".into(),
-            kind: "approval".into(),
-            chain: "eip155:1".into(),
-            payload: json!({
-                "type": "evm_transaction",
-                "from": Address::ZERO.to_string(),
-                "to": token.to_string(),
-                "data": format!(
-                    "0x{}",
-                    hex::encode(ERC20::approveCall { spender, amount }.abi_encode())
-                ),
-                "value": "0"
-            }),
-        };
+        let action = evm_action(
+            "approve",
+            ActionKind::Approval,
+            "eip155:1",
+            Address::ZERO,
+            token,
+            format!(
+                "0x{}",
+                hex::encode(ERC20::approveCall { spender, amount }.abi_encode())
+            ),
+        );
         let requirement = ApprovalRequirement { spender, amount };
 
         let maximum = maximum_approval_action(&action, requirement).unwrap();

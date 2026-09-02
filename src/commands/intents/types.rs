@@ -6,7 +6,7 @@ use std::time::Duration;
 use alloy::primitives::{Address, U256};
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChainsResponse {
@@ -116,83 +116,234 @@ pub struct QuoteResponse {
 #[serde(rename_all = "camelCase")]
 pub struct Quote {
     pub quote_id: String,
+    pub selection_reason: SelectionReason,
     pub backend: Backend,
+    pub estimated_time_seconds: u64,
     pub validity: Validity,
-    pub input: QuoteAmount,
-    pub output: QuoteAmount,
+    pub input: QuoteInput,
+    pub output: QuoteOutput,
+    pub fees: Fees,
     pub actions: Vec<Action>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionReason {
+    BestAvailable,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Backend {
     #[serde(rename = "type")]
-    pub kind: String,
-    #[serde(default)]
-    pub tracking: BackendTracking,
+    pub kind: BackendType,
+    pub name: String,
+    pub tracking: serde_json::Value,
+    pub metadata: serde_json::Value,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BackendTracking {
-    pub swap_id: Option<String>,
+impl Backend {
+    pub fn swap_id(&self) -> Option<&str> {
+        self.tracking.get("swapId").and_then(|value| value.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackendType {
+    Intent,
+    Its,
+    Gateway,
+    GatewayExpress,
+}
+
+impl Display for BackendType {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Intent => "intent",
+            Self::Its => "its",
+            Self::Gateway => "gateway",
+            Self::GatewayExpress => "gateway-express",
+        };
+        formatter.write_str(value)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Validity {
-    #[serde(deserialize_with = "deserialize_datetime")]
+    #[serde(rename = "type")]
+    pub kind: String,
     pub quote_expires_at: DateTime<Utc>,
-    #[serde(default, deserialize_with = "deserialize_optional_datetime")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fulfillment_deadline: Option<DateTime<Utc>>,
 }
 
-fn deserialize_datetime<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = String::deserialize(deserializer)?;
-    DateTime::parse_from_rfc3339(&value)
-        .map(|datetime| datetime.with_timezone(&Utc))
-        .map_err(serde::de::Error::custom)
-}
-
-fn deserialize_optional_datetime<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Option::<String>::deserialize(deserializer)?
-        .map(|value| {
-            DateTime::parse_from_rfc3339(&value).map(|datetime| datetime.with_timezone(&Utc))
-        })
-        .transpose()
-        .map_err(serde::de::Error::custom)
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct QuoteAmount {
+#[serde(rename_all = "camelCase")]
+pub struct QuoteInput {
     pub chain: String,
     pub token: String,
     pub amount: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount_usd_approx: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuoteOutput {
+    pub chain: String,
+    pub token: String,
+    pub amount: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimum_amount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount_usd_approx: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct Fees {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gas: Option<FeeEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<FeeEntry>,
+    pub integrator: Option<FeeEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeeEntry {
+    pub amount: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount_usd_approx: Option<String>,
+    pub token: FeeToken,
+    pub payment_method: PaymentMethod,
+    pub quote_treatment: QuoteTreatment,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FeeToken {
+    pub chain: String,
+    pub symbol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaymentMethod {
+    WalletNative,
+    TxValue,
+    InputToken,
+    OutputToken,
+    Sponsored,
+    Offchain,
+}
+
+impl Display for PaymentMethod {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::WalletNative => "wallet native",
+            Self::TxValue => "transaction value",
+            Self::InputToken => "input token",
+            Self::OutputToken => "output token",
+            Self::Sponsored => "sponsored",
+            Self::Offchain => "off-chain",
+        };
+        formatter.write_str(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuoteTreatment {
+    OutsideQuote,
+    IncludedInQuote,
+    Informational,
+}
+
+impl Display for QuoteTreatment {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::OutsideQuote => "outside quote",
+            Self::IncludedInQuote => "included in quote",
+            Self::Informational => "informational",
+        };
+        formatter.write_str(value)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Action {
     pub id: String,
+    pub label: String,
     #[serde(rename = "type")]
-    pub kind: String,
+    pub kind: ActionKind,
     pub chain: String,
-    pub payload: serde_json::Value,
+    pub payload: ActionPayload,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionKind {
+    Approval,
+    Transaction,
+    DepositAddress,
+}
+
+impl Display for ActionKind {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Approval => "approval",
+            Self::Transaction => "transaction",
+            Self::DepositAddress => "deposit_address",
+        };
+        formatter.write_str(value)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ActionPayload {
+    EvmTransaction(EvmTransactionPayload),
+    SolanaInstructions(SolanaInstructionsPayload),
+    DepositAddress(DepositAddressPayload),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EvmTransactionPayload {
-    #[serde(rename = "type")]
-    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     pub to: String,
     pub data: String,
     pub value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gas_limit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_fee_per_gas: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_priority_fee_per_gas: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SolanaInstructionsPayload {
+    pub instructions: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub address_lookup_table_addresses: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DepositAddressPayload {
+    pub address: String,
+    pub amount: String,
+    pub token: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -200,9 +351,13 @@ pub struct EvmTransactionPayload {
 pub struct StatusResponse {
     pub quote_id: String,
     pub state: TransferState,
+    pub backend: Backend,
+    pub source: Option<ChainExecution>,
     pub destination: Option<ChainDelivery>,
+    pub input: Option<StatusInput>,
     pub output: Option<StatusOutput>,
     pub refund: Option<Refund>,
+    pub details: serde_json::Value,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -235,8 +390,26 @@ impl TransferState {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ChainDelivery {
+pub struct ChainExecution {
+    pub chain: String,
     pub tx_hash: String,
+    pub message_id: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainDelivery {
+    pub chain: String,
+    pub tx_hash: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StatusInput {
+    pub chain: String,
+    pub token: String,
+    pub amount: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -501,6 +674,7 @@ impl Display for AssetId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn formats_base_units_without_float_rounding() {
@@ -598,5 +772,137 @@ mod tests {
         assert!(!TransferState::AwaitingDeposit.is_terminal());
         assert!(!TransferState::Pending.is_terminal());
         assert!(!TransferState::NotFound.is_terminal());
+    }
+
+    #[test]
+    fn quote_response_round_trips_the_current_rfq_schema() {
+        let response = json!({
+            "quotes": [{
+                "quoteId": "quote-id",
+                "selectionReason": "best_available",
+                "backend": {
+                    "type": "intent",
+                    "name": "Axelar Intents",
+                    "tracking": { "swapId": "0xswap" },
+                    "metadata": { "solver": "test" }
+                },
+                "estimatedTimeSeconds": 60,
+                "validity": {
+                    "type": "expires_at",
+                    "quoteExpiresAt": "2026-09-02T14:08:56Z",
+                    "fulfillmentDeadline": "2026-09-02T14:26:56Z"
+                },
+                "input": {
+                    "chain": "eip155:421614",
+                    "token": "0xsource",
+                    "amount": "1000000",
+                    "amountUsdApprox": "1.00"
+                },
+                "output": {
+                    "chain": "eip155:43113",
+                    "token": "0xdestination",
+                    "amount": "996499",
+                    "minimumAmount": "996499",
+                    "amountUsdApprox": "1.00"
+                },
+                "fees": {
+                    "gas": {
+                        "amount": "53338194000000",
+                        "amountUsdApprox": "0.13",
+                        "token": {
+                            "chain": "eip155:421614",
+                            "symbol": "ETH",
+                            "type": "native"
+                        },
+                        "paymentMethod": "wallet_native",
+                        "quoteTreatment": "outside_quote"
+                    },
+                    "user": {
+                        "amount": "3501",
+                        "amountUsdApprox": "0.01",
+                        "token": {
+                            "chain": "eip155:43113",
+                            "symbol": "USDC",
+                            "address": "0xdestination"
+                        },
+                        "paymentMethod": "output_token",
+                        "quoteTreatment": "included_in_quote"
+                    },
+                    "integrator": null
+                },
+                "actions": [{
+                    "id": "deposit",
+                    "label": "Deposit 1 USDC",
+                    "type": "transaction",
+                    "chain": "eip155:421614",
+                    "payload": {
+                        "type": "evm_transaction",
+                        "from": "0xsender",
+                        "to": "0xcontract",
+                        "data": "0x1234",
+                        "value": "0",
+                        "gasLimit": "100000",
+                        "maxFeePerGas": "2",
+                        "maxPriorityFeePerGas": "1"
+                    }
+                }]
+            }]
+        });
+
+        let typed: QuoteResponse = serde_json::from_value(response.clone()).unwrap();
+
+        assert_eq!(typed.quotes[0].backend.swap_id(), Some("0xswap"));
+        assert_eq!(
+            typed.quotes[0].fees.gas.as_ref().unwrap().amount,
+            "53338194000000"
+        );
+        assert_eq!(serde_json::to_value(typed).unwrap(), response);
+    }
+
+    #[test]
+    fn status_response_round_trips_the_current_rfq_schema() {
+        let response = json!({
+            "quoteId": "quote-id",
+            "state": "REFUNDED",
+            "backend": {
+                "type": "intent",
+                "name": "Axelar Intents",
+                "tracking": { "swapId": "0xswap" },
+                "metadata": {}
+            },
+            "source": {
+                "chain": "eip155:421614",
+                "txHash": "0xsource-tx",
+                "messageId": "0xmessage",
+                "timestamp": "2026-09-02T13:57:25Z"
+            },
+            "destination": {
+                "chain": "eip155:43113",
+                "txHash": "0xdestination-tx",
+                "timestamp": "2026-09-02T13:57:28Z"
+            },
+            "input": {
+                "chain": "eip155:421614",
+                "token": "0xsource",
+                "amount": "1000000"
+            },
+            "output": {
+                "chain": "eip155:43113",
+                "token": "0xdestination",
+                "amount": "996499"
+            },
+            "refund": {
+                "chain": "eip155:421614",
+                "token": "0xsource",
+                "amount": "1000000",
+                "txHash": "0xrefund"
+            },
+            "details": { "reason": "test" }
+        });
+
+        let typed: StatusResponse = serde_json::from_value(response.clone()).unwrap();
+
+        assert_eq!(typed.source.as_ref().unwrap().message_id, "0xmessage");
+        assert_eq!(serde_json::to_value(typed).unwrap(), response);
     }
 }
