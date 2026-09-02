@@ -1,5 +1,6 @@
 mod progress;
 mod report;
+mod reservoir;
 mod types;
 
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use tokio::time::{Interval, MissedTickBehavior};
 
 use self::progress::BenchmarkProgress;
 use self::report::{duration_ms, render_report, report_json};
+use self::reservoir::SampleReservoir;
 use self::types::{BenchmarkReport, BenchmarkTarget, FailureKind, Sample, SampleOutcome};
 use super::client::RfqClient;
 use super::read::{PreparedQuote, QuoteRequestArgs, api_client, prepare_quote_from_tokens};
@@ -103,6 +105,7 @@ async fn run_benchmark(
         args.phase,
         args.show_progress,
     ));
+    let samples = Arc::new(SampleReservoir::new());
     let workers = (0..args.concurrency).map(|_| {
         benchmark_worker(BenchmarkWorker {
             client: client.clone(),
@@ -114,14 +117,16 @@ async fn run_benchmark(
             rate_limit: rate_limit.clone(),
             shutdown: Arc::clone(&shutdown),
             progress: Arc::clone(&progress),
+            samples: Arc::clone(&samples),
         })
     });
-    let samples = join_all(workers).await.into_iter().flatten().collect();
+    join_all(workers).await;
     progress.finish();
     BenchmarkReport {
         mode: args.limit.mode(),
         interrupted: shutdown.requested(),
-        samples,
+        counts: progress.counts(),
+        samples: samples.snapshot(),
         elapsed: started.elapsed(),
         output_symbol: target.output_symbol.clone(),
         output_decimals: target.output_decimals,
@@ -143,6 +148,7 @@ struct BenchmarkWorker {
     rate_limit: Option<Arc<Mutex<Interval>>>,
     shutdown: Arc<Shutdown>,
     progress: Arc<BenchmarkProgress>,
+    samples: Arc<SampleReservoir>,
 }
 
 async fn resolve_benchmark_target(
@@ -265,8 +271,7 @@ fn token_spec(token: &TokenInfo) -> Result<AssetSpec> {
         .map_err(eyre::Report::msg)
 }
 
-async fn benchmark_worker(worker: BenchmarkWorker) -> Vec<Sample> {
-    let mut samples = Vec::new();
+async fn benchmark_worker(worker: BenchmarkWorker) {
     loop {
         if worker.shutdown.requested() {
             break;
@@ -287,15 +292,15 @@ async fn benchmark_worker(worker: BenchmarkWorker) -> Vec<Sample> {
         let sample =
             benchmark_request(&worker.client, &worker.target, worker.request_timeout).await;
         worker.progress.record(&sample);
-        samples.push(sample);
+        worker.samples.record(sample);
     }
-    samples
 }
 
 fn should_start(limit: QuoteBenchmarkLimit, request_index: u64, elapsed: Duration) -> bool {
     match limit {
         QuoteBenchmarkLimit::Requests(requests) => request_index < requests,
         QuoteBenchmarkLimit::Duration(duration) => elapsed < duration,
+        QuoteBenchmarkLimit::Continuous => true,
     }
 }
 
@@ -342,6 +347,7 @@ fn remaining_duration(limit: QuoteBenchmarkLimit, elapsed: Duration) -> Option<D
     match limit {
         QuoteBenchmarkLimit::Requests(_) => None,
         QuoteBenchmarkLimit::Duration(duration) => Some(duration.saturating_sub(elapsed)),
+        QuoteBenchmarkLimit::Continuous => None,
     }
 }
 

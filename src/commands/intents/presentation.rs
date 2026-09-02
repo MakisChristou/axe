@@ -1,4 +1,47 @@
+use std::time::Duration;
+
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
+use indicatif::ProgressBar;
+
+use crate::ui;
+
+const INTENT_ACTIVITY_FRAMES: &[&str] = &[
+    "=>                              ",
+    " ==>                            ",
+    "   ==>                          ",
+    "      ==>                       ",
+    "         ==>                    ",
+    "            ==>                 ",
+    "               ==>              ",
+    "                  ==>           ",
+    "                     ==>        ",
+    "                        ==>     ",
+    "                           ==>  ",
+    "                              =>",
+];
+
+pub fn intent_progress_bar(length: u64, message: &str) -> ProgressBar {
+    let progress = ProgressBar::new(length);
+    progress.set_style(
+        ui::progress_bar_style("  {spinner:.cyan} [{bar:32.cyan/dim}] {percent:>3}% · {msg}")
+            .progress_chars("=> ")
+            .tick_strings(&["|", "/", "-", "\\", ""]),
+    );
+    progress.set_message(message.to_owned());
+    progress.enable_steady_tick(Duration::from_millis(100));
+    progress
+}
+
+pub fn intent_activity_bar(message: &str) -> ProgressBar {
+    let progress = ProgressBar::new_spinner();
+    progress.set_style(
+        ui::progress_spinner_style("  [{spinner:.cyan}] {elapsed_precise} · {msg}")
+            .tick_strings(INTENT_ACTIVITY_FRAMES),
+    );
+    progress.set_message(message.to_owned());
+    progress.enable_steady_tick(Duration::from_millis(100));
+    progress
+}
 
 pub fn asset_table(headers: &[&str]) -> Table {
     let mut table = Table::new();

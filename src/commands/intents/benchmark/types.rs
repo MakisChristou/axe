@@ -7,7 +7,6 @@ use super::super::read::{ApiArgs, PreparedQuote};
 use super::super::types::{AssetId, AssetSpec, AssetType, HumanAmount, OrderType, QuoteRequest};
 
 const DEFAULT_BURST_REQUESTS: u64 = 100;
-const DEFAULT_CONTINUOUS_DURATION: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum QuoteBenchmarkMode {
@@ -29,6 +28,7 @@ impl QuoteBenchmarkMode {
 pub enum QuoteBenchmarkLimit {
     Requests(u64),
     Duration(Duration),
+    Continuous,
 }
 
 impl QuoteBenchmarkLimit {
@@ -57,9 +57,7 @@ impl QuoteBenchmarkLimit {
                 if requests.is_some() {
                     return Err(eyre!("--requests cannot be used with --mode continuous"));
                 }
-                Ok(Self::Duration(
-                    duration.unwrap_or(DEFAULT_CONTINUOUS_DURATION),
-                ))
+                Ok(duration.map_or(Self::Continuous, Self::Duration))
             }
         }
     }
@@ -67,7 +65,7 @@ impl QuoteBenchmarkLimit {
     pub const fn mode(self) -> QuoteBenchmarkMode {
         match self {
             Self::Requests(_) => QuoteBenchmarkMode::Burst,
-            Self::Duration(_) => QuoteBenchmarkMode::Continuous,
+            Self::Duration(_) | Self::Continuous => QuoteBenchmarkMode::Continuous,
         }
     }
 }
@@ -137,6 +135,7 @@ impl From<PreparedQuote> for BenchmarkTarget {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum SampleOutcome {
     Available {
         output_amount: U256,
@@ -154,6 +153,7 @@ pub(super) enum FailureKind {
     InvalidOutput,
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct Sample {
     pub latency_ms: u64,
     pub outcome: SampleOutcome,
@@ -162,6 +162,7 @@ pub(super) struct Sample {
 pub(super) struct BenchmarkReport {
     pub mode: QuoteBenchmarkMode,
     pub interrupted: bool,
+    pub counts: SampleCounts,
     pub samples: Vec<Sample>,
     pub elapsed: Duration,
     pub output_symbol: String,
@@ -171,6 +172,18 @@ pub(super) struct BenchmarkReport {
     pub requested_amount: U256,
     pub requested_symbol: String,
     pub requested_decimals: u8,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct SampleCounts {
+    pub attempted: u64,
+    pub available: u64,
+    pub unavailable: u64,
+    pub failed: u64,
+    pub timed_out: u64,
+    pub request_failures: u64,
+    pub invalid_quotes: u64,
+    pub invalid_outputs: u64,
 }
 
 #[cfg(test)]
@@ -189,7 +202,7 @@ mod tests {
         ));
         assert!(matches!(
             QuoteBenchmarkLimit::resolve(Some(QuoteBenchmarkMode::Continuous), None, None),
-            Ok(QuoteBenchmarkLimit::Duration(duration)) if duration == Duration::from_secs(60)
+            Ok(QuoteBenchmarkLimit::Continuous)
         ));
     }
 

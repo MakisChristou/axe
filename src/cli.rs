@@ -349,7 +349,7 @@ pub struct IntentQuoteBenchOptions {
     #[arg(long, conflicts_with = "duration_secs", value_parser = clap::value_parser!(u64).range(1..))]
     pub requests: Option<u64>,
 
-    /// Runtime for continuous mode. Defaults to 60 seconds.
+    /// Optional total-time cap for continuous mode. Otherwise run until Ctrl-C.
     #[arg(long, conflicts_with = "requests", value_parser = clap::value_parser!(u64).range(1..))]
     pub duration_secs: Option<u64>,
 

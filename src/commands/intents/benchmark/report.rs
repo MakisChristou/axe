@@ -3,23 +3,10 @@ use std::time::Duration;
 use alloy::primitives::U256;
 use serde_json::{Value, json};
 
-use super::types::{BenchmarkReport, FailureKind, Sample, SampleOutcome};
+use super::types::{BenchmarkReport, Sample, SampleOutcome};
 use crate::commands::intents::stats::percentile;
 use crate::commands::intents::types::format_units;
 use crate::ui;
-
-struct OutcomeCounts {
-    available: usize,
-    unavailable: usize,
-    failed: usize,
-    timed_out: usize,
-}
-
-struct FailureCounts {
-    request: usize,
-    invalid_quote: usize,
-    invalid_output: usize,
-}
 
 pub(super) fn render_report(
     report: &BenchmarkReport,
@@ -27,7 +14,8 @@ pub(super) fn render_report(
     warmup: u64,
     max_rps: Option<u64>,
 ) {
-    let counts = outcome_counts(&report.samples);
+    let counts = report.counts;
+    let retained_samples = u64::try_from(report.samples.len()).unwrap_or(u64::MAX);
     ui::section("intent quote benchmark");
     ui::kv(
         "route",
@@ -48,7 +36,13 @@ pub(super) fn render_report(
             report.requested_symbol
         ),
     );
-    ui::kv("requests", &report.samples.len().to_string());
+    ui::kv("requests", &counts.attempted.to_string());
+    if retained_samples < counts.attempted {
+        ui::kv(
+            "statistics sample",
+            &format!("{} retained requests", report.samples.len()),
+        );
+    }
     ui::kv("elapsed", &ui::format_duration(report.elapsed));
     ui::kv(
         "throughput",
@@ -64,8 +58,8 @@ pub(super) fn render_report(
         &format!(
             "{}/{} ({:.1}%)",
             counts.available,
-            report.samples.len(),
-            percentage(counts.available, report.samples.len())
+            counts.attempted,
+            percentage(counts.available, counts.attempted)
         ),
     );
     ui::kv(
@@ -76,7 +70,7 @@ pub(super) fn render_report(
         ),
     );
     if counts.failed > 0 {
-        render_failures(&report.samples);
+        render_failures(report);
     }
     ui::kv("request latency", &latency_summary(&report.samples));
     if let Some(output) = output_summary(
@@ -91,20 +85,20 @@ pub(super) fn render_report(
     }
 }
 
-fn render_failures(samples: &[Sample]) {
-    let failures = failure_counts(samples);
+fn render_failures(report: &BenchmarkReport) {
     ui::kv(
         "failures",
         &format!(
             "{} request │ {} invalid quote │ {} invalid output",
-            failures.request, failures.invalid_quote, failures.invalid_output
+            report.counts.request_failures,
+            report.counts.invalid_quotes,
+            report.counts.invalid_outputs
         ),
     );
 }
 
 pub(super) fn report_json(report: &BenchmarkReport) -> Value {
-    let counts = outcome_counts(&report.samples);
-    let failures = failure_counts(&report.samples);
+    let counts = report.counts;
     let latency = latency_values(&report.samples);
     let outputs = output_values(&report.samples);
     let validity = validity_values(&report.samples);
@@ -118,15 +112,16 @@ pub(super) fn report_json(report: &BenchmarkReport) -> Value {
             "requestedSymbol": report.requested_symbol,
         },
         "requests": {
-            "attempted": report.samples.len(),
+            "attempted": counts.attempted,
+            "statisticsSampled": report.samples.len(),
             "available": counts.available,
             "unavailable": counts.unavailable,
             "failed": counts.failed,
             "timedOut": counts.timed_out,
             "failures": {
-                "request": failures.request,
-                "invalidQuote": failures.invalid_quote,
-                "invalidOutput": failures.invalid_output,
+                "request": counts.request_failures,
+                "invalidQuote": counts.invalid_quotes,
+                "invalidOutput": counts.invalid_outputs,
             },
         },
         "elapsedMs": duration_ms(report.elapsed),
@@ -135,41 +130,6 @@ pub(super) fn report_json(report: &BenchmarkReport) -> Value {
         "outputAmountBaseUnits": amount_summary(&outputs),
         "quoteValidityMs": numeric_summary(&validity),
     })
-}
-
-fn outcome_counts(samples: &[Sample]) -> OutcomeCounts {
-    let mut counts = OutcomeCounts {
-        available: 0,
-        unavailable: 0,
-        failed: 0,
-        timed_out: 0,
-    };
-    for sample in samples {
-        match sample.outcome {
-            SampleOutcome::Available { .. } => counts.available += 1,
-            SampleOutcome::Unavailable => counts.unavailable += 1,
-            SampleOutcome::Failed(_) => counts.failed += 1,
-            SampleOutcome::TimedOut => counts.timed_out += 1,
-        }
-    }
-    counts
-}
-
-fn failure_counts(samples: &[Sample]) -> FailureCounts {
-    let mut counts = FailureCounts {
-        request: 0,
-        invalid_quote: 0,
-        invalid_output: 0,
-    };
-    for sample in samples {
-        match sample.outcome {
-            SampleOutcome::Failed(FailureKind::Request) => counts.request += 1,
-            SampleOutcome::Failed(FailureKind::InvalidQuote) => counts.invalid_quote += 1,
-            SampleOutcome::Failed(FailureKind::InvalidOutput) => counts.invalid_output += 1,
-            _ => {}
-        }
-    }
-    counts
 }
 
 fn latency_summary(samples: &[Sample]) -> String {
@@ -262,10 +222,10 @@ fn throughput(report: &BenchmarkReport) -> f64 {
     if seconds == 0.0 {
         return 0.0;
     }
-    report.samples.len() as f64 / seconds
+    report.counts.attempted as f64 / seconds
 }
 
-fn percentage(count: usize, total: usize) -> f64 {
+fn percentage(count: u64, total: u64) -> f64 {
     if total == 0 {
         return 0.0;
     }
@@ -312,30 +272,5 @@ mod tests {
             validity_summary(&samples).as_deref(),
             Some("median 800 ms │ min 600 ms")
         );
-    }
-
-    #[test]
-    fn outcome_counts_cover_every_request() {
-        let samples = [
-            available(10, 100, 1_000),
-            Sample {
-                latency_ms: 20,
-                outcome: SampleOutcome::Unavailable,
-            },
-            Sample {
-                latency_ms: 30,
-                outcome: SampleOutcome::Failed(FailureKind::Request),
-            },
-            Sample {
-                latency_ms: 40,
-                outcome: SampleOutcome::TimedOut,
-            },
-        ];
-        let counts = outcome_counts(&samples);
-
-        assert_eq!(counts.available, 1);
-        assert_eq!(counts.unavailable, 1);
-        assert_eq!(counts.failed, 1);
-        assert_eq!(counts.timed_out, 1);
     }
 }
