@@ -18,7 +18,8 @@ pub struct InventoryArgs {
 }
 
 pub async fn inventory(args: InventoryArgs) -> Result<()> {
-    let solver = types::SolverDeployment::try_from(args.api.network)?.address();
+    let deployment = types::SolverDeployment::try_from(args.api.network)?;
+    let solver = deployment.address();
     let client = api_client(&args.api)?;
     let config = ChainsConfig::load(&args.config).await?;
     let (catalog_chains, catalog_tokens) = tokio::try_join!(client.chains(), client.tokens())?;
@@ -63,7 +64,7 @@ pub async fn inventory(args: InventoryArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        render::render(&report);
+        render::render(&report, deployment.low_inventory_threshold_usd());
     }
     Ok(())
 }

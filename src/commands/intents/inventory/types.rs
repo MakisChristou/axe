@@ -7,6 +7,10 @@ use serde::Serialize;
 use super::super::types::{CatalogResponse, WalletAsset, format_units};
 use crate::types::Network;
 
+const DEVNET_LOW_INVENTORY_THRESHOLD_USD: f64 = 50.0;
+const TESTNET_LOW_INVENTORY_THRESHOLD_USD: f64 = 50.0;
+const MAINNET_LOW_INVENTORY_THRESHOLD_USD: f64 = 50.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SolverDeployment {
     Devnet,
@@ -20,6 +24,14 @@ impl SolverDeployment {
             Self::Devnet => address!("509955a5cb4E1D80D3927E0cdA3Dc21a0C1d0141"),
             Self::Testnet => address!("24c5ffcaba6490556a7cf9ec73588d78ef9cce47"),
             Self::Mainnet => address!("Db291eF29c66A0A5bA35EB521fe8D52d3Ab5898c"),
+        }
+    }
+
+    pub const fn low_inventory_threshold_usd(self) -> f64 {
+        match self {
+            Self::Devnet => DEVNET_LOW_INVENTORY_THRESHOLD_USD,
+            Self::Testnet => TESTNET_LOW_INVENTORY_THRESHOLD_USD,
+            Self::Mainnet => MAINNET_LOW_INVENTORY_THRESHOLD_USD,
         }
     }
 }
@@ -201,5 +213,18 @@ mod tests {
             "0xDb291eF29c66A0A5bA35EB521fe8D52d3Ab5898c"
         );
         assert!(SolverDeployment::try_from(Network::Stagenet).is_err());
+    }
+
+    #[test]
+    fn each_solver_network_defines_its_low_inventory_threshold() {
+        assert_eq!(SolverDeployment::Devnet.low_inventory_threshold_usd(), 50.0);
+        assert_eq!(
+            SolverDeployment::Testnet.low_inventory_threshold_usd(),
+            50.0
+        );
+        assert_eq!(
+            SolverDeployment::Mainnet.low_inventory_threshold_usd(),
+            50.0
+        );
     }
 }
