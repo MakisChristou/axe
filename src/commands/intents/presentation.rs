@@ -20,6 +20,16 @@ const INTENT_ACTIVITY_FRAMES: &[&str] = &[
     "                              =>",
 ];
 
+const INTENT_TRAFFIC_FRAMES: &[&str] = &[
+    "=>          ",
+    " ==>        ",
+    "   ==>      ",
+    "      ==>   ",
+    "         ==>",
+    "          =>",
+];
+const INTENT_TRAFFIC_MESSAGE_WIDTH: usize = 84;
+
 pub fn intent_progress_bar(length: u64, message: &str) -> ProgressBar {
     let progress = ProgressBar::new(length);
     progress.set_style(
@@ -47,10 +57,27 @@ pub fn intent_traffic_bar() -> ProgressBar {
     let progress = ProgressBar::new_spinner();
     progress.set_style(
         ui::progress_spinner_style("  [{spinner:.cyan}] {elapsed_precise} · {wide_msg}")
-            .tick_strings(INTENT_ACTIVITY_FRAMES),
+            .tick_strings(INTENT_TRAFFIC_FRAMES),
     );
     progress.enable_steady_tick(Duration::from_millis(100));
     progress
+}
+
+pub fn set_intent_traffic_message(progress: &ProgressBar, message: &str) {
+    progress.set_message(truncate_message(message, INTENT_TRAFFIC_MESSAGE_WIDTH));
+}
+
+fn truncate_message(message: &str, width: usize) -> String {
+    if message.chars().count() <= width {
+        return message.to_owned();
+    }
+
+    let mut truncated = message
+        .chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 pub fn asset_table(headers: &[&str]) -> Table {
@@ -135,5 +162,14 @@ mod tests {
         assert_eq!(format_usd_price(0.123_456), "$0.1235");
         assert_eq!(format_token_amount("12345.600000"), "12,345.6");
         assert_eq!(format_token_amount("0.000001"), "0.000001");
+    }
+
+    #[test]
+    fn traffic_messages_have_a_fixed_visual_ceiling() {
+        let message = "x".repeat(INTENT_TRAFFIC_MESSAGE_WIDTH + 10);
+        let truncated = truncate_message(&message, INTENT_TRAFFIC_MESSAGE_WIDTH);
+
+        assert_eq!(truncated.chars().count(), INTENT_TRAFFIC_MESSAGE_WIDTH);
+        assert!(truncated.ends_with('…'));
     }
 }

@@ -4,8 +4,9 @@ use eyre::{Result, WrapErr};
 use indicatif::ProgressBar;
 
 use super::execution::{ExecutionFeedback, execute_round_trip};
+use super::presentation::set_intent_traffic_message;
 use super::route::{DiscoveryFeedback, PlanningFeedback, discover_wallet, plan_sweep};
-use super::types::{AssetType, OrderType};
+use super::types::{AssetType, LegResult, OrderType};
 use super::{IntentRuntime, IntentRuntimeArgs, prepare_runtime};
 use crate::shutdown::{DrainTarget, Shutdown};
 use crate::ui;
@@ -44,10 +45,9 @@ const TRAFFIC_MODES: [TrafficMode; 4] = [
 
 #[derive(Default)]
 struct TrafficStats {
-    cycles: u64,
-    round_trips: u64,
     intents: u64,
     failures: u64,
+    intent_latency_ms: u64,
     route_cursors: [usize; TRAFFIC_MODES.len()],
 }
 
@@ -59,7 +59,6 @@ pub async fn run(args: TrafficArgs) -> Result<()> {
     let progress = traffic_progress();
     set_traffic_status(&progress, &stats, "starting");
     while !shutdown.requested() {
-        stats.cycles += 1;
         match run_cycle(&runtime, args.wallet_bps, &shutdown, &mut stats, &progress).await {
             Ok(true) => {}
             Ok(false) => {
@@ -95,11 +94,7 @@ async fn run_cycle(
         if shutdown.requested() {
             break;
         }
-        set_traffic_status(
-            progress,
-            stats,
-            &format!("{} · discovering routes", mode.short_label()),
-        );
+        set_traffic_status(progress, stats, "discovering routes");
         let discovery = discover_wallet(
             &runtime.client,
             &runtime.config,
@@ -121,11 +116,7 @@ async fn run_cycle(
             return Ok(true);
         }
         if plans.is_empty() {
-            set_traffic_status(
-                progress,
-                stats,
-                &format!("{} · no quotable routes", mode.short_label()),
-            );
+            set_traffic_status(progress, stats, "no quotable routes");
             continue;
         }
         found_routes = true;
@@ -134,7 +125,7 @@ async fn run_cycle(
         let plan = &plans[plan_index];
         let feedback = ExecutionFeedback::Traffic {
             progress: progress.clone(),
-            context: traffic_context(stats, mode, plan_index, plans.len()),
+            context: traffic_context(stats, progress.elapsed()),
         };
         let mut results = Vec::with_capacity(2);
         let result = execute_round_trip(
@@ -147,7 +138,7 @@ async fn run_cycle(
             &mut results,
         )
         .await;
-        stats.intents += results.len() as u64;
+        record_intents(stats, &results);
         progress.set_position(stats.intents);
         if let Err(error) = result {
             return Err(error).wrap_err_with(|| {
@@ -158,7 +149,6 @@ async fn run_cycle(
                 )
             });
         }
-        stats.round_trips += 1;
         set_traffic_status(progress, stats, "round trip complete");
     }
     Ok(found_routes)
@@ -166,17 +156,6 @@ async fn run_cycle(
 
 const fn next_plan_index(cursor: usize, available: usize) -> usize {
     cursor % available
-}
-
-impl TrafficMode {
-    const fn short_label(self) -> &'static str {
-        match (self.asset_type, self.order_type) {
-            (AssetType::Token, OrderType::ExactInput) => "token/exact-in",
-            (AssetType::Token, OrderType::ExactOutput) => "token/exact-out",
-            (AssetType::Native, OrderType::ExactInput) => "native/exact-in",
-            (AssetType::Native, OrderType::ExactOutput) => "native/exact-out",
-        }
-    }
 }
 
 fn render_strategy(wallet_bps: u16) {
@@ -195,39 +174,64 @@ fn render_strategy(wallet_bps: u16) {
 
 fn render_stats(stats: &TrafficStats) {
     ui::section("intent traffic stopped");
-    ui::kv("cycles started", &stats.cycles.to_string());
-    ui::kv("completed round trips", &stats.round_trips.to_string());
     ui::kv("completed intents", &stats.intents.to_string());
     ui::kv("route failures", &stats.failures.to_string());
+    if let Some(average) = average_intent_time(stats) {
+        ui::kv("average intent time", &ui::format_duration(average));
+    }
 }
 
 fn traffic_progress() -> ProgressBar {
     super::presentation::intent_traffic_bar()
 }
 
-fn traffic_context(
-    stats: &TrafficStats,
-    mode: TrafficMode,
-    plan_index: usize,
-    plan_count: usize,
-) -> String {
+fn traffic_context(stats: &TrafficStats, elapsed: Duration) -> String {
+    let average = average_intent_time(stats)
+        .map(|duration| format!(" · avg {}", compact_duration(duration)))
+        .unwrap_or_default();
     format!(
-        "trips {} · errors {} · cycle {} · {} {}/{}",
-        stats.round_trips,
-        stats.failures,
-        stats.cycles,
-        mode.short_label(),
-        plan_index + 1,
-        plan_count
+        "{:.1} i/s · {} err{average}",
+        intents_per_second(stats, elapsed),
+        stats.failures
     )
 }
 
 fn set_traffic_status(progress: &ProgressBar, stats: &TrafficStats, status: &str) {
     progress.set_position(stats.intents);
-    progress.set_message(format!(
-        "intents {} · trips {} · errors {} · cycle {} · {status}",
-        stats.intents, stats.round_trips, stats.failures, stats.cycles
-    ));
+    set_intent_traffic_message(
+        progress,
+        &format!(
+            "{} intents · {} · {status}",
+            stats.intents,
+            traffic_context(stats, progress.elapsed())
+        ),
+    );
+}
+
+fn record_intents(stats: &mut TrafficStats, results: &[LegResult]) {
+    stats.intents = stats
+        .intents
+        .saturating_add(u64::try_from(results.len()).unwrap_or(u64::MAX));
+    for result in results {
+        stats.intent_latency_ms = stats
+            .intent_latency_ms
+            .saturating_add(result.end_to_end_latency_ms);
+    }
+}
+
+fn average_intent_time(stats: &TrafficStats) -> Option<Duration> {
+    (stats.intents > 0).then(|| Duration::from_millis(stats.intent_latency_ms / stats.intents))
+}
+
+fn intents_per_second(stats: &TrafficStats, elapsed: Duration) -> f64 {
+    if elapsed.is_zero() {
+        return 0.0;
+    }
+    stats.intents as f64 / elapsed.as_secs_f64()
+}
+
+fn compact_duration(duration: Duration) -> String {
+    ui::format_duration(duration).replace(' ', "")
 }
 
 async fn wait_before_retry(shutdown: &Shutdown) {
@@ -283,13 +287,13 @@ mod tests {
     #[test]
     fn traffic_context_contains_the_live_summary() {
         let stats = TrafficStats {
-            cycles: 3,
-            round_trips: 4,
+            intents: 4,
             failures: 1,
+            intent_latency_ms: 300_000,
             ..TrafficStats::default()
         };
-        let context = traffic_context(&stats, TRAFFIC_MODES[0], 1, 3);
+        let context = traffic_context(&stats, Duration::from_secs(2));
 
-        assert_eq!(context, "trips 4 · errors 1 · cycle 3 · token/exact-in 2/3");
+        assert_eq!(context, "2.0 i/s · 1 err · avg 1m15s");
     }
 }

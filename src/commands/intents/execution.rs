@@ -11,6 +11,7 @@ use eyre::{Result, WrapErr, eyre};
 use indicatif::ProgressBar;
 
 use super::client::RfqClient;
+use super::presentation::set_intent_traffic_message;
 use super::route::{quote_request, validate_quote};
 use super::types::{
     Action, ChainRuntime, EvmTransactionPayload, LegExecution, LegResult, Quote, QuoteOutcome,
@@ -48,12 +49,14 @@ impl ExecutionFeedback {
     fn stage(&self, route: &str, stage: &str) {
         match self {
             Self::Progress(progress) => progress.set_message(format!("{route} · {stage}")),
-            Self::Traffic { progress, context } => progress.set_message(format!(
-                "intents {} · {context} · {} · {}",
-                progress.position(),
-                compact_traffic_route(route),
-                compact_traffic_stage(stage)
-            )),
+            Self::Traffic { progress, context } => set_intent_traffic_message(
+                progress,
+                &format!(
+                    "{} intents · {context} · {}",
+                    progress.position(),
+                    compact_traffic_stage(stage)
+                ),
+            ),
             Self::Detailed => {}
         }
     }
@@ -66,11 +69,10 @@ impl ExecutionFeedback {
             }
             Self::Traffic { progress, context } => {
                 progress.inc(1);
-                progress.set_message(format!(
-                    "intents {} · {context} · {} · fulfilled",
-                    progress.position(),
-                    compact_traffic_route(route)
-                ));
+                set_intent_traffic_message(
+                    progress,
+                    &format!("{} intents · {context} · fulfilled", progress.position()),
+                );
             }
             Self::Detailed => {}
         }
@@ -80,20 +82,16 @@ impl ExecutionFeedback {
         match self {
             Self::Detailed => ui::warn(message),
             Self::Progress(progress) => progress.println(ui::warning_line(message)),
-            Self::Traffic { progress, context } => progress.set_message(format!(
-                "intents {} · warning: {} · {context}",
-                progress.position(),
-                ui::scrub_urls(message)
-            )),
+            Self::Traffic { progress, context } => set_intent_traffic_message(
+                progress,
+                &format!(
+                    "{} intents · warning: {} · {context}",
+                    progress.position(),
+                    ui::scrub_urls(message)
+                ),
+            ),
         }
     }
-}
-
-fn compact_traffic_route(route: &str) -> String {
-    route
-        .replace(" Sepolia", "")
-        .replace(" Fuji", "")
-        .replace(" -> ", " → ")
 }
 
 fn compact_traffic_stage(stage: &str) -> &str {
@@ -824,7 +822,7 @@ mod tests {
         let progress = ProgressBar::hidden();
         let feedback = ExecutionFeedback::Traffic {
             progress: progress.clone(),
-            context: "trips 4 · errors 1 · cycle 3 · native/exact-in 1/3".to_owned(),
+            context: "0.2 i/s · 1 err · avg 1m15s".to_owned(),
         };
 
         feedback.stage(
@@ -833,16 +831,20 @@ mod tests {
         );
         assert_eq!(
             progress.message(),
-            "intents 0 · trips 4 · errors 1 · cycle 3 · native/exact-in 1/3 · Arbitrum/ETH → Base/ETH · deposit"
+            "0 intents · 0.2 i/s · 1 err · avg 1m15s · deposit"
         );
 
         feedback.leg_completed("Arbitrum Sepolia/ETH -> Base Sepolia/ETH");
         assert_eq!(progress.position(), 1);
-        assert!(progress.message().starts_with("intents 1 · trips 4"));
+        assert!(
+            progress
+                .message()
+                .starts_with("1 intents · 0.2 i/s · 1 err")
+        );
 
         feedback.warn("pending state unavailable; using latest-pinned nonce+gas immediately");
         assert!(progress.message().starts_with(
-            "intents 1 · warning: pending state unavailable; using latest-pinned nonce+gas immediately"
+            "1 intents · warning: pending state unavailable; using latest-pinned nonce+gas immed…"
         ));
     }
 
