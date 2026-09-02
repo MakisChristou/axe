@@ -822,10 +822,10 @@ fn render_wallet_stats(
     }
 }
 
-fn render_plans(plans: &[RoutePlan]) {
+pub(super) fn render_plans(plans: &[RoutePlan]) {
     ui::section("intent preflight");
     ui::kv("quotable round trips", &plans.len().to_string());
-    if let [plan] = plans {
+    for plan in plans {
         ui::kv(
             "asset type",
             if plan.from.native { "native" } else { "token" },
@@ -846,6 +846,14 @@ fn render_plans(plans: &[RoutePlan]) {
                 format_units(plan.input_amount, plan.from.decimals),
                 format_units(plan.expected_return, plan.from.decimals),
                 plan.from.symbol
+            ),
+        );
+        ui::kv(
+            "quote latency",
+            &format!(
+                "forward {} │ reverse {}",
+                ui::format_millis(plan.forward_quote_ms),
+                ui::format_millis(plan.reverse_quote_ms)
             ),
         );
     }

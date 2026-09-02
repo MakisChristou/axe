@@ -173,9 +173,6 @@ pub enum IntentsCommands {
     /// Show the solver's catalog-backed token inventory and USD value
     Inventory(IntentInventoryOptions),
 
-    /// Discover funded routes that quote successfully in both directions
-    Routes(IntentRoutesOptions),
-
     /// Request and inspect one quote without executing it
     Quote(IntentQuoteOptions),
 
@@ -233,35 +230,6 @@ pub struct IntentInventoryOptions {
     /// Path to chains config JSON. Omit to resolve from --network.
     #[arg(long, env = "CHAINS_CONFIG")]
     pub config: Option<PathBuf>,
-}
-
-#[derive(Args)]
-pub struct IntentRoutesOptions {
-    #[command(flatten)]
-    pub read: IntentReadOptions,
-
-    /// Path to chains config JSON. Omit to resolve from --network.
-    #[arg(long, env = "CHAINS_CONFIG")]
-    pub config: Option<PathBuf>,
-
-    #[command(flatten)]
-    pub assets: IntentAssetOptions,
-
-    /// EVM address whose balances determine executable routes. Overrides EVM_PRIVATE_KEY.
-    #[arg(long)]
-    pub wallet_address: Option<Address>,
-
-    /// EVM key used only to derive the wallet address when --wallet-address is omitted.
-    #[arg(long, env = "EVM_PRIVATE_KEY", hide_env_values = true)]
-    pub private_key: Option<String>,
-
-    /// Basis points of each source asset's spendable balance to quote.
-    #[arg(long, default_value = "100", value_parser = clap::value_parser!(u16).range(1..=10_000))]
-    pub wallet_bps: u16,
-
-    /// Fix the source input or destination output amount.
-    #[arg(long, value_enum, default_value_t)]
-    pub order_type: OrderType,
 }
 
 #[derive(Args)]
@@ -456,6 +424,10 @@ pub struct IntentSweepOptions {
     /// Rediscover and sweep routes until Ctrl-C.
     #[arg(long)]
     pub continuous: bool,
+
+    /// Print every executable round trip without submitting transactions.
+    #[arg(long, conflicts_with_all = ["continuous", "sweeps", "yes"])]
+    pub dry_run: bool,
 
     /// Basis points of each source asset's spendable balance per route.
     #[arg(long, default_value = "100", value_parser = clap::value_parser!(u16).range(1..=10_000))]
@@ -1001,21 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn intent_route_discovery_and_sweep_accept_asset_types() {
-        const ADDRESS: &str = "0x0000000000000000000000000000000000000001";
-
-        assert!(
-            Cli::try_parse_from([
-                "axe",
-                "intents",
-                "routes",
-                "--wallet-address",
-                ADDRESS,
-                "--asset-type",
-                "native",
-            ])
-            .is_ok()
-        );
+    fn intent_execution_commands_accept_asset_types() {
         assert!(
             Cli::try_parse_from([
                 "axe",
@@ -1087,10 +1045,6 @@ mod tests {
                 .is_ok()
         );
         assert!(
-            Cli::try_parse_from(["axe", "intents", "routes", "--wallet-address", ADDRESS,]).is_ok()
-        );
-        assert!(Cli::try_parse_from(["axe", "intents", "routes", "--private-key", "00",]).is_ok());
-        assert!(
             Cli::try_parse_from([
                 "axe", "intents", "quote", "--from", ASSET, "--to", ASSET, "--amount", "1",
                 "--sender", ADDRESS,
@@ -1118,10 +1072,9 @@ mod tests {
     }
 
     #[test]
-    fn routes_resolve_wallet_at_runtime_and_quotes_require_sender() {
+    fn intent_quotes_require_sender_context() {
         const ASSET: &str = "eip155:11155111/0x0000000000000000000000000000000000000000";
 
-        assert!(Cli::try_parse_from(["axe", "intents", "routes"]).is_ok());
         assert!(
             Cli::try_parse_from([
                 "axe", "intents", "quote", "--from", ASSET, "--to", ASSET, "--amount", "1",
@@ -1201,6 +1154,29 @@ mod tests {
                 "--continuous",
                 "--sweeps",
                 "2",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "sweep",
+                "--private-key",
+                "00",
+                "--dry-run",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "sweep",
+                "--private-key",
+                "00",
+                "--dry-run",
+                "--continuous",
             ])
             .is_err()
         );

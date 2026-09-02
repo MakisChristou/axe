@@ -22,6 +22,7 @@ use self::client::RfqClient;
 use self::execution::{ExecutionFeedback, execute_leg, execute_round_trip};
 use self::route::{
     DiscoveryFeedback, RouteDiscovery, discover_wallet, plan_roundtrip, plan_send, plan_sweep,
+    render_plans,
 };
 use self::stats::percentile;
 use self::types::{LegExecution, LegResult, RoutePlan, RunLimits};
@@ -33,25 +34,8 @@ pub use self::types::{AssetSpec, AssetType, HumanAmount, OrderType};
 pub use benchmark::{QuoteBenchmarkArgs, QuoteBenchmarkLimit, benchmark_quotes};
 pub use inventory::{InventoryArgs, inventory};
 pub use read::{
-    ApiArgs, CatalogArgs, QuoteArgs, QuoteRequestArgs, RoutesArgs, StatusArgs, catalog, quote,
-    routes, status,
+    ApiArgs, CatalogArgs, QuoteArgs, QuoteRequestArgs, StatusArgs, catalog, quote, status,
 };
-
-pub fn resolve_wallet_address(
-    wallet_address: Option<Address>,
-    private_key: Option<String>,
-) -> Result<Address> {
-    if let Some(wallet_address) = wallet_address {
-        return Ok(wallet_address);
-    }
-    let private_key = private_key.ok_or_else(|| {
-        eyre!("Provide --wallet-address or set EVM_PRIVATE_KEY to discover executable routes")
-    })?;
-    let signer: PrivateKeySigner = private_key
-        .parse()
-        .wrap_err("EVM_PRIVATE_KEY is not a valid hex private key")?;
-    Ok(signer.address())
-}
 
 pub struct IntentRuntimeArgs {
     pub network: Network,
@@ -124,6 +108,7 @@ pub struct SweepArgs {
     pub runtime: IntentRuntimeArgs,
     pub sweeps: u64,
     pub continuous: bool,
+    pub dry_run: bool,
     pub wallet_bps: u16,
     pub order_type: OrderType,
     pub asset_type: AssetType,
@@ -246,6 +231,10 @@ pub async fn sweep(args: SweepArgs) -> Result<()> {
                 args.asset_type.label(),
                 args.asset_type.label()
             ));
+        }
+        if args.dry_run {
+            render_plans(&plans);
+            return Ok(());
         }
         let pass_intents = plans.len() * 2;
         planned_intents += pass_intents;
@@ -464,21 +453,5 @@ mod tests {
             format_latency_percentiles(&[181, 2_924, 8_823]),
             "p50 2.92 s │ p95 8.82 s"
         );
-    }
-
-    #[test]
-    fn resolves_wallet_from_an_address_or_private_key() {
-        let signer = PrivateKeySigner::random();
-        let address = signer.address();
-
-        assert_eq!(
-            resolve_wallet_address(Some(address), Some("ignored".to_owned())).unwrap(),
-            address
-        );
-        assert_eq!(
-            resolve_wallet_address(None, Some(signer.to_bytes().to_string())).unwrap(),
-            address
-        );
-        assert!(resolve_wallet_address(None, None).is_err());
     }
 }

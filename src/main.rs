@@ -441,7 +441,6 @@ async fn run_intents(
     match subcommand {
         cli::IntentsCommands::Catalog(options) => run_intent_catalog(options, global).await,
         cli::IntentsCommands::Inventory(options) => run_intent_inventory(options, global).await,
-        cli::IntentsCommands::Routes(options) => run_intent_routes(options, global).await,
         cli::IntentsCommands::Quote(options) => run_intent_quote(options, global).await,
         cli::IntentsCommands::Status(options) => run_intent_status(options, global).await,
         cli::IntentsCommands::Bench { subcommand } => run_intent_bench(subcommand, global).await,
@@ -480,6 +479,7 @@ async fn run_intents(
                 runtime,
                 sweeps: options.sweeps.unwrap_or(1),
                 continuous: options.continuous,
+                dry_run: options.dry_run,
                 wallet_bps: options.wallet_bps,
                 order_type: options.order_type,
                 asset_type: options.assets.asset_type,
@@ -511,26 +511,6 @@ async fn run_intent_catalog(
     commands::intents::catalog(commands::intents::CatalogArgs {
         api,
         chain: options.chain,
-        json: options.read.json,
-    })
-    .await
-}
-
-async fn run_intent_routes(
-    options: cli::IntentRoutesOptions,
-    global: Option<types::Network>,
-) -> Result<()> {
-    let (api, config) =
-        resolve_intent_read_config(options.read.api, options.config, global).await?;
-    let wallet =
-        commands::intents::resolve_wallet_address(options.wallet_address, options.private_key)?;
-    commands::intents::routes(commands::intents::RoutesArgs {
-        api,
-        config,
-        wallet,
-        wallet_bps: options.wallet_bps,
-        order_type: options.order_type,
-        asset_type: options.assets.asset_type,
         json: options.read.json,
     })
     .await

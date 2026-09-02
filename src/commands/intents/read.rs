@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, U256};
@@ -10,13 +9,12 @@ use serde_json::json;
 
 use super::client::RfqClient;
 use super::presentation::asset_table;
-use super::route::{DiscoveryFeedback, discover_wallet, plan_sweep, validate_quote_route};
+use super::route::validate_quote_route;
 use super::types::{
-    AssetSpec, AssetType, CatalogChain, CatalogResponse, CatalogToken, EvmTransactionPayload,
-    HumanAmount, OrderType, Quote, QuoteOutcome, QuoteRequest, RoutePlan, StatusResponse,
-    TokenInfo, TokensResponse, TransferState, format_units, is_native_token, parse_amount,
+    AssetSpec, CatalogChain, CatalogResponse, CatalogToken, EvmTransactionPayload, HumanAmount,
+    OrderType, Quote, QuoteOutcome, QuoteRequest, StatusResponse, TokenInfo, TokensResponse,
+    TransferState, format_units, is_native_token, parse_amount,
 };
-use crate::config::ChainsConfig;
 use crate::types::Network;
 use crate::ui;
 
@@ -28,16 +26,6 @@ pub struct ApiArgs {
 pub struct CatalogArgs {
     pub api: ApiArgs,
     pub chain: Option<String>,
-    pub json: bool,
-}
-
-pub struct RoutesArgs {
-    pub api: ApiArgs,
-    pub config: PathBuf,
-    pub wallet: Address,
-    pub wallet_bps: u16,
-    pub order_type: OrderType,
-    pub asset_type: AssetType,
     pub json: bool,
 }
 
@@ -132,40 +120,6 @@ fn group_tokens(tokens: Vec<TokenInfo>) -> HashMap<String, Vec<TokenInfo>> {
         });
     }
     tokens_by_chain
-}
-
-pub async fn routes(args: RoutesArgs) -> Result<()> {
-    let client = api_client(&args.api)?;
-    let config = ChainsConfig::load(&args.config).await?;
-    let discovery = discover_wallet(
-        &client,
-        &config,
-        args.wallet,
-        if args.json {
-            DiscoveryFeedback::Quiet
-        } else {
-            DiscoveryFeedback::Detailed
-        },
-    )
-    .await?;
-    let plans = plan_sweep(
-        &client,
-        &discovery,
-        args.wallet,
-        args.asset_type,
-        args.wallet_bps,
-        args.order_type,
-    )
-    .await;
-    if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&routes_json(&plans, args.asset_type))?
-        );
-    } else {
-        render_routes(&plans, args.asset_type);
-    }
-    Ok(())
 }
 
 pub async fn quote(args: QuoteArgs) -> Result<()> {
@@ -344,59 +298,6 @@ fn render_catalog(catalog: &CatalogResponse) {
     }
 }
 
-fn render_routes(plans: &[RoutePlan], asset_type: AssetType) {
-    ui::section("intent routes");
-    ui::kv("asset type", asset_type.label());
-    ui::kv("quotable round trips", &plans.len().to_string());
-    for plan in plans {
-        ui::kv(
-            "route",
-            &format!(
-                "{} -> {} -> {}",
-                plan.from.label(),
-                plan.to.label(),
-                plan.from.label()
-            ),
-        );
-        ui::kv(
-            "input / expected return",
-            &format!(
-                "{} / {} {}",
-                format_units(plan.input_amount, plan.from.decimals),
-                format_units(plan.expected_return, plan.from.decimals),
-                plan.from.symbol
-            ),
-        );
-        ui::kv(
-            "quote latency",
-            &format!(
-                "forward {} │ reverse {}",
-                ui::format_millis(plan.forward_quote_ms),
-                ui::format_millis(plan.reverse_quote_ms)
-            ),
-        );
-    }
-}
-
-fn routes_json(plans: &[RoutePlan], asset_type: AssetType) -> serde_json::Value {
-    let routes = plans
-        .iter()
-        .map(|plan| {
-            json!({
-                "from": plan.from.id.to_string(),
-                "to": plan.to.id.to_string(),
-                "orderType": plan.order_type,
-                "requestedAmount": plan.requested_amount.to_string(),
-                "inputAmount": plan.input_amount.to_string(),
-                "expectedReturn": plan.expected_return.to_string(),
-                "forwardQuoteLatencyMs": plan.forward_quote_ms,
-                "reverseQuoteLatencyMs": plan.reverse_quote_ms,
-            })
-        })
-        .collect::<Vec<_>>();
-    json!({ "assetType": asset_type, "routes": routes })
-}
-
 fn render_quote(quote: &Quote, latency: Duration, prepared: &PreparedQuote) -> Result<()> {
     ui::section("intent quote");
     ui::kv("quote ID", &quote.quote_id);
@@ -544,14 +445,6 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "Chain eip155:2 is not in the intent catalog. Run without --chain to list available chains."
-        );
-    }
-
-    #[test]
-    fn empty_route_discovery_is_a_valid_result() {
-        assert_eq!(
-            routes_json(&[], AssetType::Token),
-            json!({ "assetType": "token", "routes": [] })
         );
     }
 
