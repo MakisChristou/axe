@@ -220,6 +220,9 @@ pub struct IntentCatalogOptions {
     #[command(flatten)]
     pub read: IntentReadOptions,
 
+    #[command(flatten)]
+    pub assets: IntentAssetFilterOptions,
+
     /// Show only this CAIP-2 chain ID.
     #[arg(long)]
     pub chain: Option<String>,
@@ -229,6 +232,9 @@ pub struct IntentCatalogOptions {
 pub struct IntentInventoryOptions {
     #[command(flatten)]
     pub read: IntentReadOptions,
+
+    #[command(flatten)]
+    pub assets: IntentAssetFilterOptions,
 
     /// Path to chains config JSON. Omit to resolve from --network.
     #[arg(long, env = "CHAINS_CONFIG")]
@@ -240,6 +246,13 @@ pub struct IntentAssetOptions {
     /// Use token-to-token or native-to-native routes.
     #[arg(long, value_enum, default_value_t)]
     pub asset_type: AssetType,
+}
+
+#[derive(Args)]
+pub struct IntentAssetFilterOptions {
+    /// Use only token or native assets. Omit to include both.
+    #[arg(long, value_enum)]
+    pub asset_type: Option<AssetType>,
 }
 
 #[derive(Args)]
@@ -468,6 +481,9 @@ pub struct IntentSweepOptions {
 pub struct IntentTrafficOptions {
     #[command(flatten)]
     pub runtime: IntentRuntimeConfigOptions,
+
+    #[command(flatten)]
+    pub assets: IntentAssetFilterOptions,
 
     /// Maximum basis points of a source balance used by one route.
     #[arg(long, default_value = "10", value_parser = clap::value_parser!(u16).range(1..=1_000))]
@@ -1023,18 +1039,12 @@ mod tests {
 
     #[test]
     fn intent_execution_commands_accept_asset_types() {
-        assert!(
-            Cli::try_parse_from([
-                "axe",
-                "intents",
-                "sweep",
-                "--private-key",
-                "00",
-                "--asset-type",
-                "native",
-            ])
-            .is_ok()
-        );
+        for command in ["catalog", "inventory", "sweep", "traffic"] {
+            assert!(
+                Cli::try_parse_from(["axe", "intents", command, "--asset-type", "native"]).is_ok(),
+                "intents {command} should accept --asset-type"
+            );
+        }
         assert!(
             Cli::try_parse_from([
                 "axe",
@@ -1068,6 +1078,17 @@ mod tests {
             panic!("expected intents traffic");
         };
         assert_eq!(options.wallet_bps, 25);
+        assert_eq!(options.assets.asset_type, None);
+
+        let cli =
+            Cli::try_parse_from(["axe", "intents", "traffic", "--asset-type", "native"]).unwrap();
+        let Commands::Intents {
+            subcommand: IntentsCommands::Traffic(options),
+        } = cli.command
+        else {
+            panic!("expected intents traffic");
+        };
+        assert_eq!(options.assets.asset_type, Some(AssetType::Native));
         assert!(
             Cli::try_parse_from([
                 "axe",

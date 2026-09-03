@@ -6,8 +6,9 @@ use std::path::PathBuf;
 
 use eyre::Result;
 
-use super::read::{ApiArgs, api_client, merge_catalog};
+use super::read::{ApiArgs, api_client, filter_tokens, merge_catalog};
 use super::route::{DiscoveryFeedback, read_wallet_assets, resolve_evm_chains};
+use super::types::AssetType;
 use crate::config::ChainsConfig;
 use crate::ui;
 
@@ -15,6 +16,7 @@ pub struct InventoryArgs {
     pub api: ApiArgs,
     pub config: PathBuf,
     pub json: bool,
+    pub asset_type: Option<AssetType>,
 }
 
 pub async fn inventory(args: InventoryArgs) -> Result<()> {
@@ -23,15 +25,9 @@ pub async fn inventory(args: InventoryArgs) -> Result<()> {
     let client = api_client(&args.api)?;
     let config = ChainsConfig::load(&args.config).await?;
     let (catalog_chains, catalog_tokens) = tokio::try_join!(client.chains(), client.tokens())?;
-    let catalog = merge_catalog(
-        catalog_chains.chains.clone(),
-        catalog_tokens.tokens.clone(),
-        None,
-    )?;
-    let symbols = catalog_tokens
-        .tokens
-        .iter()
-        .map(|token| token.symbol.as_str());
+    let tokens = filter_tokens(catalog_tokens.tokens, args.asset_type);
+    let catalog = merge_catalog(catalog_chains.chains.clone(), tokens.clone(), None)?;
+    let symbols = tokens.iter().map(|token| token.symbol.as_str());
     let feedback = if args.json {
         DiscoveryFeedback::Quiet
     } else {
@@ -51,7 +47,7 @@ pub async fn inventory(args: InventoryArgs) -> Result<()> {
         }
         pricing::UsdPrices::unavailable()
     });
-    let assets = read_wallet_assets(&chains, catalog_tokens.tokens, solver, feedback).await;
+    let assets = read_wallet_assets(&chains, tokens, solver, feedback).await;
     let report = types::InventoryReport::build(types::InventoryInputs {
         network: args.api.network,
         solver_address: solver,

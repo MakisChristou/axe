@@ -16,6 +16,7 @@ const RETRY_DELAY: Duration = Duration::from_secs(5);
 pub struct TrafficArgs {
     pub runtime: IntentRuntimeArgs,
     pub wallet_bps: u16,
+    pub asset_type: Option<AssetType>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,13 +54,22 @@ struct TrafficStats {
 
 pub async fn run(args: TrafficArgs) -> Result<()> {
     let runtime = prepare_runtime(args.runtime).await?;
-    render_strategy(args.wallet_bps);
+    render_strategy(args.wallet_bps, args.asset_type);
     let shutdown = Shutdown::install(DrainTarget::RoundTrip);
     let mut stats = TrafficStats::default();
     let progress = traffic_progress();
     set_traffic_status(&progress, &stats, "starting");
     while !shutdown.requested() {
-        match run_cycle(&runtime, args.wallet_bps, &shutdown, &mut stats, &progress).await {
+        match run_cycle(
+            &runtime,
+            args.wallet_bps,
+            args.asset_type,
+            &shutdown,
+            &mut stats,
+            &progress,
+        )
+        .await
+        {
             Ok(true) => {}
             Ok(false) => {
                 set_traffic_status(&progress, &stats, "no quotable routes · retrying in 5s");
@@ -85,12 +95,13 @@ pub async fn run(args: TrafficArgs) -> Result<()> {
 async fn run_cycle(
     runtime: &IntentRuntime,
     wallet_bps: u16,
+    asset_type: Option<AssetType>,
     shutdown: &Shutdown,
     stats: &mut TrafficStats,
     progress: &ProgressBar,
 ) -> Result<bool> {
     let mut found_routes = false;
-    for (mode_index, mode) in TRAFFIC_MODES.into_iter().enumerate() {
+    for (mode_index, mode) in traffic_modes(asset_type) {
         if shutdown.requested() {
             break;
         }
@@ -154,17 +165,25 @@ async fn run_cycle(
     Ok(found_routes)
 }
 
+fn traffic_modes(asset_type: Option<AssetType>) -> impl Iterator<Item = (usize, TrafficMode)> {
+    TRAFFIC_MODES
+        .into_iter()
+        .enumerate()
+        .filter(move |(_, mode)| asset_type.is_none_or(|selected| mode.asset_type == selected))
+}
+
 const fn next_plan_index(cursor: usize, available: usize) -> usize {
     cursor % available
 }
 
-fn render_strategy(wallet_bps: u16) {
+fn render_strategy(wallet_bps: u16, asset_type: Option<AssetType>) {
     ui::section("intent traffic");
     ui::kv("strategy", "serial balance-returning round trips");
-    ui::kv(
-        "coverage",
-        "all tokens and native assets · both order types",
+    let coverage = asset_type.map_or_else(
+        || "all tokens and native assets · both order types".to_owned(),
+        |asset_type| format!("{} assets only · both order types", asset_type.label()),
     );
+    ui::kv("coverage", &coverage);
     ui::kv(
         "maximum route input",
         &format!("{:.2}% of spendable balance", f64::from(wallet_bps) / 100.0),
@@ -251,23 +270,47 @@ mod tests {
 
     #[test]
     fn traffic_rotates_through_every_asset_and_order_type() {
-        assert_eq!(TRAFFIC_MODES.len(), 4);
-        assert!(TRAFFIC_MODES.contains(&TrafficMode {
+        let modes = traffic_modes(None)
+            .map(|(_, mode)| mode)
+            .collect::<Vec<_>>();
+        assert_eq!(modes.len(), 4);
+        assert!(modes.contains(&TrafficMode {
             asset_type: AssetType::Token,
             order_type: OrderType::ExactInput,
         }));
-        assert!(TRAFFIC_MODES.contains(&TrafficMode {
+        assert!(modes.contains(&TrafficMode {
             asset_type: AssetType::Token,
             order_type: OrderType::ExactOutput,
         }));
-        assert!(TRAFFIC_MODES.contains(&TrafficMode {
+        assert!(modes.contains(&TrafficMode {
             asset_type: AssetType::Native,
             order_type: OrderType::ExactInput,
         }));
-        assert!(TRAFFIC_MODES.contains(&TrafficMode {
+        assert!(modes.contains(&TrafficMode {
             asset_type: AssetType::Native,
             order_type: OrderType::ExactOutput,
         }));
+    }
+
+    #[test]
+    fn traffic_filters_modes_by_asset_type() {
+        for asset_type in [AssetType::Token, AssetType::Native] {
+            let modes = traffic_modes(Some(asset_type))
+                .map(|(_, mode)| mode)
+                .collect::<Vec<_>>();
+            assert_eq!(modes.len(), 2);
+            assert!(modes.iter().all(|mode| mode.asset_type == asset_type));
+            assert!(
+                modes
+                    .iter()
+                    .any(|mode| mode.order_type == OrderType::ExactInput)
+            );
+            assert!(
+                modes
+                    .iter()
+                    .any(|mode| mode.order_type == OrderType::ExactOutput)
+            );
+        }
     }
 
     #[test]

@@ -105,6 +105,10 @@ impl AssetType {
     pub const fn matches(self, asset: &WalletAsset) -> bool {
         asset.native == matches!(self, Self::Native)
     }
+
+    pub fn matches_token_address(self, address: &str) -> bool {
+        is_native_token(address) == matches!(self, Self::Native)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

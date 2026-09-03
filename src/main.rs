@@ -492,6 +492,7 @@ async fn run_intents(
             commands::intents::traffic(commands::intents::TrafficArgs {
                 runtime,
                 wallet_bps: options.wallet_bps,
+                asset_type: options.assets.asset_type,
             })
             .await
         }
@@ -508,6 +509,7 @@ async fn run_intent_inventory(
         api,
         config,
         json: options.read.json,
+        asset_type: options.assets.asset_type,
     })
     .await
 }
@@ -521,6 +523,7 @@ async fn run_intent_catalog(
         api,
         chain: options.chain,
         json: options.read.json,
+        asset_type: options.assets.asset_type,
     })
     .await
 }

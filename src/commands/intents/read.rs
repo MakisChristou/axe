@@ -10,9 +10,9 @@ use serde_json::json;
 use super::client::RfqClient;
 use super::presentation::asset_table;
 use super::types::{
-    ActionPayload, AssetSpec, CatalogChain, CatalogResponse, CatalogToken, FeeEntry, HumanAmount,
-    LegPlan, OrderType, Quote, QuoteRequest, StatusResponse, TokenInfo, TokensResponse,
-    TransferState, format_units, is_native_token, parse_amount,
+    ActionPayload, AssetSpec, AssetType, CatalogChain, CatalogResponse, CatalogToken, FeeEntry,
+    HumanAmount, LegPlan, OrderType, Quote, QuoteRequest, StatusResponse, TokenInfo,
+    TokensResponse, TransferState, format_units, is_native_token, parse_amount,
 };
 use crate::types::Network;
 use crate::ui;
@@ -26,6 +26,7 @@ pub struct CatalogArgs {
     pub api: ApiArgs,
     pub chain: Option<String>,
     pub json: bool,
+    pub asset_type: Option<AssetType>,
 }
 
 #[derive(Clone)]
@@ -58,13 +59,26 @@ pub(super) struct PreparedQuote {
 pub async fn catalog(args: CatalogArgs) -> Result<()> {
     let client = api_client(&args.api)?;
     let (chains, tokens) = tokio::try_join!(client.chains(), client.tokens())?;
-    let response = merge_catalog(chains.chains, tokens.tokens, args.chain.as_deref())?;
+    let tokens = filter_tokens(tokens.tokens, args.asset_type);
+    let response = merge_catalog(chains.chains, tokens, args.chain.as_deref())?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&response)?);
     } else {
         render_catalog(&response);
     }
     Ok(())
+}
+
+pub(super) fn filter_tokens(
+    tokens: Vec<TokenInfo>,
+    asset_type: Option<AssetType>,
+) -> Vec<TokenInfo> {
+    tokens
+        .into_iter()
+        .filter(|token| {
+            asset_type.is_none_or(|asset_type| asset_type.matches_token_address(&token.address))
+        })
+        .collect()
 }
 
 pub(super) fn merge_catalog(
@@ -494,6 +508,32 @@ mod tests {
             serde_json::to_value(&catalog).unwrap()["chains"][0]["tokens"][0]
                 .get("chainId")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn catalog_asset_filter_distinguishes_tokens_from_native_assets() {
+        let tokens = vec![
+            token(
+                "eip155:1",
+                "ETH",
+                "0x0000000000000000000000000000000000000000",
+            ),
+            token(
+                "eip155:1",
+                "USDC",
+                "0x0000000000000000000000000000000000000001",
+            ),
+        ];
+
+        assert_eq!(filter_tokens(tokens.clone(), None).len(), 2);
+        assert_eq!(
+            filter_tokens(tokens.clone(), Some(AssetType::Token))[0].symbol,
+            "USDC"
+        );
+        assert_eq!(
+            filter_tokens(tokens, Some(AssetType::Native))[0].symbol,
+            "ETH"
         );
     }
 
