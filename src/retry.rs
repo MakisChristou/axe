@@ -37,6 +37,10 @@ const MAX_BACKOFF_MS: u64 = 64_000;
 /// value. 0.2 gives the usual +/-20% band.
 const JITTER_FRACTION: f64 = 0.2;
 
+fn retry_error(error: &impl std::fmt::Display) -> String {
+    crate::ui::scrub_urls(&error.to_string())
+}
+
 /// Spread `base` by +/-[`JITTER_FRACTION`] so concurrent retriers separate.
 ///
 /// This matters whenever several runs contend for one resource - a shared
@@ -88,8 +92,9 @@ where
             Ok(t) => return Ok(t),
             Err(e) if attempt + 1 < attempts && is_transient(&e) => {
                 let backoff = backoff_for_attempt(attempt);
+                let error = retry_error(&e);
                 crate::ui::warn(&format!(
-                    "{label}: attempt {} failed: {e}; retrying in {}ms",
+                    "{label}: attempt {} failed: {error}; retrying in {}ms",
                     attempt + 1,
                     backoff.as_millis(),
                 ));
@@ -140,8 +145,9 @@ where
                 Err(e) if !is_transient(&e) => return Err(e),
                 Err(e) if attempt + 1 < FALLBACK_ATTEMPTS => {
                     let backoff = backoff_for_attempt(attempt);
+                    let error = retry_error(&e);
                     crate::ui::warn(&format!(
-                        "{label}: endpoint {}/{} attempt {}/{FALLBACK_ATTEMPTS} failed: {e}; \
+                        "{label}: endpoint {}/{} attempt {}/{FALLBACK_ATTEMPTS} failed: {error}; \
                          retrying in {}ms",
                         endpoint_idx + 1,
                         endpoints.len(),
@@ -152,9 +158,10 @@ where
                 }
                 Err(e) => {
                     if endpoint_idx < last {
+                        let error = retry_error(&e);
                         crate::ui::warn(&format!(
                             "{label}: endpoint {}/{} exhausted ({FALLBACK_ATTEMPTS} attempts): \
-                             {e}; falling back to next endpoint",
+                             {error}; falling back to next endpoint",
                             endpoint_idx + 1,
                             endpoints.len(),
                         ));
@@ -232,6 +239,14 @@ pub fn is_transient_default<E: std::fmt::Display>(err: &E) -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn retry_diagnostics_redact_rpc_urls() {
+        assert_eq!(
+            retry_error(&"request failed for https://rpc.example/secret-key"),
+            "request failed for <redacted-url>"
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn retry_succeeds_on_second_attempt() {

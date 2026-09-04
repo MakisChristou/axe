@@ -1,7 +1,7 @@
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, U256};
 use chrono::{DateTime, Utc};
@@ -590,6 +590,8 @@ pub struct RoutePlan {
     pub forward_quote_ms: u64,
     pub reverse_quote_ms: u64,
     pub input_budget: RoundTripInputBudget,
+    pub forward_settlement_contract: Address,
+    pub reverse_settlement_contract: Address,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -607,6 +609,7 @@ pub struct LegPlan {
     pub input_amount: U256,
     pub expected_output: U256,
     pub quote_ms: u64,
+    pub settlement_contract: Address,
     pub request: QuoteRequest,
     pub quote: TimedQuote,
 }
@@ -619,6 +622,22 @@ pub struct LegExecution {
     pub amount: U256,
     pub recipient: Address,
     pub max_input_amount: Option<U256>,
+    pub settlement_contract: Address,
+}
+
+pub struct SubmittedIntent {
+    pub from: WalletAsset,
+    pub to: WalletAsset,
+    pub selected: TimedQuote,
+    pub input_amount: U256,
+    pub started: Instant,
+    pub deposit_confirmation_latency_ms: u64,
+}
+
+pub(super) struct PreparedDeposit {
+    pub transaction: crate::evm::pipeline::PipelineTransaction,
+    pub quote_id: String,
+    pub quote_latency_ms: u64,
 }
 
 #[derive(Clone, Debug)]

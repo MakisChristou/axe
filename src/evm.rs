@@ -1,3 +1,5 @@
+pub mod pipeline;
+
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
 
@@ -24,6 +26,8 @@ use tower::Layer;
 
 use crate::timing::EVM_TX_RECEIPT_TIMEOUT;
 use crate::ui;
+
+const AVALANCHE_FUJI_CHAIN_ID: u64 = 43_113;
 
 /// Build a read-only EVM provider that transparently fails over across `urls`
 /// (primary first, then the public fallback).
@@ -174,6 +178,7 @@ impl EvmEndpoints {
         tx: TransactionRequest,
         on_warning: &impl Fn(&str),
     ) -> Result<TxEnvelope> {
+        let tx = self.prepare_fill(tx).await?;
         match self.fill_and_sign_once(signer, tx.clone()).await {
             Err(error) if is_pending_state_error(&error) => {
                 on_warning("pending state unavailable; using latest-pinned nonce+gas immediately");
@@ -194,6 +199,15 @@ impl EvmEndpoints {
                     .await
             }
             other => other,
+        }
+    }
+
+    /// Fuji cannot reliably serve pending state, so skip that probe entirely.
+    async fn prepare_fill(&self, tx: TransactionRequest) -> Result<TransactionRequest> {
+        if tx.chain_id == Some(AVALANCHE_FUJI_CHAIN_ID) {
+            self.prefill_from_latest(tx).await
+        } else {
+            Ok(tx)
         }
     }
 
@@ -1146,10 +1160,73 @@ where
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::Address;
+    use alloy::providers::{Provider as _, ProviderBuilder};
+    use alloy::rpc::{client::RpcClient, types::TransactionRequest};
+    use alloy::transports::mock::Asserter;
+
     use super::{
-        is_pending_state_error, nonce_contention_backoff, nonce_held_by_pooled_tx,
-        parse_expected_nonce, send_error_may_mean_landed, should_retry_fill,
+        AVALANCHE_FUJI_CHAIN_ID, EvmEndpoints, is_pending_state_error, nonce_contention_backoff,
+        nonce_held_by_pooled_tx, parse_expected_nonce, send_error_may_mean_landed,
+        should_retry_fill,
     };
+
+    fn mocked_endpoints(asserter: Asserter) -> EvmEndpoints {
+        EvmEndpoints {
+            urls: vec!["http://unused.invalid".to_owned()],
+            providers: vec![
+                ProviderBuilder::new()
+                    .connect_client(RpcClient::mocked(asserter))
+                    .erased(),
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn fuji_prefills_nonce_and_gas_before_the_wallet_filler() {
+        let asserter = Asserter::new();
+        asserter.push_success(&"0x2a");
+        asserter.push_success(&"0x5208");
+        let endpoints = mocked_endpoints(asserter.clone());
+        let tx = TransactionRequest {
+            chain_id: Some(AVALANCHE_FUJI_CHAIN_ID),
+            ..Default::default()
+        }
+        .from(Address::ZERO)
+        .to(Address::ZERO);
+
+        let prepared = endpoints.prepare_fill(tx).await.unwrap();
+
+        assert_eq!(prepared.nonce, Some(42));
+        assert_eq!(prepared.gas, Some(25_200));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fuji_preserves_explicit_nonce_and_gas_without_rpc_calls() {
+        let endpoints = mocked_endpoints(Asserter::new());
+        let tx = TransactionRequest {
+            chain_id: Some(AVALANCHE_FUJI_CHAIN_ID),
+            ..Default::default()
+        }
+        .from(Address::ZERO)
+        .nonce(123)
+        .gas_limit(50_000);
+
+        assert_eq!(endpoints.prepare_fill(tx.clone()).await.unwrap(), tx);
+    }
+
+    #[tokio::test]
+    async fn other_and_unspecified_chains_keep_the_existing_fill_path() {
+        let endpoints = mocked_endpoints(Asserter::new());
+        for chain_id in [None, Some(1), Some(84_532), Some(43_114)] {
+            let tx = TransactionRequest {
+                chain_id,
+                ..Default::default()
+            };
+            assert_eq!(endpoints.prepare_fill(tx.clone()).await.unwrap(), tx);
+        }
+    }
 
     #[test]
     fn parses_geth_nonce_too_low() {

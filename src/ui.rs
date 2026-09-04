@@ -1,4 +1,7 @@
+use std::future::Future;
 use std::io::{self, IsTerminal, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use indicatif::{ProgressBar, ProgressStyle};
@@ -33,7 +36,22 @@ pub fn info(msg: &str) {
 
 /// Print warning: "  ! {msg}" in yellow
 pub fn warn(msg: &str) {
+    if COUNTED_WARNINGS
+        .try_with(|count| count.fetch_add(1, Ordering::Relaxed))
+        .is_ok()
+    {
+        return;
+    }
     println!("{}", warning_line(msg));
+}
+
+tokio::task_local! {
+    static COUNTED_WARNINGS: Arc<AtomicU64>;
+}
+
+/// Collect warnings for a summary while this task runs.
+pub async fn count_warnings<T>(count: Arc<AtomicU64>, work: impl Future<Output = T>) -> T {
+    COUNTED_WARNINGS.scope(count, work).await
 }
 
 /// Print a warning to stderr so structured stdout remains machine-readable.
@@ -213,6 +231,26 @@ pub fn scrub_urls(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn warning_counts_are_scoped_to_each_task_and_reset_afterward() {
+        let first = Arc::new(AtomicU64::new(0));
+        let second = Arc::new(AtomicU64::new(0));
+        tokio::join!(
+            count_warnings(Arc::clone(&first), async {
+                warn("nonce retry");
+                tokio::task::yield_now().await;
+                warn("pending-state fallback");
+            }),
+            count_warnings(Arc::clone(&second), async {
+                warn("RPC retry");
+                tokio::task::yield_now().await;
+            }),
+        );
+        assert_eq!(first.load(Ordering::Relaxed), 2);
+        assert_eq!(second.load(Ordering::Relaxed), 1);
+        assert!(COUNTED_WARNINGS.try_with(|_| ()).is_err());
+    }
 
     #[test]
     fn formats_subsecond_durations_as_milliseconds() {

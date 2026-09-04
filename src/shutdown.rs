@@ -15,6 +15,7 @@ pub enum DrainTarget {
     RoundTrip,
     QuoteRequests,
     LoadTestSubmissions,
+    IntentStress,
 }
 
 impl DrainTarget {
@@ -30,6 +31,7 @@ impl DrainTarget {
             Self::LoadTestSubmissions => {
                 "shutting down gracefully; stopping new submissions and waiting for in-flight work"
             }
+            Self::IntentStress => "stopping new deposits and waiting for pending receipts",
         }
     }
 }
@@ -146,6 +148,11 @@ mod tests {
             DrainTarget::LoadTestSubmissions
                 .message()
                 .contains("stopping new submissions")
+        );
+        assert!(
+            DrainTarget::IntentStress
+                .message()
+                .contains("stopping new deposits")
         );
     }
 }

@@ -4,6 +4,7 @@ use eyre::{Result, WrapErr};
 use indicatif::ProgressBar;
 
 use super::execution::{ExecutionFeedback, execute_round_trip};
+use super::execution_lock::ExecutionLock;
 use super::presentation::set_intent_traffic_message;
 use super::route::{DiscoveryFeedback, PlanningFeedback, discover_wallet, plan_sweep};
 use super::types::{AssetType, LegResult, OrderType};
@@ -54,6 +55,7 @@ struct TrafficStats {
 
 pub async fn run(args: TrafficArgs) -> Result<()> {
     let runtime = prepare_runtime(args.runtime).await?;
+    let _execution_lock = ExecutionLock::acquire(runtime.signer.address())?;
     render_strategy(args.wallet_bps, args.asset_type);
     let shutdown = Shutdown::install(DrainTarget::RoundTrip);
     let mut stats = TrafficStats::default();

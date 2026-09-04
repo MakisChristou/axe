@@ -7,6 +7,7 @@ use rand::seq::SliceRandom;
 
 use super::RouteChoice;
 use super::client::RfqClient;
+use super::execution::validate_quote_actions;
 use super::types::{
     AssetId, AssetSpec, AssetType, ChainInfo, ChainRuntime, HumanAmount, LegPlan, OrderType, Quote,
     QuoteOutcome, QuoteRequest, RoundTripInputBudget, RoutePlan, TokenInfo, WalletAsset,
@@ -305,8 +306,27 @@ pub(super) async fn read_wallet_assets(
 }
 
 async fn read_balance(chain: &ChainRuntime, token: &TokenInfo, wallet: Address) -> Result<U256> {
+    let asset = WalletAsset {
+        id: AssetId {
+            chain_id: token.chain_id.clone(),
+            token_address: token.address.clone(),
+        },
+        chain_label: chain.label.clone(),
+        symbol: token.symbol.clone(),
+        decimals: token.decimals,
+        balance: U256::ZERO,
+        native: is_native_token(&token.address),
+    };
+    read_asset_balance(chain, &asset, wallet).await
+}
+
+pub(super) async fn read_asset_balance(
+    chain: &ChainRuntime,
+    asset: &WalletAsset,
+    wallet: Address,
+) -> Result<U256> {
     let endpoints = EvmEndpoints::connect(std::slice::from_ref(&chain.rpc_url))?;
-    if is_native_token(&token.address) {
+    if asset.native {
         return retry_with_fallback_all(
             "intents native balance",
             endpoints.providers(),
@@ -315,10 +335,11 @@ async fn read_balance(chain: &ChainRuntime, token: &TokenInfo, wallet: Address) 
         .await
         .map_err(Into::into);
     }
-    let token_address: Address = token
-        .address
+    let token_address: Address = asset
+        .id
+        .token_address
         .parse()
-        .wrap_err_with(|| format!("invalid EVM token address {}", token.address))?;
+        .wrap_err_with(|| format!("invalid EVM token address {}", asset.id.token_address))?;
     retry_with_fallback_all(
         "intents token balance",
         endpoints.providers(),
@@ -331,6 +352,53 @@ async fn read_balance(chain: &ChainRuntime, token: &TokenInfo, wallet: Address) 
     )
     .await
     .map_err(Into::into)
+}
+
+pub(super) async fn plan_stress_routes(
+    client: &RfqClient,
+    discovery: &RouteDiscovery,
+    signer: Address,
+    symbol: &str,
+    amount: &HumanAmount,
+) -> Result<Vec<LegPlan>> {
+    let mut routes = Vec::new();
+    for (left, right) in directed_cross_chain_pairs(&discovery.assets, AssetType::Token) {
+        if !left.symbol.eq_ignore_ascii_case(symbol)
+            || !right.symbol.eq_ignore_ascii_case(symbol)
+            || left.decimals != right.decimals
+            || ensure_source_ready(discovery, left).is_err()
+        {
+            continue;
+        }
+        let input_amount = amount.to_base_units(left.decimals)?;
+        if input_amount.is_zero() {
+            return Err(eyre!("stress intent amount must be greater than zero"));
+        }
+        if ensure_input_is_spendable(left, input_amount).is_err() {
+            continue;
+        }
+        match preflight_leg(
+            client,
+            left,
+            right,
+            signer,
+            signer,
+            OrderType::ExactInput,
+            input_amount,
+        )
+        .await
+        {
+            Ok(Some(plan)) => routes.push(plan),
+            Ok(None) => {}
+            Err(error) => ui::warn(&format!(
+                "skipping {} -> {}: {}",
+                left.label(),
+                right.label(),
+                ui::scrub_urls(&error.to_string())
+            )),
+        }
+    }
+    Ok(routes)
 }
 
 pub async fn plan_send(
@@ -789,6 +857,7 @@ async fn preflight_leg(
     validate_quote(&quote.quote, from, to, order_type, requested_amount)?;
     let input_amount = parse_amount(&quote.quote.input.amount)?;
     let expected_output = parse_amount(&quote.quote.output.amount)?;
+    let settlement_contract = validate_quote_actions(&quote.quote, from, input_amount)?;
     let quote_ms = duration_ms(quote.latency);
     Ok(Some(LegPlan {
         from: from.clone(),
@@ -798,6 +867,7 @@ async fn preflight_leg(
         input_amount,
         expected_output,
         quote_ms,
+        settlement_contract,
         request,
         quote: *quote,
     }))
@@ -846,6 +916,8 @@ async fn preflight_pair(
         return Ok(None);
     }
     let expected_return = parse_amount(&reverse.quote.output.amount)?;
+    let reverse_settlement_contract =
+        validate_quote_actions(&reverse.quote, &reverse_source, reverse_input)?;
     Ok(Some(RoutePlan {
         from: from.clone(),
         to: to.clone(),
@@ -856,6 +928,8 @@ async fn preflight_pair(
         forward_quote_ms: forward.quote_ms,
         reverse_quote_ms: duration_ms(reverse.latency),
         input_budget,
+        forward_settlement_contract: forward.settlement_contract,
+        reverse_settlement_contract,
     }))
 }
 
@@ -864,6 +938,7 @@ struct ForwardPreflight {
     input: U256,
     output: U256,
     quote_ms: u64,
+    settlement_contract: Address,
 }
 
 async fn preflight_forward(
@@ -885,11 +960,13 @@ async fn preflight_forward(
         let input = parse_amount(&quote.quote.input.amount)?;
         if forward_input_is_within_budget(input, input_budget) {
             validate_quote(&quote.quote, from, to, order_type, requested)?;
+            let settlement_contract = validate_quote_actions(&quote.quote, from, input)?;
             return Ok(Some(ForwardPreflight {
                 requested,
                 input,
                 output: parse_amount(&quote.quote.output.amount)?,
                 quote_ms: duration_ms(quote.latency),
+                settlement_contract,
             }));
         }
         if order_type != OrderType::ExactOutput {
@@ -1393,6 +1470,8 @@ mod tests {
             forward_quote_ms: 10,
             reverse_quote_ms: 30,
             input_budget: RoundTripInputBudget::SpendableBalance,
+            forward_settlement_contract: Address::ZERO,
+            reverse_settlement_contract: Address::ZERO,
         }];
 
         assert_eq!(average_quote_ms(&plans), 20);

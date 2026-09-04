@@ -196,6 +196,9 @@ pub enum IntentsCommands {
 
     /// Continuously simulate users across all executable intent routes
     Traffic(IntentTrafficOptions),
+
+    /// Submit concurrent intent deposits across funded chains, starting without confirmation
+    Stress(IntentStressOptions),
 }
 
 #[derive(Args)]
@@ -488,6 +491,48 @@ pub struct IntentTrafficOptions {
     /// Maximum basis points of a source balance used by one route.
     #[arg(long, default_value = "10", value_parser = clap::value_parser!(u16).range(1..=1_000))]
     pub wallet_bps: u16,
+}
+
+#[derive(Args)]
+pub struct IntentStressOptions {
+    #[command(flatten)]
+    pub runtime: IntentRuntimeOptions,
+
+    /// Token symbol to deposit across all funded source chains.
+    #[arg(long, default_value = "USDC")]
+    pub symbol: String,
+
+    /// Fixed exact-input amount for every intent.
+    #[arg(long, default_value = "0.1")]
+    pub amount: HumanAmount,
+
+    /// Stop admitting new intents after this many seconds.
+    #[arg(long, default_value = "900", value_parser = clap::value_parser!(u64).range(1..))]
+    pub duration_secs: u64,
+
+    /// Hard cap on deposit attempts that reach broadcast, including uncertain broadcasts.
+    #[arg(long, default_value = "200", value_parser = clap::value_parser!(u64).range(1..))]
+    pub max_intents: u64,
+
+    /// Concurrent quote and deposit jobs. Receipt waits overlap later broadcasts.
+    #[arg(long, default_value = "32", value_parser = clap::value_parser!(u16).range(1..=128))]
+    pub max_in_flight: u16,
+
+    /// Maximum cumulative input volume in human token units.
+    #[arg(long, default_value = "20")]
+    pub max_volume: HumanAmount,
+
+    /// Maximum native gas spend per source chain for deposits. Approvals are extra.
+    #[arg(long, default_value = "0.01")]
+    pub max_native_spend: HumanAmount,
+
+    /// Never submit on a chain whose native balance is below this amount.
+    #[arg(long, default_value = "0.01")]
+    pub min_native_balance: HumanAmount,
+
+    /// Print the final benchmark report as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Subcommand)]
@@ -1004,7 +1049,7 @@ mod tests {
 
     #[test]
     fn intent_execution_commands_do_not_require_private_key_flags() {
-        for command in ["send", "roundtrip", "sweep", "traffic"] {
+        for command in ["send", "roundtrip", "sweep", "traffic", "stress"] {
             assert!(
                 Cli::try_parse_from(["axe", "intents", command]).is_ok(),
                 "intents {command} should resolve its key after CLI parsing"
@@ -1104,6 +1149,40 @@ mod tests {
         assert!(
             Cli::try_parse_from(["axe", "intents", "traffic", "--private-key", "00", "--yes",])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn intent_stress_parses_bounded_defaults_and_overrides() {
+        let cli = Cli::try_parse_from([
+            "axe",
+            "intents",
+            "stress",
+            "--max-intents",
+            "40",
+            "--max-in-flight",
+            "8",
+            "--max-volume",
+            "4",
+            "--max-native-spend",
+            "1",
+            "--yes",
+        ])
+        .unwrap();
+        let Commands::Intents {
+            subcommand: IntentsCommands::Stress(options),
+        } = cli.command
+        else {
+            panic!("expected intents stress");
+        };
+
+        assert_eq!(options.max_intents, 40);
+        assert_eq!(options.max_in_flight, 8);
+        assert_eq!(options.max_volume.to_string(), "4");
+        assert_eq!(options.max_native_spend.to_string(), "1");
+        assert!(options.runtime.yes);
+        assert!(
+            Cli::try_parse_from(["axe", "intents", "stress", "--max-in-flight", "129",]).is_err()
         );
     }
 

@@ -1,11 +1,13 @@
 mod benchmark;
 mod client;
 mod execution;
+mod execution_lock;
 mod inventory;
 mod presentation;
 mod read;
 mod route;
 mod stats;
+mod stress;
 mod traffic;
 mod types;
 
@@ -18,13 +20,14 @@ use eyre::{Result, WrapErr, eyre};
 use indicatif::ProgressBar;
 
 use self::client::RfqClient;
-use self::execution::{ExecutionFeedback, execute_leg, execute_planned_leg, execute_round_trip};
+use self::execution::{ExecutionFeedback, execute_planned_leg, execute_round_trip};
+use self::execution_lock::ExecutionLock;
 use self::route::{
     DiscoveryFeedback, PlanningFeedback, RouteDiscovery, discover_wallet, plan_roundtrip,
     plan_send, plan_sweep, render_plans,
 };
 use self::stats::percentile;
-use self::types::{LegExecution, LegResult, RoutePlan, RunLimits};
+use self::types::{LegResult, RoutePlan, RunLimits};
 use crate::config::ChainsConfig;
 use crate::shutdown::{DrainTarget, Shutdown};
 use crate::types::Network;
@@ -37,6 +40,7 @@ pub use benchmark::{
 };
 pub use inventory::{InventoryArgs, inventory};
 pub use read::{ApiArgs, CatalogArgs, StatusArgs, catalog, status};
+pub use stress::{StressArgs, run as stress};
 pub use traffic::{TrafficArgs, run as traffic};
 
 pub fn resolve_quote_sender(
@@ -71,6 +75,7 @@ pub fn resolve_private_key(
         })
 }
 
+#[derive(Clone)]
 pub struct IntentRuntimeArgs {
     pub network: Network,
     pub rfq_url: Option<String>,
@@ -201,6 +206,7 @@ pub async fn quote(args: QuoteArgs) -> Result<()> {
     }
 
     let quote_id = plan.quote.quote.quote_id.clone();
+    let _execution_lock = ExecutionLock::acquire(wallet)?;
     let _shutdown = Shutdown::install(DrainTarget::Intent);
     let result = execute_planned_leg(
         &runtime.client,
@@ -238,20 +244,14 @@ pub async fn send(args: SendArgs) -> Result<()> {
     ui::kv("mode", "one intent");
     ui::kv("intent deposits", "1");
     confirm_execution(runtime.auto_confirm, "Execute this intent?").await?;
+    let _execution_lock = ExecutionLock::acquire(runtime.signer.address())?;
     let _shutdown = Shutdown::install(DrainTarget::Intent);
 
-    let result = execute_leg(
+    let result = execute_planned_leg(
         &runtime.client,
         &discovery.chains,
         &runtime.signer,
-        LegExecution {
-            from: plan.from,
-            to: plan.to,
-            order_type: plan.order_type,
-            amount: plan.requested_amount,
-            recipient,
-            max_input_amount: None,
-        },
+        plan,
         runtime.limits,
         &ExecutionFeedback::Detailed,
     )
@@ -278,6 +278,7 @@ pub async fn roundtrip(args: RoundtripArgs) -> Result<()> {
     .await?;
     ui::kv("mode", "one round trip");
     ui::kv("intent deposits", "2");
+    let _execution_lock = ExecutionLock::acquire(runtime.signer.address())?;
     let _shutdown = Shutdown::install(DrainTarget::RoundTrip);
 
     let mut results = Vec::new();
@@ -297,6 +298,9 @@ pub async fn roundtrip(args: RoundtripArgs) -> Result<()> {
 
 pub async fn sweep(args: SweepArgs) -> Result<()> {
     let runtime = prepare_runtime(args.runtime).await?;
+    let _execution_lock = (!args.dry_run)
+        .then(|| ExecutionLock::acquire(runtime.signer.address()))
+        .transpose()?;
     let shutdown = Shutdown::install(DrainTarget::RoundTrip);
     let mut results = Vec::new();
     let mut planned_intents = 0usize;

@@ -496,6 +496,22 @@ async fn run_intents(
             })
             .await
         }
+        cli::IntentsCommands::Stress(options) => {
+            let runtime = resolve_intent_runtime(options.runtime, global).await?;
+            commands::intents::stress(commands::intents::StressArgs {
+                runtime,
+                symbol: options.symbol,
+                amount: options.amount,
+                duration: std::time::Duration::from_secs(options.duration_secs),
+                max_intents: options.max_intents,
+                max_in_flight: usize::from(options.max_in_flight),
+                max_volume: options.max_volume,
+                max_native_spend: options.max_native_spend,
+                min_native_balance: options.min_native_balance,
+                json: options.json,
+            })
+            .await
+        }
     }
 }
 

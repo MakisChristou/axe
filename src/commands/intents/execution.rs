@@ -15,8 +15,8 @@ use super::presentation::set_intent_traffic_message;
 use super::route::{quote_request, validate_quote};
 use super::types::{
     Action, ActionKind, ActionPayload, ChainRuntime, EvmTransactionPayload, LegExecution, LegPlan,
-    LegResult, Quote, QuoteOutcome, QuoteRequest, RoundTripInputBudget, RoutePlan, RunLimits,
-    StatusOutput, TimedQuote, TransferState, WalletAsset, parse_amount,
+    LegResult, PreparedDeposit, Quote, QuoteOutcome, QuoteRequest, RoundTripInputBudget, RoutePlan,
+    RunLimits, StatusOutput, SubmittedIntent, TimedQuote, TransferState, WalletAsset, parse_amount,
 };
 use crate::evm::{ERC20, EvmEndpoints, send_tx_robust_with_warning};
 use crate::retry::retry_with_fallback_all;
@@ -35,6 +35,7 @@ struct ApprovalRequirement {
 pub enum ExecutionFeedback {
     Detailed,
     Debugger,
+    Startup(ProgressBar),
     Progress(ProgressBar),
     Traffic {
         progress: ProgressBar,
@@ -53,7 +54,9 @@ impl ExecutionFeedback {
 
     fn stage(&self, route: &str, stage: &str) {
         match self {
-            Self::Progress(progress) => progress.set_message(format!("{route} · {stage}")),
+            Self::Progress(progress) | Self::Startup(progress) => {
+                progress.set_message(format!("{route} · {stage}"));
+            }
             Self::Traffic { progress, context } => set_intent_traffic_message(
                 progress,
                 &format!(
@@ -79,13 +82,13 @@ impl ExecutionFeedback {
                     &format!("{} intents · {context} · fulfilled", progress.position()),
                 );
             }
-            Self::Detailed | Self::Debugger => {}
+            Self::Detailed | Self::Debugger | Self::Startup(_) => {}
         }
     }
 
     fn warn(&self, message: &str) {
         match self {
-            Self::Detailed | Self::Debugger => ui::warn(message),
+            Self::Detailed | Self::Debugger | Self::Startup(_) => ui::warn(message),
             Self::Progress(progress) => progress.println(ui::warning_line(message)),
             Self::Traffic { progress, context } => set_intent_traffic_message(
                 progress,
@@ -137,6 +140,7 @@ pub async fn execute_round_trip(
             amount: plan.requested_amount,
             recipient: signer.address(),
             max_input_amount: forward_input_limit,
+            settlement_contract: plan.forward_settlement_contract,
         },
         limits,
         feedback,
@@ -172,6 +176,7 @@ pub async fn execute_round_trip(
             amount: reverse_amount,
             recipient: signer.address(),
             max_input_amount: reverse_input_limit,
+            settlement_contract: plan.reverse_settlement_contract,
         },
         limits,
         feedback,
@@ -189,25 +194,8 @@ pub async fn execute_leg(
     limits: RunLimits,
     feedback: &ExecutionFeedback,
 ) -> Result<LegResult> {
-    let started = Instant::now();
-    let route = format!("{} -> {}", leg.from.label(), leg.to.label());
-    feedback.stage(&route, "requesting quote");
-    let (selected, input_amount) = quote_for_execution(client, signer.address(), &leg).await?;
-    execute_selected_leg(
-        client,
-        chains,
-        signer,
-        SelectedLegExecution {
-            from: leg.from,
-            to: leg.to,
-            selected,
-            input_amount,
-            started,
-        },
-        limits,
-        feedback,
-    )
-    .await
+    let submitted = submit_leg(client, chains, signer, leg, feedback).await?;
+    finish_submitted_intent(client, submitted, limits, feedback).await
 }
 
 pub async fn execute_planned_leg(
@@ -228,8 +216,11 @@ pub async fn execute_planned_leg(
     validate_quote_lifetime(&plan.quote.quote)?;
     let input_amount = parse_amount(&plan.quote.quote.input.amount)?;
     validate_input_limit(input_amount, None)?;
-    execute_selected_leg(
-        client,
+    let settlement = validate_quote_actions(&plan.quote.quote, &plan.from, input_amount)?;
+    if settlement != plan.settlement_contract {
+        return Err(eyre!("intent quote changed its settlement contract"));
+    }
+    let submitted = submit_selected_leg(
         chains,
         signer,
         SelectedLegExecution {
@@ -239,10 +230,10 @@ pub async fn execute_planned_leg(
             input_amount,
             started: Instant::now(),
         },
-        limits,
         feedback,
     )
-    .await
+    .await?;
+    finish_submitted_intent(client, submitted, limits, feedback).await
 }
 
 struct SelectedLegExecution {
@@ -253,14 +244,76 @@ struct SelectedLegExecution {
     started: Instant,
 }
 
-async fn execute_selected_leg(
+pub(super) async fn submit_leg(
     client: &RfqClient,
     chains: &std::collections::HashMap<String, ChainRuntime>,
     signer: &PrivateKeySigner,
-    execution: SelectedLegExecution,
-    limits: RunLimits,
+    leg: LegExecution,
     feedback: &ExecutionFeedback,
-) -> Result<LegResult> {
+) -> Result<SubmittedIntent> {
+    let started = Instant::now();
+    let route = format!("{} -> {}", leg.from.label(), leg.to.label());
+    feedback.stage(&route, "requesting quote");
+    let (selected, input_amount) = quote_for_execution(client, signer.address(), &leg).await?;
+    submit_selected_leg(
+        chains,
+        signer,
+        SelectedLegExecution {
+            from: leg.from,
+            to: leg.to,
+            selected,
+            input_amount,
+            started,
+        },
+        feedback,
+    )
+    .await
+}
+
+pub(super) async fn prepare_deposit(
+    client: &RfqClient,
+    sender: Address,
+    leg: LegExecution,
+) -> Result<PreparedDeposit> {
+    let (selected, input_amount) = quote_for_execution(client, sender, &leg).await?;
+    let action = deposit_action(&selected.quote, &leg.from, input_amount)?;
+    Ok(PreparedDeposit {
+        transaction: crate::evm::pipeline::PipelineTransaction {
+            request: action_request(action, sender, &leg.from.id.chain_id)?,
+            token: leg.from.id.token_address.parse()?,
+            amount: input_amount,
+            deadline: Instant::now()
+                + selected
+                    .quote
+                    .quote_expires_in()
+                    .saturating_sub(Duration::from_secs(2)),
+        },
+        quote_id: selected.quote.quote_id,
+        quote_latency_ms: elapsed_ms(selected.latency),
+    })
+}
+
+fn deposit_action<'a>(quote: &'a Quote, source: &WalletAsset, amount: U256) -> Result<&'a Action> {
+    let mut deposits = quote
+        .actions
+        .iter()
+        .filter(|action| action.kind == ActionKind::Transaction);
+    let deposit = deposits
+        .next()
+        .ok_or_else(|| eyre!("intent quote had no deposit transaction"))?;
+    if deposits.next().is_some() {
+        return Err(eyre!("intent quote returned multiple deposit transactions"));
+    }
+    validate_deposit_action(deposit, source, amount)?;
+    Ok(deposit)
+}
+
+async fn submit_selected_leg(
+    chains: &std::collections::HashMap<String, ChainRuntime>,
+    signer: &PrivateKeySigner,
+    execution: SelectedLegExecution,
+    feedback: &ExecutionFeedback,
+) -> Result<SubmittedIntent> {
     let route = format!("{} -> {}", execution.from.label(), execution.to.label());
     let selected = execution.selected;
 
@@ -275,24 +328,7 @@ async fn execute_selected_leg(
     )
     .await?;
 
-    let deposits: Vec<Action> = selected
-        .quote
-        .actions
-        .iter()
-        .filter(|action| action.kind == ActionKind::Transaction)
-        .cloned()
-        .collect();
-    if deposits.len() != 1 {
-        return Err(eyre!(
-            "intent quote {} returned {} transaction actions; expected exactly one deposit",
-            selected.quote.quote_id,
-            deposits.len()
-        ));
-    }
-    let deposit = deposits
-        .first()
-        .ok_or_else(|| eyre!("intent quote had no deposit transaction"))?;
-    validate_deposit_action(deposit, &execution.from, execution.input_amount)?;
+    let deposit = deposit_action(&selected.quote, &execution.from, execution.input_amount)?;
     if feedback.is_detailed() {
         ui::kv("quote", &selected.quote.quote_id);
         if let Some(swap_id) = selected.quote.backend.swap_id() {
@@ -305,7 +341,7 @@ async fn execute_selected_leg(
         chains,
         signer,
         &execution.from,
-        &deposits,
+        std::slice::from_ref(deposit),
         "intent deposit",
         feedback,
     )
@@ -316,32 +352,49 @@ async fn execute_selected_leg(
         ui::tx_hash("deposit", &deposit_hash);
     }
 
+    Ok(SubmittedIntent {
+        from: execution.from,
+        to: execution.to,
+        selected,
+        input_amount: execution.input_amount,
+        started: execution.started,
+        deposit_confirmation_latency_ms,
+    })
+}
+
+pub(super) async fn finish_submitted_intent(
+    client: &RfqClient,
+    submitted: SubmittedIntent,
+    limits: RunLimits,
+    feedback: &ExecutionFeedback,
+) -> Result<LegResult> {
+    let route = format!("{} -> {}", submitted.from.label(), submitted.to.label());
     feedback.stage(&route, "awaiting fulfillment");
     let fulfillment_started = Instant::now();
     let status_output = wait_for_fulfillment(
         client,
-        &selected.quote,
-        &execution.to,
+        &submitted.selected.quote,
+        &submitted.to,
         limits,
         feedback,
         &route,
     )
     .await?;
     let fulfillment_latency_ms = elapsed_ms(fulfillment_started.elapsed());
-    let end_to_end_latency_ms = elapsed_ms(execution.started.elapsed());
+    let end_to_end_latency_ms = elapsed_ms(submitted.started.elapsed());
     let output_amount = parse_amount(&status_output.amount)?;
     if feedback.is_detailed() {
         ui::success(&format!(
             "fulfilled {route} in {:.1}s",
-            execution.started.elapsed().as_secs_f64()
+            submitted.started.elapsed().as_secs_f64()
         ));
     }
     feedback.leg_completed(&route);
     Ok(LegResult {
-        input_amount: execution.input_amount,
+        input_amount: submitted.input_amount,
         output_amount,
-        quote_latency_ms: elapsed_ms(selected.latency),
-        deposit_confirmation_latency_ms,
+        quote_latency_ms: elapsed_ms(submitted.selected.latency),
+        deposit_confirmation_latency_ms: submitted.deposit_confirmation_latency_ms,
         fulfillment_latency_ms,
         end_to_end_latency_ms,
     })
@@ -371,6 +424,10 @@ async fn quote_for_execution(
     validate_quote_lifetime(&selected.quote)?;
     let input_amount = parse_amount(&selected.quote.input.amount)?;
     validate_input_limit(input_amount, leg.max_input_amount)?;
+    let settlement = validate_quote_actions(&selected.quote, &leg.from, input_amount)?;
+    if settlement != leg.settlement_contract {
+        return Err(eyre!("intent quote changed its settlement contract"));
+    }
     Ok((selected, input_amount))
 }
 
@@ -403,8 +460,16 @@ async fn ensure_input_approval(
         return Ok(());
     }
     feedback.stage(route, "checking allowance");
-    let required =
-        required_approvals(chains, signer, source, &approvals, input_amount, feedback).await?;
+    let required = required_approvals(
+        chains,
+        signer,
+        source,
+        &approvals,
+        input_amount,
+        None,
+        feedback,
+    )
+    .await?;
     if required.is_empty() {
         return Ok(());
     }
@@ -510,11 +575,19 @@ fn action_request(
         .wrap_err_with(|| format!("action '{}' has invalid calldata", action.id))?;
     let value = U256::from_str(&payload.value)
         .wrap_err_with(|| format!("action '{}' has an invalid value", action.id))?;
-    Ok(TransactionRequest::default()
-        .from(signer)
-        .to(to)
-        .input(Bytes::from(data).into())
-        .value(value))
+    let chain_id = expected_chain
+        .strip_prefix("eip155:")
+        .ok_or_else(|| eyre!("expected an EVM chain ID, got {expected_chain}"))?
+        .parse::<u64>()
+        .wrap_err_with(|| format!("invalid EVM chain ID {expected_chain}"))?;
+    Ok(TransactionRequest {
+        chain_id: Some(chain_id),
+        ..Default::default()
+    }
+    .from(signer)
+    .to(to)
+    .input(Bytes::from(data).into())
+    .value(value))
 }
 
 fn action_payload(action: &Action) -> Result<&EvmTransactionPayload> {
@@ -532,6 +605,7 @@ async fn required_approvals(
     source: &WalletAsset,
     actions: &[Action],
     amount: U256,
+    approval_amount: Option<U256>,
     feedback: &ExecutionFeedback,
 ) -> Result<Vec<Action>> {
     let chain = chains
@@ -559,10 +633,14 @@ async fn required_approvals(
         )
         .await
         .map_err(|error| eyre!("could not read intent token allowance: {error}"))?;
-        if allowance < requirement.amount {
-            required.push(maximum_approval_action(action, requirement)?);
+        let approval_amount = approval_amount.unwrap_or(requirement.amount);
+        if approval_amount < requirement.amount {
+            return Err(eyre!("approval cap is below the quoted input"));
+        }
+        if allowance < approval_amount {
+            required.push(approval_action(action, requirement, approval_amount)?);
             if feedback.is_detailed() {
-                ui::info("Token allowance is insufficient; approving the maximum amount.");
+                ui::info("Token allowance is insufficient; approving the bounded amount.");
             }
         } else if feedback.is_detailed() {
             ui::success("Token allowance is already sufficient; skipping approval.");
@@ -571,9 +649,16 @@ async fn required_approvals(
     Ok(required)
 }
 
-fn maximum_approval_action(action: &Action, requirement: ApprovalRequirement) -> Result<Action> {
-    let mut maximum = action.clone();
-    let ActionPayload::EvmTransaction(payload) = &mut maximum.payload else {
+fn approval_action(
+    action: &Action,
+    requirement: ApprovalRequirement,
+    amount: U256,
+) -> Result<Action> {
+    if amount < requirement.amount {
+        return Err(eyre!("approval amount is below the quoted input"));
+    }
+    let mut bounded = action.clone();
+    let ActionPayload::EvmTransaction(payload) = &mut bounded.payload else {
         return Err(eyre!("action '{}' is not an EVM transaction", action.id));
     };
     payload.data = format!(
@@ -581,12 +666,89 @@ fn maximum_approval_action(action: &Action, requirement: ApprovalRequirement) ->
         hex::encode(
             ERC20::approveCall {
                 spender: requirement.spender,
-                amount: U256::MAX,
+                amount,
             }
             .abi_encode()
         )
     );
-    Ok(maximum)
+    Ok(bounded)
+}
+
+pub(super) async fn prepare_stress_approval(
+    chains: &std::collections::HashMap<String, ChainRuntime>,
+    signer: &PrivateKeySigner,
+    plan: &LegPlan,
+    approval_amount: U256,
+    feedback: &ExecutionFeedback,
+) -> Result<()> {
+    let mut approvals = plan
+        .quote
+        .quote
+        .actions
+        .iter()
+        .filter(|action| action.kind == ActionKind::Approval)
+        .cloned()
+        .collect::<Vec<_>>();
+    if approvals.is_empty() {
+        approvals.push(stress_approval_action(
+            plan,
+            signer.address(),
+            approval_amount,
+        ));
+    }
+    let route = format!("{} -> {}", plan.from.label(), plan.to.label());
+    let required = required_approvals(
+        chains,
+        signer,
+        &plan.from,
+        &approvals,
+        plan.input_amount,
+        Some(approval_amount),
+        feedback,
+    )
+    .await?;
+    if required.is_empty() {
+        feedback.stage(&route, "allowance sufficient · no approval needed");
+        return Ok(());
+    }
+    feedback.stage(&route, "approving token");
+    execute_actions(
+        chains,
+        signer,
+        &plan.from,
+        &required,
+        "intent stress approval",
+        feedback,
+    )
+    .await?;
+    Ok(())
+}
+
+fn stress_approval_action(plan: &LegPlan, signer: Address, amount: U256) -> Action {
+    Action {
+        id: "axe-stress-approval".to_owned(),
+        label: "Approve bounded intent stress volume".to_owned(),
+        kind: ActionKind::Approval,
+        chain: plan.from.id.chain_id.clone(),
+        payload: ActionPayload::EvmTransaction(EvmTransactionPayload {
+            from: Some(signer.to_string()),
+            to: plan.from.id.token_address.clone(),
+            data: format!(
+                "0x{}",
+                hex::encode(
+                    ERC20::approveCall {
+                        spender: plan.settlement_contract,
+                        amount,
+                    }
+                    .abi_encode()
+                )
+            ),
+            value: "0".to_owned(),
+            gas_limit: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+        }),
+    }
 }
 
 fn approval_requirement(
@@ -630,8 +792,12 @@ fn approval_requirement(
     Ok(requirement)
 }
 
-fn validate_deposit_action(action: &Action, source: &WalletAsset, amount: U256) -> Result<()> {
+fn validate_deposit_action(action: &Action, source: &WalletAsset, amount: U256) -> Result<Address> {
     let payload = action_payload(action)?;
+    let target = payload
+        .to
+        .parse::<Address>()
+        .wrap_err_with(|| format!("action '{}' has an invalid target", action.id))?;
     let value = U256::from_str(&payload.value)
         .wrap_err_with(|| format!("action '{}' has an invalid value", action.id))?;
     let expected_value = if source.native { amount } else { U256::ZERO };
@@ -641,7 +807,53 @@ fn validate_deposit_action(action: &Action, source: &WalletAsset, amount: U256) 
             action.id
         ));
     }
-    Ok(())
+    Ok(target)
+}
+
+pub(super) fn validate_quote_actions(
+    quote: &Quote,
+    source: &WalletAsset,
+    input_amount: U256,
+) -> Result<Address> {
+    let deposits = quote
+        .actions
+        .iter()
+        .filter(|action| action.kind == ActionKind::Transaction)
+        .collect::<Vec<_>>();
+    if deposits.len() != 1 {
+        return Err(eyre!(
+            "intent quote {} returned {} transaction actions; expected exactly one deposit",
+            quote.quote_id,
+            deposits.len()
+        ));
+    }
+    let settlement = validate_deposit_action(deposits[0], source, input_amount)?;
+    let approvals = quote
+        .actions
+        .iter()
+        .filter(|action| action.kind == ActionKind::Approval)
+        .collect::<Vec<_>>();
+    if source.native {
+        if !approvals.is_empty() {
+            return Err(eyre!("native-token quote unexpectedly requested approval"));
+        }
+        return Ok(settlement);
+    }
+    if approvals.len() > 1 {
+        return Err(eyre!(
+            "token quote returned {} approval actions; expected at most one",
+            approvals.len()
+        ));
+    }
+    if let Some(approval) = approvals.first() {
+        let requirement = approval_requirement(approval, source, input_amount)?;
+        if requirement.spender != settlement {
+            return Err(eyre!(
+                "intent approval spender does not match the deposit contract"
+            ));
+        }
+    }
+    Ok(settlement)
 }
 
 async fn wait_for_fulfillment(
@@ -689,7 +901,7 @@ async fn wait_for_fulfillment(
                         let output = status
                             .output
                             .ok_or_else(|| eyre!("DONE status omitted output"))?;
-                        validate_status_output(&output, expected_output)?;
+                        validate_status_output(&output, expected_output, quote)?;
                         if feedback.is_detailed()
                             && let Some(destination) = status.destination
                         {
@@ -750,7 +962,11 @@ fn effective_timeout(quote: &Quote, configured: Duration) -> Duration {
     deadline.map_or(configured, |deadline| deadline.min(configured))
 }
 
-fn validate_status_output(output: &StatusOutput, expected: &WalletAsset) -> Result<()> {
+fn validate_status_output(
+    output: &StatusOutput,
+    expected: &WalletAsset,
+    quote: &Quote,
+) -> Result<()> {
     if output.chain != expected.id.chain_id
         || !output
             .token
@@ -759,6 +975,14 @@ fn validate_status_output(output: &StatusOutput, expected: &WalletAsset) -> Resu
         return Err(eyre!(
             "RFQ DONE output does not match the requested destination asset"
         ));
+    }
+    let promised = quote
+        .output
+        .minimum_amount
+        .as_deref()
+        .unwrap_or(&quote.output.amount);
+    if parse_amount(&output.amount)? < parse_amount(promised)? {
+        return Err(eyre!("RFQ DONE output is below the quoted minimum"));
     }
     Ok(())
 }
@@ -777,9 +1001,30 @@ impl Quote {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
 
-    use super::super::types::AssetId;
+    use super::super::types::{
+        AssetId, Backend, BackendType, Fees, QuoteInput, QuoteOutput, SelectionReason, Validity,
+    };
+
+    #[tokio::test]
+    async fn startup_feedback_updates_stage_without_printing_recovery_warnings() {
+        let progress = ProgressBar::hidden();
+        let feedback = ExecutionFeedback::Startup(progress.clone());
+        let warnings = Arc::new(AtomicU64::new(0));
+        ui::count_warnings(Arc::clone(&warnings), async {
+            feedback.stage("Base Sepolia/USDC", "checking allowance");
+            feedback.warn("temporary RPC failure");
+        })
+        .await;
+
+        assert_eq!(progress.message(), "Base Sepolia/USDC · checking allowance");
+        assert_eq!(warnings.load(Ordering::Relaxed), 1);
+        assert!(!feedback.is_detailed());
+    }
 
     fn evm_action(
         id: &str,
@@ -806,6 +1051,54 @@ mod tests {
         }
     }
 
+    fn token_asset(chain_id: &str, token: Address) -> WalletAsset {
+        WalletAsset {
+            id: AssetId {
+                chain_id: chain_id.to_owned(),
+                token_address: token.to_string(),
+            },
+            chain_label: chain_id.to_owned(),
+            symbol: "USDC".to_owned(),
+            decimals: 6,
+            balance: U256::from(1_000_000u64),
+            native: false,
+        }
+    }
+
+    fn quote_with_actions(actions: Vec<Action>) -> Quote {
+        Quote {
+            quote_id: "quote-id".to_owned(),
+            selection_reason: SelectionReason::BestAvailable,
+            backend: Backend {
+                kind: BackendType::Intent,
+                name: "solver".to_owned(),
+                tracking: serde_json::json!({}),
+                metadata: serde_json::json!({}),
+            },
+            estimated_time_seconds: 10,
+            validity: Validity {
+                kind: "expires_at".to_owned(),
+                quote_expires_at: Utc::now() + chrono::Duration::minutes(1),
+                fulfillment_deadline: None,
+            },
+            input: QuoteInput {
+                chain: "eip155:1".to_owned(),
+                token: Address::from([1u8; 20]).to_string(),
+                amount: "100".to_owned(),
+                amount_usd_approx: None,
+            },
+            output: QuoteOutput {
+                chain: "eip155:2".to_owned(),
+                token: Address::from([4u8; 20]).to_string(),
+                amount: "95".to_owned(),
+                minimum_amount: Some("90".to_owned()),
+                amount_usd_approx: None,
+            },
+            fees: Fees::default(),
+            actions,
+        }
+    }
+
     #[test]
     fn rejects_an_action_for_another_chain() {
         let action = evm_action(
@@ -828,14 +1121,15 @@ mod tests {
         let action = evm_action(
             "deposit",
             ActionKind::Transaction,
-            "eip155:1",
+            "eip155:43113",
             signer,
             "0x0000000000000000000000000000000000000002"
                 .parse()
                 .unwrap(),
             "0x1234".into(),
         );
-        assert!(action_request(&action, signer, "eip155:1").is_ok());
+        let request = action_request(&action, signer, "eip155:43113").unwrap();
+        assert_eq!(request.chain_id, Some(43_113));
     }
 
     #[test]
@@ -872,7 +1166,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_a_validated_approval_to_the_maximum_amount() {
+    fn rewrites_a_validated_approval_to_the_bounded_amount() {
         let token = Address::from([1u8; 20]);
         let spender = Address::from([2u8; 20]);
         let amount = U256::from(1_000_000u64);
@@ -889,17 +1183,84 @@ mod tests {
         );
         let requirement = ApprovalRequirement { spender, amount };
 
-        let maximum = maximum_approval_action(&action, requirement).unwrap();
-        let payload = action_payload(&maximum).unwrap();
+        let bounded_amount = amount + U256::from(500_000u64);
+        let bounded = approval_action(&action, requirement, bounded_amount).unwrap();
+        let payload = action_payload(&bounded).unwrap();
         let calldata = ERC20::approveCall::abi_decode(
             &hex::decode(payload.data.strip_prefix("0x").unwrap()).unwrap(),
         )
         .unwrap();
 
         assert_eq!(calldata.spender, spender);
-        assert_eq!(calldata.amount, U256::MAX);
+        assert_eq!(calldata.amount, bounded_amount);
         assert_eq!(payload.to, token.to_string());
-        assert_eq!(maximum.chain, action.chain);
+        assert_eq!(bounded.chain, action.chain);
+    }
+
+    #[test]
+    fn rejects_an_approval_spender_that_is_not_the_deposit_contract() {
+        let token = Address::from([1u8; 20]);
+        let settlement = Address::from([2u8; 20]);
+        let other_spender = Address::from([3u8; 20]);
+        let source = token_asset("eip155:1", token);
+        let approval = evm_action(
+            "approve",
+            ActionKind::Approval,
+            "eip155:1",
+            Address::ZERO,
+            token,
+            format!(
+                "0x{}",
+                hex::encode(
+                    ERC20::approveCall {
+                        spender: other_spender,
+                        amount: U256::from(100),
+                    }
+                    .abi_encode()
+                )
+            ),
+        );
+        let deposit = evm_action(
+            "deposit",
+            ActionKind::Transaction,
+            "eip155:1",
+            Address::ZERO,
+            settlement,
+            "0x1234".to_owned(),
+        );
+
+        let error = validate_quote_actions(
+            &quote_with_actions(vec![approval, deposit]),
+            &source,
+            U256::from(100),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn rejects_fulfillment_below_the_quoted_minimum() {
+        let quote = quote_with_actions(Vec::new());
+        let expected = token_asset("eip155:2", Address::from([4u8; 20]));
+        let output = StatusOutput {
+            chain: "eip155:2".to_owned(),
+            token: Address::from([4u8; 20]).to_string(),
+            amount: "89".to_owned(),
+        };
+
+        assert!(validate_status_output(&output, &expected, &quote).is_err());
+        assert!(
+            validate_status_output(
+                &StatusOutput {
+                    amount: "90".to_owned(),
+                    ..output
+                },
+                &expected,
+                &quote
+            )
+            .is_ok()
+        );
     }
 
     #[test]
