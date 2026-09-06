@@ -22,6 +22,7 @@ use indicatif::ProgressBar;
 use self::client::RfqClient;
 use self::execution::{ExecutionFeedback, execute_planned_leg, execute_round_trip};
 use self::execution_lock::ExecutionLock;
+use self::presentation::IntentActivity;
 use self::route::{
     DiscoveryFeedback, PlanningFeedback, RouteDiscovery, discover_wallet, plan_roundtrip,
     plan_send, plan_sweep, render_plans,
@@ -170,17 +171,16 @@ struct IntentRuntime {
 }
 
 pub async fn quote(args: QuoteArgs) -> Result<()> {
+    let startup = IntentActivity::new("Loading intent configuration…", !args.json);
     let runtime = prepare_runtime(args.runtime).await?;
     let wallet = runtime.signer.address();
     let sender = args.sender.unwrap_or(wallet);
     let recipient = args.recipient.unwrap_or(sender);
-    let discovery_feedback = if args.json {
-        DiscoveryFeedback::Quiet
-    } else {
-        DiscoveryFeedback::Detailed
-    };
+    startup.bar.set_message("Checking funded chains…");
+    let discovery_feedback = DiscoveryFeedback::Quiet;
     let discovery =
         discover_wallet(&runtime.client, &runtime.config, sender, discovery_feedback).await?;
+    startup.bar.set_message("Requesting intent quote…");
     let plan = plan_send(
         &runtime.client,
         &discovery,
@@ -190,6 +190,7 @@ pub async fn quote(args: QuoteArgs) -> Result<()> {
         PlanningFeedback::Hidden,
     )
     .await?;
+    drop(startup);
     read::render_planned_quote(&plan, args.json)?;
     if args.json {
         return Ok(());
@@ -223,52 +224,63 @@ pub async fn quote(args: QuoteArgs) -> Result<()> {
 }
 
 pub async fn send(args: SendArgs) -> Result<()> {
+    let startup = IntentActivity::new("Loading intent configuration…", true);
     let runtime = prepare_runtime(args.runtime).await?;
+    startup.bar.set_message("Checking funded chains…");
     let discovery = discover_wallet(
         &runtime.client,
         &runtime.config,
         runtime.signer.address(),
-        DiscoveryFeedback::Detailed,
+        DiscoveryFeedback::Quiet,
     )
     .await?;
     let recipient = args.recipient.unwrap_or_else(|| runtime.signer.address());
+    startup.bar.set_message("Finding an available route…");
     let plan = plan_send(
         &runtime.client,
         &discovery,
         runtime.signer.address(),
         recipient,
         &args.route,
-        PlanningFeedback::Visible,
+        PlanningFeedback::Hidden,
     )
     .await?;
-    ui::kv("mode", "one intent");
-    ui::kv("intent deposits", "1");
+    drop(startup);
+    route::render_leg_plan(&plan);
     confirm_execution(runtime.auto_confirm, "Execute this intent?").await?;
     let _execution_lock = ExecutionLock::acquire(runtime.signer.address())?;
     let _shutdown = Shutdown::install(DrainTarget::Intent);
 
+    let activity = IntentActivity {
+        bar: presentation::intent_progress_bar(1, "Starting intent…"),
+    };
     let result = execute_planned_leg(
         &runtime.client,
         &discovery.chains,
         &runtime.signer,
         plan,
         runtime.limits,
-        &ExecutionFeedback::Detailed,
+        &ExecutionFeedback::Progress(activity.bar.clone()),
     )
-    .await?;
+    .await;
+    drop(activity);
+    let result = result?;
     render_summary(std::slice::from_ref(&result), 1);
     Ok(())
 }
 
 pub async fn roundtrip(args: RoundtripArgs) -> Result<()> {
+    let startup = IntentActivity::new("Loading intent configuration…", true);
     let runtime = prepare_runtime(args.runtime).await?;
+    startup.bar.set_message("Checking funded chains…");
     let discovery = discover_wallet(
         &runtime.client,
         &runtime.config,
         runtime.signer.address(),
-        DiscoveryFeedback::Detailed,
+        DiscoveryFeedback::Quiet,
     )
     .await?;
+    startup.bar.set_message("Finding a round-trip route…");
     let plan = plan_roundtrip(
         &runtime.client,
         &discovery,
@@ -276,22 +288,26 @@ pub async fn roundtrip(args: RoundtripArgs) -> Result<()> {
         &args.route,
     )
     .await?;
-    ui::kv("mode", "one round trip");
-    ui::kv("intent deposits", "2");
+    drop(startup);
+    render_plans(std::slice::from_ref(&plan));
     let _execution_lock = ExecutionLock::acquire(runtime.signer.address())?;
     let _shutdown = Shutdown::install(DrainTarget::RoundTrip);
 
     let mut results = Vec::new();
+    let activity = IntentActivity {
+        bar: presentation::intent_progress_bar(2, "Starting round trip…"),
+    };
     let executed = execute_round_trip(
         &runtime.client,
         &discovery.chains,
         &runtime.signer,
         &plan,
         runtime.limits,
-        &ExecutionFeedback::Detailed,
+        &ExecutionFeedback::Progress(activity.bar.clone()),
         &mut results,
     )
     .await;
+    drop(activity);
     render_summary(&results, 2);
     executed
 }
@@ -308,6 +324,7 @@ pub async fn sweep(args: SweepArgs) -> Result<()> {
 
     loop {
         sweep += 1;
+        let startup = IntentActivity::new("Checking funded chains…", true);
         let discovery = discover_wallet(
             &runtime.client,
             &runtime.config,
@@ -315,6 +332,7 @@ pub async fn sweep(args: SweepArgs) -> Result<()> {
             DiscoveryFeedback::Quiet,
         )
         .await?;
+        drop(startup);
         let plans = plan_sweep(
             &runtime.client,
             &discovery,
@@ -444,9 +462,9 @@ async fn confirm_execution(auto_confirm: bool, prompt: &str) -> Result<()> {
 }
 
 fn render_summary(results: &[LegResult], planned: usize) {
-    ui::section("intent summary");
+    ui::section("intent result");
     ui::kv(
-        "completed intents",
+        "fulfilled",
         &format!(
             "{}/{} ({:.1}%)",
             results.len(),
@@ -493,7 +511,7 @@ fn render_summary(results: &[LegResult], planned: usize) {
 
 fn format_latency_percentiles(values: &[u64]) -> String {
     format!(
-        "p50 {} │ p95 {}",
+        "p50 {} | p95 {}",
         ui::format_millis(percentile(values, 50)),
         ui::format_millis(percentile(values, 95))
     )
@@ -527,7 +545,7 @@ mod tests {
     fn latency_percentiles_are_labeled_and_human_readable() {
         assert_eq!(
             format_latency_percentiles(&[181, 2_924, 8_823]),
-            "p50 2.92 s │ p95 8.82 s"
+            "p50 2.92 s | p95 8.82 s"
         );
     }
 

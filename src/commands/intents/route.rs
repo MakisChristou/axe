@@ -492,7 +492,6 @@ pub async fn plan_roundtrip(
                 .ok_or_else(|| eyre!("the solver returned no bidirectional quote for the route"))?
         }
     };
-    render_plans(std::slice::from_ref(&plan));
     Ok(plan)
 }
 
@@ -1127,7 +1126,7 @@ fn render_wallet_stats(
 }
 
 pub(super) fn render_plans(plans: &[RoutePlan]) {
-    ui::section("intent preflight");
+    ui::section("intent round-trip plan");
     ui::kv("quotable round trips", &plans.len().to_string());
     for plan in plans {
         ui::kv(
@@ -1155,7 +1154,7 @@ pub(super) fn render_plans(plans: &[RoutePlan]) {
         ui::kv(
             "quote latency",
             &format!(
-                "forward {} │ reverse {}",
+                "forward {} | reverse {}",
                 ui::format_millis(plan.forward_quote_ms),
                 ui::format_millis(plan.reverse_quote_ms)
             ),
@@ -1167,8 +1166,8 @@ pub(super) fn render_plans(plans: &[RoutePlan]) {
     );
 }
 
-fn render_leg_plan(plan: &LegPlan) {
-    ui::section("intent preflight");
+pub(super) fn render_leg_plan(plan: &LegPlan) {
+    ui::section("intent send plan");
     ui::kv(
         "asset type",
         if plan.from.native { "native" } else { "token" },

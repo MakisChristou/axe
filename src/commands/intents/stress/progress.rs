@@ -5,21 +5,16 @@ use std::time::Duration;
 
 use indicatif::ProgressBar;
 
+use super::super::presentation::intent_activity_bar;
 use super::super::types::format_units;
 use super::types::{
     AdmissionState, RateSample, StopReason, StressLimits, StressProgress, StressTelemetry,
 };
-use crate::ui;
 
 const RATE_WINDOW: Duration = Duration::from_secs(10);
 
 pub(super) fn bar() -> ProgressBar {
-    let bar = ProgressBar::new_spinner();
-    bar.set_style(ui::progress_spinner_style(
-        "  {spinner:.cyan} {elapsed_precise}  {msg}",
-    ));
-    bar.enable_steady_tick(Duration::from_millis(100));
-    bar
+    intent_activity_bar("")
 }
 
 impl StressProgress {
@@ -95,7 +90,7 @@ mod tests {
     #[test]
     fn throughput_counts_deposits_separately_and_decays_when_work_stalls() {
         let limits = StressLimits {
-            duration: Duration::from_secs(60),
+            duration: Some(Duration::from_secs(60)),
             max_intents: 200,
             max_in_flight: 16,
             amount: U256::from(1),

@@ -16,7 +16,7 @@ pub(super) fn render_report(
 ) {
     let counts = report.counts;
     let retained_samples = u64::try_from(report.samples.len()).unwrap_or(u64::MAX);
-    ui::section("intent quote benchmark");
+    ui::section("intent quote benchmark result");
     render_target(report);
     ui::kv("mode", report.mode.label());
     if report.interrupted {
@@ -25,7 +25,13 @@ pub(super) fn render_report(
             "stopped gracefully after draining in-flight requests",
         );
     }
-    ui::kv("requests", &counts.attempted.to_string());
+    ui::kv(
+        "requests",
+        &format!(
+            "{} total | {} available | {} unavailable | {} failed | {} timed out",
+            counts.attempted, counts.available, counts.unavailable, counts.failed, counts.timed_out
+        ),
+    );
     if retained_samples < counts.attempted {
         ui::kv(
             "statistics sample",
@@ -33,30 +39,14 @@ pub(super) fn render_report(
         );
     }
     ui::kv("elapsed", &ui::format_duration(report.elapsed));
-    ui::kv(
-        "throughput",
-        &format!("{:.1} requests/s", throughput(report)),
-    );
-    ui::kv("concurrency", &concurrency.to_string());
-    ui::kv("warmup requests", &warmup.to_string());
-    if let Some(max_rps) = max_rps {
-        ui::kv("rate limit", &format!("{max_rps} requests/s"));
-    }
-    ui::kv(
-        "available quotes",
-        &format!(
-            "{}/{} ({:.1}%)",
-            counts.available,
-            counts.attempted,
-            percentage(counts.available, counts.attempted)
-        ),
+    ui::kv("rate", &format!("{:.1} requests/s", throughput(report)));
+    let rate_limit = max_rps.map_or_else(
+        || "uncapped rate".to_owned(),
+        |rate| format!("{rate} requests/s cap"),
     );
     ui::kv(
-        "other outcomes",
-        &format!(
-            "{} unavailable │ {} failed │ {} timed out",
-            counts.unavailable, counts.failed, counts.timed_out
-        ),
+        "settings",
+        &format!("{concurrency} concurrent | {warmup} warmup | {rate_limit}"),
     );
     if counts.failed > 0 {
         render_failures(report);
@@ -117,7 +107,7 @@ fn render_failures(report: &BenchmarkReport) {
     ui::kv(
         "failures",
         &format!(
-            "{} request │ {} invalid quote │ {} invalid output",
+            "{} request | {} invalid quote | {} invalid output",
             report.counts.request_failures,
             report.counts.invalid_quotes,
             report.counts.invalid_outputs
@@ -183,12 +173,9 @@ pub(super) fn report_json(report: &BenchmarkReport) -> Value {
 fn latency_summary(samples: &[Sample]) -> String {
     let values = latency_values(samples);
     format!(
-        "p50 {} │ p90 {} │ p95 {} │ p99 {} │ max {}",
+        "p50 {} | p95 {}",
         ui::format_millis(percentile(&values, 50)),
-        ui::format_millis(percentile(&values, 90)),
         ui::format_millis(percentile(&values, 95)),
-        ui::format_millis(percentile(&values, 99)),
-        ui::format_millis(values.iter().copied().max().unwrap_or_default())
     )
 }
 
@@ -196,7 +183,7 @@ fn output_summary(samples: &[Sample], decimals: u8, symbol: &str) -> Option<Stri
     let mut values = output_values(samples);
     values.sort_unstable();
     Some(format!(
-        "min {} │ median {} │ max {} {}",
+        "min {} | median {} | max {} {}",
         format_units(*values.first()?, decimals),
         format_units(values[(values.len() - 1) / 2], decimals),
         format_units(*values.last()?, decimals),
@@ -208,7 +195,7 @@ fn validity_summary(samples: &[Sample]) -> Option<String> {
     let values = validity_values(samples);
     (!values.is_empty()).then(|| {
         format!(
-            "median {} │ min {}",
+            "median {} | min {}",
             ui::format_millis(percentile(&values, 50)),
             ui::format_millis(values.iter().copied().min().unwrap_or_default())
         )
@@ -273,13 +260,6 @@ fn throughput(report: &BenchmarkReport) -> f64 {
     report.counts.attempted as f64 / seconds
 }
 
-fn percentage(count: u64, total: u64) -> f64 {
-    if total == 0 {
-        return 0.0;
-    }
-    count as f64 / total as f64 * 100.0
-}
-
 pub(super) fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -308,17 +288,14 @@ mod tests {
             available(50, 80, 600),
         ];
 
-        assert_eq!(
-            latency_summary(&samples),
-            "p50 30 ms │ p90 50 ms │ p95 50 ms │ p99 50 ms │ max 50 ms"
-        );
+        assert_eq!(latency_summary(&samples), "p50 30 ms | p95 50 ms");
         assert_eq!(
             output_summary(&samples, 0, "TOKEN").as_deref(),
-            Some("min 80 │ median 100 │ max 120 TOKEN")
+            Some("min 80 | median 100 | max 120 TOKEN")
         );
         assert_eq!(
             validity_summary(&samples).as_deref(),
-            Some("median 800 ms │ min 600 ms")
+            Some("median 800 ms | min 600 ms")
         );
     }
 }

@@ -8,7 +8,7 @@ use eyre::{Result, bail, eyre};
 use serde_json::json;
 
 use super::client::RfqClient;
-use super::presentation::asset_table;
+use super::presentation::{IntentActivity, asset_table};
 use super::types::{
     ActionPayload, AssetSpec, AssetType, CatalogChain, CatalogResponse, CatalogToken, FeeEntry,
     HumanAmount, LegPlan, OrderType, Quote, QuoteRequest, StatusResponse, TokenInfo,
@@ -57,10 +57,12 @@ pub(super) struct PreparedQuote {
 }
 
 pub async fn catalog(args: CatalogArgs) -> Result<()> {
+    let activity = IntentActivity::new("Loading supported chains and assets…", !args.json);
     let client = api_client(&args.api)?;
     let (chains, tokens) = tokio::try_join!(client.chains(), client.tokens())?;
     let tokens = filter_tokens(tokens.tokens, args.asset_type);
     let response = merge_catalog(chains.chains, tokens, args.chain.as_deref())?;
+    drop(activity);
     if args.json {
         println!("{}", serde_json::to_string_pretty(&response)?);
     } else {
@@ -164,7 +166,9 @@ pub(super) fn render_planned_quote(plan: &LegPlan, json: bool) -> Result<()> {
 pub async fn status(args: StatusArgs) -> Result<()> {
     let client = api_client(&args.api)?;
     if !args.watch {
+        let activity = IntentActivity::new("Fetching intent status…", !args.json);
         let response = checked_status(&client, &args.quote_id).await?;
+        drop(activity);
         return render_status(&response, args.json);
     }
     watch_status(&client, args).await
@@ -235,22 +239,18 @@ async fn checked_status(client: &RfqClient, quote_id: &str) -> Result<StatusResp
 
 async fn watch_status(client: &RfqClient, args: StatusArgs) -> Result<()> {
     let started = Instant::now();
-    let mut last_state = None;
+    let activity = IntentActivity::new("Fetching intent status…", !args.json);
     loop {
         let response = checked_status(client, &args.quote_id).await?;
         ensure_watchable_status(&response)?;
-        if last_state != Some(response.state) {
-            if !args.json {
-                render_status(&response, false)?;
-            }
-            last_state = Some(response.state);
-        }
+        activity.bar.set_message(format!(
+            "{}\n  quote ID: {}",
+            response.state.label(),
+            args.quote_id
+        ));
         if response.state.is_terminal() {
-            return if args.json {
-                render_status(&response, true)
-            } else {
-                Ok(())
-            };
+            drop(activity);
+            return render_status(&response, args.json);
         }
         if started.elapsed() >= args.timeout {
             bail!(
@@ -453,8 +453,6 @@ fn render_status(status: &StatusResponse, json: bool) -> Result<()> {
         );
         ui::tx_hash("refund transaction", &refund.tx_hash);
     }
-    ui::section("status response");
-    println!("{response}");
     Ok(())
 }
 

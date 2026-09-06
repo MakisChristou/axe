@@ -22,6 +22,7 @@ use self::types::{
     BenchmarkReport, BenchmarkSelection, BenchmarkTarget, FailureKind, Sample, SampleOutcome,
 };
 use super::client::RfqClient;
+use super::presentation::IntentActivity;
 use super::read::{QuoteRequestArgs, api_client, prepare_quote_from_tokens};
 use super::route::validate_quote_route;
 use super::types::{
@@ -51,9 +52,11 @@ impl BenchmarkTargets {
 }
 
 pub async fn benchmark_quotes(args: QuoteBenchmarkArgs) -> eyre::Result<()> {
+    let activity = IntentActivity::new("Finding quote benchmark routes…", !args.json);
     let client = api_client(&args.api)?;
     let targets =
         Arc::new(resolve_benchmark_targets(&client, &args.target, args.concurrency).await?);
+    drop(activity);
     let shutdown = Shutdown::install(DrainTarget::QuoteRequests);
     run_warmup(&client, &targets, &args, Arc::clone(&shutdown)).await?;
     let report = run_benchmark(

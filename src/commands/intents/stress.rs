@@ -13,6 +13,7 @@ use indicatif::ProgressBar;
 use self::types::{SchedulerArgs, SourceReport, SourceState, StressLimits, StressTelemetry};
 use super::execution::{ExecutionFeedback, prepare_stress_approval};
 use super::execution_lock::ExecutionLock;
+use super::presentation::IntentActivity;
 use super::route::{DiscoveryFeedback, discover_wallet, plan_stress_routes};
 use super::types::{ChainRuntime, LegPlan, format_units};
 use super::{IntentRuntime, prepare_runtime};
@@ -26,18 +27,12 @@ pub use self::types::StressArgs;
 
 pub async fn run(args: StressArgs) -> Result<()> {
     let telemetry = Arc::new(StressTelemetry::default());
-    let startup = if args.json {
-        ProgressBar::hidden()
-    } else {
-        ui::wait_spinner("Loading intent configuration…")
-    };
-    let result = ui::count_warnings(
+    let startup = IntentActivity::new("Loading intent configuration…", !args.json);
+    ui::count_warnings(
         Arc::clone(&telemetry.warnings),
-        run_stress(args, telemetry, &startup),
+        run_stress(args, telemetry, &startup.bar),
     )
-    .await;
-    startup.finish_and_clear();
-    result
+    .await
 }
 
 async fn run_stress(
@@ -214,7 +209,10 @@ fn render_plan(sources: &[SourceState], limits: &StressLimits) {
             limits.max_intents,
             format_units(limits.max_volume, limits.decimals),
             limits.symbol,
-            ui::format_duration(limits.duration)
+            limits.duration.map_or_else(
+                || "no time limit (Ctrl-C to stop)".to_owned(),
+                ui::format_duration,
+            )
         ),
     );
     ui::kv(

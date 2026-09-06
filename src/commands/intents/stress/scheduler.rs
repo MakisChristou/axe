@@ -19,7 +19,10 @@ pub(super) async fn run(mut args: SchedulerArgs) -> StressRun {
     let mut records = Vec::new();
     let mut cursor = 0;
     let mut stop = None;
-    let deadline = tokio::time::Instant::now() + args.limits.duration;
+    let deadline = args
+        .limits
+        .duration
+        .map(|duration| tokio::time::Instant::now() + duration);
     let mut refresh = tokio::time::interval(Duration::from_secs(1));
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut progress = StressProgress::new(
@@ -32,7 +35,7 @@ pub(super) async fn run(mut args: SchedulerArgs) -> StressRun {
         if stop.is_none() {
             stop = if args.shutdown.requested() {
                 Some(StopReason::Interrupted)
-            } else if tokio::time::Instant::now() >= deadline {
+            } else if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
                 Some(StopReason::Duration)
             } else {
                 state.permanent_stop(&args.limits)
@@ -68,7 +71,7 @@ pub(super) async fn run(mut args: SchedulerArgs) -> StressRun {
                 }
             }
             () = args.shutdown.cancelled(), if stop.is_none() => stop = Some(StopReason::Interrupted),
-            () = tokio::time::sleep_until(deadline), if stop.is_none() => stop = Some(StopReason::Duration),
+            () = wait_for_deadline(deadline), if stop.is_none() => stop = Some(StopReason::Duration),
             _ = refresh.tick() => {}
         }
     }
@@ -87,6 +90,13 @@ pub(super) async fn run(mut args: SchedulerArgs) -> StressRun {
             .into_iter()
             .map(|source| source.report)
             .collect(),
+    }
+}
+
+async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -188,6 +198,35 @@ fn complete_deposit(
         DepositOutcome::Failed(reason) => {
             source.report.failed += 1;
             source.report.last_issue = Some(reason);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shutdown::{DrainTarget, Shutdown};
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_runs_wait_for_the_configured_deadline() {
+        let started = tokio::time::Instant::now();
+        let duration = Duration::from_secs(7200);
+        wait_for_deadline(Some(started + duration)).await;
+        assert_eq!(started.elapsed(), duration);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continuous_runs_have_no_deadline_and_can_be_interrupted() {
+        assert!(
+            tokio::time::timeout(Duration::from_secs(86400), wait_for_deadline(None))
+                .await
+                .is_err()
+        );
+        let shutdown = Shutdown::test_instance(DrainTarget::IntentStress);
+        shutdown.request_for_test();
+        tokio::select! {
+            () = wait_for_deadline(None) => panic!("continuous run must not expire"),
+            () = shutdown.cancelled() => {}
         }
     }
 }

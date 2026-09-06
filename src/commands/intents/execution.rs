@@ -11,7 +11,7 @@ use eyre::{Result, WrapErr, eyre};
 use indicatif::ProgressBar;
 
 use super::client::RfqClient;
-use super::presentation::set_intent_traffic_message;
+use super::presentation::{compact_detail, set_intent_traffic_message};
 use super::route::{quote_request, validate_quote};
 use super::types::{
     Action, ActionKind, ActionPayload, ChainRuntime, EvmTransactionPayload, LegExecution, LegPlan,
@@ -33,7 +33,6 @@ struct ApprovalRequirement {
 
 #[derive(Clone)]
 pub enum ExecutionFeedback {
-    Detailed,
     Debugger,
     Startup(ProgressBar),
     Progress(ProgressBar),
@@ -45,7 +44,7 @@ pub enum ExecutionFeedback {
 
 impl ExecutionFeedback {
     fn is_detailed(&self) -> bool {
-        matches!(self, Self::Detailed | Self::Debugger)
+        matches!(self, Self::Debugger)
     }
 
     fn is_debugger(&self) -> bool {
@@ -59,13 +58,10 @@ impl ExecutionFeedback {
             }
             Self::Traffic { progress, context } => set_intent_traffic_message(
                 progress,
-                &format!(
-                    "{} intents · {context} · {}",
-                    progress.position(),
-                    compact_traffic_stage(stage)
-                ),
+                context,
+                &format!("{route} · {}", compact_traffic_stage(stage)),
             ),
-            Self::Detailed | Self::Debugger => {}
+            Self::Debugger => {}
         }
     }
 
@@ -77,27 +73,21 @@ impl ExecutionFeedback {
             }
             Self::Traffic { progress, context } => {
                 progress.inc(1);
-                set_intent_traffic_message(
-                    progress,
-                    &format!("{} intents · {context} · fulfilled", progress.position()),
-                );
+                set_intent_traffic_message(progress, context, "fulfilled");
             }
-            Self::Detailed | Self::Debugger | Self::Startup(_) => {}
+            Self::Debugger | Self::Startup(_) => {}
         }
     }
 
     fn warn(&self, message: &str) {
         match self {
-            Self::Detailed | Self::Debugger | Self::Startup(_) => ui::warn(message),
-            Self::Progress(progress) => progress.println(ui::warning_line(message)),
-            Self::Traffic { progress, context } => set_intent_traffic_message(
-                progress,
-                &format!(
-                    "{} intents · warning: {} · {context}",
-                    progress.position(),
-                    ui::scrub_urls(message)
-                ),
-            ),
+            Self::Debugger | Self::Startup(_) => ui::warn(message),
+            Self::Progress(progress) => {
+                progress.set_message(format!("warning · {}", compact_detail(message)));
+            }
+            Self::Traffic { progress, context } => {
+                set_intent_traffic_message(progress, context, &format!("warning · {message}"))
+            }
         }
     }
 }
@@ -350,6 +340,9 @@ async fn submit_selected_leg(
     let deposit_confirmation_latency_ms = elapsed_ms(deposit_started.elapsed());
     if feedback.is_detailed() {
         ui::tx_hash("deposit", &deposit_hash);
+    } else if let ExecutionFeedback::Progress(progress) = feedback {
+        progress.println(format!("  quote ID: {}", selected.quote.quote_id));
+        progress.println(format!("  deposit: {deposit_hash}"));
     }
 
     Ok(SubmittedIntent {
@@ -1275,11 +1268,11 @@ mod tests {
     }
 
     #[test]
-    fn traffic_feedback_keeps_compact_status_on_one_line() {
+    fn traffic_feedback_keeps_metrics_separate_from_status_and_warnings() {
         let progress = ProgressBar::hidden();
         let feedback = ExecutionFeedback::Traffic {
             progress: progress.clone(),
-            context: "1.5 i/m · 1 err · avg 1m15s".to_owned(),
+            context: "1 route failures | avg 1m 15s".to_owned(),
         };
 
         feedback.stage(
@@ -1287,8 +1280,8 @@ mod tests {
             "submitting deposit",
         );
         assert_eq!(
-            progress.message(),
-            "0 intents · 1.5 i/m · 1 err · avg 1m15s · deposit"
+            progress.message().lines().last(),
+            Some("  Arbitrum Sepolia/ETH -> Base Sepolia/ETH · deposit")
         );
 
         feedback.leg_completed("Arbitrum Sepolia/ETH -> Base Sepolia/ETH");
@@ -1296,13 +1289,21 @@ mod tests {
         assert!(
             progress
                 .message()
-                .starts_with("1 intents · 1.5 i/m · 1 err")
+                .contains("1 fulfilled | 1 route failures")
         );
 
         feedback.warn("pending state unavailable; using latest-pinned nonce+gas immediately");
-        assert!(progress.message().starts_with(
-            "1 intents · warning: pending state unavailable; using latest-pinned nonce+gas immed…"
-        ));
+        assert!(
+            progress
+                .message()
+                .contains("1 fulfilled | 1 route failures")
+        );
+        assert!(
+            progress
+                .message()
+                .contains("warning · pending state unavailable")
+        );
+        assert_eq!(progress.message().lines().count(), 3);
     }
 
     #[test]

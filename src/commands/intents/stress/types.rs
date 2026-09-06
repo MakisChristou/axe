@@ -17,7 +17,7 @@ pub struct StressArgs {
     pub runtime: IntentRuntimeArgs,
     pub symbol: String,
     pub amount: HumanAmount,
-    pub duration: Duration,
+    pub duration: Option<Duration>,
     pub max_intents: u64,
     pub max_in_flight: usize,
     pub max_volume: HumanAmount,
@@ -46,7 +46,7 @@ pub(super) struct StressProgress {
 
 #[derive(Clone, Debug)]
 pub(super) struct StressLimits {
-    pub duration: Duration,
+    pub duration: Option<Duration>,
     pub max_intents: u64,
     pub max_in_flight: usize,
     pub amount: U256,
@@ -221,7 +221,7 @@ mod tests {
 
     pub(super) fn limits() -> StressLimits {
         StressLimits {
-            duration: Duration::from_secs(60),
+            duration: Some(Duration::from_secs(60)),
             max_intents: 5,
             max_in_flight: 3,
             amount: U256::from(10),
@@ -260,6 +260,20 @@ mod tests {
             state.complete(&DepositOutcome::Failed("broadcast uncertain".to_owned()));
         }
         assert_eq!(state.permanent_stop(&limits), Some(StopReason::MaxIntents));
+        assert!(!state.can_admit(&limits));
+    }
+
+    #[test]
+    fn continuous_runs_still_enforce_deposit_and_volume_caps() {
+        let mut limits = limits();
+        limits.duration = None;
+        let mut state = AdmissionState::new();
+        state.committed = limits.max_intents;
+        assert_eq!(state.permanent_stop(&limits), Some(StopReason::MaxIntents));
+        assert!(!state.can_admit(&limits));
+
+        limits.max_intents = 100;
+        assert_eq!(state.permanent_stop(&limits), Some(StopReason::MaxVolume));
         assert!(!state.can_admit(&limits));
     }
 }

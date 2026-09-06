@@ -3,8 +3,9 @@ use std::time::Instant;
 
 use indicatif::ProgressBar;
 
-use super::super::presentation::{intent_activity_bar, intent_progress_bar};
+use super::super::presentation::intent_activity_bar;
 use super::types::{FailureKind, QuoteBenchmarkLimit, Sample, SampleCounts, SampleOutcome};
+use crate::ui;
 
 pub(super) struct BenchmarkProgress {
     bar: ProgressBar,
@@ -30,7 +31,7 @@ impl BenchmarkProgress {
         visible: bool,
     ) -> Self {
         let bar = if visible {
-            progress_bar(limit)
+            intent_activity_bar("")
         } else {
             ProgressBar::hidden()
         };
@@ -98,31 +99,18 @@ impl BenchmarkProgress {
         let failed = self.failed.load(Ordering::Relaxed);
         let timed_out = self.timed_out.load(Ordering::Relaxed);
         let completed = available + unavailable + failed + timed_out;
-        match self.limit {
-            QuoteBenchmarkLimit::Requests(_) => self.bar.set_position(completed),
+        let limit = match self.limit {
+            QuoteBenchmarkLimit::Requests(requests) => format!("{completed}/{requests} requests"),
             QuoteBenchmarkLimit::Duration(duration) => {
-                let position = u64::try_from(self.started.elapsed().as_millis())
-                    .unwrap_or(u64::MAX)
-                    .min(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
-                self.bar.set_position(position);
+                format!("{} limit", ui::format_duration(duration))
             }
-            QuoteBenchmarkLimit::Continuous => self.bar.set_position(completed),
-        }
+            QuoteBenchmarkLimit::Continuous => "continuous".to_owned(),
+        };
         let rps = completed as f64 / self.started.elapsed().as_secs_f64().max(f64::EPSILON);
         self.bar.set_message(format!(
-            "{} · {} · {available} available · {unavailable} unavailable · {failed} failed · {timed_out} timed out · {rps:.1} req/s",
-            self.phase, self.coverage
+            "{} | QUOTE {rps:.2}/s (average)\n  {available} available | {unavailable} unavailable | {failed} failed | {timed_out} timed out\n  {} | {limit}",
+            self.phase.to_ascii_uppercase(), self.coverage
         ));
-    }
-}
-
-fn progress_bar(limit: QuoteBenchmarkLimit) -> ProgressBar {
-    match limit {
-        QuoteBenchmarkLimit::Requests(requests) => intent_progress_bar(requests, ""),
-        QuoteBenchmarkLimit::Duration(duration) => {
-            intent_progress_bar(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX), "")
-        }
-        QuoteBenchmarkLimit::Continuous => intent_activity_bar(""),
     }
 }
 
@@ -161,5 +149,25 @@ mod tests {
         assert_eq!(counts.failed, 1);
         assert_eq!(counts.timed_out, 1);
         assert_eq!(counts.invalid_quotes, 1);
+        let message = progress.bar.message();
+        assert_eq!(message.lines().count(), 3);
+        assert!(message.contains("QUOTE"));
+        assert!(message.contains("1 available | 1 unavailable | 1 failed | 1 timed out"));
+        assert!(!message.contains("fulfilled"));
+    }
+
+    #[test]
+    fn progress_distinguishes_request_and_duration_limits() {
+        for (limit, expected) in [
+            (QuoteBenchmarkLimit::Requests(20), "0/20 requests"),
+            (
+                QuoteBenchmarkLimit::Duration(std::time::Duration::from_secs(60)),
+                "1m 00s limit",
+            ),
+            (QuoteBenchmarkLimit::Continuous, "continuous"),
+        ] {
+            let progress = BenchmarkProgress::new(limit, "benchmark", "fixed route".into(), false);
+            assert!(progress.bar.message().contains(expected));
+        }
     }
 }

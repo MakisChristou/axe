@@ -5,7 +5,7 @@ use indicatif::ProgressBar;
 
 use super::execution::{ExecutionFeedback, execute_round_trip};
 use super::execution_lock::ExecutionLock;
-use super::presentation::set_intent_traffic_message;
+use super::presentation::{IntentActivity, set_intent_traffic_message};
 use super::route::{DiscoveryFeedback, PlanningFeedback, discover_wallet, plan_sweep};
 use super::types::{AssetType, LegResult, OrderType};
 use super::{IntentRuntime, IntentRuntimeArgs, prepare_runtime};
@@ -54,8 +54,11 @@ struct TrafficStats {
 }
 
 pub async fn run(args: TrafficArgs) -> Result<()> {
+    let startup = IntentActivity::new("Loading intent configuration…", true);
     let runtime = prepare_runtime(args.runtime).await?;
+    startup.bar.set_message("Locking intent wallet…");
     let _execution_lock = ExecutionLock::acquire(runtime.signer.address())?;
+    drop(startup);
     render_strategy(args.wallet_bps, args.asset_type);
     let shutdown = Shutdown::install(DrainTarget::RoundTrip);
     let mut stats = TrafficStats::default();
@@ -90,7 +93,7 @@ pub async fn run(args: TrafficArgs) -> Result<()> {
     }
 
     progress.finish_and_clear();
-    render_stats(&stats);
+    render_stats(&stats, progress.elapsed());
     Ok(())
 }
 
@@ -138,7 +141,7 @@ async fn run_cycle(
         let plan = &plans[plan_index];
         let feedback = ExecutionFeedback::Traffic {
             progress: progress.clone(),
-            context: traffic_context(stats, progress.elapsed()),
+            context: traffic_context(stats),
         };
         let mut results = Vec::with_capacity(2);
         let result = execute_round_trip(
@@ -193,40 +196,42 @@ fn render_strategy(wallet_bps: u16, asset_type: Option<AssetType>) {
     ui::kv("lifetime", "continuous until Ctrl-C");
 }
 
-fn render_stats(stats: &TrafficStats) {
-    ui::section("intent traffic stopped");
-    ui::kv("completed intents", &stats.intents.to_string());
-    ui::kv("route failures", &stats.failures.to_string());
+fn render_stats(stats: &TrafficStats, elapsed: Duration) {
+    ui::section("intent traffic result");
+    ui::kv(
+        "stop",
+        &format!("interrupted after {}", ui::format_duration(elapsed)),
+    );
+    ui::kv(
+        "intents",
+        &format!(
+            "{} fulfilled | {} route failures",
+            stats.intents, stats.failures
+        ),
+    );
+    ui::kv(
+        "rate",
+        &format!("{:.2} fulfilled/s", intents_per_second(stats, elapsed)),
+    );
     if let Some(average) = average_intent_time(stats) {
         ui::kv("average intent time", &ui::format_duration(average));
     }
 }
 
 fn traffic_progress() -> ProgressBar {
-    super::presentation::intent_traffic_bar()
+    super::presentation::intent_activity_bar("")
 }
 
-fn traffic_context(stats: &TrafficStats, elapsed: Duration) -> String {
+fn traffic_context(stats: &TrafficStats) -> String {
     let average = average_intent_time(stats)
-        .map(|duration| format!(" · avg {}", compact_duration(duration)))
+        .map(|duration| format!(" | avg {}", ui::format_duration(duration)))
         .unwrap_or_default();
-    format!(
-        "{:.1} i/m · {} err{average}",
-        intents_per_minute(stats, elapsed),
-        stats.failures
-    )
+    format!("{} route failures{average}", stats.failures)
 }
 
 fn set_traffic_status(progress: &ProgressBar, stats: &TrafficStats, status: &str) {
     progress.set_position(stats.intents);
-    set_intent_traffic_message(
-        progress,
-        &format!(
-            "{} intents · {} · {status}",
-            stats.intents,
-            traffic_context(stats, progress.elapsed())
-        ),
-    );
+    set_intent_traffic_message(progress, &traffic_context(stats), status);
 }
 
 fn record_intents(stats: &mut TrafficStats, results: &[LegResult]) {
@@ -244,15 +249,11 @@ fn average_intent_time(stats: &TrafficStats) -> Option<Duration> {
     (stats.intents > 0).then(|| Duration::from_millis(stats.intent_latency_ms / stats.intents))
 }
 
-fn intents_per_minute(stats: &TrafficStats, elapsed: Duration) -> f64 {
+fn intents_per_second(stats: &TrafficStats, elapsed: Duration) -> f64 {
     if elapsed.is_zero() {
         return 0.0;
     }
-    stats.intents as f64 * 60.0 / elapsed.as_secs_f64()
-}
-
-fn compact_duration(duration: Duration) -> String {
-    ui::format_duration(duration).replace(' ', "")
+    stats.intents as f64 / elapsed.as_secs_f64()
 }
 
 async fn wait_before_retry(shutdown: &Shutdown) {
@@ -337,8 +338,9 @@ mod tests {
             intent_latency_ms: 300_000,
             ..TrafficStats::default()
         };
-        let context = traffic_context(&stats, Duration::from_secs(120));
+        let context = traffic_context(&stats);
 
-        assert_eq!(context, "2.0 i/m · 1 err · avg 1m15s");
+        assert_eq!(context, "1 route failures | avg 1m 15s");
+        assert_eq!(intents_per_second(&stats, Duration::from_secs(2)), 2.0);
     }
 }

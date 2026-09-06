@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use eyre::Result;
 
+use super::presentation::IntentActivity;
 use super::read::{ApiArgs, api_client, filter_tokens, merge_catalog};
 use super::route::{DiscoveryFeedback, read_wallet_assets, resolve_evm_chains};
 use super::types::AssetType;
@@ -20,6 +21,7 @@ pub struct InventoryArgs {
 }
 
 pub async fn inventory(args: InventoryArgs) -> Result<()> {
+    let activity = IntentActivity::new("Loading solver inventory…", !args.json);
     let deployment = types::SolverDeployment::try_from(args.api.network)?;
     let solver = deployment.address();
     let client = api_client(&args.api)?;
@@ -57,6 +59,7 @@ pub async fn inventory(args: InventoryArgs) -> Result<()> {
         price_source: prices.source,
         prices: prices.by_symbol,
     });
+    drop(activity);
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {

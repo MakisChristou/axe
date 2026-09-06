@@ -506,9 +506,13 @@ pub struct IntentStressOptions {
     #[arg(long, default_value = "0.1")]
     pub amount: HumanAmount,
 
-    /// Stop admitting new intents after this many seconds.
+    /// Stop admitting new intents after this many seconds (7200 = 2 hours).
     #[arg(long, default_value = "900", value_parser = clap::value_parser!(u64).range(1..))]
     pub duration_secs: u64,
+
+    /// Run without a time limit. Deposit, volume, and gas caps still apply.
+    #[arg(long, conflicts_with = "duration_secs")]
+    pub continuous: bool,
 
     /// Hard cap on deposit attempts that reach broadcast, including uncertain broadcasts.
     #[arg(long, default_value = "200", value_parser = clap::value_parser!(u64).range(1..))]
@@ -1177,6 +1181,8 @@ mod tests {
         };
 
         assert_eq!(options.max_intents, 40);
+        assert_eq!(options.duration_secs, 900);
+        assert!(!options.continuous);
         assert_eq!(options.max_in_flight, 8);
         assert_eq!(options.max_volume.to_string(), "4");
         assert_eq!(options.max_native_spend.to_string(), "1");
@@ -1184,6 +1190,40 @@ mod tests {
         assert!(
             Cli::try_parse_from(["axe", "intents", "stress", "--max-in-flight", "129",]).is_err()
         );
+    }
+
+    #[test]
+    fn intent_stress_supports_continuous_or_two_hour_runs() {
+        for (flags, continuous, duration) in [
+            (vec!["--continuous"], true, 900),
+            (vec!["--duration-secs", "7200"], false, 7200),
+        ] {
+            let cli =
+                Cli::try_parse_from(["axe", "intents", "stress"].into_iter().chain(flags)).unwrap();
+            let Commands::Intents {
+                subcommand: IntentsCommands::Stress(options),
+            } = cli.command
+            else {
+                panic!("expected intents stress");
+            };
+            assert_eq!(options.continuous, continuous);
+            assert_eq!(options.duration_secs, duration);
+            assert_eq!(options.max_intents, 200);
+            assert_eq!(options.max_volume.to_string(), "20");
+            assert_eq!(options.max_native_spend.to_string(), "0.01");
+        }
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "stress",
+                "--continuous",
+                "--duration-secs",
+                "7200"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["axe", "intents", "stress", "--duration-secs", "0"]).is_err());
     }
 
     #[test]
