@@ -506,29 +506,47 @@ pub struct IntentStressOptions {
     #[arg(long, default_value = "0.1")]
     pub amount: HumanAmount,
 
-    /// Stop admitting new intents after this many seconds (7200 = 2 hours).
-    #[arg(long, default_value = "900", value_parser = clap::value_parser!(u64).range(1..))]
-    pub duration_secs: u64,
+    /// Run for this many seconds (7200 = 2 hours), without default spending or deposit caps.
+    /// Explicit caps still apply. Without this or --continuous, defaults to 900 seconds.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub duration_secs: Option<u64>,
 
-    /// Run without a time limit. Deposit, volume, and gas caps still apply.
+    /// Run until Ctrl-C, without default spending or deposit caps. Explicit caps still apply.
     #[arg(long, conflicts_with = "duration_secs")]
     pub continuous: bool,
 
     /// Hard cap on deposit attempts that reach broadcast, including uncertain broadcasts.
-    #[arg(long, default_value = "200", value_parser = clap::value_parser!(u64).range(1..))]
-    pub max_intents: u64,
+    /// Defaults to 200 only without --duration-secs or --continuous.
+    #[arg(long, default_value = "200", hide_default_value = true, value_parser = clap::value_parser!(u64).range(1..),
+        default_value_if("duration_secs", clap::builder::ArgPredicate::IsPresent, None),
+        default_value_if("continuous", "true", None))]
+    pub max_intents: Option<u64>,
 
     /// Concurrent quote and deposit jobs. Receipt waits overlap later broadcasts.
     #[arg(long, default_value = "32", value_parser = clap::value_parser!(u16).range(1..=128))]
     pub max_in_flight: u16,
 
-    /// Maximum cumulative input volume in human token units.
-    #[arg(long, default_value = "20")]
-    pub max_volume: HumanAmount,
+    /// Maximum cumulative input volume in token units. Defaults to 20 only without a run mode.
+    /// Without an input or deposit cap, uses unlimited settlement allowances.
+    #[arg(
+        long,
+        default_value = "20",
+        hide_default_value = true,
+        default_value_if("duration_secs", clap::builder::ArgPredicate::IsPresent, None),
+        default_value_if("continuous", "true", None)
+    )]
+    pub max_volume: Option<HumanAmount>,
 
     /// Maximum native gas spend per source chain for deposits. Approvals are extra.
-    #[arg(long, default_value = "0.01")]
-    pub max_native_spend: HumanAmount,
+    /// Defaults to 0.01 only without --duration-secs or --continuous.
+    #[arg(
+        long,
+        default_value = "0.01",
+        hide_default_value = true,
+        default_value_if("duration_secs", clap::builder::ArgPredicate::IsPresent, None),
+        default_value_if("continuous", "true", None)
+    )]
+    pub max_native_spend: Option<HumanAmount>,
 
     /// Never submit on a chain whose native balance is below this amount.
     #[arg(long, default_value = "0.01")]
@@ -1180,12 +1198,12 @@ mod tests {
             panic!("expected intents stress");
         };
 
-        assert_eq!(options.max_intents, 40);
-        assert_eq!(options.duration_secs, 900);
+        assert_eq!(options.max_intents, Some(40));
+        assert_eq!(options.duration_secs, None);
         assert!(!options.continuous);
         assert_eq!(options.max_in_flight, 8);
-        assert_eq!(options.max_volume.to_string(), "4");
-        assert_eq!(options.max_native_spend.to_string(), "1");
+        assert_eq!(options.max_volume.unwrap().to_string(), "4");
+        assert_eq!(options.max_native_spend.unwrap().to_string(), "1");
         assert!(options.runtime.yes);
         assert!(
             Cli::try_parse_from(["axe", "intents", "stress", "--max-in-flight", "129",]).is_err()
@@ -1195,8 +1213,9 @@ mod tests {
     #[test]
     fn intent_stress_supports_continuous_or_two_hour_runs() {
         for (flags, continuous, duration) in [
-            (vec!["--continuous"], true, 900),
-            (vec!["--duration-secs", "7200"], false, 7200),
+            (vec!["--continuous"], true, None),
+            (vec!["--duration-secs", "7200"], false, Some(7200)),
+            (vec!["--duration-secs", "900"], false, Some(900)),
         ] {
             let cli =
                 Cli::try_parse_from(["axe", "intents", "stress"].into_iter().chain(flags)).unwrap();
@@ -1208,9 +1227,10 @@ mod tests {
             };
             assert_eq!(options.continuous, continuous);
             assert_eq!(options.duration_secs, duration);
-            assert_eq!(options.max_intents, 200);
-            assert_eq!(options.max_volume.to_string(), "20");
-            assert_eq!(options.max_native_spend.to_string(), "0.01");
+            assert_eq!(options.max_intents, None);
+            assert!(options.max_volume.is_none());
+            assert!(options.max_native_spend.is_none());
+            assert_eq!(options.min_native_balance.to_string(), "0.01");
         }
         assert!(
             Cli::try_parse_from([
@@ -1224,6 +1244,59 @@ mod tests {
             .is_err()
         );
         assert!(Cli::try_parse_from(["axe", "intents", "stress", "--duration-secs", "0"]).is_err());
+    }
+
+    #[test]
+    fn intent_stress_without_a_run_mode_keeps_bounded_defaults() {
+        let cli = Cli::try_parse_from(["axe", "intents", "stress"]).unwrap();
+        let Commands::Intents {
+            subcommand: IntentsCommands::Stress(options),
+        } = cli.command
+        else {
+            panic!("expected intents stress");
+        };
+        assert_eq!(options.duration_secs, None);
+        assert!(!options.continuous);
+        assert_eq!(options.max_intents, Some(200));
+        assert_eq!(options.max_volume.unwrap().to_string(), "20");
+        assert_eq!(options.max_native_spend.unwrap().to_string(), "0.01");
+    }
+
+    #[test]
+    fn intent_stress_run_modes_preserve_only_explicit_caps() {
+        for mode in [vec!["--duration-secs", "7200"], vec!["--continuous"]] {
+            for (flag, value) in [
+                ("--max-intents", "200"),
+                ("--max-volume", "20"),
+                ("--max-native-spend", "0.01"),
+            ] {
+                let cli = Cli::try_parse_from(
+                    ["axe", "intents", "stress"]
+                        .into_iter()
+                        .chain(mode.clone())
+                        .chain([flag, value]),
+                )
+                .unwrap();
+                let Commands::Intents {
+                    subcommand: IntentsCommands::Stress(options),
+                } = cli.command
+                else {
+                    panic!("expected intents stress");
+                };
+                assert_eq!(
+                    options.max_intents,
+                    (flag == "--max-intents").then_some(200)
+                );
+                assert_eq!(
+                    options.max_volume.map(|cap| cap.to_string()),
+                    (flag == "--max-volume").then(|| "20".to_owned())
+                );
+                assert_eq!(
+                    options.max_native_spend.map(|cap| cap.to_string()),
+                    (flag == "--max-native-spend").then(|| "0.01".to_owned())
+                );
+            }
+        }
     }
 
     #[test]

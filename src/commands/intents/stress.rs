@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use alloy::primitives::U256;
 use eyre::{Result, eyre};
 use indicatif::ProgressBar;
 
@@ -64,6 +65,11 @@ async fn run_stress(
     )
     .await?;
     let limits = resolve_limits(&args, &routes)?;
+    if limits.approval_amount() == U256::MAX && !args.json {
+        startup.suspend(|| {
+            ui::info("Uncapped input: using unlimited token allowances for settlement contracts.");
+        });
+    }
     let shutdown = Shutdown::install(DrainTarget::IntentStress);
     let sources = prepare_sources(&runtime, &discovery.chains, routes, &limits, startup).await?;
     startup.finish_and_clear();
@@ -108,9 +114,20 @@ fn resolve_limits(args: &StressArgs, routes: &[LegPlan]) -> Result<StressLimits>
         return Err(eyre!("stress input assets must have consistent decimals"));
     }
     let amount = args.amount.to_base_units(decimals)?;
-    let max_volume = args.max_volume.to_base_units(decimals)?;
-    let max_native_spend = args.max_native_spend.to_base_units(18)?;
-    if amount.is_zero() || max_volume < amount || max_native_spend.is_zero() {
+    let max_volume = args
+        .max_volume
+        .as_ref()
+        .map(|value| value.to_base_units(decimals))
+        .transpose()?;
+    let max_native_spend = args
+        .max_native_spend
+        .as_ref()
+        .map(|value| value.to_base_units(18))
+        .transpose()?;
+    if amount.is_zero()
+        || max_volume.is_some_and(|cap| cap < amount)
+        || max_native_spend.is_some_and(|cap| cap.is_zero())
+    {
         return Err(eyre!(
             "amount and gas budget must be positive, and max-volume must cover one deposit"
         ));
@@ -144,7 +161,7 @@ async fn prepare_sources(
                 chains,
                 &runtime.signer,
                 &plan,
-                limits.max_volume,
+                limits.approval_amount(),
                 &ExecutionFeedback::Startup(startup.clone()),
             )
             .await?;
@@ -206,8 +223,13 @@ fn render_plan(sources: &[SourceState], limits: &StressLimits) {
         "limits",
         &format!(
             "{} deposits | {} {} input | {}",
-            limits.max_intents,
-            format_units(limits.max_volume, limits.decimals),
+            limits
+                .max_intents
+                .map_or_else(|| "uncapped".to_owned(), |cap| cap.to_string()),
+            limits.max_volume.map_or_else(
+                || "uncapped".to_owned(),
+                |cap| format_units(cap, limits.decimals)
+            ),
             limits.symbol,
             limits.duration.map_or_else(
                 || "no time limit (Ctrl-C to stop)".to_owned(),
@@ -219,7 +241,9 @@ fn render_plan(sources: &[SourceState], limits: &StressLimits) {
         "gas per chain",
         &format!(
             "{} native deposit budget | {} native balance reserve (approvals extra)",
-            format_units(limits.max_native_spend, 18),
+            limits
+                .max_native_spend
+                .map_or_else(|| "uncapped".to_owned(), |cap| format_units(cap, 18)),
             format_units(limits.min_native_balance, 18)
         ),
     );

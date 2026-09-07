@@ -503,7 +503,7 @@ async fn run_intents(
                 symbol: options.symbol,
                 amount: options.amount,
                 duration: (!options.continuous)
-                    .then(|| std::time::Duration::from_secs(options.duration_secs)),
+                    .then(|| std::time::Duration::from_secs(options.duration_secs.unwrap_or(900))),
                 max_intents: options.max_intents,
                 max_in_flight: usize::from(options.max_in_flight),
                 max_volume: options.max_volume,

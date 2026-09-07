@@ -38,8 +38,8 @@ pub(super) fn render(run: &StressRun, limits: &StressLimits, json_output: bool) 
                 "broadcast_per_second": rate(run.state.broadcast),
                 "confirmed_per_second": rate(run.state.confirmed),
                 "deposited_input": volume, "symbol": limits.symbol,
-                "max_volume": format_units(limits.max_volume, limits.decimals),
-                "max_native_spend_per_chain": format_units(limits.max_native_spend, 18),
+                "max_volume": limits.max_volume.map(|cap| format_units(cap, limits.decimals)),
+                "max_native_spend_per_chain": limits.max_native_spend.map(|cap| format_units(cap, 18)),
                 "sources": run.sources, "deposits": run.records,
             }))?
         );

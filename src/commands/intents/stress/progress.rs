@@ -43,7 +43,7 @@ impl StressProgress {
             "{phase} | SEND {send_rate:.2}/s | CONFIRM {confirm_rate:.2}/s (10s)\n  {} broadcast | {} confirmed | {} active | {} skipped | {} failed | {warnings} retries\n  deposited {} / {} {} input",
             state.broadcast, state.confirmed, state.active, state.skipped, state.failed,
             format_units(alloy::primitives::U256::from(state.confirmed).saturating_mul(self.limits.amount), self.limits.decimals),
-            format_units(self.limits.max_volume, self.limits.decimals), self.limits.symbol,
+            self.limits.max_volume.map_or_else(|| "uncapped".to_owned(), |cap| format_units(cap, self.limits.decimals)), self.limits.symbol,
         ));
     }
 
@@ -91,11 +91,11 @@ mod tests {
     fn throughput_counts_deposits_separately_and_decays_when_work_stalls() {
         let limits = StressLimits {
             duration: Some(Duration::from_secs(60)),
-            max_intents: 200,
+            max_intents: Some(200),
             max_in_flight: 16,
             amount: U256::from(1),
-            max_volume: U256::from(200),
-            max_native_spend: U256::from(20),
+            max_volume: Some(U256::from(200)),
+            max_native_spend: Some(U256::from(20)),
             min_native_balance: U256::ZERO,
             decimals: 6,
             symbol: "USDC".to_owned(),

@@ -11,7 +11,7 @@ use super::super::EvmEndpoints;
 
 pub struct PipelineLimits {
     pub native_reserve: U256,
-    pub gas_budget: U256,
+    pub gas_budget: Option<U256>,
     pub receipt_timeout: Duration,
 }
 

@@ -18,10 +18,10 @@ pub struct StressArgs {
     pub symbol: String,
     pub amount: HumanAmount,
     pub duration: Option<Duration>,
-    pub max_intents: u64,
+    pub max_intents: Option<u64>,
     pub max_in_flight: usize,
-    pub max_volume: HumanAmount,
-    pub max_native_spend: HumanAmount,
+    pub max_volume: Option<HumanAmount>,
+    pub max_native_spend: Option<HumanAmount>,
     pub min_native_balance: HumanAmount,
     pub json: bool,
 }
@@ -47,14 +47,27 @@ pub(super) struct StressProgress {
 #[derive(Clone, Debug)]
 pub(super) struct StressLimits {
     pub duration: Option<Duration>,
-    pub max_intents: u64,
+    pub max_intents: Option<u64>,
     pub max_in_flight: usize,
     pub amount: U256,
-    pub max_volume: U256,
-    pub max_native_spend: U256,
+    pub max_volume: Option<U256>,
+    pub max_native_spend: Option<U256>,
     pub min_native_balance: U256,
     pub decimals: u8,
     pub symbol: String,
+}
+
+impl StressLimits {
+    pub fn approval_amount(&self) -> U256 {
+        let count_volume = self
+            .max_intents
+            .map(|count| U256::from(count).saturating_mul(self.amount));
+        self.max_volume
+            .into_iter()
+            .chain(count_volume)
+            .min()
+            .unwrap_or(U256::MAX)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -172,11 +185,11 @@ impl AdmissionState {
     }
 
     pub fn permanent_stop(&self, limits: &StressLimits) -> Option<StopReason> {
-        if self.committed >= limits.max_intents {
+        if limits.max_intents.is_some_and(|cap| self.committed >= cap) {
             Some(StopReason::MaxIntents)
-        } else if U256::from(self.committed.saturating_add(1)).saturating_mul(limits.amount)
-            > limits.max_volume
-        {
+        } else if limits.max_volume.is_some_and(|cap| {
+            U256::from(self.committed.saturating_add(1)).saturating_mul(limits.amount) > cap
+        }) {
             Some(StopReason::MaxVolume)
         } else {
             None
@@ -189,8 +202,10 @@ impl AdmissionState {
             .saturating_add(self.active as u64)
             .saturating_add(1);
         self.active < limits.max_in_flight
-            && reserved <= limits.max_intents
-            && U256::from(reserved).saturating_mul(limits.amount) <= limits.max_volume
+            && limits.max_intents.is_none_or(|cap| reserved <= cap)
+            && limits
+                .max_volume
+                .is_none_or(|cap| U256::from(reserved).saturating_mul(limits.amount) <= cap)
     }
 
     pub fn admit(&mut self) {
@@ -222,11 +237,11 @@ mod tests {
     pub(super) fn limits() -> StressLimits {
         StressLimits {
             duration: Some(Duration::from_secs(60)),
-            max_intents: 5,
+            max_intents: Some(5),
             max_in_flight: 3,
             amount: U256::from(10),
-            max_volume: U256::from(50),
-            max_native_spend: U256::from(100),
+            max_volume: Some(U256::from(50)),
+            max_native_spend: Some(U256::from(100)),
             min_native_balance: U256::ZERO,
             decimals: 6,
             symbol: "USDC".to_owned(),
@@ -267,13 +282,44 @@ mod tests {
     fn continuous_runs_still_enforce_deposit_and_volume_caps() {
         let mut limits = limits();
         limits.duration = None;
+        limits.max_volume = None;
         let mut state = AdmissionState::new();
-        state.committed = limits.max_intents;
+        state.committed = 5;
         assert_eq!(state.permanent_stop(&limits), Some(StopReason::MaxIntents));
         assert!(!state.can_admit(&limits));
 
-        limits.max_intents = 100;
+        limits.max_intents = None;
+        limits.max_volume = Some(U256::from(50));
         assert_eq!(state.permanent_stop(&limits), Some(StopReason::MaxVolume));
         assert!(!state.can_admit(&limits));
+    }
+
+    #[test]
+    fn uncapped_runs_admit_past_default_budgets_but_keep_concurrency_bounded() {
+        let mut limits = limits();
+        limits.max_intents = None;
+        limits.max_volume = None;
+        let mut state = AdmissionState::new();
+        state.committed = 100_000;
+        assert_eq!(state.permanent_stop(&limits), None);
+        for _ in 0..limits.max_in_flight {
+            assert!(state.can_admit(&limits));
+            state.admit();
+        }
+        assert!(!state.can_admit(&limits));
+    }
+
+    #[test]
+    fn approvals_follow_the_tightest_explicit_input_cap() {
+        let mut limits = limits();
+        assert_eq!(limits.approval_amount(), U256::from(50));
+        limits.max_intents = Some(2);
+        assert_eq!(limits.approval_amount(), U256::from(20));
+        limits.max_volume = None;
+        assert_eq!(limits.approval_amount(), U256::from(20));
+        limits.max_intents = None;
+        assert_eq!(limits.approval_amount(), U256::MAX);
+        limits.max_volume = Some(U256::from(30));
+        assert_eq!(limits.approval_amount(), U256::from(30));
     }
 }

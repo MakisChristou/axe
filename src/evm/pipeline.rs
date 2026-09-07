@@ -127,7 +127,11 @@ impl PipelinedSender {
             .fill_and_sign(&self.signer, tx.request.clone(), &ui::warn)
             .await?;
         let gas = U256::from(envelope.gas_limit()) * U256::from(envelope.max_fee_per_gas());
-        if state.gas_spent.saturating_add(gas) > self.limits.gas_budget {
+        if self
+            .limits
+            .gas_budget
+            .is_some_and(|cap| state.gas_spent.saturating_add(gas) > cap)
+        {
             state.stopped = Some("source gas budget reached".to_owned());
             return Err(eyre!("source gas budget reached"));
         }
@@ -191,7 +195,10 @@ impl NonceState {
         gas: U256,
     ) -> Result<()> {
         let reserved = self.gas_reserved.saturating_add(gas);
-        if self.gas_spent.saturating_add(reserved) > limits.gas_budget {
+        if limits
+            .gas_budget
+            .is_some_and(|cap| self.gas_spent.saturating_add(reserved) > cap)
+        {
             return Err(eyre!("waiting for pending gas reservations"));
         }
         if native < limits.native_reserve.saturating_add(reserved) {

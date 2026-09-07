@@ -20,7 +20,7 @@ fn sender(asserter: Asserter, gas_budget: u64) -> PipelinedSender {
         PrivateKeySigner::random(),
         PipelineLimits {
             native_reserve: U256::from(100),
-            gas_budget: U256::from(gas_budget),
+            gas_budget: Some(U256::from(gas_budget)),
             receipt_timeout: Duration::ZERO,
         },
     )
@@ -69,6 +69,22 @@ async fn sends_consecutive_nonces_without_waiting_for_any_receipts() {
     assert_eq!(state.gas_spent, U256::ZERO);
     assert_eq!(state.gas_reserved, U256::from(42_000));
     assert_eq!(sender.broadcasts.load(Ordering::Relaxed), 2);
+    assert!(asserter.read_q().is_empty());
+}
+
+#[tokio::test]
+async fn uncapped_sender_broadcasts_after_exceeding_the_old_gas_budget() {
+    let asserter = Asserter::new();
+    asserter.push_success(&"0x5");
+    balances(&asserter);
+    asserter.push_success(&TxHash::ZERO);
+    let mut sender = sender(asserter.clone(), 100_000);
+    sender.limits.gas_budget = None;
+    sender.state.lock().await.gas_spent = U256::from(1_000_000);
+
+    assert!(sender.broadcast(transaction(&sender)).await.is_ok());
+    assert!(!sender.stopped());
+    assert_eq!(sender.state.lock().await.next, Some(6));
     assert!(asserter.read_q().is_empty());
 }
 
@@ -130,7 +146,7 @@ fn pending_inputs_and_native_reserve_cannot_be_double_spent() {
     };
     let limits = PipelineLimits {
         native_reserve: U256::from(100),
-        gas_budget: U256::from(100),
+        gas_budget: Some(U256::from(100)),
         receipt_timeout: Duration::ZERO,
     };
     state.reserve(&pending);
@@ -170,4 +186,38 @@ fn pending_inputs_and_native_reserve_cannot_be_double_spent() {
             )
             .is_ok()
     );
+}
+
+#[test]
+fn uncapped_gas_spending_still_checks_native_and_token_reservations() {
+    let mut state = NonceState {
+        gas_spent: U256::from(1_000_000),
+        ..Default::default()
+    };
+    state.reserve(&PendingDeposit {
+        hash: TxHash::ZERO,
+        gas_reserved: U256::from(20),
+        token: Address::ZERO,
+        amount: U256::from(10),
+    });
+    let limits = PipelineLimits {
+        native_reserve: U256::from(100),
+        gas_budget: None,
+        receipt_timeout: Duration::ZERO,
+    };
+    for (native, tokens, allowed) in [(140, 20, true), (139, 20, false), (140, 19, false)] {
+        assert_eq!(
+            state
+                .check_funding(
+                    &limits,
+                    U256::from(native),
+                    U256::from(tokens),
+                    Address::ZERO,
+                    U256::from(10),
+                    U256::from(20),
+                )
+                .is_ok(),
+            allowed
+        );
+    }
 }
