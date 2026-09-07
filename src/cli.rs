@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use alloy::primitives::Address;
+use clap::{Args, Parser, Subcommand};
 use eyre::Result;
 
+use crate::commands::intents::{AssetSpec, AssetType, HumanAmount, OrderType, QuoteBenchmarkMode};
 use crate::commands::load_test::{Protocol, TestType};
 use crate::commands::propose::ProposeArgs;
 use crate::types::Network;
@@ -51,6 +53,12 @@ pub fn network_or_default(arg: Option<Network>, global: Option<Network>) -> Resu
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Test Axelar intent routes through the public RFQ API
+    Intents {
+        #[command(subcommand)]
+        subcommand: IntentsCommands,
+    },
+
     /// Deploy and manage chain deployments
     Deploy {
         #[command(subcommand)]
@@ -155,6 +163,398 @@ pub enum BenchCommands {
     SolanaCu,
     /// Run both benchmarks.
     All,
+}
+
+#[derive(Subcommand)]
+pub enum IntentsCommands {
+    /// Show supported chains with their tokens
+    Catalog(IntentCatalogOptions),
+
+    /// Show the solver's catalog-backed token inventory and USD value
+    Inventory(IntentInventoryOptions),
+
+    /// Request a quote, then optionally deposit and watch it to fulfillment
+    Quote(IntentQuoteOptions),
+
+    /// Show or watch the status of a quote
+    Status(IntentStatusOptions),
+
+    /// Benchmark intent API operations
+    Bench {
+        #[command(subcommand)]
+        subcommand: IntentBenchCommands,
+    },
+
+    /// Send one intent over a random or explicit route
+    Send(IntentSendOptions),
+
+    /// Send one intent in each direction over the same asset pair
+    Roundtrip(IntentRoundtripOptions),
+
+    /// Run round trips across every currently executable wallet route
+    Sweep(IntentSweepOptions),
+
+    /// Continuously simulate users across all executable intent routes
+    Traffic(IntentTrafficOptions),
+
+    /// Submit concurrent intent deposits across funded chains, starting without confirmation
+    Stress(IntentStressOptions),
+}
+
+#[derive(Args)]
+pub struct IntentApiOptions {
+    /// RFQ API base URL. Defaults to the selected network's public endpoint.
+    #[arg(long, env = "INTENTS_API_URL")]
+    pub rfq_url: Option<String>,
+}
+
+#[derive(Args)]
+pub struct IntentReadOptions {
+    #[command(flatten)]
+    pub api: IntentApiOptions,
+
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct IntentCatalogOptions {
+    #[command(flatten)]
+    pub read: IntentReadOptions,
+
+    #[command(flatten)]
+    pub assets: IntentAssetFilterOptions,
+
+    /// Show only this CAIP-2 chain ID.
+    #[arg(long)]
+    pub chain: Option<String>,
+}
+
+#[derive(Args)]
+pub struct IntentInventoryOptions {
+    #[command(flatten)]
+    pub read: IntentReadOptions,
+
+    #[command(flatten)]
+    pub assets: IntentAssetFilterOptions,
+
+    /// Path to chains config JSON. Omit to resolve from --network.
+    #[arg(long, env = "CHAINS_CONFIG")]
+    pub config: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub struct IntentAssetOptions {
+    /// Use token-to-token or native-to-native routes.
+    #[arg(long, value_enum, default_value_t)]
+    pub asset_type: AssetType,
+}
+
+#[derive(Args)]
+pub struct IntentAssetFilterOptions {
+    /// Use only token or native assets. Omit to include both.
+    #[arg(long, value_enum)]
+    pub asset_type: Option<AssetType>,
+}
+
+#[derive(Args)]
+pub struct IntentQuoteOptions {
+    #[command(flatten)]
+    pub runtime: IntentRuntimeConfigOptions,
+
+    #[command(flatten)]
+    pub route: IntentRouteOptions,
+
+    /// Quote sender override. Defaults to the axe wallet.
+    #[arg(long)]
+    pub sender: Option<Address>,
+
+    /// Destination recipient. Defaults to the quote sender.
+    #[arg(long)]
+    pub recipient: Option<Address>,
+
+    /// Print the selected quote as JSON without offering to deposit it.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct IntentStatusOptions {
+    #[command(flatten)]
+    pub read: IntentReadOptions,
+
+    /// Quote ID returned by the intent API.
+    pub quote_id: String,
+
+    /// Poll until the quote completes, refunds, fails, or times out.
+    #[arg(long)]
+    pub watch: bool,
+
+    /// Seconds between status requests in watch mode.
+    #[arg(long, default_value = "2", value_parser = clap::value_parser!(u64).range(1..))]
+    pub poll_interval_secs: u64,
+
+    /// Maximum seconds to watch before returning an error.
+    #[arg(long, default_value = "1200", value_parser = clap::value_parser!(u64).range(1..))]
+    pub timeout_secs: u64,
+}
+
+#[derive(Subcommand)]
+pub enum IntentBenchCommands {
+    /// Benchmark the solver quote path across randomized bidirectional routes
+    Quote(IntentQuoteBenchOptions),
+}
+
+#[derive(Args)]
+pub struct IntentQuoteBenchOptions {
+    #[command(flatten)]
+    pub read: IntentReadOptions,
+
+    #[command(flatten)]
+    pub assets: IntentAssetOptions,
+
+    /// Use a fixed source asset instead of randomized route coverage.
+    #[arg(long)]
+    pub from: Option<AssetSpec>,
+
+    /// Use a fixed destination asset instead of randomized route coverage.
+    #[arg(long)]
+    pub to: Option<AssetSpec>,
+
+    /// Human-readable amount. Defaults to 1 source or destination token.
+    #[arg(long)]
+    pub amount: Option<HumanAmount>,
+
+    /// Quote sender. Defaults to EVM_PRIVATE_KEY's address, then the zero address.
+    #[arg(long)]
+    pub sender: Option<Address>,
+
+    /// Key used only to derive the quote sender when --sender is omitted.
+    #[arg(long, env = "EVM_PRIVATE_KEY", hide_env_values = true)]
+    pub private_key: Option<String>,
+
+    /// Destination recipient. Defaults to the resolved sender.
+    #[arg(long)]
+    pub recipient: Option<Address>,
+
+    /// Fix the source input or destination output amount.
+    #[arg(long, value_enum, default_value_t)]
+    pub order_type: OrderType,
+
+    /// Scheduling mode. Defaults to burst, or continuous when --duration-secs is set.
+    #[arg(long, value_enum)]
+    pub mode: Option<QuoteBenchmarkMode>,
+
+    /// Requests to measure in burst mode. Defaults to 100.
+    #[arg(long, conflicts_with = "duration_secs", value_parser = clap::value_parser!(u64).range(1..))]
+    pub requests: Option<u64>,
+
+    /// Optional total-time cap for continuous mode. Otherwise run until Ctrl-C.
+    #[arg(long, conflicts_with = "requests", value_parser = clap::value_parser!(u64).range(1..))]
+    pub duration_secs: Option<u64>,
+
+    /// Maximum number of in-flight quote requests.
+    #[arg(long, default_value = "8", value_parser = clap::value_parser!(u16).range(1..))]
+    pub concurrency: u16,
+
+    /// Unmeasured requests to run before the benchmark.
+    #[arg(long, default_value = "10")]
+    pub warmup: u64,
+
+    /// Maximum seconds to wait for each quote request.
+    #[arg(long, default_value = "10", value_parser = clap::value_parser!(u64).range(1..))]
+    pub request_timeout_secs: u64,
+
+    /// Limit aggregate request starts per second.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub max_rps: Option<u64>,
+}
+
+#[derive(Args)]
+pub struct IntentRuntimeConfigOptions {
+    #[command(flatten)]
+    pub api: IntentApiOptions,
+
+    /// Path to chains config JSON. Omit to resolve from --network.
+    #[arg(long, env = "CHAINS_CONFIG")]
+    pub config: Option<PathBuf>,
+
+    /// Optional EVM key override. Defaults to EVM_PRIVATE_KEY, then PRIVATE_KEY.
+    #[arg(long, env = "EVM_PRIVATE_KEY", hide_env_values = true)]
+    pub private_key: Option<String>,
+
+    /// Seconds between RFQ status requests.
+    #[arg(long, default_value = "2", value_parser = clap::value_parser!(u64).range(1..))]
+    pub poll_interval_secs: u64,
+
+    /// Maximum seconds to wait for one intent fulfillment.
+    #[arg(long, default_value = "1200", value_parser = clap::value_parser!(u64).range(1..))]
+    pub fulfillment_timeout_secs: u64,
+}
+
+#[derive(Args)]
+pub struct IntentRuntimeOptions {
+    #[command(flatten)]
+    pub config: IntentRuntimeConfigOptions,
+
+    /// Execute without an interactive confirmation.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(Args)]
+pub struct IntentRouteOptions {
+    #[command(flatten)]
+    pub assets: IntentAssetOptions,
+
+    /// Source asset as <CAIP-2 chain>/<token address>. Requires --to.
+    #[arg(long, requires = "to")]
+    pub from: Option<AssetSpec>,
+
+    /// Destination asset as <CAIP-2 chain>/<token address>. Requires --from.
+    #[arg(long, requires = "from")]
+    pub to: Option<AssetSpec>,
+
+    /// Human-readable fixed amount: source for exact-input, destination for exact-output.
+    #[arg(long, requires_all = ["from", "to"])]
+    pub amount: Option<HumanAmount>,
+
+    /// Fix the source input or destination output amount.
+    #[arg(long, value_enum, default_value_t)]
+    pub order_type: OrderType,
+
+    /// Basis points of spendable source balance when --amount is omitted.
+    #[arg(long, default_value = "100", value_parser = clap::value_parser!(u16).range(1..=10_000))]
+    pub wallet_bps: u16,
+}
+
+#[derive(Args)]
+pub struct IntentSendOptions {
+    #[command(flatten)]
+    pub runtime: IntentRuntimeOptions,
+
+    #[command(flatten)]
+    pub route: IntentRouteOptions,
+
+    /// Destination recipient. Defaults to the axe wallet.
+    #[arg(long)]
+    pub recipient: Option<Address>,
+}
+
+#[derive(Args)]
+pub struct IntentRoundtripOptions {
+    #[command(flatten)]
+    pub runtime: IntentRuntimeConfigOptions,
+
+    #[command(flatten)]
+    pub route: IntentRouteOptions,
+}
+
+#[derive(Args)]
+pub struct IntentSweepOptions {
+    #[command(flatten)]
+    pub runtime: IntentRuntimeConfigOptions,
+
+    #[command(flatten)]
+    pub assets: IntentAssetOptions,
+
+    /// Complete passes over every currently executable route.
+    #[arg(long, conflicts_with = "continuous", value_parser = clap::value_parser!(u64).range(1..))]
+    pub sweeps: Option<u64>,
+
+    /// Rediscover and sweep routes until Ctrl-C.
+    #[arg(long)]
+    pub continuous: bool,
+
+    /// Print every executable round trip without submitting transactions.
+    #[arg(long, conflicts_with_all = ["continuous", "sweeps"])]
+    pub dry_run: bool,
+
+    /// Basis points of each source asset's spendable balance per route.
+    #[arg(long, default_value = "100", value_parser = clap::value_parser!(u16).range(1..=10_000))]
+    pub wallet_bps: u16,
+
+    /// Fix the source input or destination output amount.
+    #[arg(long, value_enum, default_value_t)]
+    pub order_type: OrderType,
+}
+
+#[derive(Args)]
+pub struct IntentTrafficOptions {
+    #[command(flatten)]
+    pub runtime: IntentRuntimeConfigOptions,
+
+    #[command(flatten)]
+    pub assets: IntentAssetFilterOptions,
+
+    /// Maximum basis points of a source balance used by one route.
+    #[arg(long, default_value = "10", value_parser = clap::value_parser!(u16).range(1..=1_000))]
+    pub wallet_bps: u16,
+}
+
+#[derive(Args)]
+pub struct IntentStressOptions {
+    #[command(flatten)]
+    pub runtime: IntentRuntimeOptions,
+
+    /// Token symbol to deposit across all funded source chains.
+    #[arg(long, default_value = "USDC")]
+    pub symbol: String,
+
+    /// Fixed exact-input amount for every intent.
+    #[arg(long, default_value = "0.1")]
+    pub amount: HumanAmount,
+
+    /// Run for this many seconds (7200 = 2 hours), without default spending or deposit caps.
+    /// Explicit caps still apply. Without this or --continuous, defaults to 900 seconds.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub duration_secs: Option<u64>,
+
+    /// Run until Ctrl-C, without default spending or deposit caps. Explicit caps still apply.
+    #[arg(long, conflicts_with = "duration_secs")]
+    pub continuous: bool,
+
+    /// Hard cap on deposit attempts that reach broadcast, including uncertain broadcasts.
+    /// Defaults to 200 only without --duration-secs or --continuous.
+    #[arg(long, default_value = "200", hide_default_value = true, value_parser = clap::value_parser!(u64).range(1..),
+        default_value_if("duration_secs", clap::builder::ArgPredicate::IsPresent, None),
+        default_value_if("continuous", "true", None))]
+    pub max_intents: Option<u64>,
+
+    /// Concurrent quote and deposit jobs. Receipt waits overlap later broadcasts.
+    #[arg(long, default_value = "32", value_parser = clap::value_parser!(u16).range(1..=128))]
+    pub max_in_flight: u16,
+
+    /// Maximum cumulative input volume in token units. Defaults to 20 only without a run mode.
+    /// Without an input or deposit cap, uses unlimited settlement allowances.
+    #[arg(
+        long,
+        default_value = "20",
+        hide_default_value = true,
+        default_value_if("duration_secs", clap::builder::ArgPredicate::IsPresent, None),
+        default_value_if("continuous", "true", None)
+    )]
+    pub max_volume: Option<HumanAmount>,
+
+    /// Maximum native gas spend per source chain for deposits. Approvals are extra.
+    /// Defaults to 0.01 only without --duration-secs or --continuous.
+    #[arg(
+        long,
+        default_value = "0.01",
+        hide_default_value = true,
+        default_value_if("duration_secs", clap::builder::ArgPredicate::IsPresent, None),
+        default_value_if("continuous", "true", None)
+    )]
+    pub max_native_spend: Option<HumanAmount>,
+
+    /// Never submit on a chain whose native balance is below this amount.
+    #[arg(long, default_value = "0.01")]
+    pub min_native_balance: HumanAmount,
+
+    /// Print the final benchmark report as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Subcommand)]
@@ -563,6 +963,15 @@ mod tests {
     fn all_subcommands_parse_with_global_network_flag() {
         let cases: &[&[&str]] = &[
             &["axe", "--network", "testnet", "deploy", "status"],
+            &[
+                "axe",
+                "--network",
+                "testnet",
+                "intents",
+                "send",
+                "--private-key",
+                "00",
+            ],
             &["axe", "--network", "testnet", "test", "gmp"],
             &["axe", "--network", "testnet", "decode", "calldata", "0x00"],
             &["axe", "--network", "testnet", "decode", "tx", "0xabc"],
@@ -631,5 +1040,478 @@ mod tests {
             panic!("expected info block");
         };
         assert_eq!(network, Network::Testnet);
+    }
+
+    #[test]
+    fn intent_send_and_roundtrip_accept_automatic_routes() {
+        let cli = Cli::try_parse_from(["axe", "intents", "send", "--private-key", "00"]).unwrap();
+        let Commands::Intents {
+            subcommand: IntentsCommands::Send(options),
+        } = cli.command
+        else {
+            panic!("expected intents send");
+        };
+        assert!(options.route.from.is_none());
+        assert!(options.route.to.is_none());
+        assert_eq!(options.route.assets.asset_type, AssetType::Token);
+
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "roundtrip",
+                "--private-key",
+                "00",
+                "--asset-type",
+                "native",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn intent_execution_commands_do_not_require_private_key_flags() {
+        for command in ["send", "roundtrip", "sweep", "traffic", "stress"] {
+            assert!(
+                Cli::try_parse_from(["axe", "intents", command]).is_ok(),
+                "intents {command} should resolve its key after CLI parsing"
+            );
+        }
+        assert!(Cli::try_parse_from(["axe", "intents", "send", "--yes"]).is_ok());
+        assert!(Cli::try_parse_from(["axe", "intents", "roundtrip", "--yes"]).is_err());
+        assert!(Cli::try_parse_from(["axe", "intents", "sweep", "--yes"]).is_err());
+    }
+
+    #[test]
+    fn intent_send_accepts_an_explicit_route_and_human_amount() {
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "send",
+                "--private-key",
+                "00",
+                "--asset-type",
+                "native",
+                "--from",
+                "eip155:11155111/0x0000000000000000000000000000000000000000",
+                "--to",
+                "eip155:43113/0x0000000000000000000000000000000000000000",
+                "--amount",
+                "0.01",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn intent_execution_commands_accept_asset_types() {
+        for command in ["catalog", "inventory", "sweep", "traffic"] {
+            assert!(
+                Cli::try_parse_from(["axe", "intents", command, "--asset-type", "native"]).is_ok(),
+                "intents {command} should accept --asset-type"
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "send",
+                "--private-key",
+                "00",
+                "--asset-type",
+                "anything",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn intent_traffic_is_continuous_and_balance_capped() {
+        let cli = Cli::try_parse_from([
+            "axe",
+            "intents",
+            "traffic",
+            "--private-key",
+            "00",
+            "--wallet-bps",
+            "25",
+        ])
+        .unwrap();
+        let Commands::Intents {
+            subcommand: IntentsCommands::Traffic(options),
+        } = cli.command
+        else {
+            panic!("expected intents traffic");
+        };
+        assert_eq!(options.wallet_bps, 25);
+        assert_eq!(options.assets.asset_type, None);
+
+        let cli =
+            Cli::try_parse_from(["axe", "intents", "traffic", "--asset-type", "native"]).unwrap();
+        let Commands::Intents {
+            subcommand: IntentsCommands::Traffic(options),
+        } = cli.command
+        else {
+            panic!("expected intents traffic");
+        };
+        assert_eq!(options.assets.asset_type, Some(AssetType::Native));
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "traffic",
+                "--private-key",
+                "00",
+                "--wallet-bps",
+                "1001",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["axe", "intents", "traffic", "--private-key", "00", "--yes",])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn intent_stress_parses_bounded_defaults_and_overrides() {
+        let cli = Cli::try_parse_from([
+            "axe",
+            "intents",
+            "stress",
+            "--max-intents",
+            "40",
+            "--max-in-flight",
+            "8",
+            "--max-volume",
+            "4",
+            "--max-native-spend",
+            "1",
+            "--yes",
+        ])
+        .unwrap();
+        let Commands::Intents {
+            subcommand: IntentsCommands::Stress(options),
+        } = cli.command
+        else {
+            panic!("expected intents stress");
+        };
+
+        assert_eq!(options.max_intents, Some(40));
+        assert_eq!(options.duration_secs, None);
+        assert!(!options.continuous);
+        assert_eq!(options.max_in_flight, 8);
+        assert_eq!(options.max_volume.unwrap().to_string(), "4");
+        assert_eq!(options.max_native_spend.unwrap().to_string(), "1");
+        assert!(options.runtime.yes);
+        assert!(
+            Cli::try_parse_from(["axe", "intents", "stress", "--max-in-flight", "129",]).is_err()
+        );
+    }
+
+    #[test]
+    fn intent_stress_supports_continuous_or_two_hour_runs() {
+        for (flags, continuous, duration) in [
+            (vec!["--continuous"], true, None),
+            (vec!["--duration-secs", "7200"], false, Some(7200)),
+            (vec!["--duration-secs", "900"], false, Some(900)),
+        ] {
+            let cli =
+                Cli::try_parse_from(["axe", "intents", "stress"].into_iter().chain(flags)).unwrap();
+            let Commands::Intents {
+                subcommand: IntentsCommands::Stress(options),
+            } = cli.command
+            else {
+                panic!("expected intents stress");
+            };
+            assert_eq!(options.continuous, continuous);
+            assert_eq!(options.duration_secs, duration);
+            assert_eq!(options.max_intents, None);
+            assert!(options.max_volume.is_none());
+            assert!(options.max_native_spend.is_none());
+            assert_eq!(options.min_native_balance.to_string(), "0.01");
+        }
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "stress",
+                "--continuous",
+                "--duration-secs",
+                "7200"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["axe", "intents", "stress", "--duration-secs", "0"]).is_err());
+    }
+
+    #[test]
+    fn intent_stress_without_a_run_mode_keeps_bounded_defaults() {
+        let cli = Cli::try_parse_from(["axe", "intents", "stress"]).unwrap();
+        let Commands::Intents {
+            subcommand: IntentsCommands::Stress(options),
+        } = cli.command
+        else {
+            panic!("expected intents stress");
+        };
+        assert_eq!(options.duration_secs, None);
+        assert!(!options.continuous);
+        assert_eq!(options.max_intents, Some(200));
+        assert_eq!(options.max_volume.unwrap().to_string(), "20");
+        assert_eq!(options.max_native_spend.unwrap().to_string(), "0.01");
+    }
+
+    #[test]
+    fn intent_stress_run_modes_preserve_only_explicit_caps() {
+        for mode in [vec!["--duration-secs", "7200"], vec!["--continuous"]] {
+            for (flag, value) in [
+                ("--max-intents", "200"),
+                ("--max-volume", "20"),
+                ("--max-native-spend", "0.01"),
+            ] {
+                let cli = Cli::try_parse_from(
+                    ["axe", "intents", "stress"]
+                        .into_iter()
+                        .chain(mode.clone())
+                        .chain([flag, value]),
+                )
+                .unwrap();
+                let Commands::Intents {
+                    subcommand: IntentsCommands::Stress(options),
+                } = cli.command
+                else {
+                    panic!("expected intents stress");
+                };
+                assert_eq!(
+                    options.max_intents,
+                    (flag == "--max-intents").then_some(200)
+                );
+                assert_eq!(
+                    options.max_volume.map(|cap| cap.to_string()),
+                    (flag == "--max-volume").then(|| "20".to_owned())
+                );
+                assert_eq!(
+                    options.max_native_spend.map(|cap| cap.to_string()),
+                    (flag == "--max-native-spend").then(|| "0.01".to_owned())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn intent_commands_accept_exact_output() {
+        let cli = Cli::try_parse_from([
+            "axe",
+            "intents",
+            "send",
+            "--private-key",
+            "00",
+            "--order-type",
+            "exact-output",
+        ])
+        .unwrap();
+        let Commands::Intents {
+            subcommand: IntentsCommands::Send(options),
+        } = cli.command
+        else {
+            panic!("expected intents send");
+        };
+        assert_eq!(options.route.order_type, OrderType::ExactOutput);
+
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "sweep",
+                "--private-key",
+                "00",
+                "--order-type",
+                "exact-output",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn intent_read_commands_parse_without_a_private_key() {
+        const ASSET: &str = "eip155:11155111/0x0000000000000000000000000000000000000000";
+        const ADDRESS: &str = "0x0000000000000000000000000000000000000001";
+
+        assert!(Cli::try_parse_from(["axe", "intents", "catalog"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["axe", "intents", "catalog", "--chain", "eip155:11155111",])
+                .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "axe", "intents", "quote", "--from", ASSET, "--to", ASSET, "--amount", "1",
+                "--sender", ADDRESS,
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "status",
+                "quote-id",
+                "--watch",
+                "--timeout-secs",
+                "30",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn every_intent_command_accepts_the_rfq_url_override() {
+        const URL: &str = "http://127.0.0.1:8080/rfq/v1";
+        let commands: &[&[&str]] = &[
+            &["axe", "intents", "catalog", "--rfq-url", URL],
+            &["axe", "intents", "inventory", "--rfq-url", URL],
+            &["axe", "intents", "quote", "--rfq-url", URL],
+            &["axe", "intents", "status", "quote-id", "--rfq-url", URL],
+            &["axe", "intents", "bench", "quote", "--rfq-url", URL],
+            &["axe", "intents", "send", "--rfq-url", URL],
+            &["axe", "intents", "roundtrip", "--rfq-url", URL],
+            &["axe", "intents", "sweep", "--rfq-url", URL],
+            &["axe", "intents", "traffic", "--rfq-url", URL],
+        ];
+
+        for args in commands {
+            assert!(
+                Cli::try_parse_from(*args).is_ok(),
+                "{} should accept --rfq-url",
+                args.join(" ")
+            );
+        }
+        assert!(Cli::try_parse_from(["axe", "intents", "quote", "--api-url", URL]).is_err());
+    }
+
+    #[test]
+    fn intent_catalog_no_longer_has_nested_commands() {
+        assert!(Cli::try_parse_from(["axe", "intents", "catalog", "chains"]).is_err());
+        assert!(Cli::try_parse_from(["axe", "intents", "catalog", "tokens"]).is_err());
+    }
+
+    #[test]
+    fn intent_quotes_accept_random_defaults_and_optional_overrides() {
+        const ASSET: &str = "eip155:11155111/0x0000000000000000000000000000000000000000";
+
+        assert!(Cli::try_parse_from(["axe", "intents", "quote"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "axe", "intents", "quote", "--from", ASSET, "--to", ASSET, "--amount", "1",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn intent_quote_benchmark_accepts_parallel_controls() {
+        const ASSET: &str = "eip155:11155111/0x0000000000000000000000000000000000000000";
+        const ADDRESS: &str = "0x0000000000000000000000000000000000000001";
+        let base = [
+            "axe", "intents", "bench", "quote", "--from", ASSET, "--to", ASSET, "--amount", "1",
+            "--sender", ADDRESS,
+        ];
+        assert!(Cli::try_parse_from(["axe", "intents", "bench", "quote"]).is_ok());
+
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain([
+                "--requests",
+                "20",
+                "--concurrency",
+                "4",
+                "--warmup",
+                "2"
+            ]))
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain([
+                "--requests",
+                "20",
+                "--duration-secs",
+                "5"
+            ]))
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--concurrency", "0"])).is_err());
+    }
+
+    #[test]
+    fn intent_route_requires_both_assets() {
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "send",
+                "--private-key",
+                "00",
+                "--from",
+                "eip155:11155111/0x0000000000000000000000000000000000000000",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn intent_sweep_modes_conflict_only_when_both_are_explicit() {
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "sweep",
+                "--private-key",
+                "00",
+                "--continuous",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "sweep",
+                "--private-key",
+                "00",
+                "--continuous",
+                "--sweeps",
+                "2",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "sweep",
+                "--private-key",
+                "00",
+                "--dry-run",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "axe",
+                "intents",
+                "sweep",
+                "--private-key",
+                "00",
+                "--dry-run",
+                "--continuous",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn exercise_was_renamed_to_sweep() {
+        assert!(
+            Cli::try_parse_from(["axe", "intents", "exercise", "--private-key", "00"]).is_err()
+        );
     }
 }

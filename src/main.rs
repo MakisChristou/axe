@@ -11,6 +11,7 @@ mod hyperliquid;
 mod mcp;
 mod preflight;
 mod retry;
+mod shutdown;
 mod solana;
 mod state;
 mod stellar;
@@ -390,6 +391,7 @@ async fn run_cli() -> Result<()> {
     let cli = cli::Cli::parse();
 
     match cli.command {
+        cli::Commands::Intents { subcommand } => run_intents(subcommand, cli.network).await,
         cli::Commands::Deploy { subcommand } => run_deploy(subcommand, cli.network).await,
         cli::Commands::Decode { subcommand } => run_decode(subcommand, cli.network).await,
         cli::Commands::Info { subcommand } => match subcommand {
@@ -431,4 +433,253 @@ async fn run_cli() -> Result<()> {
         cli::Commands::Test { subcommand } => run_test(subcommand, cli.network).await,
         cli::Commands::Bench { subcommand } => commands::bench::run(subcommand).await,
     }
+}
+
+async fn run_intents(
+    subcommand: cli::IntentsCommands,
+    global: Option<types::Network>,
+) -> Result<()> {
+    match subcommand {
+        cli::IntentsCommands::Catalog(options) => run_intent_catalog(options, global).await,
+        cli::IntentsCommands::Inventory(options) => run_intent_inventory(options, global).await,
+        cli::IntentsCommands::Quote(options) => run_intent_quote(options, global).await,
+        cli::IntentsCommands::Status(options) => run_intent_status(options, global).await,
+        cli::IntentsCommands::Bench { subcommand } => run_intent_bench(subcommand, global).await,
+        cli::IntentsCommands::Send(options) => {
+            let runtime = resolve_intent_runtime(options.runtime, global).await?;
+            let route = commands::intents::RouteChoice::new(
+                options.route.from,
+                options.route.to,
+                options.route.amount,
+                options.route.wallet_bps,
+                options.route.order_type,
+                options.route.assets.asset_type,
+            )?;
+            commands::intents::send(commands::intents::SendArgs {
+                runtime,
+                route,
+                recipient: options.recipient,
+            })
+            .await
+        }
+        cli::IntentsCommands::Roundtrip(options) => {
+            let runtime = resolve_intent_runtime_config(options.runtime, global, true).await?;
+            let route = commands::intents::RouteChoice::new(
+                options.route.from,
+                options.route.to,
+                options.route.amount,
+                options.route.wallet_bps,
+                options.route.order_type,
+                options.route.assets.asset_type,
+            )?;
+            commands::intents::roundtrip(commands::intents::RoundtripArgs { runtime, route }).await
+        }
+        cli::IntentsCommands::Sweep(options) => {
+            let runtime = resolve_intent_runtime_config(options.runtime, global, true).await?;
+            commands::intents::sweep(commands::intents::SweepArgs {
+                runtime,
+                sweeps: options.sweeps.unwrap_or(1),
+                continuous: options.continuous,
+                dry_run: options.dry_run,
+                wallet_bps: options.wallet_bps,
+                order_type: options.order_type,
+                asset_type: options.assets.asset_type,
+            })
+            .await
+        }
+        cli::IntentsCommands::Traffic(options) => {
+            let runtime = resolve_intent_runtime_config(options.runtime, global, true).await?;
+            commands::intents::traffic(commands::intents::TrafficArgs {
+                runtime,
+                wallet_bps: options.wallet_bps,
+                asset_type: options.assets.asset_type,
+            })
+            .await
+        }
+        cli::IntentsCommands::Stress(options) => {
+            let runtime = resolve_intent_runtime(options.runtime, global).await?;
+            commands::intents::stress(commands::intents::StressArgs {
+                runtime,
+                symbol: options.symbol,
+                amount: options.amount,
+                duration: (!options.continuous)
+                    .then(|| std::time::Duration::from_secs(options.duration_secs.unwrap_or(900))),
+                max_intents: options.max_intents,
+                max_in_flight: usize::from(options.max_in_flight),
+                max_volume: options.max_volume,
+                max_native_spend: options.max_native_spend,
+                min_native_balance: options.min_native_balance,
+                json: options.json,
+            })
+            .await
+        }
+    }
+}
+
+async fn run_intent_inventory(
+    options: cli::IntentInventoryOptions,
+    global: Option<types::Network>,
+) -> Result<()> {
+    let (api, config) =
+        resolve_intent_read_config(options.read.api, options.config, global).await?;
+    commands::intents::inventory(commands::intents::InventoryArgs {
+        api,
+        config,
+        json: options.read.json,
+        asset_type: options.assets.asset_type,
+    })
+    .await
+}
+
+async fn run_intent_catalog(
+    options: cli::IntentCatalogOptions,
+    global: Option<types::Network>,
+) -> Result<()> {
+    let api = resolve_intent_api(options.read.api, global)?;
+    commands::intents::catalog(commands::intents::CatalogArgs {
+        api,
+        chain: options.chain,
+        json: options.read.json,
+        asset_type: options.assets.asset_type,
+    })
+    .await
+}
+
+async fn run_intent_quote(
+    options: cli::IntentQuoteOptions,
+    global: Option<types::Network>,
+) -> Result<()> {
+    let runtime = resolve_intent_runtime_config(options.runtime, global, false).await?;
+    let route = commands::intents::RouteChoice::new(
+        options.route.from,
+        options.route.to,
+        options.route.amount,
+        options.route.wallet_bps,
+        options.route.order_type,
+        options.route.assets.asset_type,
+    )?;
+    commands::intents::quote(commands::intents::QuoteArgs {
+        runtime,
+        route,
+        sender: options.sender,
+        recipient: options.recipient,
+        json: options.json,
+    })
+    .await
+}
+
+async fn run_intent_status(
+    options: cli::IntentStatusOptions,
+    global: Option<types::Network>,
+) -> Result<()> {
+    let api = resolve_intent_api(options.read.api, global)?;
+    commands::intents::status(commands::intents::StatusArgs {
+        api,
+        quote_id: options.quote_id,
+        watch: options.watch,
+        poll_interval: std::time::Duration::from_secs(options.poll_interval_secs),
+        timeout: std::time::Duration::from_secs(options.timeout_secs),
+        json: options.read.json,
+    })
+    .await
+}
+
+async fn run_intent_bench(
+    subcommand: cli::IntentBenchCommands,
+    global: Option<types::Network>,
+) -> Result<()> {
+    match subcommand {
+        cli::IntentBenchCommands::Quote(options) => {
+            let api = resolve_intent_api(options.read.api, global)?;
+            let sender =
+                commands::intents::resolve_quote_sender(options.sender, options.private_key)?;
+            let recipient = options.recipient.unwrap_or(sender);
+            let limit = commands::intents::QuoteBenchmarkLimit::resolve(
+                options.mode,
+                options.requests,
+                options.duration_secs.map(std::time::Duration::from_secs),
+            )?;
+            commands::intents::benchmark_quotes(commands::intents::QuoteBenchmarkArgs {
+                api,
+                target: commands::intents::QuoteBenchmarkTarget {
+                    from: options.from,
+                    to: options.to,
+                    amount: options.amount,
+                    sender,
+                    recipient,
+                    order_type: options.order_type,
+                    asset_type: options.assets.asset_type,
+                },
+                limit,
+                concurrency: usize::from(options.concurrency),
+                warmup: options.warmup,
+                request_timeout: std::time::Duration::from_secs(options.request_timeout_secs),
+                max_rps: options.max_rps,
+                json: options.read.json,
+            })
+            .await
+        }
+    }
+}
+
+fn resolve_intent_api(
+    options: cli::IntentApiOptions,
+    global: Option<types::Network>,
+) -> Result<commands::intents::ApiArgs> {
+    Ok(commands::intents::ApiArgs {
+        network: cli::network_or_default(None, global)?,
+        rfq_url: options.rfq_url,
+    })
+}
+
+async fn resolve_intent_read_config(
+    options: cli::IntentApiOptions,
+    config: Option<std::path::PathBuf>,
+    global: Option<types::Network>,
+) -> Result<(commands::intents::ApiArgs, std::path::PathBuf)> {
+    let network = cli::resolve_network(global, config.as_deref())?;
+    let config = match config {
+        Some(path) => path,
+        None => config_source::resolve(network, None).await?.into_path(),
+    };
+    Ok((
+        commands::intents::ApiArgs {
+            network,
+            rfq_url: options.rfq_url,
+        },
+        config,
+    ))
+}
+
+async fn resolve_intent_runtime(
+    options: cli::IntentRuntimeOptions,
+    global: Option<types::Network>,
+) -> Result<commands::intents::IntentRuntimeArgs> {
+    resolve_intent_runtime_config(options.config, global, options.yes).await
+}
+
+async fn resolve_intent_runtime_config(
+    options: cli::IntentRuntimeConfigOptions,
+    global: Option<types::Network>,
+    yes: bool,
+) -> Result<commands::intents::IntentRuntimeArgs> {
+    let network = cli::resolve_network(global, options.config.as_deref())?;
+    let private_key = commands::intents::resolve_private_key(
+        options.private_key,
+        std::env::var("EVM_PRIVATE_KEY").ok(),
+        std::env::var("PRIVATE_KEY").ok(),
+    )?;
+    let config = match options.config {
+        Some(path) => path,
+        None => config_source::resolve(network, None).await?.into_path(),
+    };
+    Ok(commands::intents::IntentRuntimeArgs {
+        network,
+        rfq_url: options.api.rfq_url,
+        config,
+        private_key,
+        poll_interval_secs: options.poll_interval_secs,
+        fulfillment_timeout_secs: options.fulfillment_timeout_secs,
+        yes,
+    })
 }

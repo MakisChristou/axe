@@ -1,3 +1,5 @@
+pub mod pipeline;
+
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
 
@@ -24,6 +26,8 @@ use tower::Layer;
 
 use crate::timing::EVM_TX_RECEIPT_TIMEOUT;
 use crate::ui;
+
+const AVALANCHE_FUJI_CHAIN_ID: u64 = 43_113;
 
 /// Build a read-only EVM provider that transparently fails over across `urls`
 /// (primary first, then the public fallback).
@@ -164,22 +168,20 @@ impl EvmEndpoints {
     ///
     /// alloy's nonce and gas fillers query the **pending** block, and some
     /// nodes (Avalanche coreth, recurringly) intermittently can't serve
-    /// pending state — for stretches longer than the whole retry budget. When
-    /// the retried fill dies on exactly that error, degrade once: pre-resolve
-    /// the nonce and gas against `latest` (which those nodes do serve), then
-    /// re-run the fill — only the fee/chain-id lookups remain, and those are
-    /// latest-based already.
+    /// pending state for stretches longer than the whole retry budget. On
+    /// that exact error, degrade immediately: pre-resolve the nonce and gas
+    /// against `latest` (which those nodes do serve), then re-run the fill.
+    /// only the fee/chain-id lookups remain, and those are latest-based already.
     pub async fn fill_and_sign(
         &self,
         signer: &PrivateKeySigner,
         tx: TransactionRequest,
+        on_warning: &impl Fn(&str),
     ) -> Result<TxEnvelope> {
+        let tx = self.prepare_fill(tx).await?;
         match self.fill_and_sign_once(signer, tx.clone()).await {
             Err(error) if is_pending_state_error(&error) => {
-                ui::warn(
-                    "fill kept hitting 'state not available for pending block' — \
-                     re-filling with nonce+gas pinned to the latest block",
-                );
+                on_warning("pending state unavailable; using latest-pinned nonce+gas immediately");
                 let pinned = self.prefill_from_latest(tx).await?;
                 self.fill_and_sign_once(signer, pinned).await
             }
@@ -188,7 +190,7 @@ impl EvmEndpoints {
             // tx with an explicit `gas_price`, which routes alloy's filler
             // through the legacy path and skips `eth_feeHistory` entirely.
             Err(error) if is_missing_base_fee_error(&error) => {
-                ui::warn(
+                on_warning(
                     "fill hit a pre-EIP-1559 fee history (null baseFeePerGas) — \
                      re-filling as a legacy type-0 tx with an explicit gas price",
                 );
@@ -197,6 +199,15 @@ impl EvmEndpoints {
                     .await
             }
             other => other,
+        }
+    }
+
+    /// Fuji cannot reliably serve pending state, so skip that probe entirely.
+    async fn prepare_fill(&self, tx: TransactionRequest) -> Result<TransactionRequest> {
+        if tx.chain_id == Some(AVALANCHE_FUJI_CHAIN_ID) {
+            self.prefill_from_latest(tx).await
+        } else {
+            Ok(tx)
         }
     }
 
@@ -210,7 +221,7 @@ impl EvmEndpoints {
         crate::retry::retry_with_fallback(
             "fill+sign evm tx",
             &self.urls,
-            |e: &eyre::Report| crate::retry::is_transient_default(e) || is_pending_state_error(e),
+            should_retry_fill,
             move |url| {
                 let signer = signer.clone();
                 let tx = tx.clone();
@@ -304,6 +315,13 @@ impl EvmEndpoints {
         )
         .await
     }
+}
+
+/// Pending-state failures need a different request, not another delayed copy
+/// of the same Alloy fill. The caller switches that request to latest-pinned
+/// nonce and gas immediately. Ordinary transient failures retain normal retry.
+fn should_retry_fill(error: &eyre::Report) -> bool {
+    !is_pending_state_error(error) && crate::retry::is_transient_default(error)
 }
 
 /// Deterministic EVM view/estimate failures - not endpoint flakiness, so
@@ -493,6 +511,17 @@ pub async fn send_tx_robust(
     label: &str,
     receipt_timeout: std::time::Duration,
 ) -> Result<alloy::rpc::types::TransactionReceipt> {
+    send_tx_robust_with_warning(endpoints, signer, tx, label, receipt_timeout, ui::warn).await
+}
+
+pub async fn send_tx_robust_with_warning(
+    endpoints: &EvmEndpoints,
+    signer: &PrivateKeySigner,
+    tx: TransactionRequest,
+    label: &str,
+    receipt_timeout: std::time::Duration,
+    on_warning: impl Fn(&str),
+) -> Result<alloy::rpc::types::TransactionReceipt> {
     let mut envelope: Option<TxEnvelope> = None;
     let mut nonce_override: Option<u64> = tx.nonce;
     // Fee floor for a replacement round: an unmined-after-timeout tx is
@@ -524,7 +553,7 @@ pub async fn send_tx_robust(
             None => {
                 let request =
                     round_request(&tx, nonce_override, gas_override, replacement_fees.as_ref());
-                let env = pool.fill_and_sign(signer, request).await?;
+                let env = pool.fill_and_sign(signer, request, &on_warning).await?;
                 envelope = Some(env.clone());
                 env
             }
@@ -551,7 +580,7 @@ pub async fn send_tx_robust(
                     envelope = None;
                     replacement_fees = None;
                     gas_override = None;
-                    ui::warn(&format!(
+                    on_warning(&format!(
                         "{label}: nonce conflict ({error}); re-signing at {}",
                         match nonce_override {
                             Some(nonce) => format!("node-reported nonce {nonce}"),
@@ -580,7 +609,7 @@ pub async fn send_tx_robust(
                 let backoff = nonce_contention_backoff(contention);
                 contention += 1;
                 pool = endpoints.rotated(contention as usize);
-                ui::warn(&format!(
+                on_warning(&format!(
                     "{label}: nonce held by another pooled tx — waiting {:.1}s, then \
                      re-signing at a fresh nonce on the next endpoint \
                      (attempt {contention}/{NONCE_CONTENTION_ATTEMPTS})",
@@ -609,7 +638,7 @@ pub async fn send_tx_robust(
                     gas_override = Some(env.gas_limit());
                     replacement_fees = Some(ReplacementFees::doubled_from(&env));
                 }
-                ui::warn(&format!(
+                on_warning(&format!(
                     "{label}: tx {tx_hash:#x} not mined in {}s — re-signing a replacement \
                      at the same nonce with doubled fees (round {}/{SEND_ROUNDS})",
                     receipt_timeout.as_secs(),
@@ -1131,10 +1160,73 @@ where
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::Address;
+    use alloy::providers::{Provider as _, ProviderBuilder};
+    use alloy::rpc::{client::RpcClient, types::TransactionRequest};
+    use alloy::transports::mock::Asserter;
+
     use super::{
-        is_pending_state_error, nonce_contention_backoff, nonce_held_by_pooled_tx,
-        parse_expected_nonce, send_error_may_mean_landed,
+        AVALANCHE_FUJI_CHAIN_ID, EvmEndpoints, is_pending_state_error, nonce_contention_backoff,
+        nonce_held_by_pooled_tx, parse_expected_nonce, send_error_may_mean_landed,
+        should_retry_fill,
     };
+
+    fn mocked_endpoints(asserter: Asserter) -> EvmEndpoints {
+        EvmEndpoints {
+            urls: vec!["http://unused.invalid".to_owned()],
+            providers: vec![
+                ProviderBuilder::new()
+                    .connect_client(RpcClient::mocked(asserter))
+                    .erased(),
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn fuji_prefills_nonce_and_gas_before_the_wallet_filler() {
+        let asserter = Asserter::new();
+        asserter.push_success(&"0x2a");
+        asserter.push_success(&"0x5208");
+        let endpoints = mocked_endpoints(asserter.clone());
+        let tx = TransactionRequest {
+            chain_id: Some(AVALANCHE_FUJI_CHAIN_ID),
+            ..Default::default()
+        }
+        .from(Address::ZERO)
+        .to(Address::ZERO);
+
+        let prepared = endpoints.prepare_fill(tx).await.unwrap();
+
+        assert_eq!(prepared.nonce, Some(42));
+        assert_eq!(prepared.gas, Some(25_200));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fuji_preserves_explicit_nonce_and_gas_without_rpc_calls() {
+        let endpoints = mocked_endpoints(Asserter::new());
+        let tx = TransactionRequest {
+            chain_id: Some(AVALANCHE_FUJI_CHAIN_ID),
+            ..Default::default()
+        }
+        .from(Address::ZERO)
+        .nonce(123)
+        .gas_limit(50_000);
+
+        assert_eq!(endpoints.prepare_fill(tx.clone()).await.unwrap(), tx);
+    }
+
+    #[tokio::test]
+    async fn other_and_unspecified_chains_keep_the_existing_fill_path() {
+        let endpoints = mocked_endpoints(Asserter::new());
+        for chain_id in [None, Some(1), Some(84_532), Some(43_114)] {
+            let tx = TransactionRequest {
+                chain_id,
+                ..Default::default()
+            };
+            assert_eq!(endpoints.prepare_fill(tx.clone()).await.unwrap(), tx);
+        }
+    }
 
     #[test]
     fn parses_geth_nonce_too_low() {
@@ -1159,6 +1251,11 @@ mod tests {
         assert!(!is_pending_state_error(
             &"execution reverted: TakeTokenFailed"
         ));
+
+        let pending = eyre::eyre!("state not available for pending block");
+        assert!(!should_retry_fill(&pending));
+        let timeout = eyre::eyre!("request timeout");
+        assert!(should_retry_fill(&timeout));
     }
 
     #[test]

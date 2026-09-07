@@ -85,6 +85,7 @@ directory is loaded automatically — see [`.env.example`](.env.example)):
 | `MNEMONIC` | `test gmp` / `test its` manual relaying, `propose` (funded Axelar account) |
 | `EVM_PRIVATE_KEY`, `SOLANA_PRIVATE_KEY`, `STELLAR_PRIVATE_KEY`, `SUI_PRIVATE_KEY`, `XRPL_PRIVATE_KEY` | load-test source flows ([details](docs/load-testing.md#configuration)) |
 | `SOURCE_RPC`, `DESTINATION_RPC`, `AXELAR_LCD_URL`, `AXELAR_RPC_URL` | RPC overrides |
+| `SEP_RPC_URL`, `ARB_SEPOLIA_RPC_URL`, `BASE_SEPOLIA_RPC_URL`, `FUJI_RPC_URL` | Intent testnet RPC overrides; validated first, then chains-config fallback |
 | `ALCHEMY_TOKEN` *(optional)* | `decode tx` archive RPCs |
 | `CHAIN`, `ENV`, `DEPLOYER_PRIVATE_KEY`, `TARGET_JSON`, … | `deploy` ([details](docs/deploying.md)) |
 

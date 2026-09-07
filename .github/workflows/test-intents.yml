@@ -1,0 +1,290 @@
+name: Test Intents (testnet)
+
+run-name: "Intents testnet: ${{ inputs.suite || 'full' }} · E2E ${{ inputs.e2e_route || 'automatic' }}"
+
+# Testnet-only RFQ health and end-to-end coverage. Scheduled runs execute the
+# full suite; manual runs can select a cheaper subset and pin the E2E canary to
+# any catalog-backed chain pair. Every state-changing route is balance-returning
+# and all transactions are serial because they share one EVM wallet.
+on:
+  schedule:
+    - cron: '30 0,12 * * *'
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Checks to run
+        type: choice
+        required: true
+        default: full
+        options:
+          - full
+          - smoke
+          - canary
+          - sweep
+      e2e_route:
+        description: Canary route (automatic chooses any funded bidirectional route)
+        type: choice
+        required: true
+        default: automatic
+        options:
+          - automatic
+          - Arbitrum Sepolia <-> Avalanche Fuji
+          - Arbitrum Sepolia <-> Base Sepolia
+          - Arbitrum Sepolia <-> Ethereum Sepolia
+          - Avalanche Fuji <-> Base Sepolia
+          - Avalanche Fuji <-> Ethereum Sepolia
+          - Base Sepolia <-> Ethereum Sepolia
+      e2e_asset_type:
+        description: Canary asset type
+        type: choice
+        required: true
+        default: token
+        options:
+          - token
+          - native
+      e2e_order_type:
+        description: Canary order type
+        type: choice
+        required: true
+        default: exact-input
+        options:
+          - exact-input
+          - exact-output
+
+permissions:
+  contents: read
+
+# The testnet jobs share EVM_PRIVATE_KEY. Queue overlapping schedules/manual
+# dispatches instead of letting two runs contend for the same account nonce.
+concurrency:
+  group: intents-testnet
+  cancel-in-progress: false
+
+jobs:
+  test-intents:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve requested suite
+        id: options
+        shell: bash
+        env:
+          INPUT_SUITE: ${{ inputs.suite }}
+          INPUT_ROUTE: ${{ inputs.e2e_route }}
+          INPUT_ASSET_TYPE: ${{ inputs.e2e_asset_type }}
+          INPUT_ORDER_TYPE: ${{ inputs.e2e_order_type }}
+        run: |
+          set -euo pipefail
+          {
+            echo "suite=${INPUT_SUITE:-full}"
+            echo "route=${INPUT_ROUTE:-automatic}"
+            echo "asset_type=${INPUT_ASSET_TYPE:-token}"
+            echo "order_type=${INPUT_ORDER_TYPE:-exact-input}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Match the route-test workflows: prefer the binary built for this exact
+      # commit, but fall back to a local release build when no artifact exists.
+      - name: Download pre-built axe (${{ github.sha }})
+        id: download_axe
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: build-axe.yml
+          name: axe-${{ github.sha }}
+          commit: ${{ github.sha }}
+          path: target/release
+          if_no_artifact_found: warn
+
+      - name: Mark pre-built axe executable
+        if: steps.download_axe.outputs.found_artifact == 'true'
+        shell: bash
+        run: chmod +x target/release/axe
+
+      - name: Set up Rust toolchain (fallback)
+        if: steps.download_axe.outputs.found_artifact != 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache (fallback)
+        if: steps.download_axe.outputs.found_artifact != 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build axe (fallback)
+        if: steps.download_axe.outputs.found_artifact != 'true'
+        shell: bash
+        run: cargo build --release --locked
+
+      - name: Clone axelar-contract-deployments (sibling)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 \
+            https://github.com/axelarnetwork/axelar-contract-deployments.git \
+            "$GITHUB_WORKSPACE/../axelar-contract-deployments"
+
+      # Intent discovery reads RPCs from chains-config. Apply optional private
+      # endpoints to a runner-temp copy so RPC credentials never enter either
+      # repository working tree.
+      - name: Prepare testnet chains config
+        id: config
+        shell: bash
+        env:
+          ARBITRUM_TESTNET_RPC: ${{ secrets.ARBITRUM_TESTNET_RPC }}
+          AVALANCHE_TESTNET_RPC: ${{ secrets.AVALANCHE_TESTNET_RPC }}
+          BASE_TESTNET_RPC: ${{ secrets.BASE_TESTNET_RPC }}
+          ETHEREUM_TESTNET_RPC: ${{ secrets.ETHEREUM_TESTNET_RPC }}
+        run: |
+          set -euo pipefail
+          SOURCE="$GITHUB_WORKSPACE/../axelar-contract-deployments/axelar-chains-config/info/testnet.json"
+          TARGET="$RUNNER_TEMP/intents-testnet.json"
+          jq \
+            --arg arbitrum "${ARBITRUM_TESTNET_RPC:-}" \
+            --arg avalanche "${AVALANCHE_TESTNET_RPC:-}" \
+            --arg base "${BASE_TESTNET_RPC:-}" \
+            --arg ethereum "${ETHEREUM_TESTNET_RPC:-}" \
+            '(.chains[] | select(.chainId == 421614).rpc) |= if $arbitrum == "" then . else $arbitrum end
+             | (.chains[] | select(.chainId == 43113).rpc) |= if $avalanche == "" then . else $avalanche end
+             | (.chains[] | select(.chainId == 84532).rpc) |= if $base == "" then . else $base end
+             | (.chains[] | select(.chainId == 11155111).rpc) |= if $ethereum == "" then . else $ethereum end' \
+            "$SOURCE" > "$TARGET"
+          chmod 600 "$TARGET"
+          echo "path=$TARGET" >> "$GITHUB_OUTPUT"
+
+      - name: Read-only API and inventory smoke
+        id: smoke
+        if: steps.options.outputs.suite == 'full' || steps.options.outputs.suite == 'smoke'
+        shell: bash
+        env:
+          CHAINS_CONFIG: ${{ steps.config.outputs.path }}
+        run: |
+          set -euo pipefail
+          CATALOG="$RUNNER_TEMP/intents-catalog.json"
+          ./target/release/axe --network testnet intents catalog --json > "$CATALOG"
+          jq -e '.chains | length > 0' "$CATALOG" > /dev/null
+          ./target/release/axe --network testnet intents inventory
+          ./target/release/axe --network testnet intents bench quote \
+            --requests 20 \
+            --warmup 2 \
+            --concurrency 4 \
+            --max-rps 5
+
+      - name: Run balance-returning E2E canary
+        id: canary
+        if: steps.options.outputs.suite == 'full' || steps.options.outputs.suite == 'canary'
+        shell: bash
+        env:
+          CHAINS_CONFIG: ${{ steps.config.outputs.path }}
+          EVM_PRIVATE_KEY: ${{ secrets.EVM_PRIVATE_KEY }}
+          E2E_ROUTE: ${{ steps.options.outputs.route }}
+          ASSET_TYPE: ${{ steps.options.outputs.asset_type }}
+          ORDER_TYPE: ${{ steps.options.outputs.order_type }}
+        run: |
+          set -euo pipefail
+          if [ -z "${EVM_PRIVATE_KEY:-}" ]; then
+            echo "::error::The EVM_PRIVATE_KEY repository secret is required for the E2E canary" >&2
+            exit 1
+          fi
+
+          ARGS=(
+            --network testnet intents roundtrip
+            --wallet-bps 1
+            --asset-type "$ASSET_TYPE"
+            --order-type "$ORDER_TYPE"
+          )
+
+          if [ "$E2E_ROUTE" != automatic ]; then
+            case "$E2E_ROUTE" in
+              "Arbitrum Sepolia <-> Avalanche Fuji")
+                FROM_CHAIN="eip155:421614"; TO_CHAIN="eip155:43113" ;;
+              "Arbitrum Sepolia <-> Base Sepolia")
+                FROM_CHAIN="eip155:421614"; TO_CHAIN="eip155:84532" ;;
+              "Arbitrum Sepolia <-> Ethereum Sepolia")
+                FROM_CHAIN="eip155:421614"; TO_CHAIN="eip155:11155111" ;;
+              "Avalanche Fuji <-> Base Sepolia")
+                FROM_CHAIN="eip155:43113"; TO_CHAIN="eip155:84532" ;;
+              "Avalanche Fuji <-> Ethereum Sepolia")
+                FROM_CHAIN="eip155:43113"; TO_CHAIN="eip155:11155111" ;;
+              "Base Sepolia <-> Ethereum Sepolia")
+                FROM_CHAIN="eip155:84532"; TO_CHAIN="eip155:11155111" ;;
+              *)
+                echo "::error::Unknown E2E route: $E2E_ROUTE" >&2
+                exit 1 ;;
+            esac
+
+            CATALOG="$RUNNER_TEMP/intents-e2e-catalog.json"
+            ./target/release/axe --network testnet intents catalog --json > "$CATALOG"
+            ZERO_ADDRESS="0x0000000000000000000000000000000000000000"
+            FROM_ADDRESS=$(jq -er \
+              --arg chain "$FROM_CHAIN" \
+              --arg asset_type "$ASSET_TYPE" \
+              --arg zero "$ZERO_ADDRESS" \
+              'first(.chains[] | select(.chainId == $chain) | .tokens[]
+                | select(if $asset_type == "native"
+                    then (.address | ascii_downcase) == $zero
+                    else (.address | ascii_downcase) != $zero
+                  end)
+                | .address)' "$CATALOG")
+            TO_ADDRESS=$(jq -er \
+              --arg chain "$TO_CHAIN" \
+              --arg asset_type "$ASSET_TYPE" \
+              --arg zero "$ZERO_ADDRESS" \
+              'first(.chains[] | select(.chainId == $chain) | .tokens[]
+                | select(if $asset_type == "native"
+                    then (.address | ascii_downcase) == $zero
+                    else (.address | ascii_downcase) != $zero
+                  end)
+                | .address)' "$CATALOG")
+            ARGS+=(--from "$FROM_CHAIN/$FROM_ADDRESS" --to "$TO_CHAIN/$TO_ADDRESS")
+          fi
+
+          ./target/release/axe "${ARGS[@]}"
+
+      - name: Sweep every funded route once
+        id: sweep
+        if: steps.options.outputs.suite == 'full' || steps.options.outputs.suite == 'sweep'
+        shell: bash
+        env:
+          CHAINS_CONFIG: ${{ steps.config.outputs.path }}
+          EVM_PRIVATE_KEY: ${{ secrets.EVM_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${EVM_PRIVATE_KEY:-}" ]; then
+            echo "::error::The EVM_PRIVATE_KEY repository secret is required for intent sweeps" >&2
+            exit 1
+          fi
+          for asset_type in token native; do
+            for order_type in exact-input exact-output; do
+              ./target/release/axe --network testnet intents sweep \
+                --sweeps 1 \
+                --wallet-bps 1 \
+                --asset-type "$asset_type" \
+                --order-type "$order_type"
+            done
+          done
+
+      - name: Write intent test summary
+        if: always()
+        shell: bash
+        env:
+          SUITE: ${{ steps.options.outputs.suite }}
+          ROUTE: ${{ steps.options.outputs.route }}
+          ASSET_TYPE: ${{ steps.options.outputs.asset_type }}
+          ORDER_TYPE: ${{ steps.options.outputs.order_type }}
+          SMOKE_RESULT: ${{ steps.smoke.outcome }}
+          CANARY_RESULT: ${{ steps.canary.outcome }}
+          SWEEP_RESULT: ${{ steps.sweep.outcome }}
+        run: |
+          {
+            echo "## Intent testnet suite"
+            echo ""
+            echo "- Suite: \`$SUITE\`"
+            echo "- E2E route: \`$ROUTE\`"
+            echo "- E2E mode: \`$ASSET_TYPE / $ORDER_TYPE\`"
+            echo ""
+            echo "| Check | Result |"
+            echo "|---|---|"
+            echo "| API, inventory, quote smoke | ${SMOKE_RESULT:-skipped} |"
+            echo "| Balance-returning E2E canary | ${CANARY_RESULT:-skipped} |"
+            echo "| All-route sweep | ${SWEEP_RESULT:-skipped} |"
+          } >> "$GITHUB_STEP_SUMMARY"

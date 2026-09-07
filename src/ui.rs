@@ -1,5 +1,8 @@
+use std::future::Future;
 use std::io::{self, IsTerminal, Write};
-use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
@@ -33,7 +36,31 @@ pub fn info(msg: &str) {
 
 /// Print warning: "  ! {msg}" in yellow
 pub fn warn(msg: &str) {
-    println!("  {} {}", "!".yellow(), msg.yellow());
+    if COUNTED_WARNINGS
+        .try_with(|count| count.fetch_add(1, Ordering::Relaxed))
+        .is_ok()
+    {
+        return;
+    }
+    println!("{}", warning_line(msg));
+}
+
+tokio::task_local! {
+    static COUNTED_WARNINGS: Arc<AtomicU64>;
+}
+
+/// Collect warnings for a summary while this task runs.
+pub async fn count_warnings<T>(count: Arc<AtomicU64>, work: impl Future<Output = T>) -> T {
+    COUNTED_WARNINGS.scope(count, work).await
+}
+
+/// Print a warning to stderr so structured stdout remains machine-readable.
+pub fn warn_stderr(msg: &str) {
+    eprintln!("{}", warning_line(msg));
+}
+
+pub fn warning_line(msg: &str) -> String {
+    format!("  {} {}", "!".yellow(), msg.yellow())
 }
 
 /// Print error: "  x {msg}" in red
@@ -118,18 +145,41 @@ fn confirm_blocking(prompt: &str) -> bool {
     matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
-/// Format elapsed duration as human-readable
-pub fn format_elapsed(start: Instant) -> String {
-    let elapsed = start.elapsed();
-    if elapsed.as_secs() >= 60 {
-        format!(
-            "{}m{:.1}s",
-            elapsed.as_secs() / 60,
-            elapsed.as_secs_f64() % 60.0
-        )
-    } else {
-        format!("{:.1}s", elapsed.as_secs_f64())
+/// Format a duration for compact human-readable terminal output.
+pub fn format_duration(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis < 1_000 {
+        return format!("{millis} ms");
     }
+
+    let seconds = duration.as_secs_f64();
+    if seconds < 10.0 {
+        return format!("{seconds:.2} s");
+    }
+    if seconds < 60.0 {
+        return format!("{seconds:.1} s");
+    }
+
+    let total_seconds = duration.as_secs();
+    let minutes = total_seconds / 60;
+    let remaining_seconds = total_seconds % 60;
+    if minutes < 60 {
+        return format!("{minutes}m {remaining_seconds:02}s");
+    }
+
+    let hours = minutes / 60;
+    let remaining_minutes = minutes % 60;
+    format!("{hours}h {remaining_minutes:02}m")
+}
+
+/// Format a millisecond metric for human-readable terminal output.
+pub fn format_millis(milliseconds: u64) -> String {
+    format_duration(Duration::from_millis(milliseconds))
+}
+
+/// Format elapsed time from an instant for human-readable terminal output.
+pub fn format_elapsed(start: Instant) -> String {
+    format_duration(start.elapsed())
 }
 
 /// Truncate large JSON strings to first/last N lines
@@ -176,4 +226,49 @@ pub fn scrub_urls(input: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn warning_counts_are_scoped_to_each_task_and_reset_afterward() {
+        let first = Arc::new(AtomicU64::new(0));
+        let second = Arc::new(AtomicU64::new(0));
+        tokio::join!(
+            count_warnings(Arc::clone(&first), async {
+                warn("nonce retry");
+                tokio::task::yield_now().await;
+                warn("pending-state fallback");
+            }),
+            count_warnings(Arc::clone(&second), async {
+                warn("RPC retry");
+                tokio::task::yield_now().await;
+            }),
+        );
+        assert_eq!(first.load(Ordering::Relaxed), 2);
+        assert_eq!(second.load(Ordering::Relaxed), 1);
+        assert!(COUNTED_WARNINGS.try_with(|_| ()).is_err());
+    }
+
+    #[test]
+    fn formats_subsecond_durations_as_milliseconds() {
+        assert_eq!(format_duration(Duration::ZERO), "0 ms");
+        assert_eq!(format_duration(Duration::from_millis(181)), "181 ms");
+        assert_eq!(format_duration(Duration::from_millis(999)), "999 ms");
+    }
+
+    #[test]
+    fn formats_seconds_with_scale_appropriate_precision() {
+        assert_eq!(format_millis(2_924), "2.92 s");
+        assert_eq!(format_millis(8_823), "8.82 s");
+        assert_eq!(format_millis(11_929), "11.9 s");
+    }
+
+    #[test]
+    fn formats_long_durations_compactly() {
+        assert_eq!(format_duration(Duration::from_secs(72)), "1m 12s");
+        assert_eq!(format_duration(Duration::from_secs(3_780)), "1h 03m");
+    }
 }
