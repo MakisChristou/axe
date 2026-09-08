@@ -360,10 +360,13 @@ pub async fn ensure_funded_evm_with_extra<P: Provider>(
     let fee_mode = super::gas_mode::EvmFeeMode::detect(provider).await?;
 
     for (i, amount) in &to_fund {
+        // Plain EOA value transfer: pin gas to 21k so the filler never
+        // estimates with fee fields present (see deploy_with_artifact).
         let tx = fee_mode.apply(
             TransactionRequest::default()
                 .with_to(derived[*i].address())
-                .with_value(U256::from(*amount)),
+                .with_value(U256::from(*amount))
+                .with_gas_limit(21_000),
         );
         let pending = provider
             .send_transaction(tx)

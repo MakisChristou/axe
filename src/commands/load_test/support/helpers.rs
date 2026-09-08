@@ -551,8 +551,8 @@ async fn deploy_pinned<P: Provider>(
         .ok_or_else(|| {
             eyre::eyre!("latest-pinned deploy needs EVM_PRIVATE_KEY to derive the deployer address")
         })?;
-    let base = fee_mode
-        .apply(TransactionRequest::default().with_deploy_code(Bytes::from(deploy_code.to_vec())))
+    let bare = TransactionRequest::default()
+        .with_deploy_code(Bytes::from(deploy_code.to_vec()))
         .with_from(from);
     let nonce = match nonce_override {
         Some(nonce) => nonce,
@@ -564,12 +564,14 @@ async fn deploy_pinned<P: Provider>(
         }
     };
     let estimate = retry_all("deploy gas (latest block)", || {
-        let tx = base.clone();
+        // Fee-free estimate - see the ordering note in `deploy_with_artifact`.
+        let tx = bare.clone();
         async move { provider.estimate_gas(tx).block(BlockId::latest()).await }
     })
     .await?;
     // 20% headroom over the latest-block estimate.
-    let tx = base
+    let tx = fee_mode
+        .apply(bare)
         .with_nonce(nonce)
         .with_gas_limit(estimate.saturating_mul(12) / 10);
     retry_async(
@@ -634,14 +636,25 @@ async fn deploy_with_artifact<P: Provider>(
     // and skip the retry. FALLBACK_ATTEMPTS (5): the Avalanche pending-state
     // stretch outlasts the 3-attempt budget (proven by stagenet run
     // 31115899822, which died here).
+    // Estimate on a BARE request and only then attach gas + fees: fee fields
+    // present during estimation make coreth derive its gas-search cap from
+    // balance/fee, and on tiny-fee chains (fuji post-upgrade: base fee 10
+    // wei) that returns a garbage estimate in the 1e16 range - the tx is
+    // then rejected with "exceeds block gas limit". A preset gas limit also
+    // keeps the filler away from pending-state estimation entirely.
+    let bare = TransactionRequest::default().with_deploy_code(Bytes::from(deploy_code.clone()));
+    let estimate = retry_all("deploy gas (latest block)", || {
+        let tx = bare.clone();
+        async move { provider.estimate_gas(tx).block(BlockId::latest()).await }
+    })
+    .await?;
+    let priced = fee_mode.apply(bare.with_gas_limit(estimate.saturating_mul(12) / 10));
     let sent = retry_async(
         "deploy_sender_receiver.send_transaction",
         FALLBACK_ATTEMPTS,
         is_retryable_evm_transport,
         || {
-            let tx = fee_mode.apply(
-                TransactionRequest::default().with_deploy_code(Bytes::from(deploy_code.clone())),
-            );
+            let tx = priced.clone();
             async { provider.send_transaction(tx).await }
         },
     )

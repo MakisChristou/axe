@@ -32,7 +32,10 @@ jobs:
       network: testnet
       source_chain: avalanche
       destination_chain: ethereum-sepolia
-      amount: '10'
+      # 1 base unit of axlUSDC (0.000001 USDC) - the express registry caps
+      # have min: 0, so the smallest nonzero amount exercises the exact same
+      # front-and-reimburse path with nothing at stake.
+      amount: '1'
     secrets: inherit
 
   testnet-its:

@@ -20,6 +20,9 @@ on:
           - Arc
           - Avalanche
           - Berachain
+          - Core Avalanche
+          - Core Ethereum
+          - Core Optimism
           - Ethereum
           - Flow
           - Optimism
@@ -35,6 +38,9 @@ on:
           - Arc
           - Avalanche
           - Berachain
+          - Core Avalanche
+          - Core Ethereum
+          - Core Optimism
           - Ethereum
           - Flow
           - Optimism

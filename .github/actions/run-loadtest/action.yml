@@ -108,6 +108,9 @@ runs:
         {
           "Arbitrum":    {"mainnet": "arbitrum",   "testnet": "arbitrum-sepolia", "stagenet": "arbitrum-sepolia"},
           "Arc":         {"devnet-amplifier": "arc-2"},
+          "Core Avalanche": {"devnet-amplifier": "core-avalanche"},
+          "Core Ethereum":  {"devnet-amplifier": "core-ethereum"},
+          "Core Optimism":  {"devnet-amplifier": "core-optimism"},
           "Avalanche":   {"mainnet": "avalanche",  "testnet": "avalanche",        "stagenet": "avalanche", "devnet-amplifier": "avalanche-fuji"},
           "Base":        {"mainnet": "base",       "testnet": "base-sepolia",     "stagenet": "base-sepolia"},
           "Berachain":   {"stagenet": "berachain", "devnet-amplifier": "berachain"},
@@ -143,6 +146,9 @@ runs:
         {
           "Arbitrum":    "evm",
           "Arc":         "evm",
+          "Core Avalanche": "evm",
+          "Core Ethereum":  "evm",
+          "Core Optimism":  "evm",
           "Avalanche":   "evm",
           "Base":        "evm",
           "Berachain":   "evm",

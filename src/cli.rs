@@ -204,7 +204,7 @@ pub enum IntentsCommands {
 #[derive(Args)]
 pub struct IntentApiOptions {
     /// RFQ API base URL. Defaults to the selected network's public endpoint.
-    #[arg(long, env = "INTENTS_API_URL")]
+    #[arg(long, env = "INTENTS_API_URL", hide_env_values = true)]
     pub rfq_url: Option<String>,
 }
 
@@ -639,7 +639,7 @@ pub enum TestCommands {
         destination_address: Option<String>,
 
         /// Cosmos mnemonic for relay transactions
-        #[arg(long, env = "MNEMONIC")]
+        #[arg(long, env = "MNEMONIC", hide_env_values = true)]
         mnemonic: Option<String>,
     },
 
@@ -662,11 +662,11 @@ pub enum TestCommands {
         destination_chain: Option<String>,
 
         /// Cosmos mnemonic for relay transactions
-        #[arg(long, env = "MNEMONIC")]
+        #[arg(long, env = "MNEMONIC", hide_env_values = true)]
         mnemonic: Option<String>,
 
         /// EVM private key (used to derive the destination receiver address)
-        #[arg(long, env = "EVM_PRIVATE_KEY")]
+        #[arg(long, env = "EVM_PRIVATE_KEY", hide_env_values = true)]
         evm_private_key: Option<String>,
 
         /// Amount of base units to transfer (default 1_000_000_000 = 1 token at 9 decimals)
@@ -746,11 +746,11 @@ pub enum TestCommands {
         symbol: Option<String>,
 
         /// EVM private key for --originate.
-        #[arg(long, env = "EVM_PRIVATE_KEY")]
+        #[arg(long, env = "EVM_PRIVATE_KEY", hide_env_values = true)]
         private_key: Option<String>,
 
         /// Override the source chain RPC URL for --originate.
-        #[arg(long, env = "SOURCE_RPC")]
+        #[arg(long, env = "SOURCE_RPC", hide_env_values = true)]
         source_rpc: Option<String>,
     },
 
@@ -779,19 +779,19 @@ pub enum TestCommands {
         source_chain: Option<String>,
 
         /// EVM private key for deploying SenderReceiver on destination chain
-        #[arg(long, env = "EVM_PRIVATE_KEY")]
+        #[arg(long, env = "EVM_PRIVATE_KEY", hide_env_values = true)]
         private_key: Option<String>,
 
         /// Path to Solana keypair JSON file
-        #[arg(long, env = "SOLANA_PRIVATE_KEY")]
+        #[arg(long, env = "SOLANA_PRIVATE_KEY", hide_env_values = true)]
         keypair: Option<String>,
 
         /// Override source chain RPC URL (default: from config)
-        #[arg(long, env = "SOURCE_RPC")]
+        #[arg(long, env = "SOURCE_RPC", hide_env_values = true)]
         source_rpc: Option<String>,
 
         /// Override destination chain RPC URL (default: from config)
-        #[arg(long, env = "DESTINATION_RPC")]
+        #[arg(long, env = "DESTINATION_RPC", hide_env_values = true)]
         destination_rpc: Option<String>,
 
         /// Hex-encoded payload to send (default: random test message)
@@ -1512,6 +1512,53 @@ mod tests {
     fn exercise_was_renamed_to_sweep() {
         assert!(
             Cli::try_parse_from(["axe", "intents", "exercise", "--private-key", "00"]).is_err()
+        );
+    }
+
+    /// Env vars whose value is safe to render in `--help`. Everything else
+    /// backed by an env var must hide it.
+    ///
+    /// Deliberately an allowlist rather than a list of secrets: a new
+    /// key-bearing arg is then caught by default, which is the way round that
+    /// fails safe. `EVM_PRIVATE_KEY` reached four call sites with the flag on
+    /// only one of them, and `axe test load-test --help` printed the key.
+    const HELP_SAFE_ENV_VARS: &[&str] = &["AXE_NETWORK", "CHAINS_CONFIG"];
+
+    /// Collect `(command path, arg id, env var)` for every env-backed arg
+    /// that would print its value in help, over the whole command tree.
+    fn args_leaking_env_values(command: &clap::Command, path: &str, out: &mut Vec<String>) {
+        for arg in command.get_arguments() {
+            let Some(env) = arg.get_env() else { continue };
+            let env = env.to_string_lossy().to_string();
+            if HELP_SAFE_ENV_VARS.contains(&env.as_str()) || arg.is_hide_env_values_set() {
+                continue;
+            }
+            out.push(format!("{path} --{} [env: {env}]", arg.get_id()));
+        }
+        for sub in command.get_subcommands() {
+            args_leaking_env_values(sub, &format!("{path} {}", sub.get_name()), out);
+        }
+    }
+
+    /// `--help` must never render the value of a secret env var.
+    ///
+    /// clap prints `[env: NAME=value]` for an env-backed arg unless
+    /// `hide_env_values` is set, so running `axe test load-test --help` on a
+    /// configured machine printed the private key straight to the terminal,
+    /// from where it was captured into logs and transcripts.
+    #[test]
+    fn help_never_renders_a_secret_env_value() {
+        use clap::CommandFactory;
+
+        let mut leaks = Vec::new();
+        args_leaking_env_values(&Cli::command(), "axe", &mut leaks);
+
+        assert!(
+            leaks.is_empty(),
+            "these args would print their env var's value in --help; add \
+             `hide_env_values = true`, or add the var to HELP_SAFE_ENV_VARS \
+             if it can never hold a secret:\n  {}",
+            leaks.join("\n  ")
         );
     }
 }
